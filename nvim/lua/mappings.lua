@@ -15,6 +15,7 @@ nmap('<leader><leader>', '<c-^>')
 
 -- Ctrl+P Fuzzy Finder
 nmap('<c-p>', ':GFiles<cr>')
+nmap('ff', ':Ag<cr>')
 
 -- Quicker window movement
 nmap('<c-j>', '<c-w>j')
