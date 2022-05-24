@@ -5,8 +5,8 @@ cmp.setup({
     ['<c-b>'] = cmp.mapping.scroll_docs(-4),
     ['<c-f>'] = cmp.mapping.scroll_docs(4),
     ['<c-space>'] = cmp.mapping.complete(),
-    ['<c-e>'] = cmp.mapping.abort(),
-    ['<cr>'] = cmp.mapping.confirm({ select = true }),
+    ['<cr>'] = cmp.mapping.abort(),
+    ['<tab>'] = cmp.mapping.confirm({ select = true }),
   }),
   sources = cmp.config.sources({
     { name = 'nvim_lsp' },
@@ -66,11 +66,28 @@ local on_attach = function(client, bufnr)
 end
 
 local capabilities = require('cmp_nvim_lsp').update_capabilities(vim.lsp.protocol.make_client_capabilities())
-
-local servers = { "solargraph" }
-for _, lsp in ipairs(servers) do
-  nvim_lsp[lsp].setup {
-	  on_attach = on_attach,
-    capabilities = capabilities,
+local lsp_default_config = { on_attach = on_attach, capabilities = capabilities }
+local servers = {
+  solargraph = {},
+  gopls = {
+    cmd = { 'gopls', '--remote=auto' },
+    capabilities = {
+      textDocument = {
+        completion = {
+          completionItem = {
+            snippetSupport = true
+          }
+        }
+      }
+    },
+    init_options = {
+      usePlaceholders = true,
+      completeUnimported = true
+    }
   }
+}
+
+for lsp, config in ipairs(servers) do
+  nvim_lsp[lsp].setup(vim.tbl_deep_extend('force', lsp_default_config, config))
 end
+

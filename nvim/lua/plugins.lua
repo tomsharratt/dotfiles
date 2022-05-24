@@ -29,5 +29,10 @@ return require('packer').startup(function()
   use 'vim-test/vim-test'
 
   -- Ruby
+  use 'vim-ruby/vim-ruby'
   use 'tpope/vim-endwise'
+
+  -- Go
+  use 'fatih/vim-go'
+
 end)
