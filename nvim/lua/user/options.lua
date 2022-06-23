@@ -1,9 +1,10 @@
-HOME = os.getenv("HOME")
-
 -- basic
 vim.opt.encoding = 'utf-8'
 vim.opt.backspace = 'indent,eol,start'
 vim.opt.completeopt = 'menu,menuone,noselect'
+vim.opt.updatetime = 300
+vim.opt.undofile = true
+vim.opt.timeoutlen = 1000
 
 -- display
 vim.opt.showmatch = true
@@ -56,3 +57,5 @@ vim.opt.splitright = true
 
 -- Theme
 vim.cmd([[ colorscheme nord ]])
+vim.cmd([[ set iskeyword+=- ]])
+
