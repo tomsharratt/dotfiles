@@ -1,11 +1,7 @@
 font:
-  size: 13
+  size: 12
   normal:
-    family: 'FiraCode Nerd Font'
-  bold:
-    family: 'FiraCode Nerd Font'
-  italic:
-    family: 'FiraCode Nerd Font'
+    family: 'Hack Nerd Font'
 colors:
   primary:
     background: '#2e3440'
