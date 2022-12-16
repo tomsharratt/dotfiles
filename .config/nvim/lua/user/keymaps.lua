@@ -31,14 +31,15 @@ nmap('<c-h>', '<c-w>h')
 nmap('<c-l>', '<c-w>l')
 
 -- Resize windows with arrows
---nmap('<c-up>', ':resize +2<cr>')
---nmap('<c-down>', ':resize -2<cr>')
---nmap('<c-left>', ':vertical resize -2<cr>')
---nmap('<c-right>', ':vertical resize +2<cr>')
+nmap('<c-up>', ':resize +2<cr>')
+nmap('<c-down>', ':resize -2<cr>')
+nmap('<c-left>', ':vertical resize -2<cr>')
+nmap('<c-right>', ':vertical resize +2<cr>')
 
--- Navigate buffers
+-- Buffers
 nmap('<s-l>', ':bnext<cr>')
 nmap('<s-h>', ':bprevious<cr>')
+nmap('<c-q>', ':bd<cr>')
 
 -- Test runners
 nmap('<leader>t', ':TestNearest<cr>')

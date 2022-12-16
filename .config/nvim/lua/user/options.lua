@@ -5,6 +5,7 @@ vim.opt.completeopt = 'menu,menuone,noselect'
 vim.opt.updatetime = 300
 vim.opt.undofile = true
 vim.opt.timeoutlen = 1000
+vim.opt.mouse = ""
 
 -- display
 vim.opt.showmatch = true
@@ -13,6 +14,7 @@ vim.opt.synmaxcol = 300
 vim.opt.laststatus = 3
 
 vim.opt.list = true
+vim.opt.listchars = 'tab:▎ '
 vim.opt.foldenable = false
 vim.opt.foldlevel = 4
 vim.opt.foldmethod = 'syntax'
@@ -29,7 +31,7 @@ vim.opt.showmode = false
 vim.opt.showcmd = true
 
 -- Ruler
-vim.opt.textwidth = 120
+vim.opt.textwidth = 80
 vim.opt.colorcolumn = '+1'
 
 -- Search
@@ -56,6 +58,7 @@ vim.opt.splitbelow = true
 vim.opt.splitright = true
 
 -- Theme
-vim.cmd([[ colorscheme nord ]])
+vim.opt.termguicolors = true
+vim.cmd([[ colorscheme nightfox ]])
 vim.cmd([[ set iskeyword+=- ]])
 

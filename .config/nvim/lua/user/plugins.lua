@@ -43,6 +43,8 @@ return packer.startup(function(use)
 
   -- Themes
   use 'arcticicestudio/nord-vim'
+  use 'nanotech/jellybeans.vim'
+  use 'EdenEast/nightfox.nvim'
 
   -- Auto pairs
   use 'windwp/nvim-autopairs'
@@ -100,6 +102,9 @@ return packer.startup(function(use)
     'nvim-treesitter/nvim-treesitter',
     run = ':TSUpdate',
   }
+
+  -- Terminal
+  use { 'akinsho/toggleterm.nvim', tag = '*' }
 
   -- Tests
   use 'vim-test/vim-test'
