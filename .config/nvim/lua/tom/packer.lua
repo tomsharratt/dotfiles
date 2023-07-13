@@ -21,6 +21,7 @@ return require('packer').startup(function(use)
 		{run = ':TSUpdate'}
 	}
 
+    use 'theprimeagen/harpoon'
 	use 'mbbill/undotree'
     use 'tpope/vim-fugitive'
 
