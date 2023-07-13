@@ -9,12 +9,7 @@ return require('packer').startup(function(use)
 		requires = { {'nvim-lua/plenary.nvim'} }
 	}
 
-	use {
-		"EdenEast/nightfox.nvim",
-		config = function()
-			vim.cmd('colorscheme nightfox')
-		end
-	}
+	use "EdenEast/nightfox.nvim"
 
 	use {
 		'nvim-treesitter/nvim-treesitter',

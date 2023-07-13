@@ -1,7 +1,17 @@
+env:
+  TERM: xterm-256color
+
 font:
   size: 12
   normal:
     family: 'Hack Nerd Font'
+
+window:
+  padding:
+    x: 4
+    y: 4
+  dynamic_padding: true
+  opacity: 0.8
 
 # Nightfox Alacritty Colors
 # Style: nightfox
