@@ -97,12 +97,6 @@ return {
                         local lua_opts = lsp_zero.nvim_lua_ls()
                         require('lspconfig').lua_ls.setup(lua_opts)
                     end,
-                    html = function()
-                        -- (Optional) Configure html language server for neovim
-                        local html_opts = lsp_zero.html_ls()
-                        html_opts.filetypes = { 'html', 'templ' }
-                        require('lspconfig').html.setup(html_opts)
-                    end,
                 }
             })
         end
