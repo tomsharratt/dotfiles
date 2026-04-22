@@ -1,26 +1,34 @@
 return {
     'nvim-treesitter/nvim-treesitter',
-    build = function()
-        require("nvim-treesitter.install").update({ with_sync = true })()
-    end,
+    branch = 'main',
+    lazy = false,
+    build = ':TSUpdate',
     config = function()
-        local configs = require("nvim-treesitter.configs")
+        local parsers = {
+            'javascript', 'typescript', 'tsx',
+            'ruby', 'embedded_template',
+            'go', 'lua', 'vim', 'vimdoc', 'query',
+            'markdown', 'markdown_inline',
+            'json', 'yaml', 'toml',
+            'html', 'css', 'bash',
+        }
 
-        configs.setup({
-            ensure_installed = { "javascript", "typescript", "elixir", "go", "lua", "vim" },
-            sync_install = false,
-            auto_install = true,
-            highlight = {
-                enable = true,
-                -- Setting this to true will run `:h syntax` and tree-sitter at the same time.
-                -- Set this to `true` if you depend on 'syntax' being enabled (like for indentation).
-                -- Using this option may slow down your editor, and you may see some duplicate highlights.
-                -- Instead of true it can also be a list of languages
-                additional_vim_regex_highlighting = false,
+        require('nvim-treesitter').install(parsers)
+
+        vim.api.nvim_create_autocmd('FileType', {
+            pattern = {
+                'javascript', 'javascriptreact',
+                'typescript', 'typescriptreact',
+                'ruby', 'eruby',
+                'go', 'lua', 'vim', 'help', 'query',
+                'markdown',
+                'json', 'yaml', 'toml',
+                'html', 'css', 'bash', 'sh',
             },
-            indent = {
-                enable = true,
-            },
+            callback = function()
+                vim.treesitter.start()
+                vim.bo.indentexpr = "v:lua.require'nvim-treesitter'.indentexpr()"
+            end,
         })
     end,
 }

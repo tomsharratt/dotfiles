@@ -1,21 +1,55 @@
 return {
     {
-        'VonHeikemen/lsp-zero.nvim',
-        branch = 'v3.x',
-        lazy = true,
-        config = false,
-        init = function()
-            -- Disable automatic setup, we are doing it manually
-            vim.g.lsp_zero_extend_cmp = 0
-            vim.g.lsp_zero_extend_lspconfig = 0
-
-            vim.filetype.add({ extension = { templ = "templ" } })
-        end,
+        'mason-org/mason.nvim',
+        lazy = false,
+        opts = {},
     },
     {
-        'williamboman/mason.nvim',
-        lazy = false,
-        config = true,
+        'mason-org/mason-lspconfig.nvim',
+        dependencies = {
+            'mason-org/mason.nvim',
+            'neovim/nvim-lspconfig',
+        },
+        opts = {
+            ensure_installed = { 'lua_ls', 'ruby_lsp', 'stimulus_ls', 'herb_ls', 'tailwindcss' },
+        },
+    },
+    {
+        'neovim/nvim-lspconfig',
+        event = { 'BufReadPre', 'BufNewFile' },
+        dependencies = { 'hrsh7th/cmp-nvim-lsp' },
+        config = function()
+            vim.filetype.add({ extension = { templ = 'templ' } })
+
+            vim.lsp.config('*', {
+                capabilities = require('cmp_nvim_lsp').default_capabilities(),
+            })
+
+            vim.lsp.config('lua_ls', {
+                settings = {
+                    Lua = {
+                        runtime = { version = 'LuaJIT' },
+                        diagnostics = { globals = { 'vim' } },
+                        workspace = {
+                            checkThirdParty = false,
+                            library = vim.api.nvim_get_runtime_file('', true),
+                        },
+                        telemetry = { enable = false },
+                    },
+                },
+            })
+
+            vim.api.nvim_create_autocmd('LspAttach', {
+                callback = function(ev)
+                    local opts = { buffer = ev.buf, remap = false }
+                    vim.keymap.set('n', 'gd', vim.lsp.buf.definition, opts)
+                    vim.keymap.set('n', 'K', vim.lsp.buf.hover, opts)
+                    vim.keymap.set('n', '<leader>va', vim.lsp.buf.code_action, opts)
+                    vim.keymap.set('n', '<leader>vrf', vim.lsp.buf.references, opts)
+                    vim.keymap.set('n', '<leader>vrn', vim.lsp.buf.rename, opts)
+                end,
+            })
+        end,
     },
 
     -- Autocompletion
@@ -23,86 +57,44 @@ return {
         'hrsh7th/nvim-cmp',
         event = 'InsertEnter',
         dependencies = {
-            { 'L3MON4D3/LuaSnip' },
+            'hrsh7th/cmp-nvim-lsp',
+            'L3MON4D3/LuaSnip',
         },
         config = function()
-            -- Here is where you configure the autocompletion settings.
-            local lsp_zero = require('lsp-zero')
-            lsp_zero.extend_cmp()
-
-            -- And you can configure cmp even more, if you want to.
             local cmp = require('cmp')
-            local cmp_action = lsp_zero.cmp_action()
+            local luasnip = require('luasnip')
 
             cmp.setup({
-                formatting = lsp_zero.cmp_format({ details = true }),
+                snippet = {
+                    expand = function(args) luasnip.lsp_expand(args.body) end,
+                },
+                sources = {
+                    { name = 'nvim_lsp' },
+                    { name = 'luasnip' },
+                },
                 mapping = cmp.mapping.preset.insert({
                     ['<C-Space>'] = cmp.mapping.complete(),
                     ['<C-u>'] = cmp.mapping.scroll_docs(-4),
                     ['<C-d>'] = cmp.mapping.scroll_docs(4),
-                    ['<C-f>'] = cmp_action.luasnip_jump_forward(),
-                    ['<C-b>'] = cmp_action.luasnip_jump_backward(),
+                    ['<CR>'] = cmp.mapping.confirm({ select = false }),
+                    ['<C-f>'] = cmp.mapping(function(fallback)
+                        if luasnip.expand_or_jumpable() then
+                            luasnip.expand_or_jump()
+                        else
+                            fallback()
+                        end
+                    end, { 'i', 's' }),
+                    ['<C-b>'] = cmp.mapping(function(fallback)
+                        if luasnip.jumpable(-1) then
+                            luasnip.jump(-1)
+                        else
+                            fallback()
+                        end
+                    end, { 'i', 's' }),
                     ['<Tab>'] = nil,
                     ['<S-Tab>'] = nil,
-                })
+                }),
             })
-        end
+        end,
     },
-
-    -- LSP
-    {
-        'neovim/nvim-lspconfig',
-        cmd = { 'LspInfo', 'LspInstall', 'LspStart' },
-        event = { 'BufReadPre', 'BufNewFile' },
-        dependencies = {
-            { 'hrsh7th/cmp-nvim-lsp' },
-            { 'williamboman/mason-lspconfig.nvim' },
-        },
-        config = function()
-            -- This is where all the LSP shenanigans will live
-            local lsp_zero = require('lsp-zero')
-            lsp_zero.extend_lspconfig()
-
-            lsp_zero.set_preferences({
-                sign_icons = {
-                    error = 'E',
-                    warn = 'W',
-                    hint = 'H',
-                    info = 'I',
-                },
-            })
-
-            --- if you want to know more about lsp-zero and mason.nvim
-            --- read this: https://github.com/VonHeikemen/lsp-zero.nvim/blob/v3.x/doc/md/guides/integrate-with-mason-nvim.md
-            lsp_zero.on_attach(function(_, bufnr)
-                -- see :help lsp-zero-keybindings
-                -- to learn the available actions
-                lsp_zero.default_keymaps({ buffer = bufnr })
-
-                local opts = {buffer = bufnr, remap = false}
-
-                vim.keymap.set("n", "gd", function() vim.lsp.buf.definition() end, opts)
-                vim.keymap.set("n", "K", function() vim.lsp.buf.hover() end, opts)
-                vim.keymap.set("n", "<leader>va", function() vim.lsp.buf.code_action() end, opts)
-                vim.keymap.set("n", "<leader>vrf", function() vim.lsp.buf.references() end, opts)
-                vim.keymap.set("n", "<leader>vrn", function() vim.lsp.buf.rename() end, opts)
-            end)
-
-            require('mason-lspconfig').setup({
-                ensure_installed = {},
-                handlers = {
-                    lsp_zero.default_setup,
-                    lua_ls = function()
-                        -- (Optional) Configure lua language server for neovim
-                        local lua_opts = lsp_zero.nvim_lua_ls()
-                        require('lspconfig').lua_ls.setup(lua_opts)
-                    end,
-                }
-            })
-        end
-    }
 }
-
---vim.diagnostic.config({
---    virtual_text = true,
---})
