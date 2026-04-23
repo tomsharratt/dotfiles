@@ -3,7 +3,7 @@ local wezterm = require("wezterm")
 local config = wezterm.config_builder()
 
 config.font = wezterm.font("Hack Nerd Font")
-config.font_size = 12.0
+config.font_size = 14.0
 
 config.window_padding = {
   left = 4,
@@ -20,6 +20,10 @@ config.hide_tab_bar_if_only_one_tab = true
 config.colors = {
   foreground = "#e0def4",
   background = "#232136",
+
+  cursor_bg = "#ff69b4",
+  cursor_border = "#ff69b4",
+  cursor_fg = "#232136",
 
   ansi = {
     "#393552", -- black
