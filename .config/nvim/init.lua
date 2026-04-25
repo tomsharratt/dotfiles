@@ -58,6 +58,11 @@ vim.keymap.set("n", "<leader><leader>", "<C-^>")
 
 vim.keymap.set("t", "<esc>", [[<C-\><C-n>]])
 
+vim.keymap.set("t", "<C-w>h", [[<C-\><C-n><C-w>h]])
+vim.keymap.set("t", "<C-w>j", [[<C-\><C-n><C-w>j]])
+vim.keymap.set("t", "<C-w>k", [[<C-\><C-n><C-w>k]])
+vim.keymap.set("t", "<C-w>l", [[<C-\><C-n><C-w>l]])
+
 vim.keymap.set("v", "J", ":m '>+1<CR>gv=gv")
 vim.keymap.set("v", "K", ":m '<-2<CR>gv=gv")
 

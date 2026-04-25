@@ -47,6 +47,9 @@ return {
                     vim.keymap.set('n', '<leader>va', vim.lsp.buf.code_action, opts)
                     vim.keymap.set('n', '<leader>vrf', vim.lsp.buf.references, opts)
                     vim.keymap.set('n', '<leader>vrn', vim.lsp.buf.rename, opts)
+                    vim.keymap.set('n', '<leader>e', vim.diagnostic.open_float, opts)
+                    vim.keymap.set('n', ']d', vim.diagnostic.goto_next, opts)
+                    vim.keymap.set('n', '[d', vim.diagnostic.goto_prev, opts)
                 end,
             })
         end,
