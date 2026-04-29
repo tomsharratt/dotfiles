@@ -57,6 +57,7 @@ vim.keymap.set("n", "<leader>pv", vim.cmd.Ex)
 vim.keymap.set("n", "<leader><leader>", "<C-^>")
 
 vim.keymap.set("t", "<esc>", [[<C-\><C-n>]])
+vim.keymap.set("t", "<C-n>", [[<C-\><C-n>]])
 
 vim.keymap.set("t", "<C-w>h", [[<C-\><C-n><C-w>h]])
 vim.keymap.set("t", "<C-w>j", [[<C-\><C-n><C-w>j]])
