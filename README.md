@@ -1,17 +1,51 @@
 # dotfiles
 
-Personal dotfiles for macOS. Manages `~/.config/nvim`, `~/.config/wezterm`, and Hack Nerd Font.
+Personal dotfiles for macOS. Manages `~/.config/nvim`, `~/.config/ghostty`, and Hack Nerd Font.
+
+## Repository Layout
+
+Everything is laid out to mirror the target `$HOME`, so a directory here maps to the same path under your home directory.
+`install.sh` copies each `.config/<name>` into `~/.config/<name>`, and `.local/share/fonts` into the OS font directory.
+
+```
+.
+├── .config/                          App configs, synced into ~/.config
+│   ├── ghostty/
+│   │   └── config
+│   └── nvim/
+│       ├── init.lua
+│       ├── lazy-lock.json
+│       └── lua/
+│           └── plugins/              One Lua file per plugin spec
+├── .local/
+│   └── share/
+│       └── fonts/                    Bundled fonts, installed to the OS font dir
+│           └── HackNerdFont-Regular.ttf
+├── install.sh                        Sync repo configs into the environment
+├── import.sh                         Pull environment configs back into the repo
+└── README.md
+```
+
+### Config directories
+
+| Directory | Purpose |
+| --- | --- |
+| `.config/ghostty/` | Ghostty terminal emulator. The single `config` file sets the font, window padding, background opacity, one keybinding, and the duskfox color palette. Edit it to change how the terminal looks or behaves. |
+| `.config/nvim/` | Neovim, managed by lazy.nvim. `init.lua` holds core options, remaps, and the lazy.nvim bootstrap; `lazy-lock.json` pins plugin versions; `lua/plugins/` has one spec file per plugin. Edit these to change editor behavior or add and remove plugins. |
+| `.local/share/fonts/` | Fonts bundled with the repo. Currently just `HackNerdFont-Regular.ttf`, used by both the terminal and Neovim. Edit only to add or update a font. |
+
+The `lua/plugins/` specs cover Claude Code (`claudecode.lua`), git (`fugitive.lua`), file navigation (`harpoon.lua`), LSP and Mason (`lsp.lua`), quality-of-life helpers (`snacks.lua`), fuzzy finding (`telescope.lua`), the colorscheme (`theme.lua`), and Treesitter (`treesitter.lua`).
 
 ## Requirements
 
 Neovim 0.12+, plus a few CLI tools the config shells out to. Install with Homebrew:
 
 ```sh
-brew install neovim wezterm tree-sitter-cli ripgrep fd asdf
+brew install neovim ghostty tree-sitter-cli ripgrep fd asdf
 ```
 
 - `neovim` — editor.
-- `wezterm` — terminal.
+- `ghostty` — terminal.
 - `tree-sitter-cli` — required by `nvim-treesitter` (main branch) to build parsers. The plain `tree-sitter` formula is the library only.
 - `ripgrep`, `fd` — used by Telescope for find/grep.
 - `asdf` — manages Ruby and Node runtimes; Mason needs both to install LSP servers.
