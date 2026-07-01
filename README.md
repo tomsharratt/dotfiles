@@ -2,6 +2,8 @@
 
 Personal dotfiles for macOS. Manages `~/.config/nvim`, `~/.config/wezterm`, and Hack Nerd Font.
 
+This repo keeps my personal configuration files - shell, editor, and tool configs - under version control, so the setup can be tracked over time and reused across machines.
+
 ## Requirements
 
 Neovim 0.12+, plus a few CLI tools the config shells out to. Install with Homebrew:
