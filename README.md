@@ -44,11 +44,11 @@ Neovim 0.12+, plus a few CLI tools the config shells out to. Install with Homebr
 brew install neovim ghostty tree-sitter-cli ripgrep fd asdf
 ```
 
-- `neovim` — editor.
-- `ghostty` — terminal.
-- `tree-sitter-cli` — required by `nvim-treesitter` (main branch) to build parsers. The plain `tree-sitter` formula is the library only.
-- `ripgrep`, `fd` — used by Telescope for find/grep.
-- `asdf` — manages Ruby and Node runtimes; Mason needs both to install LSP servers.
+- `neovim` - editor.
+- `ghostty` - terminal.
+- `tree-sitter-cli` - required by `nvim-treesitter` (main branch) to build parsers. The plain `tree-sitter` formula is the library only.
+- `ripgrep`, `fd` - used by Telescope for find/grep.
+- `asdf` - manages Ruby and Node runtimes; Mason needs both to install LSP servers.
 
 ### asdf: set user-level defaults
 
@@ -75,13 +75,13 @@ Sync this repo into `~/.config` and install fonts:
 
 On first launch, lazy.nvim bootstraps itself and pulls plugins. After that:
 
-1. `:Lazy sync` — install/update all plugins.
-2. `:TSUpdate` — build Treesitter parsers.
-3. `:Mason` — verify LSP servers installed (`lua_ls`, `ruby_lsp`, `stimulus_ls`, `herb_ls`, `tailwindcss`). Check `:MasonLog` if anything fails.
+1. `:Lazy sync` - install/update all plugins.
+2. `:TSUpdate` - build Treesitter parsers.
+3. `:Mason` - verify LSP servers installed (`lua_ls`, `ruby_lsp`, `stimulus_ls`, `herb_ls`, `tailwindcss`). Check `:MasonLog` if anything fails.
 
 ## Pulling local changes back into the repo
 
-`import.sh` does the reverse of `install.sh` — pulls configs from `~/.config` back into the repo for anything already tracked here.
+`import.sh` does the reverse of `install.sh` - pulls configs from `~/.config` back into the repo for anything already tracked here.
 
 ```sh
 ./import.sh
