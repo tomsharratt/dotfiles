@@ -1,5 +1,7 @@
 # dotfiles
 
+This repository stores my personal configuration files (dotfiles) - shell, editor, and tool configs - so I can set up and keep a consistent development environment across machines.
+
 Personal dotfiles for macOS. Manages `~/.config/nvim`, `~/.config/wezterm`, and Hack Nerd Font.
 
 ## Requirements
