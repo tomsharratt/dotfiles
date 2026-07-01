@@ -2,18 +2,18 @@
 
 This repository stores my personal configuration files (dotfiles) - shell, editor, and tool configs - so I can set up and keep a consistent development environment across machines.
 
-Personal dotfiles for macOS. Manages `~/.config/nvim`, `~/.config/wezterm`, and Hack Nerd Font.
+Personal dotfiles for macOS. Manages `~/.config/nvim`, `~/.config/ghostty`, and Hack Nerd Font.
 
 ## Requirements
 
 Neovim 0.12+, plus a few CLI tools the config shells out to. Install with Homebrew:
 
 ```sh
-brew install neovim wezterm tree-sitter-cli ripgrep fd asdf
+brew install neovim ghostty tree-sitter-cli ripgrep fd asdf
 ```
 
 - `neovim` — editor.
-- `wezterm` — terminal.
+- `ghostty` — terminal.
 - `tree-sitter-cli` — required by `nvim-treesitter` (main branch) to build parsers. The plain `tree-sitter` formula is the library only.
 - `ripgrep`, `fd` — used by Telescope for find/grep.
 - `asdf` — manages Ruby and Node runtimes; Mason needs both to install LSP servers.
