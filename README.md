@@ -4,8 +4,8 @@ Personal dotfiles for macOS. Manages `~/.config/nvim`, `~/.config/ghostty`, and 
 
 ## Repository Layout
 
-Everything is laid out to mirror the target `$HOME`, so a directory here maps to the same path under your home directory.
-`install.sh` copies each `.config/<name>` into `~/.config/<name>`, and `.local/share/fonts` into the OS font directory.
+Each directory under `.config/` mirrors the same path under `$HOME`, so `.config/<name>` maps to `~/.config/<name>`.
+Fonts are the exception: `install.sh` copies each `.config/<name>` into `~/.config/<name>`, and `.local/share/fonts` into the OS font directory (`~/Library/Fonts` on macOS).
 
 ```
 .
@@ -16,7 +16,7 @@ Everything is laid out to mirror the target `$HOME`, so a directory here maps to
 │       ├── init.lua
 │       ├── lazy-lock.json
 │       └── lua/
-│           └── plugins/              One Lua file per plugin spec
+│           └── plugins/              One Lua file per plugin topic
 ├── .local/
 │   └── share/
 │       └── fonts/                    Bundled fonts, installed to the OS font dir
@@ -31,7 +31,7 @@ Everything is laid out to mirror the target `$HOME`, so a directory here maps to
 | Directory | Purpose |
 | --- | --- |
 | `.config/ghostty/` | Ghostty terminal emulator. The single `config` file sets the font, window padding, background opacity, one keybinding, and the duskfox color palette. Edit it to change how the terminal looks or behaves. |
-| `.config/nvim/` | Neovim, managed by lazy.nvim. `init.lua` holds core options, remaps, and the lazy.nvim bootstrap; `lazy-lock.json` pins plugin versions; `lua/plugins/` has one spec file per plugin. Edit these to change editor behavior or add and remove plugins. |
+| `.config/nvim/` | Neovim, managed by lazy.nvim. `init.lua` holds core options, remaps, and the lazy.nvim bootstrap; `lazy-lock.json` pins plugin versions; `lua/plugins/` has one spec file per topic (a file may bundle several related plugins, as `lsp.lua` does). Edit these to change editor behavior or add and remove plugins. |
 | `.local/share/fonts/` | Fonts bundled with the repo. Currently just `HackNerdFont-Regular.ttf`, used by both the terminal and Neovim. Edit only to add or update a font. |
 
 The `lua/plugins/` specs cover Claude Code (`claudecode.lua`), git (`fugitive.lua`), file navigation (`harpoon.lua`), LSP and Mason (`lsp.lua`), quality-of-life helpers (`snacks.lua`), fuzzy finding (`telescope.lua`), the colorscheme (`theme.lua`), and Treesitter (`treesitter.lua`).
