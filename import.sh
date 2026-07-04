@@ -24,6 +24,18 @@ for dir in "$repo"/.config/*/; do
   fi
 done
 
+for f in "$repo"/.local/bin/*; do
+  [ -e "$f" ] || continue
+  name="$(basename "$f")"
+  src="$HOME/.local/bin/$name"
+  if [ -e "$src" ]; then
+    cp "$src" "$f"
+    echo "bin:    $src  →  .local/bin/$name"
+  else
+    echo "skip:   .local/bin/$name (not present in env)"
+  fi
+done
+
 for font in "$repo"/.local/share/fonts/*; do
   [ -e "$font" ] || continue
   name="$(basename "$font")"

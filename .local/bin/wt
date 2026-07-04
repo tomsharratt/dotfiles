@@ -1,0 +1,193 @@
+#!/usr/bin/env bash
+# wt — worktree workflow backend for the tmux keybindings.
+#
+# You don't type this by hand; tmux drives it (see ~/.config/tmux/tmux.conf):
+#   prefix+T  →  wt spawn <name>            new task: a worktree + Claude in a named window
+#   prefix+D  →  wt dev <pane> <path>       toggle the dev server onto the current worktree
+#
+# Single-slot model: puma-dev forwards *.supercast.test to whatever holds port
+# 3000. Staging a worktree = its `bin/dev` takes port 3000 (the previous holder
+# is gracefully stopped — silent handoff). Unstaging hands the port back to the
+# canonical checkout. Worktrees live under ~/projects/.worktrees/<repo>/<name>.
+
+set -uo pipefail
+
+WT_ROOT="$HOME/projects/.worktrees"
+STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/wt"
+DEV_PORT=3000
+DEV_WINDOW=dev
+SELF="$HOME/.local/bin/wt"
+mkdir -p "$STATE_DIR"
+
+die() { tmux display-message "wt: $*" 2>/dev/null || true; printf 'wt: %s\n' "$*" >&2; exit 1; }
+msg() { tmux display-message "wt: $*" 2>/dev/null || printf 'wt: %s\n' "$*" >&2; }
+
+# main (canonical) working tree of the repo containing $1
+main_worktree() { git -C "$1" worktree list --porcelain 2>/dev/null | awk '/^worktree /{print substr($0,10); exit}'; }
+# git toplevel of a path (the worktree you're standing in)
+toplevel() { git -C "$1" rev-parse --show-toplevel 2>/dev/null; }
+# Base new worktrees fork from (and we diff against for migrations): the repo's
+# default branch as a remote-tracking ref via origin/HEAD (e.g. origin/master),
+# so worktrees fork from the shared base rather than the canonical checkout's
+# current branch. Falls back to a remote/local main or master.
+base_ref() {
+  local repo=$1 ref b
+  ref=$(git -C "$repo" symbolic-ref --quiet --short refs/remotes/origin/HEAD 2>/dev/null) \
+    && { printf '%s' "$ref"; return; }
+  for b in origin/main origin/master main master; do
+    git -C "$repo" rev-parse --verify --quiet "$b^{commit}" >/dev/null && { printf '%s' "$b"; return; }
+  done
+}
+
+# Free port 3000 by gracefully TERMing the process GROUP of whatever holds it
+# (so foreman reaps sidekiq / the watchers / stripe instead of orphaning them),
+# whether that's our managed `dev` window or a hand-started bin/dev.
+stop_dev() {
+  local pids pid pgid i
+  for i in $(seq 1 30); do
+    pids=$(lsof -ti "tcp:$DEV_PORT" 2>/dev/null || true)
+    [ -z "$pids" ] && break
+    for pid in $pids; do
+      pgid=$(ps -o pgid= -p "$pid" 2>/dev/null | tr -d ' ')
+      if [ -n "$pgid" ]; then kill -TERM -"$pgid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null || true
+      else kill -TERM "$pid" 2>/dev/null || true; fi
+    done
+    sleep 0.5
+  done
+  # tidy any leftover dev window
+  tmux list-windows -a -F '#{window_id} #{window_name}' 2>/dev/null \
+    | awk -v n="$DEV_WINDOW" '$2==n{print $1}' \
+    | while read -r w; do tmux kill-window -t "$w" 2>/dev/null || true; done
+}
+
+# start bin/dev for <dir> in a backgrounded `dev` window of <session>
+start_dev() {
+  local session=$1 dir=$2
+  tmux new-window -d -t "$session" -n "$DEV_WINDOW" -c "$dir" "$SELF _run-dev '$dir'"
+}
+
+cmd=${1:-}; shift 2>/dev/null || true
+case "$cmd" in
+
+  spawn) # wt spawn <name>  — foreground command of a freshly-created window
+    # Any setup failure prints in red and drops to a shell so the window stays
+    # open and you can read what went wrong (instead of flashing shut).
+    fail() { printf '\n\033[38;2;235;111;146mwt: %s\033[0m\n\n' "$*" >&2; exec "$SHELL" -l; }
+    name=${1:-}
+    [ -n "$name" ] || fail "no task name given"
+    # a task name IS a branch name; let git vet it (rejects spaces, '..', //, leading/trailing /, etc.)
+    git check-ref-format "refs/heads/$name" || fail "invalid task/branch name: '$name'"
+    origin=$(main_worktree "$PWD")
+    [ -n "$origin" ] || fail "cwd is not inside a git repo:
+      $PWD
+    Press prefix+T from inside the repo (or a worktree of it) you want."
+    repo=$(basename "$origin")
+    wt_path="$WT_ROOT/$repo/$name"
+    if [ ! -e "$wt_path" ]; then
+      mkdir -p "$(dirname "$wt_path")"   # parent chain for slash-namespaced names (e.g. tom/foo)
+      if git -C "$origin" show-ref --verify --quiet "refs/heads/$name"; then
+        # existing local branch → check it out, then fast-forward to origin if we can
+        git -C "$origin" worktree add "$wt_path" "$name" \
+          || fail "worktree add failed for '$name' (already checked out in another worktree?)"
+        if git -C "$wt_path" fetch --quiet origin "+refs/heads/$name:refs/remotes/origin/$name" 2>/dev/null; then
+          git -C "$wt_path" merge --ff-only --quiet "origin/$name" 2>/dev/null \
+            && echo "wt: synced '$name' with origin" \
+            || msg "'$name' has diverged from origin - kept your local copy as-is"
+        fi
+      elif git -C "$origin" ls-remote --exit-code --heads origin "$name" >/dev/null 2>&1; then
+        # branch exists only on the remote → check out a local copy that tracks it
+        echo "wt: checking out existing remote branch '$name'"
+        git -C "$origin" fetch --quiet origin "+refs/heads/$name:refs/remotes/origin/$name" \
+          || msg "fetch failed (offline?) - using last-known origin/$name"
+        git -C "$origin" worktree add -b "$name" "$wt_path" "origin/$name" \
+          || fail "worktree add failed for remote branch '$name'"
+      else
+        # brand-new task → new branch off an up-to-date default base
+        base=$(base_ref "$origin")
+        [ -n "$base" ] || fail "couldn't determine the repo's default branch (is 'origin' set up?)"
+        # fork from an up-to-date base: refresh it from origin first (soft-fail offline)
+        case "$base" in
+          */*) echo "wt: fetching latest $base"
+               git -C "$origin" fetch --quiet "${base%%/*}" "+${base#*/}:refs/remotes/$base" \
+                 || msg "fetch failed (offline?) - forking from last-known $base" ;;
+        esac
+        git -C "$origin" worktree add --no-track -b "$name" "$wt_path" "$base" \
+          || fail "worktree add failed (base: $base)"
+      fi
+    fi
+    cd "$wt_path" || fail "cannot cd into $wt_path"
+    claude   # interactive — you type the prompt and pick auto/plan inside Claude
+
+    # On exit, offer to clean up (we made the worktree, so Claude won't).
+    printf '\n'
+    read -r -p "wt: remove worktree '$name'? [y/N] " ans || ans=n
+    if [[ "${ans:-}" =~ ^[Yy]$ ]]; then
+      if [ "$wt_path" = "$(cat "$STATE_DIR/staged_path" 2>/dev/null)" ]; then
+        echo "wt: '$name' still holds the dev server — unstage with prefix+D first; not removing."
+      elif git -C "$origin" worktree remove "$wt_path" 2>/dev/null; then
+        # prune now-empty namespace dirs (e.g. .worktrees/supercast/tom/), never $repo itself
+        parent=$(dirname "$wt_path")
+        while [ "$parent" != "$WT_ROOT/$repo" ] && rmdir "$parent" 2>/dev/null; do parent=$(dirname "$parent"); done
+        echo "wt: removed worktree '$name' (branch kept)."; exit 0
+      else
+        echo "wt: not removed (uncommitted changes?). Manual: git -C '$origin' worktree remove '$wt_path'"
+      fi
+    fi
+    cd "$wt_path" 2>/dev/null || cd "$origin" 2>/dev/null || cd "$HOME"
+    exec "$SHELL" -l
+    ;;
+
+  dev)   # wt dev <trigger_pane_id> <pane_current_path>  — toggle the handoff
+    pane=${1:-}; path=${2:-}
+    [ -n "$pane" ] && [ -n "$path" ] || die "usage: wt dev <pane> <path>"
+    wt_path=$(toplevel "$path"); [ -n "$wt_path" ] || { msg "not a git worktree"; exit 0; }
+    canonical=$(main_worktree "$path")
+    session=$(tmux display -p -t "$pane" '#{session_name}' 2>/dev/null)
+    window=$(tmux display -p -t "$pane" '#{window_id}' 2>/dev/null)
+    staged_path=$(cat "$STATE_DIR/staged_path" 2>/dev/null || true)
+    staged_win=$(cat "$STATE_DIR/staged_window" 2>/dev/null || true)
+
+    if [ "$wt_path" = "$staged_path" ]; then
+      # release → hand the port back to canonical
+      stop_dev; start_dev "$session" "$canonical"
+      [ -n "$staged_win" ] && tmux set -w -t "$staged_win" -u @staged 2>/dev/null || true
+      : > "$STATE_DIR/staged_path"; : > "$STATE_DIR/staged_window"
+      msg "released — supercast.test → $(basename "$canonical") (canonical)"
+    elif [ "$wt_path" = "$canonical" ]; then
+      msg "that's the canonical checkout — press prefix+D inside a worktree window"
+    else
+      local_old=${staged_path:+$(basename "$staged_path")}
+      stop_dev; start_dev "$session" "$wt_path"
+      [ -n "$staged_win" ] && tmux set -w -t "$staged_win" -u @staged 2>/dev/null || true
+      tmux set -w -t "$window" @staged 1 2>/dev/null || true
+      printf '%s' "$wt_path" > "$STATE_DIR/staged_path"
+      printf '%s' "$window"  > "$STATE_DIR/staged_window"
+      msg "dev: ${local_old:-canonical} → $(basename "$wt_path")  (serving supercast.test)"
+    fi
+    ;;
+
+  _run-dev) # wt _run-dev <dir>  — internal: link gitignored bits, migrate, exec bin/dev
+    dir=${1:-}; [ -d "$dir" ] || die "no dir: $dir"
+    canonical=$(main_worktree "$dir")
+    # symlink the gitignored files a fresh worktree needs to boot
+    for key in "$canonical"/config/master.key "$canonical"/config/credentials/*.key; do
+      [ -e "$key" ] || continue
+      rel=${key#"$canonical"/}
+      if [ ! -e "$dir/$rel" ]; then mkdir -p "$(dirname "$dir/$rel")"; ln -s "$key" "$dir/$rel"; echo "wt: linked $rel"; fi
+    done
+    if [ -d "$canonical/node_modules" ] && [ ! -e "$dir/node_modules" ]; then
+      ln -s "$canonical/node_modules" "$dir/node_modules"; echo "wt: linked node_modules"
+    fi
+    # migrate only if this branch adds migrations vs the default branch (mutates the shared dev DB)
+    base=$(base_ref "$canonical")
+    if [ "$dir" != "$canonical" ] && [ -n "$base" ] && [ -n "$(git -C "$dir" diff --name-only "$base" HEAD -- db/migrate 2>/dev/null)" ]; then
+      echo "wt: branch adds migrations → bin/rails db:migrate"
+      ( cd "$dir" && bin/rails db:migrate ) || echo "wt: db:migrate failed — fix before testing"
+    fi
+    cd "$dir" || exit 1
+    echo "wt: bin/dev in $(basename "$dir")  →  supercast.test (:$DEV_PORT)"
+    exec bin/dev
+    ;;
+
+  *) die "unknown command: ${cmd:-<none>}  (spawn | dev)";;
+esac

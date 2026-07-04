@@ -2,7 +2,14 @@
 
 ## About
 
-Personal dotfiles for macOS. Manages `~/.config/nvim`, `~/.config/ghostty`, and Hack Nerd Font.
+Personal dotfiles for macOS. Manages:
+
+- `~/.config/nvim` - Neovim config.
+- `~/.config/ghostty` - Ghostty terminal config.
+- `~/.config/tmux` - tmux config (Rose Pine theme + the worktree workflow keybindings).
+- `~/.local/bin/wt` - worktree workflow backend driven by the tmux keybindings.
+- `~/.local/bin/claude-tmux-signal` - Claude Code hook target that flags tmux windows when a session needs you; wired up in `~/.claude/settings.json` (not tracked here).
+- Hack Nerd Font.
 
 This repo keeps my personal configuration files - shell, editor, and tool configs - under version control, so the setup can be tracked over time and reused across machines.
 
@@ -39,7 +46,7 @@ Sync this repo into `~/.config` and install fonts:
 ./install.sh
 ```
 
-`install.sh` rsyncs each `.config/<name>` into `~/.config/<name>` and copies fonts into `~/Library/Fonts` (macOS) or `~/.local/share/fonts` (Linux).
+`install.sh` rsyncs each `.config/<name>` into `~/.config/<name>`, installs the executables under `.local/bin` into `~/.local/bin` (file-by-file, so unmanaged binaries there are left alone), and copies fonts into `~/Library/Fonts` (macOS) or `~/.local/share/fonts` (Linux).
 
 ## First-time Neovim setup
 
@@ -51,7 +58,7 @@ On first launch, lazy.nvim bootstraps itself and pulls plugins. After that:
 
 ## Pulling local changes back into the repo
 
-`import.sh` does the reverse of `install.sh` — pulls configs from `~/.config` back into the repo for anything already tracked here.
+`import.sh` does the reverse of `install.sh` - pulls configs from `~/.config`, executables from `~/.local/bin`, and fonts back into the repo, but only for the files already tracked here (it never expands the managed set).
 
 ```sh
 ./import.sh

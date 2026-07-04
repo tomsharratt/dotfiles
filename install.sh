@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Sync configs from this repo into the current environment.
-# Mirrors each .config/<name> dir into ~/.config/<name> and installs fonts
-# from .local/share/fonts into the OS-appropriate font directory.
+# Mirrors each .config/<name> dir into ~/.config/<name>, installs the
+# executables under .local/bin, and installs fonts from .local/share/fonts
+# into the OS-appropriate font directory.
 
 set -euo pipefail
 
@@ -20,6 +21,19 @@ for dir in "$repo"/.config/*/; do
   rsync -a --delete "$dir" "$dst/"
   echo "config: $name  →  $dst"
 done
+
+# Executables under .local/bin: install each tracked file individually.
+# Unlike .config, this dir is shared with unmanaged binaries, so never --delete;
+# copy file-by-file and preserve the executable bit.
+if [ -d "$repo/.local/bin" ]; then
+  mkdir -p "$HOME/.local/bin"
+  for f in "$repo"/.local/bin/*; do
+    [ -f "$f" ] || continue
+    name="$(basename "$f")"
+    install -m 0755 "$f" "$HOME/.local/bin/$name"
+    echo "bin:    $name  →  $HOME/.local/bin/$name"
+  done
+fi
 
 if [ -d "$repo/.local/share/fonts" ]; then
   mkdir -p "$fonts_dst"
