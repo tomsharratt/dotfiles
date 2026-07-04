@@ -21,6 +21,17 @@ return {
         config = function()
             vim.filetype.add({ extension = { templ = 'templ' } })
 
+            vim.diagnostic.config({
+                signs = {
+                    text = {
+                        [vim.diagnostic.severity.ERROR] = '󰅚',
+                        [vim.diagnostic.severity.WARN]  = '󰀪',
+                        [vim.diagnostic.severity.INFO]  = '󰋽',
+                        [vim.diagnostic.severity.HINT]  = '󰌶',
+                    },
+                },
+            })
+
             vim.lsp.config('*', {
                 capabilities = require('cmp_nvim_lsp').default_capabilities(),
             })
@@ -41,6 +52,11 @@ return {
 
             vim.api.nvim_create_autocmd('LspAttach', {
                 callback = function(ev)
+                    local client = vim.lsp.get_client_by_id(ev.data.client_id)
+                    if client and client.name == 'tailwindcss' then
+                        vim.lsp.document_color.enable(false, { bufnr = ev.buf })
+                    end
+
                     local opts = { buffer = ev.buf, remap = false }
                     vim.keymap.set('n', 'gd', vim.lsp.buf.definition, opts)
                     vim.keymap.set('n', 'K', vim.lsp.buf.hover, opts)

@@ -1,13 +1,14 @@
 return {
-    "EdenEast/nightfox.nvim",
+    "rose-pine/neovim",
+    name = "rose-pine",
     config = function()
-        require('nightfox').setup({
-            options = {
-                transparent = true,
+        require("rose-pine").setup({
+            styles = {
+                transparency = true,
             },
         })
 
-        vim.cmd.colorscheme("duskfox")
+        vim.cmd.colorscheme("rose-pine")
 
         vim.api.nvim_set_hl(0, "Normal", { bg = "none" })
         vim.api.nvim_set_hl(0, "NormalFloat", { bg = "none" })

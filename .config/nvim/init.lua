@@ -43,6 +43,15 @@ vim.opt.updatetime = 50
 vim.opt.colorcolumn = "80"
 vim.opt.laststatus = 3
 
+vim.api.nvim_create_autocmd({ "TermOpen", "BufWinEnter", "BufEnter" }, {
+    pattern = "term://*",
+    callback = function() vim.opt.laststatus = 0 end,
+})
+vim.api.nvim_create_autocmd({ "BufLeave", "TermClose" }, {
+    pattern = "term://*",
+    callback = function() vim.opt.laststatus = 3 end,
+})
+
 vim.opt.mouse = ""
 
 vim.g.netrw_browse_split = 0
