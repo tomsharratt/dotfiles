@@ -6,12 +6,28 @@ Personal dotfiles for macOS. Manages:
 
 - `~/.config/nvim` - Neovim config.
 - `~/.config/ghostty` - Ghostty terminal config.
-- `~/.config/tmux` - tmux config (Rose Pine theme + the worktree workflow keybindings).
+- `~/.config/tmux` - tmux config (Rose Pine theme, the worktree workflow keybindings, and the Claude session status glyphs in the window list).
 - `~/.local/bin/wt` - worktree workflow backend driven by the tmux keybindings.
-- `~/.local/bin/claude-tmux-signal` - Claude Code hook target that flags tmux windows when a session needs you; wired up in `~/.claude/settings.json` (not tracked here).
+- `~/.local/bin/claude-tmux-signal` - Claude Code hook target that sets the tmux `@claude` window flag (working / waiting / done / clear) driving the status-bar glyph.
+- `~/.local/bin/claude-tmux-spinner` - animates the ✻ "working" pulse in the tmux status bar while a Claude session is busy.
+- `~/.claude/settings.json` - Claude Code settings; the `hooks` block wires the two scripts above (UserPromptSubmit → working, Notification → waiting, Stop → done, SessionEnd → clear). Git-tracked for reference but applied manually - `install.sh` does not touch `~/.claude`.
 - Hack Nerd Font.
 
 This repo keeps my personal configuration files - shell, editor, and tool configs - under version control, so the setup can be tracked over time and reused across machines.
+
+### Claude Code tmux status
+
+The tmux window list shows what each Claude session is doing, so background agents are visible at a glance:
+
+- ✻ iris (animated pulse) - Claude is working.
+- ● red - Claude needs your input.
+- ● gold - Claude finished its turn; clears when you focus the window.
+- no glyph - idle.
+
+State lives per-window in the `@claude` tmux option.
+`claude-tmux-signal` (run from the Claude Code hooks in `~/.claude/settings.json`) sets it on UserPromptSubmit/Notification/Stop/SessionEnd.
+`claude-tmux-spinner` animates the ✻ frame while any window is working.
+A `pane-focus-in` hook in `tmux.conf` clears the "done" dot when you look at the window, while "waiting" persists until you reply or exit Claude.
 
 ## Requirements
 

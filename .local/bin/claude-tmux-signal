@@ -1,11 +1,15 @@
 #!/usr/bin/env bash
-# claude-tmux-signal — Claude Code hook target. Flags the tmux window a session
-# lives in when Claude wants you (Notification → "waiting") or finishes a turn
-# (Stop → "done"), and clears the flag when you send a prompt (UserPromptSubmit).
-# Only signals windows you are NOT currently looking at, and fires a matching
-# macOS notification. Wired up in ~/.claude/settings.json.
+# claude-tmux-signal — Claude Code hook target. Sets the tmux @claude window flag
+# that drives the status-bar glyph:
+#   working  (UserPromptSubmit) → animated ✻  — Claude is busy (claude-tmux-spinner)
+#   waiting  (Notification)     → red ●        — Claude needs your input
+#   done     (Stop)            → gold ●        — Claude finished its turn
+#   clear    (SessionEnd)       → nothing      — session gone / idle
+# waiting/done only flag windows you are NOT looking at (and fire a macOS
+# notification); on the window you're already viewing they just clear the flag,
+# so the ✻ stops. Wired up in ~/.claude/settings.json.
 #
-#   usage:  claude-tmux-signal <waiting|done|clear>
+#   usage:  claude-tmux-signal <working|waiting|done|clear>
 
 set -uo pipefail
 state=${1:-}
@@ -25,15 +29,23 @@ case "$state" in
   clear)
     tmux set -w -t "$win" -u @claude 2>/dev/null || true
     ;;
+  working)
+    tmux set -w -t "$win" @claude working 2>/dev/null || true
+    # Kick off the animator (no-op if one is already running).
+    tmux run-shell -b "$HOME/.local/bin/claude-tmux-spinner" 2>/dev/null || true
+    ;;
   waiting|done)
-    # If you're already on this window you can see it — don't nag.
     if [ "$active" != 1 ]; then
+      # You're not looking — flag the window and nudge you.
       tmux set -w -t "$win" @claude "$state" 2>/dev/null || true
       title="Claude · ${wname:-session}"
       if [ -n "$msg" ]; then body=$msg
       elif [ "$state" = waiting ]; then body="needs your input"
       else body="finished"; fi
       osascript -e "display notification \"${body//\"/\\\"}\" with title \"${title//\"/\\\"}\"" >/dev/null 2>&1 || true
+    else
+      # You're already on this window — no dot needed, and stop the ✻.
+      tmux set -w -t "$win" -u @claude 2>/dev/null || true
     fi
     ;;
 esac
