@@ -1,10 +1,21 @@
 #!/usr/bin/env bash
-# claude-tmux-signal — Claude Code hook target. Sets the tmux @claude window flag
+# claude-tmux-signal - Claude Code hook target. Sets the tmux @claude window flag
 # that drives the status-bar glyph:
-#   working  (UserPromptSubmit) → animated ✻  — Claude is busy (claude-tmux-spinner)
-#   waiting  (Notification)     → red ●        — Claude needs your input
-#   done     (Stop)            → gold ●        — Claude finished its turn
-#   clear    (SessionEnd)       → nothing      — session gone / idle
+#   working  (UserPromptSubmit + PreToolUse) -> animated ✻  - Claude is busy
+#   waiting  (Notification)                  -> red ●        - Claude needs your input
+#   done     (Stop)                          -> gold ●        - Claude finished its turn
+#   clear    (SessionEnd)                    -> nothing       - session gone / idle
+#
+# Reliability notes:
+#   - PreToolUse also maps to `working`, so the ✻ is re-asserted whenever the agent
+#     actually does something. Without it a Notification (permission / idle) that
+#     fired mid-turn leaves a stale red ● on a window that has since resumed work.
+#     This is the hot path (fires on every tool call), so it stays cheap - no jq.
+#   - A `done` or `waiting` event that still reports in-flight background_tasks is
+#     treated as `working`: the session is busy/paused, not finished or waiting on
+#     you. Claude Code reports these in the hook JSON (v2.1.145+); absent the field
+#     bgcount is 0 and behavior is unchanged.
+#
 # waiting/done only flag windows you are NOT looking at (and fire a macOS
 # notification); on the window you're already viewing they just clear the flag,
 # so the ✻ stops. Wired up in ~/.claude/settings.json.
@@ -13,9 +24,15 @@
 
 set -uo pipefail
 state=${1:-}
-
 payload=$(cat 2>/dev/null || true)
-msg=$(printf '%s' "$payload" | jq -r '.message // empty' 2>/dev/null || true)
+
+# Optional debug trace: `touch ~/.claude/claude-tmux-signal.debug` to enable,
+# `rm` it to stop. Records every invocation + raw payload to inspect the sequence.
+if [ -f "$HOME/.claude/claude-tmux-signal.debug" ]; then
+  { printf '%s\tstate=%s\tpane=%s\n%s\n---\n' \
+      "$(date '+%F %T')" "$state" "${TMUX_PANE:-}" "$payload"; } \
+    >> "$HOME/.claude/claude-tmux-signal.log" 2>/dev/null || true
+fi
 
 # Nothing to do outside tmux (Claude Code's own notifier still handles the rest).
 [ -n "${TMUX:-}" ] && [ -n "${TMUX_PANE:-}" ] || exit 0
@@ -25,27 +42,51 @@ wname=$(tmux display -p -t "$TMUX_PANE" '#{window_name}' 2>/dev/null || true)
 active=$(tmux display -p -t "$TMUX_PANE" '#{window_active}' 2>/dev/null || echo 1)
 [ -n "$win" ] || exit 0
 
+# In-flight background tasks on the payload (0 if none / no jq / older Claude Code).
+bgcount() {
+  local n
+  n=$(printf '%s' "$payload" | jq -r '(.background_tasks // []) | length' 2>/dev/null || echo 0)
+  case "$n" in ''|*[!0-9]*) n=0 ;; esac
+  printf '%s' "$n"
+}
+
+# Show the animated ✻ and make sure the animator daemon is running.
+set_working() {
+  tmux set -w -t "$win" @claude working 2>/dev/null || true
+  tmux run-shell -b "$HOME/.local/bin/claude-tmux-spinner" 2>/dev/null || true
+}
+
+# Flag the window (waiting/done) with a macOS nudge, but only when you're not
+# already looking at it; on the active window just clear the flag (and stop ✻).
+flag_or_clear() {
+  local s=$1 msg title body
+  if [ "$active" != 1 ]; then
+    tmux set -w -t "$win" @claude "$s" 2>/dev/null || true
+    msg=$(printf '%s' "$payload" | jq -r '.message // empty' 2>/dev/null || true)
+    title="Claude · ${wname:-session}"
+    if [ -n "$msg" ]; then body=$msg
+    elif [ "$s" = waiting ]; then body="needs your input"
+    else body="finished"; fi
+    osascript -e "display notification \"${body//\"/\\\"}\" with title \"${title//\"/\\\"}\"" >/dev/null 2>&1 || true
+  else
+    tmux set -w -t "$win" -u @claude 2>/dev/null || true
+  fi
+}
+
 case "$state" in
   clear)
     tmux set -w -t "$win" -u @claude 2>/dev/null || true
     ;;
   working)
-    tmux set -w -t "$win" @claude working 2>/dev/null || true
-    # Kick off the animator (no-op if one is already running).
-    tmux run-shell -b "$HOME/.local/bin/claude-tmux-spinner" 2>/dev/null || true
+    set_working
     ;;
-  waiting|done)
-    if [ "$active" != 1 ]; then
-      # You're not looking — flag the window and nudge you.
-      tmux set -w -t "$win" @claude "$state" 2>/dev/null || true
-      title="Claude · ${wname:-session}"
-      if [ -n "$msg" ]; then body=$msg
-      elif [ "$state" = waiting ]; then body="needs your input"
-      else body="finished"; fi
-      osascript -e "display notification \"${body//\"/\\\"}\" with title \"${title//\"/\\\"}\"" >/dev/null 2>&1 || true
+  done|waiting)
+    # If background work is still in flight, the session is busy/paused, not
+    # finished or waiting on you - keep the ✻ rather than a stale gold/red dot.
+    if [ "$(bgcount)" -gt 0 ]; then
+      set_working
     else
-      # You're already on this window — no dot needed, and stop the ✻.
-      tmux set -w -t "$win" -u @claude 2>/dev/null || true
+      flag_or_clear "$state"
     fi
     ;;
 esac

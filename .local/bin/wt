@@ -166,8 +166,12 @@ case "$cmd" in
     fi
     ;;
 
-  _run-dev) # wt _run-dev <dir>  — internal: link gitignored bits, migrate, exec bin/dev
+  _run-dev) # wt _run-dev <dir>  - internal: link gitignored bits, migrate, run bin/dev
     dir=${1:-}; [ -d "$dir" ] || die "no dir: $dir"
+    # If bin/dev exits (a crash, or a leftover server we couldn't clear), keep the
+    # window open with the error and a shell instead of letting it flash shut - so
+    # failures are readable, mirroring how `wt spawn` handles setup failures.
+    devfail() { printf '\n\033[38;2;235;111;146mwt: %s\033[0m\n\n' "$*" >&2; cd "$dir" 2>/dev/null || true; exec "$SHELL" -l; }
     canonical=$(main_worktree "$dir")
     # symlink the gitignored files a fresh worktree needs to boot
     for key in "$canonical"/config/master.key "$canonical"/config/credentials/*.key; do
@@ -178,15 +182,34 @@ case "$cmd" in
     if [ -d "$canonical/node_modules" ] && [ ! -e "$dir/node_modules" ]; then
       ln -s "$canonical/node_modules" "$dir/node_modules"; echo "wt: linked node_modules"
     fi
+    # A dev server for this worktree may already be running - e.g. one a Claude
+    # session started on another port, or one killed so hard it left its pidfile.
+    # Either way it owns tmp/pids/server.pid, and `rails s` refuses to boot ("A
+    # server is already running") while that file names a live pid; foreman then
+    # tears the whole window down. We're taking over this worktree's dev slot, so
+    # stop that server (its whole process group) and clear the pidfile first.
+    pidfile="$dir/tmp/pids/server.pid"
+    if [ -f "$pidfile" ]; then
+      oldpid=$(tr -dc '0-9' < "$pidfile" 2>/dev/null || true)
+      if [ -n "$oldpid" ] && kill -0 "$oldpid" 2>/dev/null; then
+        oldpgid=$(ps -o pgid= -p "$oldpid" 2>/dev/null | tr -d ' ')
+        if [ -n "$oldpgid" ]; then kill -TERM -"$oldpgid" 2>/dev/null || kill -TERM "$oldpid" 2>/dev/null || true
+        else kill -TERM "$oldpid" 2>/dev/null || true; fi
+        echo "wt: stopped an existing dev server for $(basename "$dir") (pid $oldpid)"
+        for _ in 1 2 3 4 5 6 7 8; do kill -0 "$oldpid" 2>/dev/null || break; sleep 0.5; done
+      fi
+      rm -f "$pidfile" 2>/dev/null && echo "wt: cleared tmp/pids/server.pid"
+    fi
     # migrate only if this branch adds migrations vs the default branch (mutates the shared dev DB)
     base=$(base_ref "$canonical")
     if [ "$dir" != "$canonical" ] && [ -n "$base" ] && [ -n "$(git -C "$dir" diff --name-only "$base" HEAD -- db/migrate 2>/dev/null)" ]; then
       echo "wt: branch adds migrations → bin/rails db:migrate"
       ( cd "$dir" && bin/rails db:migrate ) || echo "wt: db:migrate failed — fix before testing"
     fi
-    cd "$dir" || exit 1
+    cd "$dir" || devfail "cannot cd into $dir"
     echo "wt: bin/dev in $(basename "$dir")  →  supercast.test (:$DEV_PORT)"
-    exec bin/dev
+    bin/dev
+    devfail "dev server exited (code $?). Fix the error above, then prefix+D to restage."
     ;;
 
   *) die "unknown command: ${cmd:-<none>}  (spawn | dev)";;

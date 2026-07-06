@@ -40,7 +40,11 @@
       {
         "matcher": "",
         "hooks": [
-          { "type": "command", "command": "/Users/tsharratt/.local/bin/claude-tmux-signal waiting", "timeout": 5 }
+          {
+            "type": "command",
+            "command": "/Users/tsharratt/.local/bin/claude-tmux-signal waiting",
+            "timeout": 5
+          }
         ]
       }
     ],
@@ -48,7 +52,11 @@
       {
         "matcher": "",
         "hooks": [
-          { "type": "command", "command": "/Users/tsharratt/.local/bin/claude-tmux-signal done", "timeout": 5 }
+          {
+            "type": "command",
+            "command": "/Users/tsharratt/.local/bin/claude-tmux-signal done",
+            "timeout": 5
+          }
         ]
       }
     ],
@@ -56,7 +64,23 @@
       {
         "matcher": "",
         "hooks": [
-          { "type": "command", "command": "/Users/tsharratt/.local/bin/claude-tmux-signal working", "timeout": 5 }
+          {
+            "type": "command",
+            "command": "/Users/tsharratt/.local/bin/claude-tmux-signal working",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/Users/tsharratt/.local/bin/claude-tmux-signal working",
+            "timeout": 5
+          }
         ]
       }
     ],
@@ -64,7 +88,11 @@
       {
         "matcher": "",
         "hooks": [
-          { "type": "command", "command": "/Users/tsharratt/.local/bin/claude-tmux-signal clear", "timeout": 5 }
+          {
+            "type": "command",
+            "command": "/Users/tsharratt/.local/bin/claude-tmux-signal clear",
+            "timeout": 5
+          }
         ]
       }
     ]
