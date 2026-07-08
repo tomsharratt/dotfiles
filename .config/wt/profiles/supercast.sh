@@ -65,6 +65,19 @@ wt_dev() {
   export DATABASE_URL="postgres:///$db"
   export REDIS_URL="redis://localhost:6379/${WT_REDIS:-0}"
   export LOCAL_DOMAIN="$WT_DOMAIN"
+  # Scope the session cookie to THIS worktree's host. figaro loads config/application.yml,
+  # which sets ENV["domain"]="supercast.test"; the session_store treats a LOCAL_DOMAIN host as
+  # "known" and scopes the cookie to ENV["domain"], so without this the browser drops the
+  # cookie (domain=supercast.test on a <slug>.test host) and login silently fails. figaro skips
+  # keys already in ENV, so exporting it here wins.
+  export domain="$WT_DOMAIN"
+  # Clear a stale server pidfile (only if its process is dead) so a restart after a
+  # hard kill isn't blocked by "A server is already running".
+  local pidfile="$WT_PATH/tmp/pids/server.pid" oldpid
+  if [ -f "$pidfile" ]; then
+    oldpid=$(tr -dc '0-9' < "$pidfile" 2>/dev/null)
+    { [ -z "$oldpid" ] || ! kill -0 "$oldpid" 2>/dev/null; } && rm -f "$pidfile"
+  fi
   # Procfile.dev pins the web port to 3000, so it can't be shared. Generate a
   # per-worktree copy that binds this worktree's port instead - derived fresh
   # from the tracked Procfile.dev each boot (so it can't drift), written outside
@@ -74,8 +87,10 @@ wt_dev() {
   sed "s/3000/$WT_PORT/g" "$WT_PATH/Procfile.dev" | grep -v '^stripe_connect:' > "$pf"
   msg "dev  ->  https://$WT_DOMAIN (:$PORT)  db=$db  redis/${WT_REDIS:-0}"
   # -d: foreman defaults its working dir to the Procfile's dir; point it at the
-  # worktree since the generated Procfile lives outside the repo.
-  exec foreman start -f "$pf" -d "$WT_PATH" --env /dev/null
+  # worktree since the generated Procfile lives outside the repo. Not exec'd, so
+  # when the server stops (crash or Ctrl-C) `wt dev` drops to a shell you can
+  # restart from rather than the pane vanishing.
+  foreman start -f "$pf" -d "$WT_PATH" --env /dev/null
 }
 
 wt_teardown() {
