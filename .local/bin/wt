@@ -1,35 +1,63 @@
 #!/usr/bin/env bash
-# wt — worktree workflow backend for the tmux keybindings.
+# wt - worktree + isolated dev-server workflow, driven through Herdr.
 #
-# You don't type this by hand; tmux drives it (see ~/.config/tmux/tmux.conf):
-#   prefix+T  →  wt spawn <name>            new task: a worktree + Claude in a named window
-#   prefix+D  →  wt dev <pane> <path>       toggle the dev server onto the current worktree
+# Herdr (the terminal workspace manager for AI agents) owns the worktree
+# lifecycle, the panes, and Claude-session status. `wt` layers on top the two
+# things Herdr can't know about: how to PROVISION a fresh worktree of a given
+# project so it runs in full isolation - its own database, redis db, url and
+# port - and how to LAUNCH that project's dev server. Those steps differ per
+# project, so they live in a per-project *profile* (see PROFILES); `wt` itself
+# is project-agnostic.
 #
-# Single-slot model: puma-dev forwards *.supercast.test to whatever holds port
-# 3000. Staging a worktree = its `bin/dev` takes port 3000 (the previous holder
-# is gracefully stopped — silent handoff). Unstaging hands the port back to the
-# canonical checkout. Worktrees live under ~/projects/.worktrees/<repo>/<name>.
+#   wt new [name]        create/open an isolated worktree, provision it,
+#                        start the dev server + Claude, focus it
+#   wt dev  <path>       run the worktree's dev server (the dev pane's command)
+#   wt provision <path>  (re)run the project's provisioning for a worktree (idempotent)
+#   wt rm  [name]        tear the worktree down (drop db, free port, remove worktree)
+#   wt ls                list worktrees and their allocated port / redis / url / db
+#
+# Bind `wt new` to a key in ~/.config/herdr/config.toml (see README).
+#
+# PROFILES ───────────────────────────────────────────────────────────────────
+# For repo <name>, wt sources the first profile it finds:
+#   1. <repo>/.wt/profile.sh              (committed with the project, team-shared)
+#   2. ~/.config/wt/profiles/<name>.sh    (personal, tracked in dotfiles)
+# A profile may set:
+#   WT_RESOURCES="port redis"   isolated resources to allocate (default: none)
+#   WT_PORT_BASE=3101           first port to hand out (default 3101)
+#   WT_AGENT="claude"           agent command to launch in the worktree (default claude)
+# and define any of these functions, which run with the worktree's facts
+# exported (WT_NAME WT_SLUG WT_PATH WT_REPO WT_REPO_NAME WT_DOMAIN WT_PORT WT_REDIS):
+#   wt_provision   prepare the worktree so its dev server can boot in isolation
+#   wt_dev         exec the dev server (long-running)
+#   wt_teardown    release external resources on `wt rm` (best-effort)
+# Helpers available to profiles: msg, warn, wt_state_set KEY VALUE.
+# A repo with no profile still gets a worktree + Claude; it just has no dev server.
 
 set -uo pipefail
 
-WT_ROOT="$HOME/projects/.worktrees"
-STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/wt"
-DEV_PORT=3000
-DEV_WINDOW=dev
+HERDR="$HOME/.local/bin/herdr"
 SELF="$HOME/.local/bin/wt"
+STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/wt"
+PROFILE_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/wt/profiles"
 mkdir -p "$STATE_DIR"
 
-die() { tmux display-message "wt: $*" 2>/dev/null || true; printf 'wt: %s\n' "$*" >&2; exit 1; }
-msg() { tmux display-message "wt: $*" 2>/dev/null || printf 'wt: %s\n' "$*" >&2; }
+msg()  { printf 'wt: %s\n' "$*" >&2; }
+warn() { printf '\033[38;2;246;193;119mwt: %s\033[0m\n' "$*" >&2; }
+die()  { printf '\033[38;2;235;111;146mwt: %s\033[0m\n' "$*" >&2; exit 1; }
 
-# main (canonical) working tree of the repo containing $1
+# ── Herdr plumbing ────────────────────────────────────────────────────────
+in_herdr() { [ "${HERDR_ENV:-}" = 1 ] && [ -S "${HERDR_SOCKET_PATH:-/nonexistent}" ]; }
+need_herdr() { in_herdr || die "run this inside Herdr (start it with: herdr)"; }
+# jq extract from a json string: hj '<json>' '<filter>'
+hj() { jq -r "$2" 2>/dev/null <<<"$1"; }
+herr() { hj "$1" '.error.message // empty'; }
+
+# ── git helpers ─────────────────────────────────────────────────────────────
 main_worktree() { git -C "$1" worktree list --porcelain 2>/dev/null | awk '/^worktree /{print substr($0,10); exit}'; }
-# git toplevel of a path (the worktree you're standing in)
-toplevel() { git -C "$1" rev-parse --show-toplevel 2>/dev/null; }
-# Base new worktrees fork from (and we diff against for migrations): the repo's
-# default branch as a remote-tracking ref via origin/HEAD (e.g. origin/master),
-# so worktrees fork from the shared base rather than the canonical checkout's
-# current branch. Falls back to a remote/local main or master.
+cur_branch()    { git -C "$1" rev-parse --abbrev-ref HEAD 2>/dev/null; }
+# The repo's default branch as a remote-tracking ref (origin/HEAD), so worktrees
+# fork from the shared up-to-date base rather than a local checkout's HEAD.
 base_ref() {
   local repo=$1 ref b
   ref=$(git -C "$repo" symbolic-ref --quiet --short refs/remotes/origin/HEAD 2>/dev/null) \
@@ -39,178 +67,258 @@ base_ref() {
   done
 }
 
-# Free port 3000 by gracefully TERMing the process GROUP of whatever holds it
-# (so foreman reaps sidekiq / the watchers / stripe instead of orphaning them),
-# whether that's our managed `dev` window or a hand-started bin/dev.
-stop_dev() {
-  local pids pid pgid i
-  for i in $(seq 1 30); do
-    pids=$(lsof -ti "tcp:$DEV_PORT" 2>/dev/null || true)
-    [ -z "$pids" ] && break
-    for pid in $pids; do
-      pgid=$(ps -o pgid= -p "$pid" 2>/dev/null | tr -d ' ')
-      if [ -n "$pgid" ]; then kill -TERM -"$pgid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null || true
-      else kill -TERM "$pid" 2>/dev/null || true; fi
-    done
-    sleep 0.5
+# ── slug / state ──────────────────────────────────────────────────────────
+# Hostname-safe slug from a branch name (also the puma-dev app + <slug>.test label).
+slugify() { printf '%s' "$1" | tr '[:upper:]/' '[:lower:]-' | tr -c 'a-z0-9-' '-' | sed -E 's/-+/-/g; s/^-|-$//g'; }
+state_file() { printf '%s/%s--%s.env' "$STATE_DIR" "$1" "$2"; }   # repo_name slug
+# Upsert KEY=VALUE in a state file, preserving the other keys.
+state_set() {                          # file key value
+  { grep -v "^$2=" "$1" 2>/dev/null || true; printf '%s=%s\n' "$2" "$3"; } > "$1.tmp" && mv "$1.tmp" "$1"
+}
+# Same, but for the active worktree - handed to profiles to record extras (url, db).
+wt_state_set() { [ -n "${WT_STATE_FILE:-}" ] && state_set "$WT_STATE_FILE" "$1" "$2"; }
+# Rehydrate a worktree's facts from its state file into the environment.
+load_state() {                          # state_file_path
+  [ -f "$1" ] || return 1
+  set -a; # shellcheck disable=SC1090
+  . "$1"; set +a; WT_STATE_FILE=$1; return 0
+}
+
+# Allocate the lowest free value not recorded in any worktree's state file.
+alloc_port() {
+  local base=${WT_PORT_BASE:-3101} p used
+  used=$(awk -F= '/^WT_PORT=/{print $2}' "$STATE_DIR"/*.env 2>/dev/null)
+  for ((p=base; p<base+500; p++)); do
+    grep -qx "$p" <<<"$used" && continue
+    lsof -ti "tcp:$p" >/dev/null 2>&1 && continue
+    printf '%s' "$p"; return 0
   done
-  # tidy any leftover dev window
-  tmux list-windows -a -F '#{window_id} #{window_name}' 2>/dev/null \
-    | awk -v n="$DEV_WINDOW" '$2==n{print $1}' \
-    | while read -r w; do tmux kill-window -t "$w" 2>/dev/null || true; done
+  return 1
+}
+alloc_redis() {
+  local i used; used=$(awk -F= '/^WT_REDIS=/{print $2}' "$STATE_DIR"/*.env 2>/dev/null)
+  for i in $(seq 1 15); do grep -qx "$i" <<<"$used" && continue; printf '%s' "$i"; return 0; done
+  return 1
 }
 
-# start bin/dev for <dir> in a backgrounded `dev` window of <session>
-start_dev() {
-  local session=$1 dir=$2
-  tmux new-window -d -t "$session" -n "$DEV_WINDOW" -c "$dir" "$SELF _run-dev '$dir'"
+# ── profile loading ─────────────────────────────────────────────────────────
+# Reset the profile surface, then source the first profile found for this repo.
+load_profile() {
+  local repo=$1 name=$2 f
+  unset -f wt_provision wt_dev wt_teardown 2>/dev/null || true
+  WT_RESOURCES="" WT_PORT_BASE=3101 WT_AGENT="claude"
+  for f in "$repo/.wt/profile.sh" "$PROFILE_DIR/$name.sh"; do
+    [ -f "$f" ] || continue
+    # shellcheck disable=SC1090
+    . "$f"; WT_PROFILE=$f; return 0
+  done
+  WT_PROFILE=""
 }
 
-cmd=${1:-}; shift 2>/dev/null || true
-case "$cmd" in
+# Establish (or top up) a worktree's identity + allocated resources, persisted to
+# its state file. Idempotent: existing port/redis are kept, only missing declared
+# resources are allocated. load_profile must have run first (for WT_RESOURCES).
+# Sets WT_NAME WT_SLUG WT_PATH WT_REPO WT_REPO_NAME WT_DOMAIN WT_PORT WT_REDIS WT_STATE_FILE.
+prepare_state() {                       # name path repo repo_name [workspace_id]
+  local name=$1 path=$2 repo=$3 repo_name=$4 ws=${5:-} slug res
+  slug=$(slugify "$name")
+  WT_PORT="" WT_REDIS=""
+  load_state "$(state_file "$repo_name" "$slug")" || true    # keep any prior allocations
+  WT_NAME=$name WT_SLUG=$slug WT_PATH=$path WT_REPO=$repo WT_REPO_NAME=$repo_name WT_DOMAIN="$slug.test"
+  WT_STATE_FILE=$(state_file "$repo_name" "$slug")
+  for res in ${WT_RESOURCES:-}; do
+    case "$res" in
+      port)  [ -n "${WT_PORT:-}" ]  || WT_PORT=$(alloc_port)   || die "no free port available" ;;
+      redis) [ -n "${WT_REDIS:-}" ] || WT_REDIS=$(alloc_redis) || die "no free redis db (1-15) available" ;;
+    esac
+  done
+  state_set "$WT_STATE_FILE" WT_NAME      "$WT_NAME"
+  state_set "$WT_STATE_FILE" WT_SLUG      "$WT_SLUG"
+  state_set "$WT_STATE_FILE" WT_PATH      "$WT_PATH"
+  state_set "$WT_STATE_FILE" WT_REPO      "$WT_REPO"
+  state_set "$WT_STATE_FILE" WT_REPO_NAME "$WT_REPO_NAME"
+  state_set "$WT_STATE_FILE" WT_DOMAIN    "$WT_DOMAIN"
+  [ -n "$ws" ]         && state_set "$WT_STATE_FILE" WT_WORKSPACE "$ws"
+  [ -n "${WT_PORT:-}" ]  && state_set "$WT_STATE_FILE" WT_PORT  "$WT_PORT"
+  [ -n "${WT_REDIS:-}" ] && state_set "$WT_STATE_FILE" WT_REDIS "$WT_REDIS"
+}
 
-  spawn) # wt spawn <name>  — foreground command of a freshly-created window
-    # Any setup failure prints in red and drops to a shell so the window stays
-    # open and you can read what went wrong (instead of flashing shut).
-    fail() { printf '\n\033[38;2;235;111;146mwt: %s\033[0m\n\n' "$*" >&2; exec "$SHELL" -l; }
-    name=${1:-}
-    [ -n "$name" ] || fail "no task name given"
-    # a task name IS a branch name; let git vet it (rejects spaces, '..', //, leading/trailing /, etc.)
-    git check-ref-format "refs/heads/$name" || fail "invalid task/branch name: '$name'"
-    origin=$(main_worktree "$PWD")
-    [ -n "$origin" ] || fail "cwd is not inside a git repo:
-      $PWD
-    Press prefix+T from inside the repo (or a worktree of it) you want."
-    repo=$(basename "$origin")
-    wt_path="$WT_ROOT/$repo/$name"
-    if [ ! -e "$wt_path" ]; then
-      mkdir -p "$(dirname "$wt_path")"   # parent chain for slash-namespaced names (e.g. tom/foo)
-      if git -C "$origin" show-ref --verify --quiet "refs/heads/$name"; then
-        # existing local branch → check it out, then fast-forward to origin if we can
-        git -C "$origin" worktree add "$wt_path" "$name" \
-          || fail "worktree add failed for '$name' (already checked out in another worktree?)"
-        if git -C "$wt_path" fetch --quiet origin "+refs/heads/$name:refs/remotes/origin/$name" 2>/dev/null; then
-          git -C "$wt_path" merge --ff-only --quiet "origin/$name" 2>/dev/null \
-            && echo "wt: synced '$name' with origin" \
-            || msg "'$name' has diverged from origin - kept your local copy as-is"
-        fi
-      elif git -C "$origin" ls-remote --exit-code --heads origin "$name" >/dev/null 2>&1; then
-        # branch exists only on the remote → check out a local copy that tracks it
-        echo "wt: checking out existing remote branch '$name'"
-        git -C "$origin" fetch --quiet origin "+refs/heads/$name:refs/remotes/origin/$name" \
-          || msg "fetch failed (offline?) - using last-known origin/$name"
-        git -C "$origin" worktree add -b "$name" "$wt_path" "origin/$name" \
-          || fail "worktree add failed for remote branch '$name'"
-      else
-        # brand-new task → new branch off an up-to-date default base
-        base=$(base_ref "$origin")
-        [ -n "$base" ] || fail "couldn't determine the repo's default branch (is 'origin' set up?)"
-        # fork from an up-to-date base: refresh it from origin first (soft-fail offline)
-        case "$base" in
-          */*) echo "wt: fetching latest $base"
-               git -C "$origin" fetch --quiet "${base%%/*}" "+${base#*/}:refs/remotes/$base" \
-                 || msg "fetch failed (offline?) - forking from last-known $base" ;;
-        esac
-        git -C "$origin" worktree add --no-track -b "$name" "$wt_path" "$base" \
-          || fail "worktree add failed (base: $base)"
-      fi
+# Export the worktree facts, then run a profile function if it is defined.
+run_profile_fn() {                      # fn  (WT_* must already be set)
+  export WT_NAME WT_SLUG WT_PATH WT_REPO WT_REPO_NAME WT_DOMAIN WT_PORT WT_REDIS WT_STATE_FILE
+  declare -F "$1" >/dev/null || return 0
+  "$1"
+}
+
+# ── garbage collection ───────────────────────────────────────────────────────
+# Reclaim resources from worktrees that no longer exist on disk - however they
+# were removed (`wt rm`, Herdr's own remove-worktree, or a manual `git worktree
+# remove`). Herdr exposes no worktree-removal hook, so this reconcile is the
+# safety net that keeps databases, ports and redis dbs from leaking. The single
+# invariant: if the worktree dir is still a git worktree it is live and left
+# untouched; otherwise it is an orphan and its profile teardown runs. Runs
+# automatically at the start of every `wt new`, or on demand via `wt gc`.
+GC_RECLAIMED=0
+gc_run() {
+  GC_RECLAIMED=0
+  local f
+  for f in "$STATE_DIR"/*.env; do
+    [ -e "$f" ] || return 0
+    WT_PATH="" WT_REPO="" WT_REPO_NAME="" WT_NAME="" WT_SLUG="" WT_PORT="" WT_REDIS="" WT_DOMAIN="" WT_WORKSPACE="" WT_URL="" WT_DB=""
+    load_state "$f" || continue
+    # Live worktree? leave it entirely alone.
+    [ -n "${WT_PATH:-}" ] && git -C "$WT_PATH" rev-parse --is-inside-work-tree >/dev/null 2>&1 && continue
+    GC_RECLAIMED=$((GC_RECLAIMED + 1))
+    msg "orphan ${WT_REPO_NAME:-?}/${WT_NAME:-?} - worktree gone, reclaiming its resources"
+    load_profile "${WT_REPO:-}" "${WT_REPO_NAME:-}"
+    declare -F wt_teardown >/dev/null && run_profile_fn wt_teardown || true
+    if in_herdr && [ -n "${WT_WORKSPACE:-}" ] && [ "${WT_WORKSPACE:-}" != null ]; then
+      "$HERDR" worktree remove --workspace "$WT_WORKSPACE" --force --json >/dev/null 2>&1 \
+        || "$HERDR" workspace close "$WT_WORKSPACE" >/dev/null 2>&1 || true
     fi
-    cd "$wt_path" || fail "cannot cd into $wt_path"
-    claude   # interactive — you type the prompt and pick auto/plan inside Claude
+    [ -n "${WT_REPO:-}" ] && git -C "$WT_REPO" worktree prune 2>/dev/null || true
+    rm -f "$f"
+  done
+}
 
-    # On exit, offer to clean up (we made the worktree, so Claude won't).
-    printf '\n'
-    read -r -p "wt: remove worktree '$name'? [y/N] " ans || ans=n
-    if [[ "${ans:-}" =~ ^[Yy]$ ]]; then
-      if [ "$wt_path" = "$(cat "$STATE_DIR/staged_path" 2>/dev/null)" ]; then
-        echo "wt: '$name' still holds the dev server — unstage with prefix+D first; not removing."
-      elif git -C "$origin" worktree remove "$wt_path" 2>/dev/null; then
-        # prune now-empty namespace dirs (e.g. .worktrees/supercast/tom/), never $repo itself
-        parent=$(dirname "$wt_path")
-        while [ "$parent" != "$WT_ROOT/$repo" ] && rmdir "$parent" 2>/dev/null; do parent=$(dirname "$parent"); done
-        echo "wt: removed worktree '$name' (branch kept)."; exit 0
-      else
-        echo "wt: not removed (uncommitted changes?). Manual: git -C '$origin' worktree remove '$wt_path'"
-      fi
-    fi
-    cd "$wt_path" 2>/dev/null || cd "$origin" 2>/dev/null || cd "$HOME"
-    exec "$SHELL" -l
-    ;;
+cmd_gc() {
+  gc_run
+  [ "${GC_RECLAIMED:-0}" -gt 0 ] && msg "reclaimed ${GC_RECLAIMED} orphan(s)" || msg "no orphans - all worktrees accounted for"
+}
 
-  dev)   # wt dev <trigger_pane_id> <pane_current_path>  — toggle the handoff
-    pane=${1:-}; path=${2:-}
-    [ -n "$pane" ] && [ -n "$path" ] || die "usage: wt dev <pane> <path>"
-    wt_path=$(toplevel "$path"); [ -n "$wt_path" ] || { msg "not a git worktree"; exit 0; }
-    canonical=$(main_worktree "$path")
-    session=$(tmux display -p -t "$pane" '#{session_name}' 2>/dev/null)
-    window=$(tmux display -p -t "$pane" '#{window_id}' 2>/dev/null)
-    staged_path=$(cat "$STATE_DIR/staged_path" 2>/dev/null || true)
-    staged_win=$(cat "$STATE_DIR/staged_window" 2>/dev/null || true)
+# ── commands ────────────────────────────────────────────────────────────────
+cmd_new() {
+  need_herdr
+  gc_run   # reclaim worktrees removed outside `wt rm` before allocating fresh resources
+  local name=${1:-}
+  if [ -z "$name" ]; then printf 'wt: task name (branch): ' >&2; read -r name || true; fi
+  [ -n "$name" ] || die "no task name given"
+  git check-ref-format "refs/heads/$name" || die "invalid task/branch name: '$name'"
 
-    if [ "$wt_path" = "$staged_path" ]; then
-      # release → hand the port back to canonical
-      stop_dev; start_dev "$session" "$canonical"
-      [ -n "$staged_win" ] && tmux set -w -t "$staged_win" -u @staged 2>/dev/null || true
-      : > "$STATE_DIR/staged_path"; : > "$STATE_DIR/staged_window"
-      msg "released — supercast.test → $(basename "$canonical") (canonical)"
-    elif [ "$wt_path" = "$canonical" ]; then
-      msg "that's the canonical checkout — press prefix+D inside a worktree window"
+  # Which repo are we in? Ask Herdr for the source checkout of the current dir.
+  local repo repo_name
+  repo=$("$HERDR" worktree list --cwd "$PWD" --json 2>/dev/null | jq -r '.result.source.repo_root // empty')
+  [ -n "$repo" ] && [ "$repo" != null ] || repo=$(main_worktree "$PWD")
+  [ -n "$repo" ] || die "not inside a git repo: $PWD"
+  repo_name=$(basename "$repo")
+  load_profile "$repo" "$repo_name"
+
+  # Create the worktree+workspace in Herdr; if its dir already exists, open it.
+  local base resp
+  base=$(base_ref "$repo")
+  case "${base:-}" in */*)
+    git -C "$repo" fetch --quiet "${base%%/*}" "+${base#*/}:refs/remotes/$base" 2>/dev/null \
+      || msg "fetch failed (offline?) - forking from last-known $base" ;;
+  esac
+  msg "creating worktree '$name' off ${base:-HEAD}"
+  resp=$("$HERDR" worktree create --cwd "$repo" --branch "$name" ${base:+--base "$base"} --json 2>/dev/null)
+  case "$(herr "$resp")" in
+    *"already exists"*|*"already open"*)
+      msg "worktree exists - opening it"
+      resp=$("$HERDR" worktree open --cwd "$repo" --branch "$name" --json 2>/dev/null) ;;
+  esac
+  [ -z "$(herr "$resp")" ] || die "herdr: $(herr "$resp")"
+
+  local ws root_pane path
+  ws=$(hj "$resp" '.result.workspace.workspace_id')
+  root_pane=$(hj "$resp" '.result.root_pane.pane_id')
+  path=$(hj "$resp" '.result.worktree.path')
+  [ -n "$path" ] && [ "$path" != null ] || die "could not determine worktree path from herdr"
+
+  prepare_state "$name" "$path" "$repo" "$repo_name" "$ws"
+
+  # Provision synchronously so Claude and the dev server see a ready worktree.
+  local provisioned=1
+  if declare -F wt_provision >/dev/null; then
+    msg "provisioning $WT_SLUG  (db / redis / url / port isolated)"
+    run_profile_fn wt_provision || { provisioned=0; warn "provisioning failed - dev server NOT started; fix, then: wt provision '$WT_PATH'"; }
+  fi
+
+  # Dev server in its own "dev" tab (only if the profile defines one and provisioning
+  # worked). A dedicated tab keeps Claude's pane full-height and the server's logs one
+  # tab away. Run it in the tab's root pane so no idle shell is left behind.
+  if [ "$provisioned" = 1 ] && declare -F wt_dev >/dev/null; then
+    local dtab dpane
+    dtab=$("$HERDR" tab create --workspace "$ws" --cwd "$WT_PATH" --label dev --no-focus 2>/dev/null)
+    dpane=$(hj "$dtab" '.result.root_pane.pane_id')
+    if [ -n "$dpane" ] && [ "$dpane" != null ]; then
+      "$HERDR" pane send-text "$dpane" "$(printf '%q dev %q' "$SELF" "$WT_PATH")" >/dev/null 2>&1
+      "$HERDR" pane send-keys "$dpane" enter >/dev/null 2>&1
+      msg "dev server starting${WT_DOMAIN:+ - https://$WT_DOMAIN}${WT_PORT:+ (:$WT_PORT)}"
     else
-      local_old=${staged_path:+$(basename "$staged_path")}
-      stop_dev; start_dev "$session" "$wt_path"
-      [ -n "$staged_win" ] && tmux set -w -t "$staged_win" -u @staged 2>/dev/null || true
-      tmux set -w -t "$window" @staged 1 2>/dev/null || true
-      printf '%s' "$wt_path" > "$STATE_DIR/staged_path"
-      printf '%s' "$window"  > "$STATE_DIR/staged_window"
-      msg "dev: ${local_old:-canonical} → $(basename "$wt_path")  (serving supercast.test)"
+      warn "could not open dev tab - run 'wt dev $WT_PATH' manually"
     fi
-    ;;
+  fi
 
-  _run-dev) # wt _run-dev <dir>  - internal: link gitignored bits, migrate, run bin/dev
-    dir=${1:-}; [ -d "$dir" ] || die "no dir: $dir"
-    # If bin/dev exits (a crash, or a leftover server we couldn't clear), keep the
-    # window open with the error and a shell instead of letting it flash shut - so
-    # failures are readable, mirroring how `wt spawn` handles setup failures.
-    devfail() { printf '\n\033[38;2;235;111;146mwt: %s\033[0m\n\n' "$*" >&2; cd "$dir" 2>/dev/null || true; exec "$SHELL" -l; }
-    canonical=$(main_worktree "$dir")
-    # symlink the gitignored files a fresh worktree needs to boot
-    for key in "$canonical"/config/master.key "$canonical"/config/credentials/*.key; do
-      [ -e "$key" ] || continue
-      rel=${key#"$canonical"/}
-      if [ ! -e "$dir/$rel" ]; then mkdir -p "$(dirname "$dir/$rel")"; ln -s "$key" "$dir/$rel"; echo "wt: linked $rel"; fi
-    done
-    if [ -d "$canonical/node_modules" ] && [ ! -e "$dir/node_modules" ]; then
-      ln -s "$canonical/node_modules" "$dir/node_modules"; echo "wt: linked node_modules"
-    fi
-    # A dev server for this worktree may already be running - e.g. one a Claude
-    # session started on another port, or one killed so hard it left its pidfile.
-    # Either way it owns tmp/pids/server.pid, and `rails s` refuses to boot ("A
-    # server is already running") while that file names a live pid; foreman then
-    # tears the whole window down. We're taking over this worktree's dev slot, so
-    # stop that server (its whole process group) and clear the pidfile first.
-    pidfile="$dir/tmp/pids/server.pid"
-    if [ -f "$pidfile" ]; then
-      oldpid=$(tr -dc '0-9' < "$pidfile" 2>/dev/null || true)
-      if [ -n "$oldpid" ] && kill -0 "$oldpid" 2>/dev/null; then
-        oldpgid=$(ps -o pgid= -p "$oldpid" 2>/dev/null | tr -d ' ')
-        if [ -n "$oldpgid" ]; then kill -TERM -"$oldpgid" 2>/dev/null || kill -TERM "$oldpid" 2>/dev/null || true
-        else kill -TERM "$oldpid" 2>/dev/null || true; fi
-        echo "wt: stopped an existing dev server for $(basename "$dir") (pid $oldpid)"
-        for _ in 1 2 3 4 5 6 7 8; do kill -0 "$oldpid" 2>/dev/null || break; sleep 0.5; done
-      fi
-      rm -f "$pidfile" 2>/dev/null && echo "wt: cleared tmp/pids/server.pid"
-    fi
-    # migrate only if this branch adds migrations vs the default branch (mutates the shared dev DB)
-    base=$(base_ref "$canonical")
-    if [ "$dir" != "$canonical" ] && [ -n "$base" ] && [ -n "$(git -C "$dir" diff --name-only "$base" HEAD -- db/migrate 2>/dev/null)" ]; then
-      echo "wt: branch adds migrations → bin/rails db:migrate"
-      ( cd "$dir" && bin/rails db:migrate ) || echo "wt: db:migrate failed — fix before testing"
-    fi
-    cd "$dir" || devfail "cannot cd into $dir"
-    echo "wt: bin/dev in $(basename "$dir")  →  supercast.test (:$DEV_PORT)"
-    bin/dev
-    devfail "dev server exited (code $?). Fix the error above, then prefix+D to restage."
-    ;;
+  # Launch the agent in the worktree's root pane, then jump to the workspace.
+  "$HERDR" pane send-text "$root_pane" "${WT_AGENT:-claude}" >/dev/null 2>&1
+  "$HERDR" pane send-keys "$root_pane" enter >/dev/null 2>&1
+  "$HERDR" workspace focus "$ws" >/dev/null 2>&1
+  msg "ready: $name"
+}
 
-  *) die "unknown command: ${cmd:-<none>}  (spawn | dev)";;
+cmd_dev() {
+  local path=${1:-$PWD} repo repo_name name
+  repo=$(main_worktree "$path"); [ -n "$repo" ] || die "not a git worktree: $path"
+  repo_name=$(basename "$repo"); name=$(cur_branch "$path")
+  load_profile "$repo" "$repo_name"
+  load_state "$(state_file "$repo_name" "$(slugify "$name")")" \
+    || warn "no saved state for this worktree - run 'wt provision $path' first"
+  WT_PATH=$path WT_REPO=$repo WT_REPO_NAME=$repo_name
+  # Keep the pane open with the error instead of flashing shut if the server dies.
+  devfail() { warn "$*"; cd "$WT_PATH" 2>/dev/null || true; exec "$SHELL" -l; }
+  declare -F wt_dev >/dev/null || devfail "no dev server configured for $repo_name (add wt_dev to its profile)"
+  cd "$WT_PATH" || devfail "cannot cd into $WT_PATH"
+  run_profile_fn wt_dev
+  devfail "dev server exited (code $?). Fix the error above, then rerun: wt dev '$WT_PATH'"
+}
+
+cmd_provision() {
+  local path=${1:-$PWD} repo repo_name name
+  repo=$(main_worktree "$path"); [ -n "$repo" ] || die "not a git worktree: $path"
+  repo_name=$(basename "$repo"); name=$(cur_branch "$path")
+  load_profile "$repo" "$repo_name"
+  prepare_state "$name" "$path" "$repo" "$repo_name"
+  declare -F wt_provision >/dev/null || { msg "no provisioning configured for $repo_name"; return 0; }
+  run_profile_fn wt_provision
+}
+
+cmd_rm() {
+  need_herdr
+  local name=${1:-} repo repo_name slug sf ws ans
+  if [ -z "$name" ]; then name=$(cur_branch "$PWD"); repo=$(main_worktree "$PWD"); else repo=$(main_worktree "$PWD"); fi
+  [ -n "$repo" ] || die "not inside a git repo"
+  repo_name=$(basename "$repo"); slug=$(slugify "$name"); sf=$(state_file "$repo_name" "$slug")
+  load_profile "$repo" "$repo_name"; load_state "$sf" || true
+  ws=${WT_WORKSPACE:-$("$HERDR" worktree list --cwd "$repo" --json 2>/dev/null \
+        | jq -r --arg b "$name" '.result.worktrees[]? | select(.branch==$b) | .open_workspace_id // empty')}
+  printf 'wt: remove worktree "%s" (branch, db, port all go)? [y/N] ' "$name" >&2; read -r ans || ans=n
+  [[ "${ans:-}" =~ ^[Yy]$ ]] || { msg "cancelled"; return 0; }
+  declare -F wt_teardown >/dev/null && { msg "tearing down external resources"; run_profile_fn wt_teardown || warn "teardown reported errors"; }
+  [ -n "$ws" ] && [ "$ws" != null ] && "$HERDR" worktree remove --workspace "$ws" --force --json >/dev/null 2>&1
+  git -C "$repo" worktree prune 2>/dev/null || true
+  rm -f "$sf"
+  printf 'wt: also delete the git branch "%s"? [y/N] ' "$name" >&2; read -r ans || ans=n
+  [[ "${ans:-}" =~ ^[Yy]$ ]] && git -C "$repo" branch -D "$name" 2>/dev/null && msg "branch deleted"
+  msg "removed $name"
+}
+
+cmd_ls() {
+  local f first=1
+  for f in "$STATE_DIR"/*.env; do
+    [ -e "$f" ] || { msg "no worktrees provisioned"; return 0; }
+    [ "$first" = 1 ] && printf '%-20s %-24s %-6s %-5s %s\n' REPO WORKTREE PORT REDIS URL >&2 && first=0
+    ( set -a; . "$f"; set +a
+      printf '%-20s %-24s %-6s %-5s %s\n' "${WT_REPO_NAME:-?}" "${WT_NAME:-?}" "${WT_PORT:--}" "${WT_REDIS:--}" "${WT_URL:-https://${WT_DOMAIN:-?}}" ) >&2
+  done
+}
+
+case "${1:-}" in
+  new)        shift; cmd_new "$@" ;;
+  dev)        shift; cmd_dev "$@" ;;
+  provision)  shift; cmd_provision "$@" ;;
+  rm|remove)  shift; cmd_rm "$@" ;;
+  ls|list)    shift; cmd_ls "$@" ;;
+  gc)         shift; cmd_gc "$@" ;;
+  *) die "usage: wt {new [name] | dev <path> | provision <path> | rm [name] | ls | gc}" ;;
 esac

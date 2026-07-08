@@ -6,36 +6,59 @@ Personal dotfiles for macOS. Manages:
 
 - `~/.config/nvim` - Neovim config.
 - `~/.config/ghostty` - Ghostty terminal config.
-- `~/.config/tmux` - tmux config (Rose Pine theme, the worktree workflow keybindings, and the Claude session status glyphs in the window list).
-- `~/.local/bin/wt` - worktree workflow backend driven by the tmux keybindings.
-- `~/.local/bin/claude-tmux-signal` - Claude Code hook target that sets the tmux `@claude` window flag (working / waiting / done / clear) driving the status-bar glyph.
-- `~/.local/bin/claude-tmux-spinner` - animates the ✻ "working" pulse in the tmux status bar while a Claude session is busy.
-- `~/.claude/settings.json` - Claude Code settings; the `hooks` block wires the two scripts above (UserPromptSubmit + PreToolUse → working, Notification → waiting, Stop → done, SessionEnd → clear). Git-tracked for reference but applied manually - `install.sh` does not touch `~/.claude`.
+- `~/.config/tmux` - tmux config (Rose Pine theme; splits inherit the pane's directory).
+- `~/.local/bin/wt` - worktree workflow backend: creates an isolated worktree (its own database, redis db, url and port) through Herdr, provisions it, and starts the dev server + Claude on it. Project-agnostic; the per-project steps live in profiles.
+- `~/.config/wt/profiles/<repo>.sh` - per-project provisioning + dev-server steps for `wt` (e.g. `supercast.sh`).
+- `~/.claude/settings.json` - Claude Code settings. Agent status now comes from Herdr's built-in Claude integration (`herdr integration install claude`), which installs a `SessionStart` hook. Git-tracked for reference but applied manually - `install.sh` does not touch `~/.claude`.
 - Hack Nerd Font.
 
 This repo keeps my personal configuration files - shell, editor, and tool configs - under version control, so the setup can be tracked over time and reused across machines.
 
-### Claude Code tmux status
+### Worktree workflow (Herdr)
 
-The tmux window list shows what each Claude session is doing, so background agents are visible at a glance:
+Agent work runs inside [Herdr](https://herdr.dev), a terminal workspace manager for AI coding agents.
+Herdr provides, as first-class features, the two things this repo previously hand-built in tmux:
 
-- ✻ iris (animated pulse) - Claude is working, including while it waits on its own background tasks.
-- ● red - Claude needs your input.
-- ● gold - Claude finished its turn; clears when you focus the window.
-- no glyph - idle.
+**Claude session status.**
+`herdr integration install claude` wires a `SessionStart` hook that reports each Claude session (and its transcript) to Herdr, which then tracks every agent as working / blocked / idle in its sidebar.
+This replaces the old `claude-tmux-signal` + window-glyph machinery (now removed).
+Because Herdr owns the pane-to-agent binding itself, rather than inferring the window from `$TMUX_PANE` and racing on tmux options, it does not suffer the flakiness the tmux version had.
+The trade-off: status is shown only for agents running inside a Herdr pane.
 
-State lives per-window in the `@claude` tmux option.
-`claude-tmux-signal` (run from the Claude Code hooks in `~/.claude/settings.json`) sets it on UserPromptSubmit/PreToolUse/Notification/Stop/SessionEnd.
-`claude-tmux-spinner` animates the ✻ frame while any window is working.
-A `pane-focus-in` hook in `tmux.conf` clears the "done" dot when you look at the window, while "waiting" persists until you reply or exit Claude.
+**Worktrees with full isolation.**
+`wt` (bound to `prefix+t` in `~/.config/herdr/config.toml`) creates a worktree through Herdr and runs it isolated, so several branches can be developed and tested at the same time.
+`wt new <name>` forks a branch off the up-to-date default branch, opens it as a Herdr workspace, provisions it, then starts Claude in the workspace's main pane and the dev server in its own `dev` tab.
 
-`working` is re-asserted on every `PreToolUse`, not just at the start of a turn.
-This matters because Claude Code's `Notification` hook fires for many status events - not only "needs your input" but also permission prompts, auth success, MCP elicitation, and background-agent completion - so a bare Notification-to-red mapping would leave a stale red ● on a window that is actually still working.
-Because `PreToolUse` fires before the permission check and on every tool call, any tool activity flips the window back to the animated ✻; a red dot therefore only persists while the agent is genuinely idle and doing nothing.
-`Stop`/`Notification` events that still report in-flight `background_tasks` are also treated as `working` rather than done/waiting.
+Isolation is per project, described by a *profile*.
+`wt` itself is project-agnostic: it resolves the branch, allocates a free port and redis db index, and calls the profile's steps.
+Profiles are discovered at `<repo>/.wt/profile.sh` (committed with the project) or `~/.config/wt/profiles/<repo>.sh` (personal, tracked here).
+A profile declares which resources to allocate and defines `wt_provision`, `wt_dev`, and `wt_teardown`.
+A repo with no profile still gets a worktree + Claude - it just has no dev server.
 
-A turn can end (`Stop`) while background work is still running - a background build, test run, or background agent - in which case the session only looks idle even though it will wake itself back up.
-To avoid that, the `Stop` hook reads the `background_tasks` array Claude Code sends in its payload (v2.1.145+): if any task is still in flight the window stays `working` (animated ✻) instead of going gold, and only flips to "done" once the final `Stop` reports no background tasks left.
+For `supercast` (`~/.config/wt/profiles/supercast.sh`) each worktree gets:
+
+- its own postgres database - a logical copy of `supercast-web_development`, so migrations and data changes never touch the shared dev db or the other worktrees;
+- its own redis db index, so Sidekiq queues don't collide;
+- its own puma-dev url `https://<name>.test` on its own port.
+
+So `wt new premier-video` and `wt new spotify-reconcile` can run side by side, each serving its own url against its own database, with no handoff between them.
+The app needs no changes for this: its `database.yml`, `sidekiq.rb`, and `development.rb`/`session_store.rb` already honor `DATABASE_URL` / `REDIS_URL` / `LOCAL_DOMAIN`, and `config.hosts.clear` allows any `*.test` host.
+The profile injects the port by generating a per-worktree Procfile (the tracked `Procfile.dev` pins the web port to 3000), written outside the repo so the checkout stays clean.
+
+Commands:
+
+```
+wt new [name]        create/open an isolated worktree, provision, start dev + Claude
+wt dev  <path>       run a worktree's dev server (this is the dev pane's command)
+wt provision <path>  re-run provisioning for a worktree (idempotent)
+wt rm  [name]        tear a worktree down (drop db, free port, remove worktree)
+wt ls                list worktrees with their allocated port / redis / url / db
+wt gc                reclaim resources from worktrees removed outside wt rm
+```
+
+Herdr has no worktree-removal hook, so removing a worktree through Herdr's own UI (rather than `wt rm`) would otherwise leak its database, port, and redis db.
+`wt gc` reconciles this: it checks each recorded worktree and, for any whose directory no longer exists, runs the profile's teardown and frees the reservation.
+`wt new` runs it automatically, so orphans are always reclaimed on the next task - run `wt gc` yourself any time to clean up immediately.
 
 ## Requirements
 
