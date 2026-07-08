@@ -203,14 +203,27 @@ cmd_new() {
   repo_name=$(basename "$repo")
   load_profile "$repo" "$repo_name"
 
-  # Create the worktree+workspace in Herdr; if its dir already exists, open it.
+  # Resolve the branch, then create the worktree+workspace in Herdr. Three cases,
+  # matching the tmux-era wt: reuse an existing local branch, adopt an existing
+  # remote branch (fork a tracking copy at its tip), or fork a brand-new branch
+  # off the up-to-date default base. The --base we pass decides which.
   local base resp
-  base=$(base_ref "$repo")
-  case "${base:-}" in */*)
-    git -C "$repo" fetch --quiet "${base%%/*}" "+${base#*/}:refs/remotes/$base" 2>/dev/null \
-      || msg "fetch failed (offline?) - forking from last-known $base" ;;
-  esac
-  msg "creating worktree '$name' off ${base:-HEAD}"
+  if git -C "$repo" show-ref --verify --quiet "refs/heads/$name"; then
+    base=""                                    # existing local branch: check it out as-is
+    msg "using existing local branch '$name'"
+  elif git -C "$repo" ls-remote --exit-code --heads origin "$name" >/dev/null 2>&1; then
+    msg "checking out existing remote branch '$name'"
+    git -C "$repo" fetch --quiet origin "+refs/heads/$name:refs/remotes/origin/$name" 2>/dev/null \
+      || msg "fetch failed (offline?) - using last-known origin/$name"
+    base="origin/$name"                        # remote branch: fork a local copy at its tip
+  else
+    base=$(base_ref "$repo")                   # brand-new task: fork off the default branch
+    case "${base:-}" in */*)
+      git -C "$repo" fetch --quiet "${base%%/*}" "+${base#*/}:refs/remotes/$base" 2>/dev/null \
+        || msg "fetch failed (offline?) - forking from last-known $base" ;;
+    esac
+    msg "creating worktree '$name' off ${base:-HEAD}"
+  fi
   resp=$("$HERDR" worktree create --cwd "$repo" --branch "$name" ${base:+--base "$base"} --json 2>/dev/null)
   case "$(herr "$resp")" in
     *"already exists"*|*"already open"*)
