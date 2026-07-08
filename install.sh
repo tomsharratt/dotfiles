@@ -13,12 +13,17 @@ case "$(uname -s)" in
   *)      fonts_dst="$HOME/.local/share/fonts" ;;
 esac
 
+# Volatile per-tool runtime files kept alongside tracked config (herdr stores its
+# sockets, logs, and session state in ~/.config/herdr). Never sync these, and keep
+# --delete from removing them from the destination (rsync protects excluded files).
+config_excludes=(--exclude='*.sock' --exclude='*.log' --exclude='/session.json' --exclude='/release-notes.json')
+
 for dir in "$repo"/.config/*/; do
   [ -d "$dir" ] || continue
   name="$(basename "$dir")"
   dst="$HOME/.config/$name"
   mkdir -p "$dst"
-  rsync -a --delete "$dir" "$dst/"
+  rsync -a --delete "${config_excludes[@]}" "$dir" "$dst/"
   echo "config: $name  →  $dst"
 done
 

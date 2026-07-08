@@ -12,12 +12,16 @@ case "$(uname -s)" in
   *)      fonts_src="$HOME/.local/share/fonts" ;;
 esac
 
+# Don't pull volatile runtime files (herdr's sockets, logs, and session state)
+# back into the repo, and keep --delete from clobbering tracked files with them.
+config_excludes=(--exclude='*.sock' --exclude='*.log' --exclude='/session.json' --exclude='/release-notes.json')
+
 for dir in "$repo"/.config/*/; do
   [ -d "$dir" ] || continue
   name="$(basename "$dir")"
   src="$HOME/.config/$name"
   if [ -d "$src" ]; then
-    rsync -a --delete "$src/" "$dir"
+    rsync -a --delete "${config_excludes[@]}" "$src/" "$dir"
     echo "config: $src  →  .config/$name"
   else
     echo "skip:   .config/$name (not present in env)"
