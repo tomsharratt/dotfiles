@@ -12,6 +12,9 @@
 #   wt new [name]        create/open an isolated worktree, provision it,
 #                        start the dev server + Claude, focus it
 #   wt dev  <path>       run the worktree's dev server (the dev pane's command)
+#   wt run  [cmd...]     run a command with the worktree's isolated env loaded
+#                        (e.g. `wt run bin/rails console`); no cmd -> a shell
+#   wt open [name]       open the worktree's dev url in the browser
 #   wt provision <path>  (re)run the project's provisioning for a worktree (idempotent)
 #   wt rm  [name]        tear the worktree down (drop db, free port, remove worktree)
 #   wt ls                list worktrees and their allocated port / redis / url / db
@@ -30,6 +33,11 @@
 # exported (WT_NAME WT_SLUG WT_PATH WT_REPO WT_REPO_NAME WT_DOMAIN WT_PORT WT_REDIS):
 #   wt_provision   prepare the worktree so its dev server can boot in isolation
 #   wt_dev         exec the dev server (long-running)
+#   wt_env         export the worktree's isolated env (db / redis / url / port);
+#                  shared by wt_dev and `wt run` so the server and one-off
+#                  commands (console, rake, tests) all agree on the same db
+#   wt_open_url    print the url `wt open` should launch (default: WT_URL);
+#                  receives any extra `wt open` args (e.g. a login email)
 #   wt_teardown    release external resources on `wt rm` (best-effort)
 # Helpers available to profiles: msg, warn, wt_state_set KEY VALUE.
 # A repo with no profile still gets a worktree + Claude; it just has no dev server.
@@ -143,11 +151,13 @@ prepare_state() {                       # name path repo repo_name [workspace_id
   [ -n "${WT_REDIS:-}" ] && state_set "$WT_STATE_FILE" WT_REDIS "$WT_REDIS"
 }
 
-# Export the worktree facts, then run a profile function if it is defined.
-run_profile_fn() {                      # fn  (WT_* must already be set)
+# Export the worktree facts, then run a profile function (with any extra args) if
+# it is defined.
+run_profile_fn() {                      # fn [args...]  (WT_* must already be set)
   export WT_NAME WT_SLUG WT_PATH WT_REPO WT_REPO_NAME WT_DOMAIN WT_PORT WT_REDIS WT_STATE_FILE
   declare -F "$1" >/dev/null || return 0
-  "$1"
+  local fn=$1; shift
+  "$fn" "$@"
 }
 
 # ── garbage collection ───────────────────────────────────────────────────────
@@ -238,35 +248,54 @@ cmd_new() {
   path=$(hj "$resp" '.result.worktree.path')
   [ -n "$path" ] && [ "$path" != null ] || die "could not determine worktree path from herdr"
 
+  # prepare_state is cheap and MUST run here (not just in the backgrounded
+  # `wt provision` below): it persists WT_WORKSPACE=$ws, and `wt provision`'s own
+  # prepare_state has no workspace to record - so skipping it here would leave gc
+  # and `wt rm` unable to find the workspace to close.
   prepare_state "$name" "$path" "$repo" "$repo_name" "$ws"
 
-  # Provision synchronously so Claude and the dev server see a ready worktree.
-  local provisioned=1
-  if declare -F wt_provision >/dev/null; then
-    msg "provisioning $WT_SLUG  (db / redis / url / port isolated)"
-    run_profile_fn wt_provision || { provisioned=0; warn "provisioning failed - dev server NOT started; fix, then: wt provision '$WT_PATH'"; }
-  fi
+  # Launch the agent immediately in the worktree's root pane and focus it, so you
+  # can start writing your prompt right away. Provisioning (a full dev-db copy,
+  # migrate, flag seed) is the slow part, so it does NOT block this - it runs in a
+  # background dev tab below and the worktree just isn't server-ready until it lands.
+  "$HERDR" pane send-text "$root_pane" "${WT_AGENT:-claude}" >/dev/null 2>&1
+  "$HERDR" pane send-keys "$root_pane" enter >/dev/null 2>&1
+  "$HERDR" workspace focus "$ws" >/dev/null 2>&1
 
-  # Dev server in its own "dev" tab (only if the profile defines one and provisioning
-  # worked). A dedicated tab keeps Claude's pane full-height and the server's logs one
-  # tab away. Run it in the tab's root pane so no idle shell is left behind.
-  if [ "$provisioned" = 1 ] && declare -F wt_dev >/dev/null; then
+  # Provision, then boot the dev server, in their own background "dev" tab. A
+  # dedicated tab keeps Claude's pane full-height and the setup logs one tab away;
+  # --no-focus leaves focus on Claude. `wt provision` is idempotent and writes the
+  # state `wt dev` reads. Provisioning is the step that can fail, and you're off
+  # writing your prompt rather than watching this tab - so on failure we raise a
+  # herdr notification (the error itself stays in the tab); a clean provision falls
+  # through to the server. With no provisioning, the server just runs (its own
+  # crash handler drops the tab to a shell you can restart from). Each fragment is
+  # %q-quoted so it survives being re-parsed by the pane's shell.
+  local setup="" prov dev notify
+  prov=$(printf '%q provision %q' "$SELF" "$WT_PATH")
+  dev=$(printf '%q dev %q' "$SELF" "$WT_PATH")
+  notify=$(printf '%q notification show %q --body %q --sound request' \
+    "$HERDR" "${WT_SLUG:-worktree}: dev setup failed" \
+    "Provisioning failed in the 'dev' tab - fix the error there, then rerun.")
+  if declare -F wt_provision >/dev/null && declare -F wt_dev >/dev/null; then
+    setup="if $prov; then $dev; else $notify; fi"
+  elif declare -F wt_provision >/dev/null; then
+    setup="$prov || $notify"
+  elif declare -F wt_dev >/dev/null; then
+    setup="$dev"
+  fi
+  if [ -n "$setup" ]; then
     local dtab dpane
     dtab=$("$HERDR" tab create --workspace "$ws" --cwd "$WT_PATH" --label dev --no-focus 2>/dev/null)
     dpane=$(hj "$dtab" '.result.root_pane.pane_id')
     if [ -n "$dpane" ] && [ "$dpane" != null ]; then
-      "$HERDR" pane send-text "$dpane" "$(printf '%q dev %q' "$SELF" "$WT_PATH")" >/dev/null 2>&1
+      "$HERDR" pane send-text "$dpane" "$setup" >/dev/null 2>&1
       "$HERDR" pane send-keys "$dpane" enter >/dev/null 2>&1
-      msg "dev server starting${WT_DOMAIN:+ - https://$WT_DOMAIN}${WT_PORT:+ (:$WT_PORT)}"
+      msg "setup + dev server running in the 'dev' tab${WT_DOMAIN:+ - https://$WT_DOMAIN}${WT_PORT:+ (:$WT_PORT)}"
     else
-      warn "could not open dev tab - run 'wt dev $WT_PATH' manually"
+      warn "could not open dev tab - run 'wt provision $WT_PATH && wt dev $WT_PATH' manually"
     fi
   fi
-
-  # Launch the agent in the worktree's root pane, then jump to the workspace.
-  "$HERDR" pane send-text "$root_pane" "${WT_AGENT:-claude}" >/dev/null 2>&1
-  "$HERDR" pane send-keys "$root_pane" enter >/dev/null 2>&1
-  "$HERDR" workspace focus "$ws" >/dev/null 2>&1
   msg "ready: $name"
 }
 
@@ -286,6 +315,54 @@ cmd_dev() {
   devfail "dev server exited (code $?). Fix the error above, then rerun: wt dev '$WT_PATH'"
 }
 
+# Run a command inside the current worktree with its isolated env loaded, so
+# `bin/rails console`, rake, tests, psql etc. all read the SAME db / redis / url /
+# port the dev server does - instead of silently falling back to the canonical
+# dev db. The env comes from the profile's wt_env (single source of truth with
+# wt_dev). With no command, drop into an interactive shell that has the env set,
+# so a literal `bin/rails console` typed there just works. exec so signals and
+# the exit code pass straight through.
+cmd_run() {
+  local path=$PWD repo repo_name name
+  repo=$(main_worktree "$path"); [ -n "$repo" ] || die "not inside a git worktree: $path"
+  repo_name=$(basename "$repo"); name=$(cur_branch "$path")
+  load_profile "$repo" "$repo_name"
+  load_state "$(state_file "$repo_name" "$(slugify "$name")")" \
+    || die "no saved state for this worktree - run 'wt provision $path' first"
+  WT_PATH=$path WT_REPO=$repo WT_REPO_NAME=$repo_name
+  declare -F wt_env >/dev/null || die "no env configured for $repo_name (add wt_env to its profile)"
+  run_profile_fn wt_env
+  [ "$#" -gt 0 ] || exec "${SHELL:-/bin/bash}" -i
+  exec "$@"
+}
+
+# Open the worktree's dev url in the browser. Which url (subdomain, path, any
+# pre-filled query) is project-specific, so a profile defines it via wt_open_url;
+# with none we fall back to the worktree's base url. `wt open` uses the current
+# worktree, or `wt open <name>` names one; any further args pass through to
+# wt_open_url (e.g. `wt open my-task someone@example.com` to pre-fill a login).
+cmd_open() {
+  local name=${1:-} repo repo_name url
+  repo=$(main_worktree "$PWD"); [ -n "$repo" ] || die "not inside a git worktree"
+  if [ -n "$name" ]; then shift; else name=$(cur_branch "$PWD"); fi
+  [ -n "$name" ] || die "no worktree name given (and not on a branch)"
+  repo_name=$(basename "$repo")
+  load_profile "$repo" "$repo_name"
+  load_state "$(state_file "$repo_name" "$(slugify "$name")")" \
+    || die "no saved state for '$name' - run 'wt provision' first"
+  if declare -F wt_open_url >/dev/null; then
+    url=$(run_profile_fn wt_open_url "$@")
+  else
+    url=${WT_URL:-https://${WT_DOMAIN}}
+  fi
+  [ -n "$url" ] || die "no url to open for '$name'"
+  msg "opening $url"
+  # Quote the url everywhere: query strings like ?user[email]= are valid globs.
+  if command -v open >/dev/null 2>&1; then open "$url"
+  elif command -v xdg-open >/dev/null 2>&1; then xdg-open "$url"
+  else die "no 'open'/'xdg-open' on PATH - visit: $url"; fi
+}
+
 cmd_provision() {
   local path=${1:-$PWD} repo repo_name name
   repo=$(main_worktree "$path"); [ -n "$repo" ] || die "not a git worktree: $path"
@@ -298,22 +375,53 @@ cmd_provision() {
 
 cmd_rm() {
   need_herdr
-  local name=${1:-} repo repo_name slug sf ws ans
-  if [ -z "$name" ]; then name=$(cur_branch "$PWD"); repo=$(main_worktree "$PWD"); else repo=$(main_worktree "$PWD"); fi
-  [ -n "$repo" ] || die "not inside a git repo"
+  local name=${1:-} repo repo_name slug sf ws ans del=n wtpath
+  repo=$(main_worktree "$PWD"); [ -n "$repo" ] || die "not inside a git repo"
+  [ -n "$name" ] || name=$(cur_branch "$PWD")
+  [ -n "$name" ] || die "no worktree name given (and not on a branch)"
   repo_name=$(basename "$repo"); slug=$(slugify "$name"); sf=$(state_file "$repo_name" "$slug")
-  load_profile "$repo" "$repo_name"; load_state "$sf" || true
+  load_profile "$repo" "$repo_name"
+  load_state "$sf" || warn "no saved state for '$name' - its db/redis/puma-dev may not be fully freed"
+  wtpath=${WT_PATH:-}
   ws=${WT_WORKSPACE:-$("$HERDR" worktree list --cwd "$repo" --json 2>/dev/null \
         | jq -r --arg b "$name" '.result.worktrees[]? | select(.branch==$b) | .open_workspace_id // empty')}
+
+  # Ask both questions up front. Closing the workspace (last step) tears down the
+  # pane this command is running in whenever we're removing the worktree we're
+  # sitting in - so nothing after that close is guaranteed to run: no prompts, no
+  # cleanup. Everything that must happen has to happen before it.
   printf 'wt: remove worktree "%s" (branch, db, port all go)? [y/N] ' "$name" >&2; read -r ans || ans=n
   [[ "${ans:-}" =~ ^[Yy]$ ]] || { msg "cancelled"; return 0; }
-  declare -F wt_teardown >/dev/null && { msg "tearing down external resources"; run_profile_fn wt_teardown || warn "teardown reported errors"; }
-  [ -n "$ws" ] && [ "$ws" != null ] && "$HERDR" worktree remove --workspace "$ws" --force --json >/dev/null 2>&1
-  git -C "$repo" worktree prune 2>/dev/null || true
-  rm -f "$sf"
   printf 'wt: also delete the git branch "%s"? [y/N] ' "$name" >&2; read -r ans || ans=n
-  [[ "${ans:-}" =~ ^[Yy]$ ]] && git -C "$repo" branch -D "$name" 2>/dev/null && msg "branch deleted"
+  [[ "${ans:-}" =~ ^[Yy]$ ]] && del=y
+
+  # 1. Free external resources (db / redis / puma-dev) while we're certain to be alive.
+  declare -F wt_teardown >/dev/null && { msg "tearing down external resources"; run_profile_fn wt_teardown || warn "teardown reported errors"; }
+
+  # 2. Step out of the worktree before removing it - otherwise the rest of this
+  #    process runs with a deleted CWD (getcwd errors on every later command).
+  cd "$repo" 2>/dev/null || cd / 2>/dev/null || true
+
+  # 3. Remove the worktree, then (optionally) its branch, ourselves - a branch
+  #    checked out in a live worktree can't be deleted, so the worktree has to go
+  #    first, and both must be done before the workspace close that may end us.
+  [ -n "$wtpath" ] && git -C "$repo" worktree remove --force "$wtpath" >/dev/null 2>&1
+  git -C "$repo" worktree prune 2>/dev/null || true
+  [ "$del" = y ] && git -C "$repo" branch -D "$name" >/dev/null 2>&1 && msg "deleted branch $name"
+
+  # 4. Drop our bookkeeping so it can't outlive the worktree (this is the leak gc
+  #    used to have to mop up on the next `wt new`).
+  rm -f "$sf"
   msg "removed $name"
+
+  # 5. Close the workspace LAST. This is what kills our own pane when we're inside
+  #    the worktree, so it must come after everything above. Mirror gc's fallback:
+  #    a worktree we already removed makes `worktree remove` a no-op/failure, so
+  #    fall back to closing the workspace directly.
+  if [ -n "$ws" ] && [ "$ws" != null ]; then
+    "$HERDR" worktree remove --workspace "$ws" --force --json >/dev/null 2>&1 \
+      || "$HERDR" workspace close "$ws" >/dev/null 2>&1 || true
+  fi
 }
 
 cmd_ls() {
@@ -329,9 +437,11 @@ cmd_ls() {
 case "${1:-}" in
   new)        shift; cmd_new "$@" ;;
   dev)        shift; cmd_dev "$@" ;;
+  run)        shift; cmd_run "$@" ;;
+  open)       shift; cmd_open "$@" ;;
   provision)  shift; cmd_provision "$@" ;;
   rm|remove)  shift; cmd_rm "$@" ;;
   ls|list)    shift; cmd_ls "$@" ;;
   gc)         shift; cmd_gc "$@" ;;
-  *) die "usage: wt {new [name] | dev <path> | provision <path> | rm [name] | ls | gc}" ;;
+  *) die "usage: wt {new [name] | dev <path> | run [cmd...] | open [name] | provision <path> | rm [name] | ls | gc}" ;;
 esac

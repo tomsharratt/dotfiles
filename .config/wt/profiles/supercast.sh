@@ -12,11 +12,25 @@
 
 WT_RESOURCES="port redis"   # allocate an isolated port + redis db index
 WT_PORT_BASE=3101           # 3000 stays with the canonical checkout
+WT_REDIS_MAX=14             # reserve db 15 for the spec suite (config/initializers/redis.rb)
 WT_AGENT="claude"
 
 # The dev db has a hyphen; a bareword pg db name can't, so the slug's dashes
 # become underscores for the worktree's db.
 _wt_db() { printf 'supercast-web_development_%s' "${WT_SLUG//-/_}"; }
+
+# Drop a db, first terminating any connections to it (a still-running dev server)
+# so dropdb can't fail on "database is being accessed by other users". Silent -
+# the caller prints its own context. Returns non-zero if the db doesn't exist or
+# the drop fails, so `_wt_dropdb x && msg ...` reports only a real drop.
+_wt_dropdb() {
+  local db=$1
+  psql -lqtA 2>/dev/null | cut -d'|' -f1 | grep -qx "$db" || return 1
+  psql -q -d postgres -c \
+    "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname='$db' AND pid<>pg_backend_pid();" \
+    >/dev/null 2>&1
+  dropdb "$db"
+}
 
 wt_provision() {
   local canonical=$WT_REPO db key rel
@@ -33,15 +47,21 @@ wt_provision() {
     ln -s "$canonical/node_modules" "$WT_PATH/node_modules"; msg "linked node_modules"
   fi
 
-  # 2. Isolated database. Copy the current dev db with a logical dump (works
-  #    while the canonical dev server is connected, unlike CREATE DATABASE ...
-  #    TEMPLATE, which needs exclusive access to the source).
-  if ! psql -lqtA 2>/dev/null | cut -d'|' -f1 | grep -qx "$db"; then
+  # 2. Isolated database, always a fresh copy of the current dev db. Re-running
+  #    provision RESETS it: an existing worktree db is dropped (terminating the
+  #    dev server if it's still attached) and re-seeded, so provision is the way
+  #    back to a clean copy. A logical dump is used rather than CREATE DATABASE
+  #    ... TEMPLATE, which needs exclusive access to the source the canonical dev
+  #    server holds open.
+  if psql -lqtA 2>/dev/null | cut -d'|' -f1 | grep -qx "$db"; then
+    msg "resetting database $db (fresh copy of supercast-web_development)"
+    _wt_dropdb "$db" || { warn "dropping $db failed"; return 1; }
+  else
     msg "creating database $db (copy of supercast-web_development)"
-    createdb "$db" || { warn "createdb $db failed"; return 1; }
-    if ! pg_dump --no-owner --no-privileges "supercast-web_development" 2>/dev/null | psql -q -d "$db" >/dev/null 2>&1; then
-      warn "seeding $db from the dev db failed"; return 1
-    fi
+  fi
+  createdb "$db" || { warn "createdb $db failed"; return 1; }
+  if ! pg_dump --no-owner --no-privileges "supercast-web_development" 2>/dev/null | psql -q -d "$db" >/dev/null 2>&1; then
+    warn "seeding $db from the dev db failed"; return 1
   fi
 
   # 3. Apply this branch's own migrations to the isolated db (safe - nothing shared).
@@ -50,7 +70,30 @@ wt_provision() {
     warn "db:migrate failed - fix before testing"; return 1
   fi
 
-  # 4. Route puma-dev's <slug>.test at this worktree's port.
+  # 4. Seed feature flags so the worktree matches dev instead of starting with
+  #    every flag off. flipper (config/initializers/features.rb -> Redis.new,
+  #    which honors REDIS_URL) lives on this worktree's redis db index, and a
+  #    fresh index is empty. flipper-redis keeps a SET `flipper_features` of
+  #    feature names plus one HASH per feature keyed by the bare name; copy the
+  #    set and each feature hash from the canonical dev db (redis 0). Server-side
+  #    COPY (redis >= 6.2) avoids round-tripping values through the shell. Only
+  #    when the target has no flags yet, so in-worktree toggles and re-provisions
+  #    are never clobbered.
+  if [ "${WT_REDIS:-0}" -gt 0 ] 2>/dev/null && \
+     [ "$(redis-cli -n "$WT_REDIS" scard flipper_features 2>/dev/null)" = "0" ]; then
+    local feat n
+    redis-cli -n 0 copy flipper_features flipper_features DB "$WT_REDIS" REPLACE >/dev/null 2>&1
+    # Only ~a quarter of registered features carry a gate HASH (the rest are off
+    # by default); copy whichever exist. `copy` of an absent key is a no-op.
+    while IFS= read -r feat; do
+      [ -n "$feat" ] || continue
+      redis-cli -n 0 copy "$feat" "$feat" DB "$WT_REDIS" REPLACE >/dev/null 2>&1
+    done < <(redis-cli -n 0 smembers flipper_features 2>/dev/null)
+    n=$(redis-cli -n "$WT_REDIS" scard flipper_features 2>/dev/null)
+    [ "${n:-0}" -gt 0 ] 2>/dev/null && msg "seeded $n feature flags into redis db $WT_REDIS (from dev)"
+  fi
+
+  # 5. Route puma-dev's <slug>.test at this worktree's port.
   printf '%s' "$WT_PORT" > "$HOME/.puma-dev/$WT_SLUG"
   msg "puma-dev: https://$WT_DOMAIN -> :$WT_PORT"
 
@@ -59,8 +102,14 @@ wt_provision() {
   wt_state_set WT_DB "$db"
 }
 
-wt_dev() {
-  local db pf; db=$(_wt_db); pf="${TMPDIR:-/tmp}/wt-${WT_SLUG}.Procfile"
+# Export this worktree's isolated runtime environment: its own postgres db, redis
+# db index, puma-dev url and port. This is the SINGLE source of truth for every
+# process that runs against the worktree - the long-running dev server (wt_dev)
+# AND one-off commands (`wt run`, e.g. `wt run bin/rails console`). Keeping both
+# on the same function is what stops a console from silently reading the canonical
+# dev db while the server reads the isolated one.
+wt_env() {
+  local db; db=$(_wt_db)
   export PORT="$WT_PORT"
   export DATABASE_URL="postgres:///$db"
   export REDIS_URL="redis://localhost:6379/${WT_REDIS:-0}"
@@ -71,6 +120,22 @@ wt_dev() {
   # cookie (domain=supercast.test on a <slug>.test host) and login silently fails. figaro skips
   # keys already in ENV, so exporting it here wins.
   export domain="$WT_DOMAIN"
+}
+
+# Browser entry point for `wt open`: the app login with an email pre-filled, so a
+# fresh worktree drops you onto a session in one click. Served off the app.
+# subdomain - puma-dev routes any *.<slug>.test host through this worktree's entry,
+# so app.<slug>.test resolves the same as the bare <slug>.test does. Override the
+# email with `wt open <name> <email>` or WT_OPEN_EMAIL; default is the seed admin.
+wt_open_url() {
+  local email=${1:-${WT_OPEN_EMAIL:-admin@supercast.tech}}
+  printf 'https://app.%s/login?user[email]=%s' "$WT_DOMAIN" "$email"
+}
+
+wt_dev() {
+  local db pf; db=$(_wt_db); pf="${TMPDIR:-/tmp}/wt-${WT_SLUG}.Procfile"
+  # Isolated db / redis / url / port - identical to what `wt run` hands the console.
+  wt_env
   # Clear a stale server pidfile (only if its process is dead) so a restart after a
   # hard kill isn't blocked by "A server is already running".
   local pidfile="$WT_PATH/tmp/pids/server.pid" oldpid
@@ -101,11 +166,5 @@ wt_teardown() {
   if [ "${WT_REDIS:-0}" -gt 0 ] 2>/dev/null; then
     redis-cli -n "$WT_REDIS" flushdb >/dev/null 2>&1 && msg "flushed redis db $WT_REDIS"
   fi
-  if psql -lqtA 2>/dev/null | cut -d'|' -f1 | grep -qx "$db"; then
-    # Drop any lingering connections (a still-running dev server) before dropdb.
-    psql -q -d postgres -c \
-      "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname='$db' AND pid<>pg_backend_pid();" \
-      >/dev/null 2>&1
-    dropdb "$db" && msg "dropped database $db"
-  fi
+  _wt_dropdb "$db" && msg "dropped database $db"
 }
