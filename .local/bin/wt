@@ -768,9 +768,19 @@ cmd_new() {
   # through to the server. With no provisioning, the server just runs (its own
   # crash handler drops the tab to a shell you can restart from). Each fragment is
   # %q-quoted so it survives being re-parsed by the pane's shell.
-  local setup="" prov dev notify
-  prov=$(printf '%q provision %q' "$SELF" "$WT_PATH")
-  dev=$(printf '%q dev %q' "$SELF" "$WT_PATH")
+  #
+  # The dev tab is a brand-new pane, so its shell starts fresh and inherits nothing from
+  # this process. Anything that decides WHERE wt keeps its state has to be carried across
+  # by hand, because the two halves of one `wt new` would otherwise disagree: the
+  # prepare_state above resolves one state dir and the `wt provision` below another, so
+  # the same worktree gets provisioned twice into two state files with two ports. Both
+  # variables are normally unset, which is the only reason this has never bitten.
+  local setup="" prov dev notify envp="" v
+  for v in XDG_STATE_HOME XDG_CONFIG_HOME; do
+    [ -n "${!v:-}" ] && envp="$envp$(printf '%s=%q ' "$v" "${!v}")"
+  done
+  prov=$envp$(printf '%q provision %q' "$SELF" "$WT_PATH")
+  dev=$envp$(printf '%q dev %q' "$SELF" "$WT_PATH")
   notify=$(printf '%q notification show %q --body %q --sound request' \
     "$HERDR" "${WT_SLUG:-worktree}: dev setup failed" \
     "Provisioning failed in the 'dev' tab - fix the error there, then rerun.")
