@@ -17,7 +17,10 @@
 #   wt open [name]       open the worktree's dev url in the browser
 #   wt provision <path>  (re)run the project's provisioning for a worktree (idempotent)
 #   wt rm  [name]        tear the worktree down (drop db, free port, remove worktree)
-#   wt ls                list worktrees and their allocated port / redis / url / db
+#   wt ls                every worktree: port, age, agent state, PR/CI state, url
+#   wt gc                reclaim resources from worktrees that no longer exist
+#   wt gc --merged       also reclaim worktrees whose PR has merged (needs gh)
+#   wt gc --sweep        also sweep orphan project resources (profile's wt_sweep)
 #
 # Bind `wt new` to a key in ~/.config/herdr/config.toml (see README).
 #
@@ -39,6 +42,12 @@
 #   wt_open_url    print the url `wt open` should launch (default: WT_URL);
 #                  receives any extra `wt open` args (e.g. a login email)
 #   wt_teardown    release external resources on `wt rm` (best-effort)
+#   wt_sweep       reclaim leftover project resources (databases, dns entries)
+#                  whose worktree is gone entirely, so nothing records them any
+#                  more; receives WT_LIVE_SLUGS, the slugs that are still live.
+#                  When WT_SWEEP_DRY is set it must change NOTHING and instead
+#                  print one line per resource it would reclaim, to stdout - that
+#                  is what `wt gc --sweep` shows you before asking to proceed
 # Helpers available to profiles: msg, warn, wt_state_set KEY VALUE.
 # A repo with no profile still gets a worktree + Claude; it just has no dev server.
 
@@ -75,6 +84,44 @@ base_ref() {
   done
 }
 
+# A path in its physical form, symlinks resolved, so that two paths naming the same
+# directory compare equal. Worktrees are matched to their recorded resources by path, and
+# the two sides of that comparison come from different places: git prints the path it
+# resolved at `worktree add` time while a state file records whatever string was handed
+# to `wt`. On macOS /tmp is a symlink to /private/tmp, so those two disagree for the same
+# worktree. A path that no longer exists cannot be resolved and is returned unchanged -
+# which is what the orphan sweep needs, since it works on worktrees that are already gone.
+realpath_p() {                          # path
+  local p=${1:-}
+  [ -n "$p" ] || return 0
+  ( cd "$p" 2>/dev/null && pwd -P ) || printf '%s' "$p"
+}
+
+# Every repo `wt` knows about: those with worktree state recorded, plus whichever one
+# we happen to be standing in. Enough to inventory worktrees across all projects from
+# one command, wherever it is run from.
+known_repos() {
+  { awk -F= '/^WT_REPO=/{print $2}' "$STATE_DIR"/*.env 2>/dev/null
+    main_worktree "$PWD" 2>/dev/null; } | sed '/^$/d' | sort -u
+}
+
+# Emit "path<TAB>branch" for each LINKED worktree of a repo. The main checkout is
+# skipped (it is not a task worktree) and a detached worktree reports "-".
+#
+# Git - not the state directory - is what `wt ls` and `wt gc` enumerate from, and that
+# choice is load-bearing: worktrees created outside `wt` (Claude's own
+# .claude/worktrees/agent-*, a hand-run `git worktree add`) have no state file at all,
+# so a sweep driven by state files cannot see them. Git owns the question "does this
+# worktree exist"; state files only answer "what was it given".
+repo_worktrees() {                      # repo
+  git -C "$1" worktree list --porcelain 2>/dev/null | awk -v main="$(realpath_p "$1")" '
+    function flush() { if (p != "" && p != main) printf "%s\t%s\n", p, (b == "" ? "-" : b); p = ""; b = "" }
+    /^worktree /{ flush(); p = substr($0, 10); next }
+    /^branch /  { b = substr($0, 8); sub(/^refs\/heads\//, "", b); next }
+    END { flush() }
+  '
+}
+
 # ── slug / state ──────────────────────────────────────────────────────────
 # Hostname-safe slug from a branch name (also the puma-dev app + <slug>.test label).
 slugify() { printf '%s' "$1" | tr '[:upper:]/' '[:lower:]-' | tr -c 'a-z0-9-' '-' | sed -E 's/-+/-/g; s/^-|-$//g'; }
@@ -90,6 +137,63 @@ load_state() {                          # state_file_path
   [ -f "$1" ] || return 1
   set -a; # shellcheck disable=SC1090
   . "$1"; set +a; WT_STATE_FILE=$1; return 0
+}
+# Clear the WT_* surface so one worktree's facts cannot leak into the next when we
+# process several of them in a loop.
+wt_reset() {
+  WT_NAME="" WT_SLUG="" WT_PATH="" WT_REPO="" WT_REPO_NAME="" WT_DOMAIN="" \
+  WT_PORT="" WT_REDIS="" WT_WORKSPACE="" WT_URL="" WT_DB="" WT_STATE_FILE=""
+}
+# Read one key out of a state file without disturbing the caller's own WT_* variables.
+state_get() {                           # state_file key
+  [ -f "$1" ] || return 0
+  ( set -a; . "$1" 2>/dev/null; set +a; eval "printf '%s' \"\${$2:-}\"" ) 2>/dev/null
+}
+
+# Index every state file by the worktree PATH it describes ("path<TAB>file"), so a
+# worktree is matched to its resources by identity rather than by its current branch
+# name. This matters more than it looks: a live worktree's branch can be renamed after
+# creation (supercast's tom-spotify-distribution-422 worktree now sits on
+# tom/spotify-recreate-and-scope-fixes) while its state file, database and puma-dev
+# entry all keep the ORIGINAL slug. Deriving the slug from today's branch would fail to
+# find those resources - so `wt rm` would silently leak them, and worse, `wt gc
+# --sweep` would mistake a live worktree's database for an orphan.
+state_index() {
+  local f
+  for f in "$STATE_DIR"/*.env; do
+    [ -e "$f" ] || return 0
+    ( set -a; . "$f" 2>/dev/null; set +a
+      [ -n "${WT_PATH:-}" ] && printf '%s\t%s\n' "$(realpath_p "$WT_PATH")" "$f" ) || true
+  done
+}
+SIDX=""
+sidx_load() {
+  SIDX=$(state_index)
+  # Two state files for one worktree is not a state any code path can produce any more; it
+  # is the fingerprint of a fork that already happened (see prepare_state). Say so, because
+  # only one of the two describes the resources actually in use, and the other is quietly
+  # holding a port, a redis index and a database until gc gets to it.
+  local dup
+  dup=$(cut -f1 <<<"$SIDX" | sed '/^$/d' | sort | uniq -d | head -1)
+  [ -n "$dup" ] && warn "more than one state file describes $dup - one is stale; 'wt rm' then 'wt new' to reset it"
+  return 0
+}
+# The state file describing the worktree at PATH, if any. sidx_load must have run.
+sf_for_path() {                         # path
+  [ -n "${SIDX:-}" ] || return 0
+  awk -F'\t' -v p="$(realpath_p "$1")" '$1 == p { print $2; exit }' <<<"$SIDX"
+}
+# Load the saved state of the worktree at PATH: by path first, falling back to the slug
+# its branch implies. Every command that needs a worktree's resources goes through this,
+# so `wt dev`, `wt run` and `wt open` all agree on which state file is the worktree's -
+# including on a worktree whose branch has since been renamed, where the slug no longer
+# matches. Non-zero when the worktree has no saved state at all.
+load_state_for_path() {                 # path repo_name branch
+  local sf
+  sidx_load
+  sf=$(sf_for_path "$1")
+  [ -n "$sf" ] || sf=$(state_file "$2" "$(slugify "$3")")
+  load_state "$sf"
 }
 
 # Allocate the lowest free value not recorded in any worktree's state file.
@@ -111,9 +215,17 @@ alloc_redis() {
 
 # ── profile loading ─────────────────────────────────────────────────────────
 # Reset the profile surface, then source the first profile found for this repo.
+#
+# EVERY profile function must be unset here, without exception. `wt ls` and `wt gc`
+# load one profile after another in a single process, and a function left defined by
+# the previous repo is indistinguishable from one this repo defined itself: the next
+# repo would run the previous project's code against its own facts. For wt_sweep that
+# is not a cosmetic bug - it would hand one project's "these slugs are still live"
+# list to another project's reclaim logic, which is a recipe for dropping every
+# database of a project that is not even being swept.
 load_profile() {
   local repo=$1 name=$2 f
-  unset -f wt_provision wt_dev wt_teardown 2>/dev/null || true
+  unset -f wt_provision wt_dev wt_env wt_open_url wt_teardown wt_sweep 2>/dev/null || true
   WT_RESOURCES="" WT_PORT_BASE=3101 WT_AGENT="claude"
   for f in "$repo/.wt/profile.sh" "$PROFILE_DIR/$name.sh"; do
     [ -f "$f" ] || continue
@@ -127,13 +239,38 @@ load_profile() {
 # its state file. Idempotent: existing port/redis are kept, only missing declared
 # resources are allocated. load_profile must have run first (for WT_RESOURCES).
 # Sets WT_NAME WT_SLUG WT_PATH WT_REPO WT_REPO_NAME WT_DOMAIN WT_PORT WT_REDIS WT_STATE_FILE.
+#
+# The slug is fixed for the life of the worktree, and the state file is found by PATH
+# rather than by the slug today's branch implies. Both halves of that matter, because a
+# branch gets renamed mid-task (an agent picks a better name once it understands the work)
+# while the resources keep the name they were created under:
+#
+#   wt new tom/foo   -> port 4901, redis 1, db demo_tom_foo, tom-foo.test, demo--tom-foo.env
+#   git branch -m tom/bar
+#   wt provision     -> looked up demo--tom-bar.env, found nothing, allocated it ALL again:
+#                       port 4902, redis 2, db demo_tom_bar, tom-bar.test
+#
+# One worktree, two ports, two databases, and `wt ls` then reporting the new pair while the
+# dev server still runs on the old one. Looking the state up by path finds the real file, so
+# the reload on the next line does what it was always meant to do and keeps the original
+# allocations. WT_SLUG is what freezes: it names durable external things (the database, the
+# puma-dev entry, the .test domain, this very filename), so it must not move. WT_NAME is
+# free to follow the rename - it is display text, and reap_one takes the branch from git.
 prepare_state() {                       # name path repo repo_name [workspace_id]
-  local name=$1 path=$2 repo=$3 repo_name=$4 ws=${5:-} slug res
-  slug=$(slugify "$name")
-  WT_PORT="" WT_REDIS=""
-  load_state "$(state_file "$repo_name" "$slug")" || true    # keep any prior allocations
+  local name=$1 path=$2 repo=$3 repo_name=$4 ws=${5:-} slug res sf
+  WT_PORT="" WT_REDIS="" WT_SLUG=""     # so a stale caller value cannot pose as saved state
+  sidx_load
+  sf=$(sf_for_path "$path")
+  if [ -n "$sf" ]; then
+    load_state "$sf" || true                                 # keep any prior allocations
+    slug=${WT_SLUG:-$(slugify "$name")}                      # the slug it was born with
+  else
+    slug=$(slugify "$name")
+    sf=$(state_file "$repo_name" "$slug")
+    load_state "$sf" || true
+  fi
   WT_NAME=$name WT_SLUG=$slug WT_PATH=$path WT_REPO=$repo WT_REPO_NAME=$repo_name WT_DOMAIN="$slug.test"
-  WT_STATE_FILE=$(state_file "$repo_name" "$slug")
+  WT_STATE_FILE=$sf
   for res in ${WT_RESOURCES:-}; do
     case "$res" in
       port)  [ -n "${WT_PORT:-}" ]  || WT_PORT=$(alloc_port)   || die "no free port available" ;;
@@ -160,6 +297,162 @@ run_profile_fn() {                      # fn [args...]  (WT_* must already be se
   "$fn" "$@"
 }
 
+# ── pull-request state ───────────────────────────────────────────────────────
+# "Has this work shipped?" cannot be answered from git here. supercast - like most
+# repos - squash-merges, so a merged branch's tip is NOT an ancestor of the default
+# branch: `git branch --merged origin/master` reports nothing at all for
+# tom/live-chat-username-links, which shipped as #6321. Ancestry checks look like they
+# work (they do catch a branch that never diverged) while missing every real merge, so
+# merge state has to come from the forge.
+#
+# One batch `gh pr list` covers recent history in a single round trip; any branch the
+# batch does not mention gets a targeted lookup, so correctness never depends on the
+# batch limit. PR_OK records whether gh actually answered - without it (no gh, offline,
+# no GitHub remote) callers report an unknown state and reclaim nothing, rather than
+# reading "unknown" as "finished".
+#
+# The targeted lookups run concurrently because the case that needs them most is a branch
+# with no pull request at all: it can never appear in the batch, so it costs a full round
+# trip on every single run, forever. Run in sequence they dominate the command - two
+# unshipped worktrees added ~1.8s to every `wt ls`.
+PR_CACHE="" PR_OK=0
+pr_load() {                             # repo repo_name branch...
+  local repo=$1 rn=$2 b n=0; shift 2
+  local pids=()
+  PR_CACHE="$STATE_DIR/.pr-$rn.tsv"; PR_OK=0
+  : > "$PR_CACHE"
+  command -v gh >/dev/null 2>&1 || return 0
+  ( cd "$repo" 2>/dev/null && gh pr list --state all --limit 200 \
+      --json number,state,headRefName 2>/dev/null ) \
+    | jq -r '.[] | [.headRefName, (.number | tostring), .state] | @tsv' 2>/dev/null >> "$PR_CACHE" \
+    || return 0
+  PR_OK=1
+  for b in "$@"; do
+    [ -n "$b" ] && [ "$b" != "-" ] || continue
+    awk -F'\t' -v b="$b" '$1 == b { f = 1; exit } END { exit !f }' "$PR_CACHE" && continue
+    ( cd "$repo" 2>/dev/null && gh pr list --head "$b" --state all --limit 1 \
+        --json number,state 2>/dev/null ) \
+      | jq -r --arg b "$b" '.[] | [$b, (.number | tostring), .state] | @tsv' 2>/dev/null \
+      > "$PR_CACHE.$n" &
+    pids[$n]=$!
+    n=$((n + 1))
+  done
+  [ "$n" -gt 0 ] || return 0
+  # Wait on OUR pids, never a bare `wait`: this runs inside `wt new` too (via gc_run), and
+  # a bare wait would reap every background job the calling command happens to have.
+  wait "${pids[@]}" 2>/dev/null
+  cat "$PR_CACHE".[0-9]* >> "$PR_CACHE" 2>/dev/null
+  rm -f "$PR_CACHE".[0-9]*
+}
+# "number<TAB>STATE" for a branch; empty when it has no PR. pr_load must have run.
+pr_get() { awk -F'\t' -v b="$1" '$1 == b { print $2 "\t" $3; exit }' "${PR_CACHE:-/dev/null}" 2>/dev/null; }
+
+# ── pull-request detail ──────────────────────────────────────────────────────
+# "open" is not a status you can act on. What you need to know about an open pull request
+# is the one thing standing between it and a merge: is CI still running, did it fail, does
+# it conflict, is someone waiting to review it - or is it green and mergeable and just
+# sitting there. That is four extra fields on the same query, but statusCheckRollup is
+# expensive per pull request: asking for it across `--state all --limit 200` takes 18s on
+# supercast against 1.1s without it. So it is fetched only for the branches actually
+# checked out as worktrees, and only those whose PR is open - one query each, all in
+# flight at once, so the wait is one round trip and the cost scales with how many
+# worktrees you have rather than with how many PRs the repo has ever had.
+#
+# This is deliberately separate from pr_load: `wt gc --merged` only needs to know what
+# merged, and must not pay for detail it will never print.
+PR_DETAIL_CACHE=""
+PR_DETAIL_FIELDS='headRefName,state,isDraft,reviewDecision,mergeStateStatus,statusCheckRollup'
+# Reduce a PR to a single word: the most blocking thing first, so the label always names
+# what to do rather than everything that is true. An unrecognised mergeStateStatus (GitHub
+# reports UNKNOWN while it is still computing mergeability) yields no word at all, leaving
+# the row to read a plain "open" - claiming "ready" on a state we have not confirmed is
+# the one wrong answer here.
+PR_DETAIL_JQ='
+  def checks:
+    [ .statusCheckRollup[]? | (.conclusion // .state // .status // "") | ascii_upcase ] as $c
+    | if   ($c | any(. == "FAILURE" or . == "ERROR" or . == "TIMED_OUT"
+                     or . == "ACTION_REQUIRED" or . == "STARTUP_FAILURE" or . == "CANCELLED")) then "fail"
+      elif ($c | any(. == "PENDING" or . == "QUEUED" or . == "IN_PROGRESS"
+                     or . == "EXPECTED" or . == "")) then "run"
+      elif ($c | length) == 0 then "none"
+      else "pass" end;
+  def detail:
+    if   .state != "OPEN"                       then ""
+    elif .isDraft                               then "draft"
+    elif .mergeStateStatus == "DIRTY"            then "conflict"
+    elif .mergeStateStatus == "BEHIND"           then "behind"
+    elif checks == "fail"                        then "ci fail"
+    elif checks == "run"                         then "ci run"
+    elif .reviewDecision == "CHANGES_REQUESTED"  then "changes"
+    elif .reviewDecision == "REVIEW_REQUIRED"    then "review"
+    elif .mergeStateStatus == "BLOCKED"          then "blocked"
+    elif (.mergeStateStatus | . == "CLEAN" or . == "UNSTABLE" or . == "HAS_HOOKS") then "ready"
+    else "" end;
+  .[] | [.headRefName, detail] | @tsv
+'
+pr_detail_load() {                      # repo repo_name branch...   (pr_load must have run)
+  local repo=$1 rn=$2 b n=0
+  local pids=()
+  PR_DETAIL_CACHE="$STATE_DIR/.prd-$rn.tsv"
+  : > "$PR_DETAIL_CACHE"
+  command -v gh >/dev/null 2>&1 || return 0
+  for b in "$@"; do
+    [ -n "$b" ] && [ "$b" != "-" ] || continue
+    [ "$(pr_get "$b" | cut -f2)" = OPEN ] || continue
+    # --head rather than `gh pr view <branch>`: it names the pull request unambiguously
+    # when a branch has more than one, and returns an empty array instead of failing when
+    # it has none. Each job gets its own file so concurrent appends cannot interleave.
+    ( cd "$repo" 2>/dev/null && gh pr list --head "$b" --state open --limit 1 \
+        --json "$PR_DETAIL_FIELDS" 2>/dev/null ) \
+      | jq -r "$PR_DETAIL_JQ" 2>/dev/null > "$PR_DETAIL_CACHE.$n" &
+    pids[$n]=$!
+    n=$((n + 1))
+  done
+  [ "$n" -gt 0 ] || return 0
+  wait "${pids[@]}" 2>/dev/null
+  cat "$PR_DETAIL_CACHE".[0-9]* >> "$PR_DETAIL_CACHE" 2>/dev/null
+  rm -f "$PR_DETAIL_CACHE".[0-9]*
+}
+# The one-word summary for a branch's open PR; empty when unknown or not open.
+pr_detail_get() { awk -F'\t' -v b="$1" '$1 == b { print $2; exit }' "${PR_DETAIL_CACHE:-/dev/null}" 2>/dev/null; }
+
+# ── agent status ─────────────────────────────────────────────────────────────
+# Herdr already tracks, per pane, whether its agent is working, idle, or blocked waiting on
+# you. `wt ls` joins that in because the two questions you actually have about a worktree -
+# "is anything still happening here?" and "has the work shipped?" - are answered in two
+# different places, and neither answer alone tells you what to do: an idle agent with no PR
+# is finished work that nobody opened a PR for, while an idle agent on a merged PR is just
+# resources to reclaim.
+#
+# Matched by path like everything else here, and deliberately NOT gated on running inside
+# Herdr - the CLI reaches the server over its socket, so this works from a plain terminal
+# too. AGENT_OK separates "Herdr says no agent is there" from "Herdr never answered", so a
+# stopped server reads as unknown rather than as an empty fleet.
+AIDX="" AGENT_OK=0
+aidx_load() {
+  local raw
+  AIDX=""; AGENT_OK=0
+  [ -x "$HERDR" ] || return 0
+  raw=$("$HERDR" agent list 2>/dev/null) || return 0
+  jq -e '.result.agents' >/dev/null 2>&1 <<<"$raw" || return 0
+  AIDX=$(jq -r '.result.agents[]? | select(.agent_status)
+                | [.cwd // "", .foreground_cwd // "", .agent_status] | @tsv' 2>/dev/null <<<"$raw")
+  AGENT_OK=1
+}
+# The status of the agent in the worktree at PATH - the most urgent one when several panes
+# sit inside it, since "one of these needs you" is the fact worth surfacing. A pane whose
+# shell has cd'd into a subdirectory still counts as being in the worktree; the empty-path
+# guard matters because an empty prefix would otherwise match every absolute path.
+agent_for_path() {                      # path
+  [ -n "${1:-}" ] && [ -n "${AIDX:-}" ] || return 0
+  awk -F'\t' -v p="$(realpath_p "$1")" '
+    function rank(s) { return s == "blocked" ? 3 : s == "working" ? 2 : 1 }
+    function under(c) { return p != "" && c != "" && (c == p || index(c, p "/") == 1) }
+    (under($1) || under($2)) && rank($3) > best { best = rank($3); found = $3 }
+    END { if (best) print found }
+  ' <<<"$AIDX"
+}
+
 # ── garbage collection ───────────────────────────────────────────────────────
 # Reclaim resources from worktrees that no longer exist on disk - however they
 # were removed (`wt rm`, Herdr's own remove-worktree, or a manual `git worktree
@@ -168,13 +461,19 @@ run_profile_fn() {                      # fn [args...]  (WT_* must already be se
 # invariant: if the worktree dir is still a git worktree it is live and left
 # untouched; otherwise it is an orphan and its profile teardown runs. Runs
 # automatically at the start of every `wt new`, or on demand via `wt gc`.
+#
+# That invariant is deliberately conservative, and it has a blind spot by design: a
+# worktree whose work has already SHIPPED is still a perfectly valid git worktree, so
+# this pass leaves it alone forever while it goes on holding a database, a port and a
+# few hundred MB. Detecting that needs the forge, not the filesystem - see gc_merged,
+# which `wt gc --merged` opts into.
 GC_RECLAIMED=0
 gc_run() {
   GC_RECLAIMED=0
   local f
   for f in "$STATE_DIR"/*.env; do
     [ -e "$f" ] || return 0
-    WT_PATH="" WT_REPO="" WT_REPO_NAME="" WT_NAME="" WT_SLUG="" WT_PORT="" WT_REDIS="" WT_DOMAIN="" WT_WORKSPACE="" WT_URL="" WT_DB=""
+    wt_reset
     load_state "$f" || continue
     # Live worktree? leave it entirely alone.
     [ -n "${WT_PATH:-}" ] && git -C "$WT_PATH" rev-parse --is-inside-work-tree >/dev/null 2>&1 && continue
@@ -187,13 +486,211 @@ gc_run() {
         || "$HERDR" workspace close "$WT_WORKSPACE" >/dev/null 2>&1 || true
     fi
     [ -n "${WT_REPO:-}" ] && git -C "$WT_REPO" worktree prune 2>/dev/null || true
+    rm_leftover "${WT_PATH:-}"
     rm -f "$f"
   done
 }
 
+# Remove a worktree directory git has already let go of. `git worktree remove` leaves
+# the directory behind whenever it holds something that is not git's to delete (a
+# symlinked node_modules, tmp/, log/), which is how husks accumulate under the Herdr
+# worktree root. Only ever touches a path that is no longer part of any work tree, so a
+# directory nested inside a live checkout (Claude's .claude/worktrees/agent-*) is
+# deliberately left alone - the safe direction to fail in.
+rm_leftover() {                         # path
+  local p=${1:-}
+  [ -n "$p" ] && [ -d "$p" ] || return 0
+  case "$p" in /|"$HOME"|"$HOME"/) return 0 ;; esac
+  git -C "$p" rev-parse --is-inside-work-tree >/dev/null 2>&1 && return 0
+  rm -rf "$p" && msg "removed leftover directory $p"
+}
+
+# The Herdr workspace holding a worktree, if one is open. By path first, then by branch:
+# the recorded WT_WORKSPACE is the primary route and already survives a rename, but this
+# fallback used to match on the branch alone - the one identifier a worktree can change
+# after it is created, which is exactly when a fallback is needed.
+herdr_ws_for() {                        # repo path branch
+  in_herdr || return 0
+  local list ws
+  list=$("$HERDR" worktree list --cwd "$1" --json 2>/dev/null) || return 0
+  ws=$(jq -r --arg p "$(realpath_p "$2")" \
+    '.result.worktrees[]? | select(.path == $p) | .open_workspace_id // empty' <<<"$list" | head -1)
+  [ -n "$ws" ] || ws=$(jq -r --arg b "$3" \
+    '.result.worktrees[]? | select(.branch == $b) | .open_workspace_id // empty' <<<"$list" | head -1)
+  printf '%s' "$ws"
+}
+
+# Tear one worktree down completely: the profile's external resources, the worktree
+# itself, optionally its branch, its state file, and its Herdr workspace. Self
+# contained - it finds the repo's profile and the worktree's saved state itself, keyed
+# by PATH so a worktree whose branch was renamed still resolves to its own resources.
+#
+# The ordering is load-bearing. Closing the Herdr workspace can tear down the very pane
+# this process is running in (whenever we remove the worktree we are sitting in), so
+# nothing sequenced after that close is guaranteed to run: everything that must happen
+# happens before it.
+reap_one() {                            # repo repo_name branch path del_branch(y|n)
+  local repo=$1 rn=$2 name=$3 path=$4 del=$5 sf ws
+  sf=$(sf_for_path "$path")
+  [ -n "$sf" ] || sf=$(state_file "$rn" "$(slugify "$name")")
+  load_profile "$repo" "$rn"
+  wt_reset
+  load_state "$sf" || warn "$rn/$name: no saved state - its db/redis/dns entry may not be fully freed"
+  # Resolve the workspace NOW, while the worktree still exists for Herdr to name it by.
+  # Asking after step 3 (as this used to) can only ever fail: git has let the worktree go
+  # by then, so it is in nobody's worktree list to be matched.
+  ws=${WT_WORKSPACE:-}
+  [ -n "$ws" ] && [ "$ws" != null ] || ws=$(herdr_ws_for "$repo" "$path" "$name")
+  [ -n "${WT_NAME:-}" ] || WT_NAME=$name
+  [ -n "${WT_SLUG:-}" ] || WT_SLUG=$(slugify "$name")
+  WT_PATH=$path WT_REPO=$repo WT_REPO_NAME=$rn
+  [ -n "${WT_DOMAIN:-}" ] || WT_DOMAIN="$WT_SLUG.test"
+
+  # 1. Free external resources while we are certain to still be alive.
+  if declare -F wt_teardown >/dev/null; then
+    msg "$rn/$name: releasing external resources"
+    run_profile_fn wt_teardown || warn "teardown reported errors"
+  fi
+
+  # 2. Step out of the worktree before removing it - otherwise the rest of this
+  #    process runs with a deleted CWD (getcwd errors on every later command).
+  cd "$repo" 2>/dev/null || cd / 2>/dev/null || true
+
+  # 3. Remove the worktree, then (optionally) the branch: a branch checked out in a
+  #    live worktree cannot be deleted, so the worktree has to go first.
+  git -C "$repo" worktree remove --force "$path" >/dev/null 2>&1
+  git -C "$repo" worktree prune 2>/dev/null || true
+  rm_leftover "$path"
+  [ "$del" = y ] && git -C "$repo" branch -D "$name" >/dev/null 2>&1 && msg "deleted branch $name"
+
+  # 4. Drop our bookkeeping so it cannot outlive the worktree.
+  rm -f "$sf"
+  msg "removed $rn/$name"
+
+  # 5. Close the Herdr workspace LAST (see the ordering note above). A worktree we
+  #    already removed makes `worktree remove` a no-op, so fall back to a direct close.
+  if in_herdr && [ -n "$ws" ] && [ "$ws" != null ]; then
+    "$HERDR" worktree remove --workspace "$ws" --force --json >/dev/null 2>&1 \
+      || "$HERDR" workspace close "$ws" >/dev/null 2>&1 || true
+  fi
+}
+
+# Reclaim worktrees whose PR has merged - the case plain `wt gc` structurally cannot
+# see, and the one that actually accumulates: the work shipped, so nobody thinks about
+# the branch again, while the worktree keeps its database, port, redis index and disk
+# for as long as the checkout survives.
+#
+# Destructive and network-driven, so it is opt-in, lists what it intends to take before
+# taking it, and reclaims nothing when the PR state could not be read.
+gc_merged() {                           # yes(1|0)
+  local yes=$1 repo rn wts branches path branch cur here="" n=0 ans
+  local plan="$STATE_DIR/.gc-merged.tsv"
+  cur=$(realpath_p "$(git -C "$PWD" rev-parse --show-toplevel 2>/dev/null)")
+  : > "$plan"
+  while IFS= read -r repo; do
+    [ -n "$repo" ] || continue
+    rn=$(basename "$repo")
+    wts=$(repo_worktrees "$repo"); [ -n "$wts" ] || continue
+    branches=$(cut -f2 <<<"$wts" | tr '\n' ' ')
+    pr_load "$repo" "$rn" $branches
+    if [ "${PR_OK:-0}" != 1 ]; then
+      warn "$rn: could not read PR state (gh missing, offline, or no GitHub remote) - skipped"
+      continue
+    fi
+    while IFS=$'\t' read -r path branch; do
+      [ -n "$path" ] && [ "$branch" != "-" ] || continue
+      [ "$(pr_get "$branch" | cut -f2)" = MERGED ] || continue
+      # Never reclaim the worktree we are standing in: closing its Herdr workspace
+      # would kill this pane partway through the batch.
+      if [ "$path" = "$cur" ]; then here="$rn/$branch"; continue; fi
+      printf '%s\t%s\t%s\t%s\n' "$repo" "$rn" "$path" "$branch" >> "$plan"
+      n=$((n + 1))
+    done <<<"$wts"
+  done <<<"$(known_repos)"
+
+  [ -n "$here" ] && msg "$here has merged too, but you are inside it - remove that one with: wt rm"
+  [ "$n" -gt 0 ] || { rm -f "$plan"; msg "nothing merged to reclaim"; return 0; }
+
+  msg "$n merged worktree(s) to reclaim:"
+  while IFS=$'\t' read -r repo rn path branch; do
+    [ -n "${branch:-}" ] && printf '  %-12s %-42s %s\n' "$rn" "$branch" "$path" >&2
+  done < "$plan"
+  if [ "$yes" != 1 ]; then
+    printf 'wt: reclaim all %s (worktree, branch, db, port all go)? [y/N] ' "$n" >&2
+    read -r ans || ans=n
+    [[ "${ans:-}" =~ ^[Yy]$ ]] || { rm -f "$plan"; msg "cancelled"; return 0; }
+  fi
+  while IFS=$'\t' read -r repo rn path branch; do
+    [ -n "${branch:-}" ] && reap_one "$repo" "$rn" "$branch" "$path" y
+  done < "$plan"
+  rm -f "$plan"
+}
+
+# Reclaim project-owned resources whose worktree is gone entirely - the ones no state
+# file points at any more, so neither the orphan pass nor `wt rm` can ever find them (a
+# database left behind by a worktree removed by hand, a dns entry for a branch that
+# shipped months ago). What those resources ARE is project-specific, so `wt` supplies
+# only the guest list: WT_LIVE_SLUGS, every slug that still has a live worktree. The
+# profile's wt_sweep reclaims whatever of its own is not on it.
+#
+# Opt-in and confirmed, never automatic: alone among these paths it deletes on a naming
+# pattern rather than on a recorded fact. So the guest list is deliberately a superset -
+# both the slugs recorded in state files and the slugs of today's branches. Over
+# including leaves an orphan for next time; under-including would break a live worktree.
+gc_sweep() {                            # yes(1|0)
+  local yes=$1 repo rn live path branch sf slug ans preview
+  while IFS= read -r repo; do
+    [ -n "$repo" ] || continue
+    rn=$(basename "$repo")
+    load_profile "$repo" "$rn"
+    declare -F wt_sweep >/dev/null || continue
+    live=""
+    while IFS=$'\t' read -r path branch; do
+      [ -n "$path" ] || continue
+      [ "$branch" != "-" ] && live="${live}$(slugify "$branch")"$'\n'
+      sf=$(sf_for_path "$path")
+      slug=$(state_get "${sf:-/dev/null}" WT_SLUG)
+      [ -n "$slug" ] && live="${live}${slug}"$'\n'
+    done <<<"$(repo_worktrees "$repo")"
+    wt_reset
+    WT_REPO=$repo WT_REPO_NAME=$rn
+    WT_LIVE_SLUGS=$live; export WT_LIVE_SLUGS
+
+    # Preview first. Only the profile knows what it owns, so it is the profile that
+    # answers "what would go" - under WT_SWEEP_DRY it prints its hit list and changes
+    # nothing. Deleting a database is not something to confirm blind.
+    WT_SWEEP_DRY=1; export WT_SWEEP_DRY
+    preview=$(run_profile_fn wt_sweep 2>/dev/null)
+    unset WT_SWEEP_DRY
+    if [ -z "$preview" ]; then msg "$rn: nothing to sweep"; continue; fi
+    msg "$rn would reclaim:"
+    printf '%s\n' "$preview" | sed 's/^/  /' >&2
+    if [ "$yes" != 1 ]; then
+      printf 'wt: sweep these %s resource(s)? [y/N] ' "$(printf '%s\n' "$preview" | wc -l | tr -d ' ')" >&2
+      read -r ans || ans=n
+      [[ "${ans:-}" =~ ^[Yy]$ ]] || { msg "$rn: skipped"; continue; }
+    fi
+    run_profile_fn wt_sweep || warn "$rn: sweep reported errors"
+  done <<<"$(known_repos)"
+}
+
 cmd_gc() {
+  local merged=0 sweep=0 yes=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --merged) merged=1 ;;
+      --sweep)  sweep=1 ;;
+      -y|--yes) yes=1 ;;
+      *) die "usage: wt gc [--merged] [--sweep] [-y]" ;;
+    esac
+    shift
+  done
+  sidx_load
   gc_run
   [ "${GC_RECLAIMED:-0}" -gt 0 ] && msg "reclaimed ${GC_RECLAIMED} orphan(s)" || msg "no orphans - all worktrees accounted for"
+  [ "$merged" = 1 ] && gc_merged "$yes"
+  [ "$sweep" = 1 ] && gc_sweep "$yes"
+  return 0
 }
 
 # ── commands ────────────────────────────────────────────────────────────────
@@ -304,7 +801,7 @@ cmd_dev() {
   repo=$(main_worktree "$path"); [ -n "$repo" ] || die "not a git worktree: $path"
   repo_name=$(basename "$repo"); name=$(cur_branch "$path")
   load_profile "$repo" "$repo_name"
-  load_state "$(state_file "$repo_name" "$(slugify "$name")")" \
+  load_state_for_path "$path" "$repo_name" "$name" \
     || warn "no saved state for this worktree - run 'wt provision $path' first"
   WT_PATH=$path WT_REPO=$repo WT_REPO_NAME=$repo_name
   # Keep the pane open with the error instead of flashing shut if the server dies.
@@ -327,7 +824,7 @@ cmd_run() {
   repo=$(main_worktree "$path"); [ -n "$repo" ] || die "not inside a git worktree: $path"
   repo_name=$(basename "$repo"); name=$(cur_branch "$path")
   load_profile "$repo" "$repo_name"
-  load_state "$(state_file "$repo_name" "$(slugify "$name")")" \
+  load_state_for_path "$path" "$repo_name" "$name" \
     || die "no saved state for this worktree - run 'wt provision $path' first"
   WT_PATH=$path WT_REPO=$repo WT_REPO_NAME=$repo_name
   declare -F wt_env >/dev/null || die "no env configured for $repo_name (add wt_env to its profile)"
@@ -342,13 +839,16 @@ cmd_run() {
 # worktree, or `wt open <name>` names one; any further args pass through to
 # wt_open_url (e.g. `wt open my-task someone@example.com` to pre-fill a login).
 cmd_open() {
-  local name=${1:-} repo repo_name url
+  local name=${1:-} repo repo_name url path
   repo=$(main_worktree "$PWD"); [ -n "$repo" ] || die "not inside a git worktree"
   if [ -n "$name" ]; then shift; else name=$(cur_branch "$PWD"); fi
   [ -n "$name" ] || die "no worktree name given (and not on a branch)"
   repo_name=$(basename "$repo")
   load_profile "$repo" "$repo_name"
-  load_state "$(state_file "$repo_name" "$(slugify "$name")")" \
+  # `wt open <name>` names a branch, so find the worktree sitting on it and load state
+  # by that path rather than by the slug the name implies (see load_state_for_path).
+  path=$(repo_worktrees "$repo" | awk -F'\t' -v b="$name" '$2 == b { print $1; exit }')
+  load_state_for_path "${path:-$PWD}" "$repo_name" "$name" \
     || die "no saved state for '$name' - run 'wt provision' first"
   if declare -F wt_open_url >/dev/null; then
     url=$(run_profile_fn wt_open_url "$@")
@@ -375,19 +875,26 @@ cmd_provision() {
 
 cmd_rm() {
   need_herdr
-  local name=${1:-} repo repo_name slug sf ws ans del=n wtpath
+  local name=${1:-} repo rn path sf ans del=n
   repo=$(main_worktree "$PWD"); [ -n "$repo" ] || die "not inside a git repo"
   [ -n "$name" ] || name=$(cur_branch "$PWD")
   [ -n "$name" ] || die "no worktree name given (and not on a branch)"
-  repo_name=$(basename "$repo"); slug=$(slugify "$name"); sf=$(state_file "$repo_name" "$slug")
-  load_profile "$repo" "$repo_name"
-  load_state "$sf" || warn "no saved state for '$name' - its db/redis/puma-dev may not be fully freed"
-  wtpath=${WT_PATH:-}
-  ws=${WT_WORKSPACE:-$("$HERDR" worktree list --cwd "$repo" --json 2>/dev/null \
-        | jq -r --arg b "$name" '.result.worktrees[]? | select(.branch==$b) | .open_workspace_id // empty')}
+  rn=$(basename "$repo")
+  sidx_load
+  # Resolve the branch to its worktree PATH through git: path is the identity
+  # everything else is keyed by, and unlike a slug derived from the branch name it
+  # survives a rename that would otherwise strand this worktree's db and dns entry.
+  path=$(repo_worktrees "$repo" | awk -F'\t' -v b="$name" '$2 == b { print $1; exit }')
+  if [ -z "$path" ]; then
+    # Nothing live on that branch - fall back to whatever its state file recorded, so
+    # `wt rm` can still finish the job on a worktree already removed by hand.
+    sf=$(state_file "$rn" "$(slugify "$name")")
+    path=$(state_get "$sf" WT_PATH)
+    [ -n "$path" ] || die "no worktree of $rn is on branch '$name'"
+  fi
 
-  # Ask both questions up front. Closing the workspace (last step) tears down the
-  # pane this command is running in whenever we're removing the worktree we're
+  # Ask both questions up front. Closing the workspace (reap_one's last step) tears
+  # down the pane this command is running in whenever we're removing the worktree we're
   # sitting in - so nothing after that close is guaranteed to run: no prompts, no
   # cleanup. Everything that must happen has to happen before it.
   printf 'wt: remove worktree "%s" (branch, db, port all go)? [y/N] ' "$name" >&2; read -r ans || ans=n
@@ -395,43 +902,90 @@ cmd_rm() {
   printf 'wt: also delete the git branch "%s"? [y/N] ' "$name" >&2; read -r ans || ans=n
   [[ "${ans:-}" =~ ^[Yy]$ ]] && del=y
 
-  # 1. Free external resources (db / redis / puma-dev) while we're certain to be alive.
-  declare -F wt_teardown >/dev/null && { msg "tearing down external resources"; run_profile_fn wt_teardown || warn "teardown reported errors"; }
-
-  # 2. Step out of the worktree before removing it - otherwise the rest of this
-  #    process runs with a deleted CWD (getcwd errors on every later command).
-  cd "$repo" 2>/dev/null || cd / 2>/dev/null || true
-
-  # 3. Remove the worktree, then (optionally) its branch, ourselves - a branch
-  #    checked out in a live worktree can't be deleted, so the worktree has to go
-  #    first, and both must be done before the workspace close that may end us.
-  [ -n "$wtpath" ] && git -C "$repo" worktree remove --force "$wtpath" >/dev/null 2>&1
-  git -C "$repo" worktree prune 2>/dev/null || true
-  [ "$del" = y ] && git -C "$repo" branch -D "$name" >/dev/null 2>&1 && msg "deleted branch $name"
-
-  # 4. Drop our bookkeeping so it can't outlive the worktree (this is the leak gc
-  #    used to have to mop up on the next `wt new`).
-  rm -f "$sf"
-  msg "removed $name"
-
-  # 5. Close the workspace LAST. This is what kills our own pane when we're inside
-  #    the worktree, so it must come after everything above. Mirror gc's fallback:
-  #    a worktree we already removed makes `worktree remove` a no-op/failure, so
-  #    fall back to closing the workspace directly.
-  if [ -n "$ws" ] && [ "$ws" != null ]; then
-    "$HERDR" worktree remove --workspace "$ws" --force --json >/dev/null 2>&1 \
-      || "$HERDR" workspace close "$ws" >/dev/null 2>&1 || true
-  fi
+  reap_one "$repo" "$rn" "$name" "$path" "$del"
 }
 
+# Render a TSV as a table: every column but the last is padded to its own widest cell,
+# header included, so the table is exactly as wide as its content needs and stays aligned
+# even when one branch name is far longer than all the others - which a fixed field width
+# does neither of.
+render_table() {                        # tsv_file
+  awk -F'\t' '
+    { rows = NR; if (NF > n) n = NF
+      for (i = 1; i <= NF; i++) { cell[NR, i] = $i; if (length($i) > w[i]) w[i] = length($i) } }
+    END {
+      for (r = 1; r <= rows; r++) {
+        line = ""
+        for (i = 1; i <= n; i++) line = line (i == n ? cell[r, i] : sprintf("%-*s  ", w[i], cell[r, i]))
+        sub(/[ \t]+$/, "", line); print line
+      }
+    }
+  ' "$1"
+}
+
+# The worktree inventory, and in practice the review queue: one line per worktree across
+# every repo `wt` knows, joining what git knows (which worktrees exist, how stale) with
+# what Herdr knows (is an agent still working in there, or blocked waiting on you) and
+# what the forge knows (has it shipped, and if not, what is holding it up). Those three
+# together are what decides the next action on a worktree; separately, none of them do.
+# Enumerated from git, so worktrees `wt` never created are listed too. The table goes to
+# stdout (so it can be piped or grepped); the summary stays on stderr like the rest of
+# the tool.
 cmd_ls() {
-  local f first=1
-  for f in "$STATE_DIR"/*.env; do
-    [ -e "$f" ] || { msg "no worktrees provisioned"; return 0; }
-    [ "$first" = 1 ] && printf '%-20s %-24s %-6s %-5s %s\n' REPO WORKTREE PORT REDIS URL >&2 && first=0
-    ( set -a; . "$f"; set +a
-      printf '%-20s %-24s %-6s %-5s %s\n' "${WT_REPO_NAME:-?}" "${WT_NAME:-?}" "${WT_PORT:--}" "${WT_REDIS:--}" "${WT_URL:-https://${WT_DOMAIN:-?}}" ) >&2
-  done
+  local repo rn wts branches path branch sf port url age dirty prinfo num st det pr agent
+  local rows=0 merged=0 nopr=0 ready=0 waiting=0
+  local tbl="$STATE_DIR/.ls.$$.tsv"
+  sidx_load
+  aidx_load
+  printf 'REPO\tBRANCH\tPORT\tAGE\tAGENT\tPR\tURL\n' > "$tbl"
+  while IFS= read -r repo; do
+    [ -n "$repo" ] || continue
+    rn=$(basename "$repo")
+    wts=$(repo_worktrees "$repo"); [ -n "$wts" ] || continue
+    branches=$(cut -f2 <<<"$wts" | tr '\n' ' ')
+    pr_load "$repo" "$rn" $branches
+    pr_detail_load "$repo" "$rn" $branches
+    while IFS=$'\t' read -r path branch; do
+      [ -n "$path" ] || continue
+      rows=$((rows + 1))
+      sf=$(sf_for_path "$path"); port="-"; url="-"
+      if [ -n "$sf" ]; then
+        port=$(state_get "$sf" WT_PORT)
+        url=$(state_get "$sf" WT_URL)
+        [ -n "$url" ] || { url=$(state_get "$sf" WT_DOMAIN); [ -n "$url" ] && url="https://$url"; }
+      fi
+      age=$(git -C "$path" log -1 --format=%cr 2>/dev/null); age=${age% ago}
+      dirty=""; git -C "$path" diff --quiet HEAD 2>/dev/null || dirty="*"
+      agent=$(agent_for_path "$path")
+      if [ -z "$agent" ]; then
+        [ "${AGENT_OK:-0}" = 1 ] && agent="-" || agent="?"
+      elif [ "$agent" = blocked ]; then
+        waiting=$((waiting + 1))
+      fi
+      num=""; st=""
+      prinfo=$(pr_get "$branch")
+      IFS=$'\t' read -r num st <<<"$prinfo"
+      det=$(pr_detail_get "$branch")
+      case "${st:-}" in
+        MERGED) pr="#$num merged"; merged=$((merged + 1)) ;;
+        OPEN)   pr="#$num ${det:-open}"; [ "$det" = ready ] && ready=$((ready + 1)) ;;
+        CLOSED) pr="#$num closed" ;;
+        *)      if [ "${PR_OK:-0}" = 1 ]; then pr="no pr"; nopr=$((nopr + 1)); else pr="?"; fi ;;
+      esac
+      printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+        "$rn" "$branch$dirty" "${port:--}" "${age:--}" "$agent" "$pr" "${url:--}" >> "$tbl"
+    done <<<"$wts"
+  done <<<"$(known_repos)"
+  [ "$rows" -gt 0 ] || { rm -f "$tbl"; msg "no worktrees"; return 0; }
+  render_table "$tbl"
+  rm -f "$tbl"
+  # Most urgent first: something is waiting on you, then something is finished and
+  # waiting to be merged, then resources to reclaim, then work that never shipped.
+  [ "$waiting" -gt 0 ] && msg "$waiting waiting on you (agent blocked) - jump with: herdr agent focus <name>"
+  [ "$ready" -gt 0 ] && msg "$ready green and mergeable - nothing left but the merge"
+  [ "$merged" -gt 0 ] && msg "$merged shipped (PR merged) and still holding resources - reclaim with: wt gc --merged"
+  [ "$nopr" -gt 0 ] && msg "$nopr with no PR - unshipped work or abandoned; check each before removing"
+  return 0
 }
 
 case "${1:-}" in
@@ -443,5 +997,5 @@ case "${1:-}" in
   rm|remove)  shift; cmd_rm "$@" ;;
   ls|list)    shift; cmd_ls "$@" ;;
   gc)         shift; cmd_gc "$@" ;;
-  *) die "usage: wt {new [name] | dev <path> | run [cmd...] | open [name] | provision <path> | rm [name] | ls | gc}" ;;
+  *) die "usage: wt {new [name] | dev <path> | run [cmd...] | open [name] | provision <path> | rm [name] | ls | gc [--merged] [--sweep] [-y]}" ;;
 esac

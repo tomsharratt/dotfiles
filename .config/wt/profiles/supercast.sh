@@ -158,9 +158,48 @@ wt_dev() {
   foreman start -f "$pf" -d "$WT_PATH" --env /dev/null
 }
 
+# Reclaim what this profile allocates once a worktree is gone entirely, so nothing
+# records it any more: its puma-dev entry and its database. `wt gc --sweep` passes
+# WT_LIVE_SLUGS - every slug that still has a live worktree - and anything of ours not
+# on that list is an orphan.
+#
+# Both checks are deliberately narrow, because a sweep deletes on a name pattern rather
+# than on a recorded fact:
+#   - ~/.puma-dev holds one file per app, containing a port, and other apps and tools
+#     write there too. So we only claim entries pointing at a port from OUR range
+#     (>= WT_PORT_BASE). That leaves the canonical supercast entry (:3000) and the older
+#     bin/preview-setup entries (:3100) alone - they are not wt's to reclaim.
+#   - a database must carry the supercast-web_development_ prefix WITH something after
+#     it, so the canonical supercast-web_development can never match.
+wt_sweep() {
+  local live f slug port db dry=${WT_SWEEP_DRY:-}
+  live=$(printf '%s\n' "${WT_LIVE_SLUGS:-}" | sed '/^$/d')
+
+  for f in "$HOME"/.puma-dev/*; do
+    [ -f "$f" ] || continue
+    slug=$(basename "$f")
+    grep -qxF "$slug" <<<"$live" && continue
+    port=$(tr -dc '0-9' < "$f" 2>/dev/null)
+    [ -n "$port" ] && [ "$port" -ge "${WT_PORT_BASE:-3101}" ] 2>/dev/null || continue
+    [ -n "$dry" ] && { printf 'puma-dev entry %s (:%s)\n' "$slug" "$port"; continue; }
+    rm -f "$f" && msg "swept puma-dev entry $slug (was :$port)"
+  done
+
+  while IFS= read -r db; do
+    [ -n "$db" ] || continue
+    slug=${db#supercast-web_development_}; slug=${slug//_/-}
+    grep -qxF "$slug" <<<"$live" && continue
+    [ -n "$dry" ] && { printf 'database %s\n' "$db"; continue; }
+    _wt_dropdb "$db" && msg "swept database $db"
+  done < <(psql -lqtA 2>/dev/null | cut -d'|' -f1 | grep '^supercast-web_development_.')
+}
+
 wt_teardown() {
   local db; db=$(_wt_db)
-  rm -f "$HOME/.puma-dev/$WT_SLUG" && msg "removed puma-dev entry $WT_SLUG"
+  # -e first: `rm -f` succeeds on a path that was never there, so without the test this
+  # reports removing an entry that never existed (every worktree created outside wt).
+  [ -e "$HOME/.puma-dev/$WT_SLUG" ] && rm -f "$HOME/.puma-dev/$WT_SLUG" \
+    && msg "removed puma-dev entry $WT_SLUG"
   # Flush this worktree's redis db so a future worktree reusing the index inherits
   # no stale Sidekiq state. Guarded to > 0 so db 0 (the canonical dev db) is never touched.
   if [ "${WT_REDIS:-0}" -gt 0 ] 2>/dev/null; then
