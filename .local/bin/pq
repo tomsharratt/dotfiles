@@ -21,9 +21,11 @@
 #   pq unhold <task>     put it back in the queue
 #   pq rm <task>         drop a task (never touches a worktree or a branch)
 #   pq tick              free finished slots, then fill them from the queue
+#   pq run               tick on an interval until you stop it
+#   pq cap [N]           how many may run at once; 0 pauses. Read every tick.
 #
-# `pq tick` is one idempotent pass, safe to run by hand at any time. The loop that
-# calls it on an interval (`pq run`) is not built yet - see QUEUE-PLAN.md.
+# `pq tick` is one idempotent pass, safe to run by hand at any time - including
+# alongside a running `pq run`.
 #
 # LAYOUT ─────────────────────────────────────────────────────────────────────
 # A task is a DIRECTORY, and the directory it sits in is its state:
@@ -62,6 +64,12 @@ PQ_NAMER_MODEL="${PQ_NAMER_MODEL:-haiku}"
 # under `set -u` that turns the cleanup into an "unbound variable" error instead.
 PQ_STAGING=""; PQ_LOCK=""
 
+# A tick's one-line verdict. `pq tick` prints it directly; `pq run` collects it
+# instead, so it can drop a summary identical to the previous one and leave a log
+# of what CHANGED rather than one line per interval all night.
+PQ_SUMMARY=""; PQ_RUN=0
+
+summary() { PQ_SUMMARY=$*; [ "$PQ_RUN" = 1 ] || printf 'pq: %s\n' "$*" >&2; }
 msg()  { printf 'pq: %s\n' "$*" >&2; }
 warn() { printf '\033[38;2;246;193;119mpq: %s\033[0m\n' "$*" >&2; }
 die()  { printf '\033[38;2;235;111;146mpq: %s\033[0m\n' "$*" >&2; exit 1; }
@@ -101,6 +109,42 @@ st_set() {                              # task_dir key value
   { grep -v "^$2=" "$f" 2>/dev/null || true; printf '%s=%s\n' "$2" "$3"; } > "$f.tmp" && mv "$f.tmp" "$f"
 }
 now() { date -u '+%Y-%m-%dT%H:%M:%SZ'; }
+
+# ── the cap ─────────────────────────────────────────────────────────────────
+# How many tasks may be running at once. It is STATE, not an argument: it lives in
+# a file and is re-read at the top of every tick, so `pq cap 1` in the morning and
+# `pq cap 4` at bedtime take effect on the next pass of a loop that is already
+# running - no restart, no second concept for pausing. `pq cap 0` is the pause.
+#
+# The cap is soft in both directions. Fill is `while active < cap`, so lowering it
+# never kills anything: it simply starts nothing new until enough slots free up on
+# their own. There is no drain state to track, because the arithmetic already is one.
+#
+# The default is deliberately 1 rather than the 3 you will probably settle on. A
+# fresh machine, or a state dir that got wiped, should not quietly start dispatching
+# three unattended agents because nobody had said otherwise yet.
+CAP_FILE="$PQ_HOME/cap"
+cap_get() {
+  local c
+  c=$( { tr -dc '0-9' < "$CAP_FILE"; } 2>/dev/null )
+  [ -n "$c" ] || c=${PQ_DEFAULT_CAP:-1}
+  printf '%s' "$c"
+}
+cap_set() { printf '%s\n' "$1" > "$CAP_FILE"; }
+
+cmd_cap() {
+  [ $# -eq 0 ] && { printf '%s\n' "$(cap_get)"; return 0; }
+  [[ "$1" =~ ^[0-9]+$ ]] || die "usage: pq cap [N]   (0 pauses; nothing running is touched)"
+  cap_set "$1"
+  local active; active=$(ls -d "$PQ_HOME/running"/*/ 2>/dev/null | wc -l | tr -d ' ')
+  if [ "$1" = 0 ]; then
+    msg "cap 0 - paused. $active still running; nothing new will start."
+  elif [ "$active" -gt "$1" ]; then
+    msg "cap $1 - $active already running, so nothing new starts until $(( active - $1 + 1 )) of them finish."
+  else
+    msg "cap $1 - room for $(( $1 - active )) more."
+  fi
+}
 
 # ── task lookup ─────────────────────────────────────────────────────────────
 # "queue/020-live-chat-mentions" -> "live-chat-mentions"
@@ -662,8 +706,35 @@ dispatch_task() {                       # task_dir  -> 0 launched, 1 failed
 # One idempotent pass: free what has finished, finish what was interrupted, then
 # fill whatever room that left. Reconcile runs BEFORE the cap is counted, so a task
 # that shipped during the last interval hands its slot straight to the next one.
+# One tick at a time. The per-task `mv` already stops the same plan being claimed
+# twice, but two ticks running concurrently would each see the same free slots and
+# between them overshoot the cap. mkdir is the atomic primitive; a lock whose owner
+# is gone is stale and reclaimed.
+#
+# Taken and released around each tick rather than held for the life of the process,
+# because `pq run` ticks in a loop - a lock released only at exit would make every
+# tick after the first find the lock held, by itself, forever.
+take_lock() {                           # -> 0 took it, 1 someone else has it
+  local owner
+  PQ_LOCK="$PQ_HOME/.tick.lock"
+  if ! mkdir "$PQ_LOCK" 2>/dev/null; then
+    owner=$(cat "$PQ_LOCK/pid" 2>/dev/null)
+    if [ -n "$owner" ] && kill -0 "$owner" 2>/dev/null; then PQ_LOCK=""; return 1; fi
+    warn "clearing a stale tick lock"
+    rm -rf "$PQ_LOCK"; mkdir "$PQ_LOCK" 2>/dev/null || die "could not take the tick lock"
+  fi
+  printf '%s' "$$" > "$PQ_LOCK/pid"
+  # The EXIT trap is the backstop for an abnormal exit; the normal path releases below.
+  trap 'rm -rf "$PQ_LOCK"' EXIT
+  return 0
+}
+release_lock() {
+  [ -n "${PQ_LOCK:-}" ] && rm -rf "$PQ_LOCK"
+  PQ_LOCK=""; trap - EXIT; return 0
+}
+
 cmd_tick() {
-  local cap=1 dry=0
+  local cap="" dry=0
   while [ $# -gt 0 ]; do
     case "$1" in
       --cap)     cap=${2:-}; shift 2 ;;
@@ -672,25 +743,24 @@ cmd_tick() {
       *)         die "unexpected argument '$1'" ;;
     esac
   done
+  # Re-read the cap every tick, so `pq cap 0` takes effect on the next pass of a
+  # loop that is already running. An explicit --cap overrides for this tick only and
+  # deliberately does not write the file.
+  [ -n "$cap" ] || cap=$(cap_get)
   [[ "$cap" =~ ^[0-9]+$ ]] || die "--cap must be a number, got '$cap'"
 
-  # One tick at a time. The per-task `mv` already stops the same plan being claimed
-  # twice, but two ticks running concurrently would each see the same free slots and
-  # between them overshoot the cap. mkdir is the atomic primitive here; a lock whose
-  # owner is gone is stale and reclaimed.
-  local owner
-  PQ_LOCK="$PQ_HOME/.tick.lock"
-  if ! mkdir "$PQ_LOCK" 2>/dev/null; then
-    owner=$(cat "$PQ_LOCK/pid" 2>/dev/null)
-    if [ -n "$owner" ] && kill -0 "$owner" 2>/dev/null; then
-      msg "another tick is running (pid $owner) - nothing to do"; PQ_LOCK=""; return 0
-    fi
-    warn "clearing a stale tick lock"
-    rm -rf "$PQ_LOCK"; mkdir "$PQ_LOCK" 2>/dev/null || die "could not take the tick lock"
+  if ! take_lock; then
+    msg "another tick is running (pid $(cat "$PQ_HOME/.tick.lock/pid" 2>/dev/null)) - nothing to do"
+    return 0
   fi
-  printf '%s' "$$" > "$PQ_LOCK/pid"
-  trap 'rm -rf "$PQ_LOCK"' EXIT
+  tick_body "$cap" "$dry"
+  local rc=$?
+  release_lock
+  return $rc
+}
 
+tick_body() {                           # cap dry
+  local cap=$1 dry=$2
   pidx_load
 
   # 1. Reconcile. A pull request - in any state - means the work left the queue, so
@@ -751,7 +821,7 @@ cmd_tick() {
   active=$(ls -d "$PQ_HOME/running"/*/ 2>/dev/null | wc -l | tr -d ' ')
   local free=$(( cap - active ))
   if [ "$free" -le 0 ]; then
-    msg "$active running, cap $cap - nothing to start"
+    summary "$active running, cap $cap - nothing to start"
     return 0
   fi
 
@@ -776,17 +846,89 @@ cmd_tick() {
 
   active=$(ls -d "$PQ_HOME/running"/*/ 2>/dev/null | wc -l | tr -d ' ')
   local queued; queued=$(ls -d "$PQ_HOME/queue"/*/ 2>/dev/null | wc -l | tr -d ' ')
-  msg "$active running (cap $cap), $queued queued$([ "$started" -gt 0 ] && printf ', %s started' "$started")"
+  summary "$active running (cap $cap), $queued queued$([ "$started" -gt 0 ] && printf ', %s started' "$started")"
+}
+
+# ── run ─────────────────────────────────────────────────────────────────────
+# Tick, sleep, repeat - meant to sit in a Herdr space where it inherits the socket
+# and you can watch it. Safe to stop and start whenever: the queue's state lives
+# entirely in directories, so this process holds nothing that matters.
+#
+# Ctrl-C is honest about what it can promise. During the sleep - the overwhelmingly
+# common case - it stops immediately. During a tick it cannot truly "finish the
+# tick", because the terminal sends SIGINT to the whole process group and any `wt
+# new` running underneath dies with it. What it does instead is guarantee the parts
+# that matter: the lock is released, and a task caught mid-dispatch is left with no
+# PQ_LAUNCHED, which the next reconcile recognises and resumes. So the worst a badly
+# timed Ctrl-C costs is one repeated `wt new`.
+#
+# Two `pq run` loops would not overshoot the cap - the tick lock serialises them -
+# they would just tick twice as often. Harmless enough not to be worth a second lock.
+PQ_STOP=0
+on_interrupt() {
+  if [ "$PQ_STOP" = 1 ]; then printf '\n'; msg "stopping now"; release_lock; exit 130; fi
+  PQ_STOP=1
+  printf '\n'; msg "stopping after this tick (Ctrl-C again to stop now)"
+}
+
+# sleep in the background and `wait` on it, so the trap runs the moment a signal
+# arrives rather than after the sleep has run its course. A bare `sleep` is only
+# interruptible when the signal reaches it too, which is not true of `kill -INT`.
+nap() {                                 # seconds
+  local pid
+  sleep "$1" & pid=$!
+  wait "$pid" 2>/dev/null
+  kill "$pid" 2>/dev/null
+  return 0
+}
+
+cmd_run() {
+  local interval=120 cap=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --interval) interval=${2:-}; shift 2 ;;
+      --cap)      cap=${2:-}; shift 2 ;;
+      -*)         die "unknown option '$1' (usage: pq run [--interval SECONDS] [--cap N])" ;;
+      *)          die "unexpected argument '$1'" ;;
+    esac
+  done
+  [[ "$interval" =~ ^[0-9]+$ ]] && [ "$interval" -ge 5 ] || die "--interval must be a number of seconds, at least 5"
+  # --cap here SETS the cap rather than overriding for one pass, since this is the
+  # long-running thing: what you pass at startup should be what `pq cap` reports.
+  [ -n "$cap" ] && { [[ "$cap" =~ ^[0-9]+$ ]] || die "--cap must be a number"; cap_set "$cap"; }
+
+  PQ_RUN=1
+  trap on_interrupt INT TERM
+  msg "running every ${interval}s at cap $(cap_get) - change it any time with 'pq cap N', Ctrl-C to stop"
+
+  local last=""
+  while :; do
+    # Suppress a summary identical to the last one, so an idle night leaves a log of
+    # what changed rather than hundreds of lines saying nothing happened.
+    PQ_SUMMARY=""
+    cmd_tick || true
+    if [ -n "$PQ_SUMMARY" ] && [ "$PQ_SUMMARY" != "$last" ]; then
+      printf 'pq: [%s] %s\n' "$(date '+%H:%M')" "$PQ_SUMMARY" >&2
+      last=$PQ_SUMMARY
+    fi
+    [ "$PQ_STOP" = 1 ] && break
+    nap "$interval"
+    [ "$PQ_STOP" = 1 ] && break
+  done
+  release_lock
+  msg "stopped - $(ls -d "$PQ_HOME/running"/*/ 2>/dev/null | wc -l | tr -d ' ') still running, queue untouched"
 }
 
 case "${1:-}" in
   add)        shift; cmd_add "$@" ;;
   tick)       shift; cmd_tick "$@" ;;
+  run)        shift; cmd_run "$@" ;;
+  cap)        shift; cmd_cap "$@" ;;
   ls|list)    shift; cmd_ls "$@" ;;
   show)       shift; cmd_show "$@" ;;
   priority|pri) shift; cmd_priority "$@" ;;
   hold)       shift; cmd_hold "$@" ;;
   unhold)     shift; cmd_unhold "$@" ;;
   rm|remove)  shift; cmd_rm "$@" ;;
-  *) die "usage: pq {add [plan] | ls [--json] | show <task> | tick [--cap N] [--dry-run] | priority <task> N | hold <task> | unhold <task> | rm <task>}" ;;
+  *) die "usage: pq {add [plan] | ls [--json] | show <task> | tick [--cap N] [--dry-run] | run [--interval S] [--cap N] | cap [N] | priority <task> N | hold <task> | unhold <task> | rm <task>}" ;;
 esac

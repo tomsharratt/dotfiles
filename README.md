@@ -89,6 +89,8 @@ pq add [plan]         add a plan to the queue (default: the newest one Claude wr
 pq ls [--json]        every task, its state, and what it is waiting on
 pq show <task>        one task's header and plan
 pq tick [--cap N]     free finished slots, then fill them from the queue
+pq run [--interval S] tick on an interval until you stop it
+pq cap [N]            how many may run at once; 0 pauses
 pq priority <task> N  re-order the queue
 pq hold / unhold      park a task, or put it back
 pq rm <task>          drop a task (never touches a worktree or a branch)
@@ -103,7 +105,18 @@ Each dispatch step records itself as it succeeds, so an interrupted tick is resu
 A `mkdir` lock keeps two ticks from both filling to cap.
 
 `pq tick --dry-run` shows what it would do and changes nothing.
-The loop that calls tick on an interval (`pq run`) is not built yet; see `QUEUE-PLAN.md`.
+
+`pq run` sits in a Herdr space and ticks on an interval, so it inherits the socket and you can watch it.
+It prints a summary only when one differs from the last, so an idle night leaves a log of what changed rather than a line per interval.
+
+The cap is **state, not an argument**: it lives in a file that is re-read at the top of every tick, so `pq cap 1` in the morning and `pq cap 4` at bedtime take effect on the next pass with no restart.
+`pq cap 0` is the pause, which is why pausing needs no separate concept.
+Caps are soft - lowering one never kills anything, it just starts nothing new until enough slots free up.
+The default is 1, deliberately: a fresh machine should not start dispatching several unattended agents because nobody had said otherwise yet.
+
+Ctrl-C during the sleep stops immediately.
+Ctrl-C *during* a tick cannot truly finish it - the terminal signals the whole process group, so a `wt new` running underneath dies too - but the parts that matter are guaranteed: the lock is released, and a task caught mid-dispatch keeps its claim without a launch record, which the next reconcile recognises and resumes.
+The worst a badly timed Ctrl-C costs is one repeated `wt new`.
 
 ### Reclaiming resources
 

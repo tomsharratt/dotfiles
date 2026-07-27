@@ -244,7 +244,7 @@ This also means **pausing needs no separate concept** - `pq cap 0` is the pause,
 
 **Stopping and restarting is safe by construction**, via three things:
 
-1. **Ctrl-C finishes the current tick.** A SIGINT trap sets a flag rather than tearing out mid-dispatch; the loop exits at the next clean boundary. Interrupting during the `sleep` - the overwhelmingly common case - is instant.
+1. **Ctrl-C stops cleanly, though not quite the way this originally claimed.** During the sleep - the overwhelmingly common case - it stops immediately. During a tick it cannot truly "finish the tick": the terminal sends SIGINT to the whole process group, so a `wt new` running underneath dies with it. What it does guarantee is the part that matters - the lock is released, and the task is left claimed but unlaunched, which is exactly the state reconcile resumes from. Verified by interrupting mid-`wt new` and restarting. The worst a badly timed Ctrl-C costs is one repeated `wt new`. A second Ctrl-C exits at once.
 2. **Every dispatch step is recorded as it completes.** The dangerous window is the ~60 seconds `wt new` takes: killed in there, you would otherwise leave a task sitting in `running/` with no agent, holding a slot forever. Instead, reconcile treats `running/` with no `PQ_LAUNCHED` as an **incomplete dispatch** and re-runs the dispatch from the top.
 
    This is safe for one specific reason, and it is worth being precise about it: **it only ever fires before an agent has been launched**, so there is no work in that worktree to lose. It is *not* safe because `wt new` is idempotent - it isn't. `wt new` backgrounds `wt provision`, and supercast's `wt_provision` **drops and recreates the database** on every run.
@@ -371,7 +371,7 @@ Small, and all defensible on their own merits:
 | 0 | ~~`wt` redis fix + `--no-agent/--no-focus/--no-dev/--json`~~ **done** | the seam, and a real bug |
 | 1 | ~~`pq add`, `pq ls`, directories~~ **done** | get plans into the queue by hand and look at them; no dispatch yet |
 | 2 | ~~`pq tick` - claim, dispatch, reconcile - cap 1, run by hand~~ **done** (took the lock with it) | prove atomic claim and slot accounting while watching |
-| 3 | `pq run` loop + cap file + SIGINT trap | the stop/start/restart safety you asked for |
+| 3 | ~~`pq run` loop + cap file + SIGINT trap~~ **done** | the stop/start/restart safety you asked for |
 | 4 | usage.json side-write + dispatch gate | needed before running it while you sleep |
 | 5 | quota prompt handling + re-prompt after reset | the last mile of unattended |
 | 6 | `after:` dependencies for epics | only when an epic actually needs it |
