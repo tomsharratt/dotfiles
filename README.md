@@ -121,6 +121,30 @@ That needs a little care, because a terminal signals the whole foreground proces
 A second Ctrl-C abandons the work in flight, killing that child too, so "force" does not leave a `wt new` running with nobody to record what it produced.
 Either way nothing is lost - a task caught mid-dispatch keeps its claim without a launch record, which the next reconcile recognises and resumes.
 
+#### Hitting the session limit
+
+When a Claude session runs out of its usage window it puts up a dialog - "Wait for limit to reset · Resets 8:00pm" - and every option on that dialog only dismisses it.
+Nothing resumes by itself, so an agent that hits the wall at 2am would otherwise sit there until morning holding a slot.
+Each tick reads the last lines of every running agent's pane, and when it finds the wall it dismisses the dialog and then knocks every ten minutes with "Continue with what you were doing" until the agent picks its work back up.
+
+Three details make that safe to leave running unattended.
+
+**Detection is the pane's text, not Herdr's status.**
+Herdr derives agent status from its own regexes over the terminal, and its highest-priority rule reads a spinner in the window title as `working` - which is exactly what is on screen while the request that hit the wall is still in flight.
+Waiting for Herdr to say `blocked` would risk never firing at all.
+
+**Only a screen that has stopped moving counts as stuck.**
+`pq` hashes the tail each tick and acts only when the wall is showing *and* the hash is unchanged since last time.
+A working agent's tail moves every few seconds, so this cannot interrupt one - which matters, because the wall's message stays in the scrollback for a while after the session recovers.
+
+**It polls rather than parsing "Resets 8:00pm".**
+The hint's format is undocumented and a bad parse would strand a task silently for hours, while a knock sent too early costs one API call that fails instantly and puts the same dialog back.
+At ten-minute intervals the worst case across a five-hour window is a few dozen no-op calls.
+
+The wall is the only thing `pq` ever answers.
+A permission prompt is recorded as `permission` and deliberately left alone - that is the trade for running everything in auto mode - so `pq ls` separates the agents waiting on the clock from the ones waiting on you.
+After forty unanswered knocks a task is marked `walled` and left, rather than knocking all night.
+
 ### Reclaiming resources
 
 Herdr has no worktree-removal hook, so removing a worktree through Herdr's own UI (rather than `wt rm`) would otherwise leak its database, port, and redis db.

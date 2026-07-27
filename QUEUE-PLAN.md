@@ -276,43 +276,44 @@ The payoff is that the morning review sorts itself before you look:
 
 ## Quota handling
 
-Two independent layers, because they cover different moments.
+**Built. One layer, not two.**
 
-**Layer 1 - don't start work you can't finish.**
-Your statusline already parses `.rate_limits.five_hour.used_percentage` and `.resets_at` on every render, and you have confirmed the `session N%` segment is showing - so those fields are populated on your version and this route is sound.
-Three extra lines side-writing them to `~/.local/state/pq/usage.json` gives `pq` the numbers with no polling and no new machinery, kept fresh by whatever session happens to be running.
+The earlier draft had a second layer in front of this one: a gate that refused to *dispatch* while account usage was above a threshold, fed by side-writing `.rate_limits` out of the statusline.
+That is dropped.
+It decides when not to start work, which is not the problem - the problem is only that a walled agent never restarts itself.
+A queued plan waiting an extra hour costs nothing; a gate that mis-reads a stale number and stalls the queue costs a night.
 
-Tick refuses to *dispatch* above a threshold.
-The threshold is not a generic safety margin - the plan session and the implementers share one account-wide window, so its real job is protecting your interactive planning from your own batch.
-Set it from the measured cost of one full plan-mode conversation, rather than picking a round number.
+What the wall actually is, read out of the Claude Code binary rather than assumed:
 
-Note how this pairs with the cap: **the cap is the coarse daytime control you set deliberately, the threshold is the automatic backstop.** `pq cap 1` during the day means you rarely approach the limit at all; the gate is there for the times you misjudge it.
+- a 429 becomes `error: "rate_limit"`, which raises a dialog whose options are `{id:"wait", label:"Wait for limit to reset", hint:"Resets 8:00pm"}` alongside an adjust/upgrade entry
+- every one of those handlers merely dismisses (`display:"skip"` / `value:"cancel"`) - **nothing schedules a resume**, which confirms the behaviour you described
 
-**Layer 2 - deal with the wall when a running task hits it.**
-This is the case Layer 1 cannot prevent, and the one you named.
+So each tick reads the tail of every running agent's pane, and on the wall it dismisses and then knocks every ten minutes until the agent moves again.
 
 ```
-herdr agent list                     → which running panes are `blocked`
-  (only those; never scrape text from a working agent)
-herdr agent read <pane> --source visible
-  → classify against the patterns in pq's config:
-      quota prompt      → answer it ("wait"), record PQ_BLOCKED=quota
-                          and PQ_WAITING_UNTIL from resets_at
-      permission prompt → leave it, record PQ_BLOCKED=permission
-      anything else     → leave it, record PQ_BLOCKED=unknown
-once PQ_WAITING_UNTIL passes:
-  → still idle or blocked? send "Continue with what you were doing."
+for each running task with an agent and no PR:
+  herdr agent read <pane> --source visible   → last 30 lines
+  hash the tail, compare with last tick
+  classify:
+    wall + tail unchanged → first sighting: Escape, record PQ_BLOCKED=quota
+                            thereafter:     Escape + "Continue with what you were
+                                            doing.", every PQ_QUOTA_RETRY
+    permission            → record PQ_BLOCKED=permission, touch nothing
+    anything else         → clear, it is fine
 ```
 
-Four deliberate properties:
+Four properties, each chosen against the obvious alternative:
 
-- **Gated on `blocked`.** Herdr already knows which agents are waiting on a human, so `pq` only reads pane text for those - never for an agent that is working.
-- **Quota is the only thing it ever answers.** Everything else is classified, labelled and left. Sending Enter into a dialog you have not identified is how an unattended system approves something it shouldn't.
-- **The classification is recorded, not just displayed.** `PQ_BLOCKED` is what lets `pq ls` tell you at 8am which agents were waiting on the clock and which were waiting on you.
-- **The patterns live in config, not in the code.** They are Claude Code UI strings and they will change.
+- **Detection is text, never Herdr's status.** The previous draft gated on `blocked` and flagged the risk that a walled pane might not report that way. It doesn't: `herdr agent explain` shows Herdr classifying from its own regexes over terminal regions, and its top rule (priority 1100, a braille spinner in the OSC title) outranks every `blocked` rule it has. A spinner is exactly what is on screen while the request that hit the wall is in flight. Claude Code *does* compute its own `{state:"blocked", needs:"rate limited - wait and retry"}` for this, but Herdr does not consume it.
+- **Liveness is the tail's hash, not a status either.** Acting needs the wall showing *and* an unchanged tail. This cuts both ways: a working agent's tail moves constantly so a knock cannot interrupt one, and the wall's message lingers in the scrollback after recovery so the text alone would keep firing.
+- **Escape, not an option.** There are at least two different limit dialogs in the binary with different option sets - one offers "Upgrade to Team plan" - so arrowing to the Nth entry bets on which one appeared. Escape is agnostic, and since every option only dismisses, it gives up nothing.
+- **Poll, don't parse "Resets 8:00pm".** The hint's format is undocumented and a bad parse strands a task silently for hours, where a knock sent too early costs one instantly-failing call and puts the same dialog back. A few dozen no-op calls across a five-hour window is the whole downside.
 
-The re-prompt after reset is unconditional-if-still-stuck rather than conditional on knowing whether Claude resumes itself.
-That way it is correct whichever way Claude behaves, and a redundant "continue" costs nothing.
+The wall is the only thing `pq` ever answers; a permission prompt is recorded and left, per the posture below.
+After `PQ_QUOTA_MAX_TRIES` (40, ~7h) a task is marked `walled` and left alone rather than knocked at all night.
+
+Tested end to end against a real Herdr pane with the real dialog text: first sighting records only, unchanged tail dismisses, the knock lands in the pane, a moving tail is left alone, a permission prompt is classified and untouched, and clearing the wall text logs the recovery.
+**A genuine 429 has not been through it** - that path cannot be provoked on demand.
 
 ## Permission posture
 
@@ -376,20 +377,15 @@ Small, and all defensible on their own merits:
 | 1 | ~~`pq add`, `pq ls`, directories~~ **done** | get plans into the queue by hand and look at them; no dispatch yet |
 | 2 | ~~`pq tick` - claim, dispatch, reconcile - cap 1, run by hand~~ **done** (took the lock with it) | prove atomic claim and slot accounting while watching |
 | 3 | ~~`pq run` loop + cap file + SIGINT trap~~ **done** | the stop/start/restart safety you asked for |
-| 4 | usage.json side-write + dispatch gate | needed before running it while you sleep |
-| 5 | quota prompt handling + re-prompt after reset | the last mile of unattended |
+| 4 | ~~usage.json side-write + dispatch gate~~ **dropped** | deciding when *not* to start was never the problem |
+| 5 | ~~wall detection + knock until it moves~~ **done** | the last mile of unattended |
 | 6 | `after:` dependencies for epics | only when an epic actually needs it |
 
 Phase 2 is the checkpoint. If claim-and-dispatch is not boringly reliable at cap 1, nothing above it matters.
 
 Phase 3 has its own test worth doing deliberately: kill `pq run` *during* a `wt new`, then restart it, and confirm the half-dispatched task recovers rather than sitting in `running/` holding a slot. That is the failure this phase exists to prevent, and it is easy to check on purpose and painful to discover at 4am.
 
-Phase 5 wants ten minutes of deliberate testing first. Hit the wall on purpose and capture **two** things, because the design assumes both and I have seen neither:
-
-1. the exact prompt text, and what the session does after you answer it
-2. what `herdr agent list` reports for that pane *at the same moment*
-
-The second one decides whether phase 5 works at all. Layer 2 only reads pane text for agents Herdr calls `blocked`, which is plausible - the session is waiting on a human - but Herdr derives status from watching the transcript, not from the prompt itself. If a quota-walled pane reports `working` or `idle`, that filter never fires and the trigger has to be something else.
+Phase 5's two open questions were answered by reading the Claude Code binary and `herdr agent explain` rather than by waiting to hit the wall: the dialog's exact options and the fact that none of them resume, and that Herdr's status cannot be trusted as the trigger. Both are written up under Quota handling, and the design changed because of the second.
 
 ## Settled
 
@@ -397,7 +393,7 @@ The second one decides whether phase 5 works at all. Layer 2 only reads pane tex
 - **Header knobs:** `model` (sonnet / opus / fable) and `effort`, defaulting to **sonnet / xhigh**.
 - **Driver:** `pq run` in a Herdr space, not launchd. Cap is live-editable state; stop and restart freely.
 - **No reserved side lane.** Cap 3 by default leaves you a fourth agent to use ad-hoc, outside the queue entirely.
-- **Usage numbers:** confirmed available - your statusline shows the `session N%` segment.
+- **Usage numbers:** not used. `pq` never decides when to start based on quota - it only restarts what the wall stopped.
 - **Dispatch hours:** not needed as a concept. `pq cap` covers it, and one mechanism beats two.
 - **Branch names:** generated by Haiku at `pq add` time, in the form `tom/<3-5 words>`, `--branch` overriding.
 - **Permissions:** auto mode, same as everything else. A permission stop is a `blocked` agent that waits for you.

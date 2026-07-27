@@ -59,6 +59,19 @@ PQ_DEFAULT_MODEL="${PQ_DEFAULT_MODEL:-sonnet}"
 PQ_DEFAULT_EFFORT="${PQ_DEFAULT_EFFORT:-xhigh}"
 PQ_NAMER_MODEL="${PQ_NAMER_MODEL:-haiku}"
 
+# What the session wall looks like on screen, and how hard to knock. These are
+# Claude Code UI strings, so they will change - hence up here and overridable
+# rather than buried in the logic that uses them.
+#
+# No braces in these defaults: `${VAR:-...}` ends at the first unescaped `}`, so a
+# bounded repetition like {0,24} gets cut in half and the rest leaks out as literal
+# text. It fails as a corrupt pattern at match time, not as a syntax error here.
+PQ_QUOTA_RE="${PQ_QUOTA_RE:-limit to reset|usage limit reached|out of usage credits|hit your .*limit}"
+PQ_PERM_RE="${PQ_PERM_RE:-Do you want to |Yes, and don.t ask again|Allow once}"
+PQ_QUOTA_RETRY="${PQ_QUOTA_RETRY:-600}"           # seconds between "continue" attempts
+PQ_QUOTA_MAX_TRIES="${PQ_QUOTA_MAX_TRIES:-40}"    # ~7h at that interval, then stop knocking
+PQ_TAIL_LINES="${PQ_TAIL_LINES:-30}"
+
 # Paths that a trap has to clean up must be globals: an EXIT trap runs after the
 # function has returned, so a `local` it referenced is already out of scope - and
 # under `set -u` that turns the cleanup into an "unbound variable" error instead.
@@ -109,6 +122,7 @@ st_set() {                              # task_dir key value
   { grep -v "^$2=" "$f" 2>/dev/null || true; printf '%s=%s\n' "$2" "$3"; } > "$f.tmp" && mv "$f.tmp" "$f"
 }
 now() { date -u '+%Y-%m-%dT%H:%M:%SZ'; }
+epoch() { date -u '+%s'; }
 
 # ── shielded children ───────────────────────────────────────────────────────
 # Run a command in a process group of its own, so a Ctrl-C aimed at pq does not
@@ -429,6 +443,113 @@ pane_state() {                          # pane_id
     END { if (!found) print "missing" }' <<<"$PIDX"
 }
 
+# ── the session wall ────────────────────────────────────────────────────────
+# Claude Code turns a 429 into a dialog - "Wait for limit to reset · Resets 3pm" -
+# and every option on it only dismisses the dialog. Nothing resumes by itself. So
+# an agent that hits the wall at 2am sits there until morning unless something
+# knocks on it, and that knock is the only reason this section exists.
+#
+# Three deliberate choices, each of which the obvious alternative gets wrong.
+#
+# **Detection is the pane's TEXT, never herdr's status.** Herdr derives status from
+# its own regexes over terminal regions, and its top rule (priority 1100,
+# `osc_title_working`: a braille spinner in the window title) outranks every
+# blocked rule it has. A spinner is exactly what is on screen while the request
+# that hit the wall is still in flight. Gating on `blocked` would risk never firing.
+#
+# **Liveness is the tail's HASH, not a status either.** We act only when the wall's
+# text is on screen AND the tail has not changed since the last tick. That matters
+# in both directions: a working agent's tail moves every few seconds so this cannot
+# interrupt one, and the wall's message stays in the scrollback for a while after
+# the session recovers, so the text alone would keep firing long after it should.
+#
+# **We do not parse "Resets 3pm" - we poll.** The hint's format is undocumented, and
+# a bad parse strands a task silently for hours. A "continue" sent too early costs
+# one API call that fails instantly and puts the same dialog back, so at ten-minute
+# intervals the worst case across a five-hour window is a few dozen no-op calls.
+# Dumber, and it cannot fail quietly.
+pane_tail() {                           # pane_id -> the last lines on screen
+  [ -n "${1:-}" ] || return 0
+  herdr agent read "$1" --source visible --format text 2>/dev/null \
+    | jq -r '.result.read.text // ""' 2>/dev/null | tail -n "$PQ_TAIL_LINES"
+}
+
+classify_tail() {                       # text -> quota | permission | none
+  if   grep -qiE "$PQ_QUOTA_RE" <<<"$1"; then printf 'quota'
+  elif grep -qiE "$PQ_PERM_RE"  <<<"$1"; then printf 'permission'
+  else                                        printf 'none'; fi
+}
+
+# Escape rather than picking an option off the list. There are at least two
+# different limit dialogs in the binary and their option sets differ - one of them
+# offers "Upgrade to Team plan" - so arrowing to the Nth entry is a bet on which
+# dialog turned up. Escape does not care, and since every option merely dismisses,
+# it loses nothing.
+unstick() {                             # pane_id [text to send after]
+  herdr pane send-keys "$1" escape >/dev/null 2>&1 || return 1
+  [ -n "${2:-}" ] || return 0
+  sleep 1
+  herdr pane send-text "$1" "$2" >/dev/null 2>&1 \
+    && herdr pane send-keys "$1" enter >/dev/null 2>&1
+}
+
+clear_block() {                         # task_dir
+  local d=$1 k
+  for k in PQ_BLOCKED PQ_QUOTA_SINCE PQ_TRIES PQ_RETRY_AT PQ_GAVEUP; do st_set "$d" "$k" ""; done
+}
+
+# One running task, one tick: record what its pane is waiting on, and knock if it
+# is the wall. Everything else is classified and left alone - answering a dialog
+# nobody has identified is how an unattended system approves something it shouldn't.
+check_stall() {                         # task_dir
+  local d=$1 slug pane text hash prev kind was tries at nowsec
+  pane=$(st "$d" PQ_PANE); [ -n "$pane" ] || return 0
+  text=$(pane_tail "$pane"); [ -n "$text" ] || return 0
+  slug=$(slug_of "$d"); nowsec=$(epoch)
+  hash=$(cksum <<<"$text" | awk '{ print $1 }')
+  prev=$(st "$d" PQ_TAIL); st_set "$d" PQ_TAIL "$hash"
+  kind=$(classify_tail "$text")
+  was=$(st "$d" PQ_BLOCKED)
+
+  if [ "$kind" != quota ]; then
+    [ "$was" = quota ] && msg "$slug: moving again after the session limit"
+    clear_block "$d"
+    # A permission prompt is recorded and deliberately never answered. That is the
+    # trade for running everything in auto mode, and it is the distinction `pq ls`
+    # draws in the morning between waiting on the clock and waiting on you.
+    [ "$kind" = permission ] && st_set "$d" PQ_BLOCKED permission
+    return 0
+  fi
+
+  # The wall is on screen, but only a screen that has stopped moving is stuck.
+  [ -n "$prev" ] && [ "$prev" = "$hash" ] || return 0
+
+  if [ "$was" != quota ]; then
+    st_set "$d" PQ_BLOCKED quota;  st_set "$d" PQ_QUOTA_SINCE "$(now)"
+    st_set "$d" PQ_TRIES 0;        st_set "$d" PQ_RETRY_AT "$(( nowsec + PQ_QUOTA_RETRY ))"
+    unstick "$pane"
+    warn "$slug: hit the session limit - dismissed it, retrying every $(( PQ_QUOTA_RETRY / 60 ))m from now"
+    return 0
+  fi
+
+  tries=$(st "$d" PQ_TRIES); tries=${tries:-0}
+  at=$(st "$d" PQ_RETRY_AT); at=${at:-0}
+  [ "$nowsec" -ge "$at" ] || return 0
+
+  if [ "$tries" -ge "$PQ_QUOTA_MAX_TRIES" ]; then
+    [ "$(st "$d" PQ_GAVEUP)" = 1 ] || {
+      st_set "$d" PQ_GAVEUP 1
+      warn "$slug: still walled after $tries attempts - leaving it for you"
+    }
+    return 0
+  fi
+
+  tries=$(( tries + 1 ))
+  st_set "$d" PQ_TRIES "$tries"; st_set "$d" PQ_RETRY_AT "$(( nowsec + PQ_QUOTA_RETRY ))"
+  unstick "$pane" "Continue with what you were doing."
+  msg "$slug: knocking after the session limit (attempt $tries)"
+}
+
 # One `gh` lookup per dispatched branch, concurrently. Only tasks that have been
 # dispatched can have a PR, so this costs nothing while the queue is just a queue.
 # statusCheckRollup is deliberately not requested: it is what makes `wt ls` slow,
@@ -489,7 +610,7 @@ age_of() {                              # iso8601
 # `pq` records why it classified a blocked agent the way it did, so the morning
 # read separates "waiting on the clock" from "waiting on you".
 agent_cell() {                          # task_dir state
-  local d=$1 st=$2 pane status blocked until_
+  local d=$1 st=$2 pane status blocked
   [ "$st" = running ] || { printf -- '-'; return; }
   pane=$(st "$d" PQ_PANE)
   # Claimed but not yet launched: either mid-dispatch right now, or an interrupted
@@ -500,17 +621,17 @@ agent_cell() {                          # task_dir state
     "")        printf '?';        return ;;   # herdr did not answer
     missing)   printf 'gone';     return ;;   # workspace is gone
     noagent)   printf 'exited';   return ;;   # a shell is sitting where Claude was
-    unknown)   printf 'unknown';  return ;;
   esac
-  if [ "$status" = blocked ]; then
-    blocked=$(st "$d" PQ_BLOCKED); until_=$(st "$d" PQ_WAITING_UNTIL)
-    case "$blocked" in
-      quota) printf 'quota%s' "${until_:+ $until_}" ;;
-      "")    printf 'blocked' ;;
-      *)     printf '%s' "$blocked" ;;
-    esac
-    return
-  fi
+  # What pq itself saw on the pane outranks what herdr makes of it - herdr can
+  # read a walled agent as `working` off the spinner still in its title, and the
+  # wall is the whole reason this column exists at 8am.
+  blocked=$(st "$d" PQ_BLOCKED)
+  case "$blocked" in
+    quota)      [ "$(st "$d" PQ_GAVEUP)" = 1 ] && printf 'walled ' || printf 'quota '
+                printf '%s' "$(age_of "$(st "$d" PQ_QUOTA_SINCE)")"; return ;;
+    permission) printf 'permission'; return ;;
+  esac
+  [ "$status" = unknown ] && { printf 'unknown'; return; }
   printf '%s' "$status"
 }
 
@@ -863,6 +984,7 @@ tick_body() {                           # cap dry
       case "$(pane_state "$(st "$d" PQ_PANE)")" in
         missing) warn "$slug: its workspace is gone and no PR exists - look at it, then: pq rm $slug" ;;
         noagent) warn "$slug: the agent exited without opening a PR - look at the pane, or: pq rm $slug" ;;
+        *)       [ "$dry" = 1 ] || check_stall "$d" ;;
       esac
     done
     rm -f "$allpr"
