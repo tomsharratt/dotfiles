@@ -52,11 +52,25 @@ Commands:
 ```
 wt new [name]        create/open an isolated worktree, provision, start dev + Claude
 wt dev  <path>       run a worktree's dev server (this is the dev pane's command)
+wt run  [cmd...]     run a command with the worktree's isolated env loaded
+wt open [name]       open the worktree's dev url in the browser
 wt provision <path>  re-run provisioning for a worktree (idempotent)
 wt rm  [name]        tear a worktree down (drop db, free port, remove worktree)
 wt ls                list worktrees with their allocated port / redis / url / db
 wt gc                reclaim resources from worktrees removed outside wt rm
 ```
+
+`wt new` layers three things on top of "prepare a worktree", and each can be dropped so the command can be driven by a script rather than by `prefix+t`:
+
+```
+--no-agent   don't start Claude in the root pane
+--no-dev     provision, but don't boot the dev server
+--no-focus   leave focus where it is
+--json       print the worktree's facts (path, pane ids, port, url) to stdout
+```
+
+Human-facing output always goes to stderr, so `--json` leaves stdout clean for a caller to parse.
+`--no-dev` deliberately still provisions: the dev server is four long-running foreman processes, while provisioning is the one-off that creates the isolated database - skip that too and `wt run bin/rails test` inside the worktree fails confusingly.
 
 Herdr has no worktree-removal hook, so removing a worktree through Herdr's own UI (rather than `wt rm`) would otherwise leak its database, port, and redis db.
 `wt gc` reconciles this: it checks each recorded worktree and, for any whose directory no longer exists, runs the profile's teardown and frees the reservation.

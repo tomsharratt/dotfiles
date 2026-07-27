@@ -11,6 +11,10 @@
 #
 #   wt new [name]        create/open an isolated worktree, provision it,
 #                        start the dev server + Claude, focus it
+#        --no-agent      don't start Claude in the root pane
+#        --no-dev        provision, but don't boot the dev server
+#        --no-focus      leave focus where it is
+#        --json          print the worktree's facts (path, panes, port, url) to stdout
 #   wt dev  <path>       run the worktree's dev server (the dev pane's command)
 #   wt run  [cmd...]     run a command with the worktree's isolated env loaded
 #                        (e.g. `wt run bin/rails console`); no cmd -> a shell
@@ -31,6 +35,8 @@
 # A profile may set:
 #   WT_RESOURCES="port redis"   isolated resources to allocate (default: none)
 #   WT_PORT_BASE=3101           first port to hand out (default 3101)
+#   WT_REDIS_MAX=15             highest redis db index to hand out (default 15); lower it
+#                               to reserve indices for something else, e.g. a spec suite
 #   WT_AGENT="claude"           agent command to launch in the worktree (default claude)
 # and define any of these functions, which run with the worktree's facts
 # exported (WT_NAME WT_SLUG WT_PATH WT_REPO WT_REPO_NAME WT_DOMAIN WT_PORT WT_REDIS):
@@ -69,6 +75,26 @@ need_herdr() { in_herdr || die "run this inside Herdr (start it with: herdr)"; }
 # jq extract from a json string: hj '<json>' '<filter>'
 hj() { jq -r "$2" 2>/dev/null <<<"$1"; }
 herr() { hj "$1" '.error.message // empty'; }
+
+# Run a herdr command and hand back its JSON envelope, whichever stream it arrived on.
+# herdr prints the SUCCESS envelope to stdout but the ERROR envelope to stderr (exiting
+# non-zero), so the obvious `herdr ... 2>/dev/null` silently discards every failure and
+# leaves the caller holding an empty string it cannot distinguish from a crash.
+#
+# That is not academic. It is what made cmd_new's "worktree exists - opening it" fallback
+# unreachable: the create call fails with `... already exists`, the message goes to stderr,
+# `herr` sees nothing to match on, and `wt new` on a branch whose worktree already existed
+# died with a generic "could not determine worktree path from herdr" instead of just
+# opening it. stdout wins when both are present, so a success envelope is never displaced
+# by whatever diagnostics herdr also chose to print.
+hcall() {                               # herdr args...
+  local out rc errf="$STATE_DIR/.hcall.$$"
+  out=$("$HERDR" "$@" 2>"$errf"); rc=$?
+  [ -n "$out" ] || out=$(cat "$errf" 2>/dev/null)
+  rm -f "$errf"
+  printf '%s' "$out"
+  return $rc
+}
 
 # ── git helpers ─────────────────────────────────────────────────────────────
 main_worktree() { git -C "$1" worktree list --porcelain 2>/dev/null | awk '/^worktree /{print substr($0,10); exit}'; }
@@ -207,9 +233,15 @@ alloc_port() {
   done
   return 1
 }
+# Redis db indices run 1..WT_REDIS_MAX (redis serves 0-15 and db 0 is the canonical dev
+# db, so 1 is the floor). A profile lowers the ceiling to reserve indices for something
+# else - supercast keeps 15 for its spec suite - and honoring that matters most exactly
+# when nobody is watching: hand out a reserved index to a worktree and the collision
+# surfaces as a flaky test run, not as a wt error.
 alloc_redis() {
-  local i used; used=$(awk -F= '/^WT_REDIS=/{print $2}' "$STATE_DIR"/*.env 2>/dev/null)
-  for i in $(seq 1 15); do grep -qx "$i" <<<"$used" && continue; printf '%s' "$i"; return 0; done
+  local i used max=${WT_REDIS_MAX:-15}
+  used=$(awk -F= '/^WT_REDIS=/{print $2}' "$STATE_DIR"/*.env 2>/dev/null)
+  for ((i=1; i<=max; i++)); do grep -qx "$i" <<<"$used" && continue; printf '%s' "$i"; return 0; done
   return 1
 }
 
@@ -226,7 +258,10 @@ alloc_redis() {
 load_profile() {
   local repo=$1 name=$2 f
   unset -f wt_provision wt_dev wt_env wt_open_url wt_teardown wt_sweep 2>/dev/null || true
-  WT_RESOURCES="" WT_PORT_BASE=3101 WT_AGENT="claude"
+  # Every tunable a profile may set is reset here for the same reason the functions are:
+  # `wt ls` and `wt gc` load one profile after another in a single process, and a value
+  # left behind by the previous repo is indistinguishable from one this repo chose.
+  WT_RESOURCES="" WT_PORT_BASE=3101 WT_REDIS_MAX=15 WT_AGENT="claude"
   for f in "$repo/.wt/profile.sh" "$PROFILE_DIR/$name.sh"; do
     [ -f "$f" ] || continue
     # shellcheck disable=SC1090
@@ -274,7 +309,7 @@ prepare_state() {                       # name path repo repo_name [workspace_id
   for res in ${WT_RESOURCES:-}; do
     case "$res" in
       port)  [ -n "${WT_PORT:-}" ]  || WT_PORT=$(alloc_port)   || die "no free port available" ;;
-      redis) [ -n "${WT_REDIS:-}" ] || WT_REDIS=$(alloc_redis) || die "no free redis db (1-15) available" ;;
+      redis) [ -n "${WT_REDIS:-}" ] || WT_REDIS=$(alloc_redis) || die "no free redis db (1-${WT_REDIS_MAX:-15}) available" ;;
     esac
   done
   state_set "$WT_STATE_FILE" WT_NAME      "$WT_NAME"
@@ -694,11 +729,33 @@ cmd_gc() {
 }
 
 # ── commands ────────────────────────────────────────────────────────────────
+# `wt new` has two callers with opposite needs. Interactively (prefix+t) you want the whole
+# thing: worktree, dev server, an agent typed into the root pane, and your focus moved there.
+# A script driving a queue of tasks wants only the worktree - it starts its own agent, with
+# its own model and effort, and a 3am dispatch that stole focus or booted four foreman stacks
+# would be actively hostile. The flags below are that separation: --no-agent / --no-dev /
+# --no-focus each drop one of the three things layered on top of "prepare a worktree", and
+# --json prints the resulting facts to stdout so a caller can act on them. All human-facing
+# output already goes to stderr, so stdout stays clean for the JSON.
 cmd_new() {
   need_herdr
+  local no_agent=0 no_focus=0 no_dev=0 as_json=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --no-agent) no_agent=1; shift ;;
+      --no-focus) no_focus=1; shift ;;
+      --no-dev)   no_dev=1;   shift ;;
+      --json)     as_json=1;  shift ;;
+      --)         shift; break ;;
+      -*)         die "unknown option '$1' (usage: wt new [--no-agent] [--no-dev] [--no-focus] [--json] [name])" ;;
+      *)          break ;;
+    esac
+  done
   gc_run   # reclaim worktrees removed outside `wt rm` before allocating fresh resources
   local name=${1:-}
-  if [ -z "$name" ]; then printf 'wt: task name (branch): ' >&2; read -r name || true; fi
+  # Only prompt when there is someone to answer. A non-interactive caller that forgot the
+  # name should fail immediately rather than hang forever on a read from a closed stdin.
+  if [ -z "$name" ] && [ -t 0 ]; then printf 'wt: task name (branch): ' >&2; read -r name || true; fi
   [ -n "$name" ] || die "no task name given"
   git check-ref-format "refs/heads/$name" || die "invalid task/branch name: '$name'"
 
@@ -731,11 +788,11 @@ cmd_new() {
     esac
     msg "creating worktree '$name' off ${base:-HEAD}"
   fi
-  resp=$("$HERDR" worktree create --cwd "$repo" --branch "$name" ${base:+--base "$base"} --json 2>/dev/null)
+  resp=$(hcall worktree create --cwd "$repo" --branch "$name" ${base:+--base "$base"} --json)
   case "$(herr "$resp")" in
     *"already exists"*|*"already open"*)
       msg "worktree exists - opening it"
-      resp=$("$HERDR" worktree open --cwd "$repo" --branch "$name" --json 2>/dev/null) ;;
+      resp=$(hcall worktree open --cwd "$repo" --branch "$name" --json) ;;
   esac
   [ -z "$(herr "$resp")" ] || die "herdr: $(herr "$resp")"
 
@@ -744,6 +801,13 @@ cmd_new() {
   root_pane=$(hj "$resp" '.result.root_pane.pane_id')
   path=$(hj "$resp" '.result.worktree.path')
   [ -n "$path" ] && [ "$path" != null ] || die "could not determine worktree path from herdr"
+  # Interactively a missing root pane merely means the agent doesn't get typed for you, and
+  # the reopen path (`worktree open` on an existing worktree) is where that can happen. A
+  # --json caller is asking precisely so it can start something in that pane, so for it the
+  # same condition is a hard failure - better than handing back an id that names nothing.
+  if [ "$as_json" = 1 ] && { [ -z "$root_pane" ] || [ "$root_pane" = null ]; }; then
+    die "herdr returned no root pane for '$name' - nothing to start an agent in"
+  fi
 
   # prepare_state is cheap and MUST run here (not just in the backgrounded
   # `wt provision` below): it persists WT_WORKSPACE=$ws, and `wt provision`'s own
@@ -755,9 +819,11 @@ cmd_new() {
   # can start writing your prompt right away. Provisioning (a full dev-db copy,
   # migrate, flag seed) is the slow part, so it does NOT block this - it runs in a
   # background dev tab below and the worktree just isn't server-ready until it lands.
-  "$HERDR" pane send-text "$root_pane" "${WT_AGENT:-claude}" >/dev/null 2>&1
-  "$HERDR" pane send-keys "$root_pane" enter >/dev/null 2>&1
-  "$HERDR" workspace focus "$ws" >/dev/null 2>&1
+  if [ "$no_agent" = 0 ]; then
+    "$HERDR" pane send-text "$root_pane" "${WT_AGENT:-claude}" >/dev/null 2>&1
+    "$HERDR" pane send-keys "$root_pane" enter >/dev/null 2>&1
+  fi
+  [ "$no_focus" = 1 ] || "$HERDR" workspace focus "$ws" >/dev/null 2>&1
 
   # Provision, then boot the dev server, in their own background "dev" tab. A
   # dedicated tab keeps Claude's pane full-height and the setup logs one tab away;
@@ -775,35 +841,73 @@ cmd_new() {
   # prepare_state above resolves one state dir and the `wt provision` below another, so
   # the same worktree gets provisioned twice into two state files with two ports. Both
   # variables are normally unset, which is the only reason this has never bitten.
-  local setup="" prov dev notify envp="" v
+  #
+  # --no-dev drops the server but KEEPS provisioning. The two are not the same cost: the
+  # server is four long-running foreman processes held for the life of the worktree, while
+  # provisioning is a one-off that creates the isolated database. Skip provisioning too and
+  # `wt run bin/rails test` inside the worktree fails in a way that reads as a broken
+  # checkout rather than a missing step - so the expensive, always-on half goes and the
+  # cheap, load-bearing half stays.
+  local setup="" prov dev notify envp="" v label=dev have_prov=0 have_dev=0
   for v in XDG_STATE_HOME XDG_CONFIG_HOME; do
     [ -n "${!v:-}" ] && envp="$envp$(printf '%s=%q ' "$v" "${!v}")"
   done
+  declare -F wt_provision >/dev/null && have_prov=1
+  { declare -F wt_dev >/dev/null && [ "$no_dev" = 0 ]; } && have_dev=1
+  [ "$have_dev" = 1 ] || label=setup
   prov=$envp$(printf '%q provision %q' "$SELF" "$WT_PATH")
   dev=$envp$(printf '%q dev %q' "$SELF" "$WT_PATH")
   notify=$(printf '%q notification show %q --body %q --sound request' \
     "$HERDR" "${WT_SLUG:-worktree}: dev setup failed" \
-    "Provisioning failed in the 'dev' tab - fix the error there, then rerun.")
-  if declare -F wt_provision >/dev/null && declare -F wt_dev >/dev/null; then
+    "Provisioning failed in the '$label' tab - fix the error there, then rerun.")
+  if [ "$have_prov" = 1 ] && [ "$have_dev" = 1 ]; then
     setup="if $prov; then $dev; else $notify; fi"
-  elif declare -F wt_provision >/dev/null; then
+  elif [ "$have_prov" = 1 ]; then
     setup="$prov || $notify"
-  elif declare -F wt_dev >/dev/null; then
+  elif [ "$have_dev" = 1 ]; then
     setup="$dev"
   fi
+  local dpane=""
   if [ -n "$setup" ]; then
-    local dtab dpane
-    dtab=$("$HERDR" tab create --workspace "$ws" --cwd "$WT_PATH" --label dev --no-focus 2>/dev/null)
+    local dtab
+    dtab=$("$HERDR" tab create --workspace "$ws" --cwd "$WT_PATH" --label "$label" --no-focus 2>/dev/null)
     dpane=$(hj "$dtab" '.result.root_pane.pane_id')
     if [ -n "$dpane" ] && [ "$dpane" != null ]; then
       "$HERDR" pane send-text "$dpane" "$setup" >/dev/null 2>&1
       "$HERDR" pane send-keys "$dpane" enter >/dev/null 2>&1
-      msg "setup + dev server running in the 'dev' tab${WT_DOMAIN:+ - https://$WT_DOMAIN}${WT_PORT:+ (:$WT_PORT)}"
+      if [ "$have_dev" = 1 ]; then
+        msg "setup + dev server running in the 'dev' tab${WT_DOMAIN:+ - https://$WT_DOMAIN}${WT_PORT:+ (:$WT_PORT)}"
+      else
+        msg "provisioning in the 'setup' tab (no dev server - start one with: wt dev $WT_PATH)"
+      fi
     else
-      warn "could not open dev tab - run 'wt provision $WT_PATH && wt dev $WT_PATH' manually"
+      dpane=""
+      warn "could not open $label tab - run 'wt provision $WT_PATH' manually"
     fi
   fi
   msg "ready: $name"
+
+  # The facts a caller needs to take it from here: where the worktree is, which pane to
+  # start something in, and how to reach it. Built with jq so branch names and paths are
+  # escaped properly, and so an unallocated port/redis is a JSON null rather than "".
+  if [ "$as_json" = 1 ]; then
+    jq -n \
+      --arg branch "$name" --arg slug "${WT_SLUG:-}" --arg path "$WT_PATH" \
+      --arg repo "$WT_REPO" --arg repo_name "$WT_REPO_NAME" \
+      --arg ws "$ws" --arg root_pane "$root_pane" --arg dev_pane "${dpane:-}" \
+      --arg domain "${WT_DOMAIN:-}" --arg url "${WT_URL:-}" \
+      --arg port "${WT_PORT:-}" --arg redis "${WT_REDIS:-}" '
+      def num: if . == "" then null else tonumber end;
+      # herdr renders an absent field as the string "null" through `jq -r`; JSON null is
+      # what a caller can actually test for.
+      def str: if . == "" or . == "null" then null else . end;
+      { branch: $branch, slug: $slug, path: $path,
+        repo: $repo, repo_name: $repo_name,
+        workspace_id: ($ws | str), root_pane_id: $root_pane, dev_pane_id: ($dev_pane | str),
+        port: ($port | num), redis: ($redis | num),
+        domain: ($domain | str),
+        url: (if $url != "" then $url elif $domain != "" then "https://" + $domain else null end) }'
+  fi
 }
 
 cmd_dev() {
@@ -1007,5 +1111,5 @@ case "${1:-}" in
   rm|remove)  shift; cmd_rm "$@" ;;
   ls|list)    shift; cmd_ls "$@" ;;
   gc)         shift; cmd_gc "$@" ;;
-  *) die "usage: wt {new [name] | dev <path> | run [cmd...] | open [name] | provision <path> | rm [name] | ls | gc [--merged] [--sweep] [-y]}" ;;
+  *) die "usage: wt {new [--no-agent] [--no-dev] [--no-focus] [--json] [name] | dev <path> | run [cmd...] | open [name] | provision <path> | rm [name] | ls | gc [--merged] [--sweep] [-y]}" ;;
 esac
