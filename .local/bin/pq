@@ -110,6 +110,41 @@ st_set() {                              # task_dir key value
 }
 now() { date -u '+%Y-%m-%dT%H:%M:%SZ'; }
 
+# ── shielded children ───────────────────────────────────────────────────────
+# Run a command in a process group of its own, so a Ctrl-C aimed at pq does not
+# take it down as collateral.
+#
+# A terminal sends SIGINT to the entire FOREGROUND PROCESS GROUP, which by default
+# includes every child pq has spawned. So a `wt new` halfway through copying a
+# database would die alongside the tick, and a minute of provisioning gets thrown
+# away and done again. Job control (`set -m`) puts a background job in its own
+# process group, and the signal then reaches only pq: the trap sets the stop flag,
+# the work already in flight runs to completion, and the loop exits after it. That
+# is what makes "stop after this tick" a real promise rather than a hopeful one.
+#
+# Everything comes back through files. Command substitution would defeat the whole
+# point by putting the child back in our process group, and `wait`'s return value
+# cannot be told apart from "interrupted" once signals are in play - so stdout and
+# the true exit status are written where they can be read afterwards. stdin is
+# /dev/null because a background process group that reads the terminal is stopped
+# with SIGTTIN, which would hang the tick.
+SHIELDED_OUT=""; SHIELDED_PID=""
+shielded() {                            # cmd...
+  local outf="$PQ_HOME/.out.$$" rcf="$PQ_HOME/.rc.$$" code
+  rm -f "$outf" "$rcf"
+  set -m
+  ( "$@" > "$outf" < /dev/null; printf '%s' "$?" > "$rcf" ) &
+  SHIELDED_PID=$!
+  set +m
+  # The trap interrupts `wait`, not the child - so wait again until it has gone.
+  while kill -0 "$SHIELDED_PID" 2>/dev/null; do wait "$SHIELDED_PID" 2>/dev/null; done
+  SHIELDED_PID=""
+  SHIELDED_OUT=$(cat "$outf" 2>/dev/null)
+  code=$(cat "$rcf" 2>/dev/null)
+  rm -f "$outf" "$rcf"
+  return "${code:-1}"
+}
+
 # ── the cap ─────────────────────────────────────────────────────────────────
 # How many tasks may be running at once. It is STATE, not an argument: it lives in
 # a file and is re-read at the top of every tick, so `pq cap 1` in the morning and
@@ -663,6 +698,15 @@ Never wait for input - there is nobody watching."
 # re-runs provisioning, and supercast's provisioning DROPS AND RECREATES the
 # database. That is harmless before an agent has touched anything and destructive
 # afterwards, so the cheap path is also the safe one.
+# A shell function rather than an inline `cd ... && wt`, so `shielded` can run it as
+# a single command. Functions are visible in the subshell it backgrounds; a `cd`
+# baked into a command substitution would not be.
+wt_new_in() {                           # repo wt-args...
+  local repo=$1; shift
+  cd "$repo" || return 1
+  "$WT" new "$@"
+}
+
 dispatch_task() {                       # task_dir  -> 0 launched, 1 failed
   local d=$1 repo branch model effort dev pane wtjson cmdline prompt
   repo=$(hdr "$d/plan.md" repo);     branch=$(hdr "$d/plan.md" branch)
@@ -675,9 +719,13 @@ dispatch_task() {                       # task_dir  -> 0 launched, 1 failed
   if [ -z "$pane" ] || [ "$(pane_state "$pane")" = missing ]; then
     local devflag=--no-dev; [ "$dev" = true ] && devflag=""
     msg "$(slug_of "$d"): preparing worktree for $branch"
-    # stdout is the JSON; wt's own progress goes to stderr and straight to the user.
-    wtjson=$( cd "$repo" && "$WT" new --no-agent --no-focus $devflag --json "$branch" ) \
+    # Shielded: this is the slow one - a full database copy - and the one worth
+    # letting finish when you Ctrl-C. wt's own progress still goes to stderr and
+    # straight to the user; only its stdout (the JSON) is captured.
+    # shellcheck disable=SC2086
+    shielded wt_new_in "$repo" --no-agent --no-focus $devflag --json "$branch" \
       || { warn "$(slug_of "$d"): wt new failed"; return 1; }
+    wtjson=$SHIELDED_OUT
     pane=$(jq -r '.root_pane_id // empty' <<<"$wtjson" 2>/dev/null)
     [ -n "$pane" ] || { warn "$(slug_of "$d"): wt returned no pane"; return 1; }
     st_set "$d" PQ_WORKTREE "$(jq -r '.path // ""'         <<<"$wtjson")"
@@ -748,6 +796,11 @@ cmd_tick() {
   # deliberately does not write the file.
   [ -n "$cap" ] || cap=$(cap_get)
   [[ "$cap" =~ ^[0-9]+$ ]] || die "--cap must be a number, got '$cap'"
+
+  # A one-shot tick needs the handler too, not just the loop: dispatch shields its
+  # slow child from SIGINT, so without a trap here a Ctrl-C would kill pq and leave
+  # that `wt new` running orphaned, with nobody left to record what it produced.
+  [ "$PQ_RUN" = 1 ] || trap on_interrupt INT TERM
 
   if ! take_lock; then
     msg "another tick is running (pid $(cat "$PQ_HOME/.tick.lock/pid" 2>/dev/null)) - nothing to do"
@@ -864,11 +917,29 @@ tick_body() {                           # cap dry
 #
 # Two `pq run` loops would not overshoot the cap - the tick lock serialises them -
 # they would just tick twice as often. Harmless enough not to be worth a second lock.
+# First interrupt asks for a graceful stop: the work already in flight is shielded
+# from the signal (see `shielded`), so it genuinely runs to completion and the loop
+# exits after it. Second interrupt means you would rather not wait - and it kills
+# the shielded child too, because otherwise "force" would leave a `wt new` running
+# with nobody to record what it produced.
 PQ_STOP=0
 on_interrupt() {
-  if [ "$PQ_STOP" = 1 ]; then printf '\n'; msg "stopping now"; release_lock; exit 130; fi
+  printf '\n'
+  if [ "$PQ_STOP" = 1 ]; then
+    if [ -n "$SHIELDED_PID" ]; then
+      msg "stopping now - abandoning the work in flight; the next tick will retry it"
+      kill -TERM -"$SHIELDED_PID" 2>/dev/null || kill -TERM "$SHIELDED_PID" 2>/dev/null
+    else
+      msg "stopping now"
+    fi
+    release_lock; exit 130
+  fi
   PQ_STOP=1
-  printf '\n'; msg "stopping after this tick (Ctrl-C again to stop now)"
+  if [ -n "$SHIELDED_PID" ]; then
+    msg "finishing the work in flight, then stopping (Ctrl-C again to abandon it)"
+  else
+    msg "stopping after this tick (Ctrl-C again to stop now)"
+  fi
 }
 
 # sleep in the background and `wait` on it, so the trap runs the moment a signal

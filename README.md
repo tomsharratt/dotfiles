@@ -114,9 +114,12 @@ The cap is **state, not an argument**: it lives in a file that is re-read at the
 Caps are soft - lowering one never kills anything, it just starts nothing new until enough slots free up.
 The default is 1, deliberately: a fresh machine should not start dispatching several unattended agents because nobody had said otherwise yet.
 
-Ctrl-C during the sleep stops immediately.
-Ctrl-C *during* a tick cannot truly finish it - the terminal signals the whole process group, so a `wt new` running underneath dies too - but the parts that matter are guaranteed: the lock is released, and a task caught mid-dispatch keeps its claim without a launch record, which the next reconcile recognises and resumes.
-The worst a badly timed Ctrl-C costs is one repeated `wt new`.
+Ctrl-C is a graceful shutdown: during the sleep it stops immediately, and during a tick it lets the work in flight finish first.
+That needs a little care, because a terminal signals the whole foreground process group - so by default a `wt new` halfway through copying a database would die alongside the tick.
+`pq` gives that child a process group of its own, which leaves the signal going only where it should: provisioning completes, the dispatch finishes, and then the loop exits.
+
+A second Ctrl-C abandons the work in flight, killing that child too, so "force" does not leave a `wt new` running with nobody to record what it produced.
+Either way nothing is lost - a task caught mid-dispatch keeps its claim without a launch record, which the next reconcile recognises and resumes.
 
 ### Reclaiming resources
 

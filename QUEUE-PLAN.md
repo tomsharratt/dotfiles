@@ -244,7 +244,11 @@ This also means **pausing needs no separate concept** - `pq cap 0` is the pause,
 
 **Stopping and restarting is safe by construction**, via three things:
 
-1. **Ctrl-C stops cleanly, though not quite the way this originally claimed.** During the sleep - the overwhelmingly common case - it stops immediately. During a tick it cannot truly "finish the tick": the terminal sends SIGINT to the whole process group, so a `wt new` running underneath dies with it. What it does guarantee is the part that matters - the lock is released, and the task is left claimed but unlaunched, which is exactly the state reconcile resumes from. Verified by interrupting mid-`wt new` and restarting. The worst a badly timed Ctrl-C costs is one repeated `wt new`. A second Ctrl-C exits at once.
+1. **Ctrl-C finishes the work in flight, then stops.** The obstacle is that a terminal sends SIGINT to the whole foreground process group, so by default a `wt new` halfway through copying a database dies alongside the tick. The fix is to give that child a process group of its own - `set -m` does exactly this for a backgrounded job - after which the signal reaches only `pq`. The trap sets a stop flag, provisioning runs to completion, the dispatch finishes, and the loop exits. Verified by interrupting mid-provision: the child completed and the agent still started.
+
+   A second Ctrl-C abandons it deliberately, killing the shielded child too - otherwise "force" would leave a `wt new` running with nobody left to record what it produced. The task keeps its claim without a launch record, which is exactly what reconcile resumes from.
+
+   The same handler is installed for a one-shot `pq tick`, not just the loop: dispatch shields its child either way, so without it a Ctrl-C would kill `pq` and orphan the `wt new`.
 2. **Every dispatch step is recorded as it completes.** The dangerous window is the ~60 seconds `wt new` takes: killed in there, you would otherwise leave a task sitting in `running/` with no agent, holding a slot forever. Instead, reconcile treats `running/` with no `PQ_LAUNCHED` as an **incomplete dispatch** and re-runs the dispatch from the top.
 
    This is safe for one specific reason, and it is worth being precise about it: **it only ever fires before an agent has been launched**, so there is no work in that worktree to lose. It is *not* safe because `wt new` is idempotent - it isn't. `wt new` backgrounds `wt provision`, and supercast's `wt_provision` **drops and recreates the database** on every run.
