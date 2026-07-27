@@ -513,7 +513,9 @@ check_stall() {                         # task_dir
 
   if [ "$kind" != quota ]; then
     [ "$was" = quota ] && msg "$slug: moving again after the session limit"
-    clear_block "$d"
+    # Only when there is something to clear: this is the overwhelmingly common
+    # branch, and each clear is five rewrites of state.env for no change at all.
+    [ -n "$was" ] && clear_block "$d"
     # A permission prompt is recorded and deliberately never answered. That is the
     # trade for running everything in auto mode, and it is the distinction `pq ls`
     # draws in the morning between waiting on the clock and waiting on you.
@@ -618,20 +620,23 @@ agent_cell() {                          # task_dir state
   [ -n "$(st "$d" PQ_LAUNCHED)" ] || { printf 'starting'; return; }
   status=$(pane_state "$pane")
   case "$status" in
-    "")        printf '?';        return ;;   # herdr did not answer
-    missing)   printf 'gone';     return ;;   # workspace is gone
-    noagent)   printf 'exited';   return ;;   # a shell is sitting where Claude was
+    "")        printf '?';    return ;;       # herdr did not answer
+    missing)   printf 'gone'; return ;;       # workspace is gone, so nothing else applies
   esac
-  # What pq itself saw on the pane outranks what herdr makes of it - herdr can
-  # read a walled agent as `working` off the spinner still in its title, and the
-  # wall is the whole reason this column exists at 8am.
+  # What pq itself read off the pane outranks whatever herdr makes of it - herdr
+  # can call a walled agent `working` off the spinner still in its title, or
+  # `noagent` if the binding lapsed, and the wall is the whole reason this column
+  # exists at 8am. Same ordering as reconcile, for the same reason.
   blocked=$(st "$d" PQ_BLOCKED)
   case "$blocked" in
     quota)      [ "$(st "$d" PQ_GAVEUP)" = 1 ] && printf 'walled ' || printf 'quota '
                 printf '%s' "$(age_of "$(st "$d" PQ_QUOTA_SINCE)")"; return ;;
     permission) printf 'permission'; return ;;
   esac
-  [ "$status" = unknown ] && { printf 'unknown'; return; }
+  case "$status" in
+    noagent) printf 'exited';  return ;;      # a shell is sitting where Claude was
+    unknown) printf 'unknown'; return ;;
+  esac
   printf '%s' "$status"
 }
 
@@ -981,10 +986,17 @@ tick_body() {                           # cap dry
         else warn "$slug: dispatch was interrupted - resuming"; dispatch_task "$d" || true; fi
         continue
       fi
-      case "$(pane_state "$(st "$d" PQ_PANE)")" in
+      # The wall check runs for every state but `missing`, deliberately including
+      # `noagent`. Whether herdr currently has an agent bound to the pane is the
+      # same kind of dependency the detection itself avoids - a walled session that
+      # momentarily reads as `noagent` would otherwise be written off as exited and
+      # never knocked on.
+      local pstate; pstate=$(pane_state "$(st "$d" PQ_PANE)")
+      [ "$dry" = 1 ] || [ "$pstate" = missing ] || check_stall "$d"
+      case "$pstate" in
         missing) warn "$slug: its workspace is gone and no PR exists - look at it, then: pq rm $slug" ;;
-        noagent) warn "$slug: the agent exited without opening a PR - look at the pane, or: pq rm $slug" ;;
-        *)       [ "$dry" = 1 ] || check_stall "$d" ;;
+        noagent) [ "$(st "$d" PQ_BLOCKED)" = quota ] \
+                   || warn "$slug: the agent exited without opening a PR - look at the pane, or: pq rm $slug" ;;
       esac
     done
     rm -f "$allpr"
