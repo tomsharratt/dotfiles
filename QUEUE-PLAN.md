@@ -186,7 +186,7 @@ One idempotent pass.
 1. reconcile   for each running/ task, in order:
                  PR open?                    → mv to done/, slot freed
                  no PQ_LAUNCHED?             → incomplete dispatch, resume it (see below)
-                 PQ_LAUNCHED but pane gone?  → agent died, flag it
+                 PQ_LAUNCHED but agent gone? → flag it (see below)
 2. attend      for each running/ task whose agent is blocked → see quota handling
 3. gate        over the usage threshold? → stop here, nothing new starts
 4. fill        while active < cap: claim the lowest-numbered queue/ task
@@ -201,6 +201,7 @@ One idempotent pass.
 Three notes:
 
 - **`wt new` returning does not mean the worktree is ready.** Provisioning runs in a background tab, so `wt new --json` hands back a path and a port while the database copy is still 30-60 seconds from finishing. The agent is dispatched into a worktree that is still being built. For most plans that is fine - reading code and editing files needs nothing from the database - but a plan whose first act is `bin/rails test` can lose a race it will report as a broken checkout. Options when we get to phase 2: have the dispatch prompt tell the agent to expect it, or have `pq` wait for a readiness marker before sending the prompt. The existing failure signal is the herdr notification `wt` already raises.
+- **"Agent gone" is three different things, and reconcile has to tell them apart.** `herdr agent list` reports only panes it has detected an agent in, so a pane missing from it can mean the agent crashed, *or* that Claude exited cleanly and dropped the pane to a shell, *or* that the session is still starting and its `SessionStart` hook has not reported yet. Phase 1's `pq ls` collapses all three to `gone`, which is fine when nothing dispatches, but reconcile would be deciding "this task is dead" on it. The discriminator is `herdr api snapshot`, which lists **all** panes rather than only agent-bearing ones: pane absent = the workspace is gone; pane present with no agent = the agent exited; recently dispatched with no agent yet = still starting, give it a grace period.
 - **PR detection is `pq`'s own, not borrowed from `wt ls`.** It only ever asks about the handful of branches in `running/`, so it is one cheap `gh pr list --head <branch> --json state,number,isDraft --limit 1` each, run concurrently. It deliberately does not fetch `statusCheckRollup` - that is the field that makes `wt ls` slow, and a two-minute tick must not pay for it.
 - **The plan is passed by path, never pasted into the pane.** The dispatch prompt is short and fixed:
 

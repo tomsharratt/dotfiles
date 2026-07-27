@@ -174,6 +174,13 @@ name_plan() {                           # plan_file
 # two tasks sharing a name would quietly land in the same worktree and fight over
 # it. Live tasks and git both get a say; `done` deliberately does not, so a name
 # whose branch has since been reclaimed is free to be used again.
+#
+# Three checks, cheapest first. The last one goes to the network, which is worth a
+# round trip to catch a branch pushed from somewhere else - but it is bounded, so an
+# add made offline fails fast instead of sitting on a TCP timeout, and a network we
+# could not reach reports "not taken". That is the safe direction to be wrong in:
+# the worst case is `wt new` later adopting the existing remote branch, which is a
+# thing it already knows how to do.
 branch_taken() {                        # branch repo
   local branch=$1 repo=$2 d
   while IFS= read -r d; do
@@ -182,7 +189,10 @@ branch_taken() {                        # branch repo
     [ "$(hdr "$d/plan.md" branch)" = "$branch" ] && { printf 'queued as %s' "$(slug_of "$d")"; return 0; }
   done <<<"$(all_tasks)"
   git -C "$repo" show-ref --verify --quiet "refs/heads/$branch" && { printf 'a local git branch'; return 0; }
-  git -C "$repo" ls-remote --exit-code --heads origin "$branch" >/dev/null 2>&1 && { printf 'a remote branch'; return 0; }
+  git -C "$repo" show-ref --verify --quiet "refs/remotes/origin/$branch" && { printf 'a known remote branch'; return 0; }
+  GIT_SSH_COMMAND="${GIT_SSH_COMMAND:-ssh -o ConnectTimeout=5 -o BatchMode=yes}" \
+    git -C "$repo" ls-remote --exit-code --heads origin "$branch" >/dev/null 2>&1 \
+    && { printf 'a remote branch'; return 0; }
   return 1
 }
 
@@ -215,20 +225,23 @@ cmd_add() {
   [ -n "$repo" ] || die "not inside a git repo - run this from the project, or pass --repo"
 
   msg "plan:   $plan"
-  local intent=""
-  if [ -z "$branch" ]; then
-    local named; named=$(name_plan "$plan")
-    if [ -n "$named" ]; then
-      IFS=$'\t' read -r branch intent <<<"$named"
-    fi
-    [ -n "$branch" ] || die "could not derive a branch name from the plan - pass --branch"
-  else
-    local named; named=$(name_plan "$plan")
-    [ -n "$named" ] && intent=$(cut -f2 <<<"$named")
-  fi
 
-  git check-ref-format "refs/heads/$branch" || die "invalid branch name: '$branch'"
-  local why; why=$(branch_taken "$branch" "$repo") && die "branch '$branch' is already $why"
+  # Reject a name we cannot use BEFORE paying for the model call. When --branch was
+  # given we already know the name, so the cheap checks come first and a duplicate
+  # add fails in milliseconds instead of after a round trip to Haiku. Without it we
+  # have no choice: the name is what we are asking for.
+  local intent="" named why
+  if [ -n "$branch" ]; then
+    git check-ref-format "refs/heads/$branch" || die "invalid branch name: '$branch'"
+    why=$(branch_taken "$branch" "$repo") && die "branch '$branch' is already $why"
+    named=$(name_plan "$plan"); [ -n "$named" ] && intent=$(cut -f2 <<<"$named")
+  else
+    named=$(name_plan "$plan")
+    [ -n "$named" ] && IFS=$'\t' read -r branch intent <<<"$named"
+    [ -n "$branch" ] || die "could not derive a branch name from the plan - pass --branch"
+    git check-ref-format "refs/heads/$branch" || die "invalid branch name: '$branch'"
+    why=$(branch_taken "$branch" "$repo") && die "branch '$branch' is already $why"
+  fi
 
   local slug=${branch##*/}
   slug=$(tr '[:upper:]' '[:lower:]' <<<"$slug" | tr -c 'a-z0-9-' '-' | sed -E 's/-+/-/g; s/^-|-$//g')
@@ -254,7 +267,14 @@ cmd_add() {
     ls -d "$PQ_HOME/$d2"/*-"$slug" >/dev/null 2>&1 && die "a task named '$slug' already exists in $d2/"
   done
 
-  mkdir -p "$dir" || die "could not create $dir"
+  # Build the task somewhere the queue cannot see, then move it into place. A task
+  # directory with no plan.md would be listed by `pq ls` as a blank row, matched by
+  # `find_task`, and - once tick exists - iterated unattended with an empty `repo`,
+  # which is a `cd ""` into the wrong place. Assembling out of sight means a failed
+  # or interrupted add leaves nothing behind rather than something half-formed.
+  local staging="$PQ_HOME/.add.$$"
+  rm -rf "$staging"; mkdir -p "$staging" || die "could not create $staging"
+  trap 'rm -rf "$staging"' EXIT
   # COPY, never move: ~/.claude/plans is Claude Code's directory and it prunes it,
   # so the original is not ours to consume. `source` keeps the trail back.
   {
@@ -269,7 +289,10 @@ cmd_add() {
     printf 'added:    %s\n'   "$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
     printf -- '---\n\n'
     cat "$plan"
-  } > "$dir/plan.md" || die "could not write $dir/plan.md"
+  } > "$staging/plan.md" || die "could not write the task's plan.md"
+  [ -s "$staging/plan.md" ] || die "wrote an empty plan.md - refusing to queue it"
+  mv "$staging" "$dir" || die "could not move the new task into $state/"
+  trap - EXIT
 
   msg "branch: $branch"
   [ -n "$intent" ] && msg "intent: $intent"
