@@ -20,8 +20,10 @@
 #   pq hold <task>       park a task so nothing picks it up
 #   pq unhold <task>     put it back in the queue
 #   pq rm <task>         drop a task (never touches a worktree or a branch)
+#   pq tick              free finished slots, then fill them from the queue
 #
-# Dispatch (`pq tick` / `pq run`) is not built yet - see QUEUE-PLAN.md.
+# `pq tick` is one idempotent pass, safe to run by hand at any time. The loop that
+# calls it on an interval (`pq run`) is not built yet - see QUEUE-PLAN.md.
 #
 # LAYOUT ─────────────────────────────────────────────────────────────────────
 # A task is a DIRECTORY, and the directory it sits in is its state:
@@ -55,6 +57,11 @@ PQ_DEFAULT_MODEL="${PQ_DEFAULT_MODEL:-sonnet}"
 PQ_DEFAULT_EFFORT="${PQ_DEFAULT_EFFORT:-xhigh}"
 PQ_NAMER_MODEL="${PQ_NAMER_MODEL:-haiku}"
 
+# Paths that a trap has to clean up must be globals: an EXIT trap runs after the
+# function has returned, so a `local` it referenced is already out of scope - and
+# under `set -u` that turns the cleanup into an "unbound variable" error instead.
+PQ_STAGING=""; PQ_LOCK=""
+
 msg()  { printf 'pq: %s\n' "$*" >&2; }
 warn() { printf '\033[38;2;246;193;119mpq: %s\033[0m\n' "$*" >&2; }
 die()  { printf '\033[38;2;235;111;146mpq: %s\033[0m\n' "$*" >&2; exit 1; }
@@ -86,6 +93,14 @@ st() {                                  # task_dir key
   [ -f "$1/state.env" ] || return 0
   ( set -a; . "$1/state.env" 2>/dev/null; set +a; eval "printf '%s' \"\${$2:-}\"" ) 2>/dev/null
 }
+# Upsert KEY=VALUE, preserving the other keys. Each dispatch step records itself the
+# moment it succeeds, which is what lets reconcile tell a half-finished dispatch from
+# a finished one after an interrupted tick.
+st_set() {                              # task_dir key value
+  local f="$1/state.env"
+  { grep -v "^$2=" "$f" 2>/dev/null || true; printf '%s=%s\n' "$2" "$3"; } > "$f.tmp" && mv "$f.tmp" "$f"
+}
+now() { date -u '+%Y-%m-%dT%H:%M:%SZ'; }
 
 # ── task lookup ─────────────────────────────────────────────────────────────
 # "queue/020-live-chat-mentions" -> "live-chat-mentions"
@@ -272,9 +287,9 @@ cmd_add() {
   # `find_task`, and - once tick exists - iterated unattended with an empty `repo`,
   # which is a `cd ""` into the wrong place. Assembling out of sight means a failed
   # or interrupted add leaves nothing behind rather than something half-formed.
-  local staging="$PQ_HOME/.add.$$"
-  rm -rf "$staging"; mkdir -p "$staging" || die "could not create $staging"
-  trap 'rm -rf "$staging"' EXIT
+  PQ_STAGING="$PQ_HOME/.add.$$"
+  rm -rf "$PQ_STAGING"; mkdir -p "$PQ_STAGING" || die "could not create $PQ_STAGING"
+  trap 'rm -rf "$PQ_STAGING"' EXIT
   # COPY, never move: ~/.claude/plans is Claude Code's directory and it prunes it,
   # so the original is not ours to consume. `source` keeps the trail back.
   {
@@ -289,9 +304,9 @@ cmd_add() {
     printf 'added:    %s\n'   "$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
     printf -- '---\n\n'
     cat "$plan"
-  } > "$staging/plan.md" || die "could not write the task's plan.md"
-  [ -s "$staging/plan.md" ] || die "wrote an empty plan.md - refusing to queue it"
-  mv "$staging" "$dir" || die "could not move the new task into $state/"
+  } > "$PQ_STAGING/plan.md" || die "could not write the task's plan.md"
+  [ -s "$PQ_STAGING/plan.md" ] || die "wrote an empty plan.md - refusing to queue it"
+  mv "$PQ_STAGING" "$dir" || die "could not move the new task into $state/"
   trap - EXIT
 
   msg "branch: $branch"
@@ -299,21 +314,40 @@ cmd_add() {
   msg "added:  $state/$(basename "$dir")  ($model, effort $effort, dev $dev)"
 }
 
-# ── ls ──────────────────────────────────────────────────────────────────────
-# Herdr knows whether each dispatched agent is working, idle or waiting on a
-# human; pq knows which pane belongs to which task. Joined by pane id rather than
-# by path, because that is what pq recorded at dispatch.
-AIDX=""
-aidx_load() {
+# ── pane state ──────────────────────────────────────────────────────────────
+# "Is the agent still there" is three questions, not one, and answering it with
+# `herdr agent list` collapses them: that call reports only panes it FOUND an agent
+# in, so a missing pane could equally mean the workspace is gone, or that Claude
+# exited cleanly and left a shell behind, or that the session is seconds old and its
+# SessionStart hook has not reported yet. Deciding "this task is dead" on that is
+# how a live task gets written off.
+#
+# `herdr api snapshot` lists every pane, with `agent` null on the ones holding no
+# agent, so a single call separates all three:
+#
+#   pane absent from the snapshot   -> missing   the workspace itself is gone
+#   pane present, agent null        -> noagent   Claude exited; a shell is sitting there
+#   pane present, agent named       -> working | idle | blocked | unknown
+#
+PIDX=""; PIDX_OK=0
+pidx_load() {
   local raw
-  AIDX=""
+  PIDX=""; PIDX_OK=0
   command -v herdr >/dev/null 2>&1 || return 0
-  raw=$(herdr agent list 2>/dev/null) || return 0
-  AIDX=$(jq -r '.result.agents[]? | [.pane_id // "", .agent_status // ""] | @tsv' 2>/dev/null <<<"$raw")
+  raw=$(herdr api snapshot 2>/dev/null) || return 0
+  jq -e '.result.snapshot.panes' >/dev/null 2>&1 <<<"$raw" || return 0
+  PIDX=$(jq -r '.result.snapshot.panes[]? | [.pane_id // "", (.agent // ""), (.agent_status // "")] | @tsv' \
+    2>/dev/null <<<"$raw")
+  PIDX_OK=1
 }
-agent_for_pane() {                      # pane_id
-  [ -n "${1:-}" ] && [ -n "$AIDX" ] || return 0
-  awk -F'\t' -v p="$1" '$1 == p { print $2; exit }' <<<"$AIDX"
+# missing | noagent | working | idle | blocked | unknown. Empty when herdr never
+# answered at all, so a stopped server reads as "no idea" rather than "all dead".
+pane_state() {                          # pane_id
+  [ "${PIDX_OK:-0}" = 1 ] || return 0
+  [ -n "${1:-}" ] || { printf 'missing'; return; }
+  awk -F'\t' -v p="$1" '
+    $1 == p { print ($2 == "" ? "noagent" : ($3 == "" ? "unknown" : $3)); found = 1; exit }
+    END { if (!found) print "missing" }' <<<"$PIDX"
 }
 
 # One `gh` lookup per dispatched branch, concurrently. Only tasks that have been
@@ -379,9 +413,16 @@ agent_cell() {                          # task_dir state
   local d=$1 st=$2 pane status blocked until_
   [ "$st" = running ] || { printf -- '-'; return; }
   pane=$(st "$d" PQ_PANE)
-  [ -n "$pane" ] || { printf 'starting'; return; }
-  status=$(agent_for_pane "$pane")
-  [ -n "$status" ] || { printf 'gone'; return; }
+  # Claimed but not yet launched: either mid-dispatch right now, or an interrupted
+  # tick left it half-done and the next reconcile will finish it.
+  [ -n "$(st "$d" PQ_LAUNCHED)" ] || { printf 'starting'; return; }
+  status=$(pane_state "$pane")
+  case "$status" in
+    "")        printf '?';        return ;;   # herdr did not answer
+    missing)   printf 'gone';     return ;;   # workspace is gone
+    noagent)   printf 'exited';   return ;;   # a shell is sitting where Claude was
+    unknown)   printf 'unknown';  return ;;
+  esac
   if [ "$status" = blocked ]; then
     blocked=$(st "$d" PQ_BLOCKED); until_=$(st "$d" PQ_WAITING_UNTIL)
     case "$blocked" in
@@ -411,7 +452,7 @@ cmd_ls() {
     repos="$repos$(hdr "$d/plan.md" repo)"$'\n'
   done <<<"$tasks"
   repos=$(printf '%s' "$repos" | sed '/^$/d' | sort -u)
-  aidx_load
+  pidx_load
   local allpr="$PQ_HOME/.prall.$$"; : > "$allpr"
   while IFS= read -r r; do
     [ -n "$r" ] || continue
@@ -442,7 +483,7 @@ cmd_ls() {
     intent=$(hdr "$d/plan.md" intent);  added=$(hdr "$d/plan.md" added)
     repo=$(hdr "$d/plan.md" repo)
     agent=$(agent_cell "$d" "$st")
-    case "$agent" in permission|gone|blocked) needs=$((needs + 1)) ;; esac
+    case "$agent" in permission|gone|exited|blocked|unknown) needs=$((needs + 1)) ;; esac
     num=""; prstate=""; draft=""
     IFS=$'\t' read -r num prstate draft <<<"$(pr_get "$branch")"
     case "${prstate:-}" in
@@ -547,13 +588,205 @@ cmd_rm() {
   esac
 }
 
+# ── dispatch ────────────────────────────────────────────────────────────────
+# What every implementer is told. Short and fixed: the plan carries the work, this
+# carries only the contract - how to finish, and how to fail without stalling.
+#
+# The two exits matter more than anything else here. pq frees a slot when a pull
+# request exists, so an agent that finishes cleanly and simply stops has deadlocked
+# the queue: done, idle, and holding its slot until morning. Leaving that to each
+# plan to remember would mean one forgetful plan costs a whole night, so it lives
+# here where it cannot be forgotten.
+#
+# Deliberately free of single quotes - it is wrapped in them below so it survives
+# being re-parsed by the pane's shell, and dispatch_prompt_safe enforces that.
+dispatch_prompt() {                     # plan_path
+  printf '%s' "Read $1 and carry it out. \
+Before opening a pull request, run /code-review on your diff and act on what it finds. \
+Then commit, push, and open a pull request whose description opens with the intent line \
+from the plan header, followed by what you actually did. \
+If you get stuck, or the plan turns out not to fit, commit what you have, push, and open \
+a DRAFT pull request whose description explains what blocked you, then stop. \
+Never wait for input - there is nobody watching."
+}
+
+# Start the agent for a task, resuming from wherever a previous tick got to. Each
+# step records itself the instant it succeeds, so this is safe to re-enter: an
+# interrupted dispatch picks up rather than starting over.
+#
+# Re-entry deliberately does NOT re-run `wt new` when the pane is still there. It
+# would work - wt reopens an existing worktree rather than failing - but it also
+# re-runs provisioning, and supercast's provisioning DROPS AND RECREATES the
+# database. That is harmless before an agent has touched anything and destructive
+# afterwards, so the cheap path is also the safe one.
+dispatch_task() {                       # task_dir  -> 0 launched, 1 failed
+  local d=$1 repo branch model effort dev pane wtjson cmdline prompt
+  repo=$(hdr "$d/plan.md" repo);     branch=$(hdr "$d/plan.md" branch)
+  model=$(hdr "$d/plan.md" model);   effort=$(hdr "$d/plan.md" effort)
+  dev=$(hdr "$d/plan.md" dev)
+  [ -n "$repo" ] && [ -n "$branch" ] || { warn "$(slug_of "$d"): plan.md has no repo/branch"; return 1; }
+  [ -d "$repo" ] || { warn "$(slug_of "$d"): repo $repo is gone"; return 1; }
+
+  pane=$(st "$d" PQ_PANE)
+  if [ -z "$pane" ] || [ "$(pane_state "$pane")" = missing ]; then
+    local devflag=--no-dev; [ "$dev" = true ] && devflag=""
+    msg "$(slug_of "$d"): preparing worktree for $branch"
+    # stdout is the JSON; wt's own progress goes to stderr and straight to the user.
+    wtjson=$( cd "$repo" && "$WT" new --no-agent --no-focus $devflag --json "$branch" ) \
+      || { warn "$(slug_of "$d"): wt new failed"; return 1; }
+    pane=$(jq -r '.root_pane_id // empty' <<<"$wtjson" 2>/dev/null)
+    [ -n "$pane" ] || { warn "$(slug_of "$d"): wt returned no pane"; return 1; }
+    st_set "$d" PQ_WORKTREE "$(jq -r '.path // ""'         <<<"$wtjson")"
+    st_set "$d" PQ_WORKSPACE "$(jq -r '.workspace_id // ""' <<<"$wtjson")"
+    st_set "$d" PQ_PANE      "$pane"
+    st_set "$d" PQ_URL       "$(jq -r '.url // ""'          <<<"$wtjson")"
+    st_set "$d" PQ_PORT      "$(jq -r '.port // ""'         <<<"$wtjson")"
+  else
+    msg "$(slug_of "$d"): worktree already prepared, resuming at the agent"
+  fi
+
+  prompt=$(dispatch_prompt "$d/plan.md")
+  case "$prompt$d" in
+    *"'"*) warn "$(slug_of "$d"): prompt or path contains a quote - refusing to send"; return 1 ;;
+  esac
+  cmdline=$(printf "claude --model %s --effort %s '%s'" "${model:-$PQ_DEFAULT_MODEL}" "${effort:-$PQ_DEFAULT_EFFORT}" "$prompt")
+  herdr pane send-text "$pane" "$cmdline" >/dev/null 2>&1 \
+    && herdr pane send-keys "$pane" enter >/dev/null 2>&1 \
+    || { warn "$(slug_of "$d"): could not start the agent in $pane"; return 1; }
+  st_set "$d" PQ_LAUNCHED "$(now)"
+  msg "$(slug_of "$d"): running ${model:-$PQ_DEFAULT_MODEL}/${effort:-$PQ_DEFAULT_EFFORT} in $pane"
+  return 0
+}
+
+# ── tick ────────────────────────────────────────────────────────────────────
+# One idempotent pass: free what has finished, finish what was interrupted, then
+# fill whatever room that left. Reconcile runs BEFORE the cap is counted, so a task
+# that shipped during the last interval hands its slot straight to the next one.
+cmd_tick() {
+  local cap=1 dry=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --cap)     cap=${2:-}; shift 2 ;;
+      --dry-run) dry=1; shift ;;
+      -*)        die "unknown option '$1' (usage: pq tick [--cap N] [--dry-run])" ;;
+      *)         die "unexpected argument '$1'" ;;
+    esac
+  done
+  [[ "$cap" =~ ^[0-9]+$ ]] || die "--cap must be a number, got '$cap'"
+
+  # One tick at a time. The per-task `mv` already stops the same plan being claimed
+  # twice, but two ticks running concurrently would each see the same free slots and
+  # between them overshoot the cap. mkdir is the atomic primitive here; a lock whose
+  # owner is gone is stale and reclaimed.
+  local owner
+  PQ_LOCK="$PQ_HOME/.tick.lock"
+  if ! mkdir "$PQ_LOCK" 2>/dev/null; then
+    owner=$(cat "$PQ_LOCK/pid" 2>/dev/null)
+    if [ -n "$owner" ] && kill -0 "$owner" 2>/dev/null; then
+      msg "another tick is running (pid $owner) - nothing to do"; PQ_LOCK=""; return 0
+    fi
+    warn "clearing a stale tick lock"
+    rm -rf "$PQ_LOCK"; mkdir "$PQ_LOCK" 2>/dev/null || die "could not take the tick lock"
+  fi
+  printf '%s' "$$" > "$PQ_LOCK/pid"
+  trap 'rm -rf "$PQ_LOCK"' EXIT
+
+  pidx_load
+
+  # 1. Reconcile. A pull request - in any state - means the work left the queue, so
+  #    the slot is free whether it merged, is in review, or was opened as a draft
+  #    because the agent got stuck. Judging what to do about it is yours.
+  local d slug branch repo repos="" running=()
+  while IFS= read -r d; do
+    [ -n "$d" ] || continue
+    running+=("$d"); repos="$repos$(hdr "$d/plan.md" repo)"$'\n'
+  done <<<"$(for x in "$PQ_HOME/running"/*/; do [ -d "$x" ] && printf '%s\n' "${x%/}"; done)"
+
+  if [ "${#running[@]}" -gt 0 ]; then
+    local r allpr="$PQ_HOME/.tickpr.$$"; : > "$allpr"
+    while IFS= read -r r; do
+      [ -n "$r" ] || continue
+      local branches=""
+      for d in "${running[@]}"; do
+        [ "$(hdr "$d/plan.md" repo)" = "$r" ] && branches="$branches $(hdr "$d/plan.md" branch)"
+      done
+      # shellcheck disable=SC2086
+      pr_load "$r" $branches
+      cat "$PR_CACHE" >> "$allpr" 2>/dev/null; rm -f "$PR_CACHE"
+    done <<<"$(printf '%s' "$repos" | sed '/^$/d' | sort -u)"
+    PR_CACHE=$allpr
+
+    for d in "${running[@]}"; do
+      slug=$(slug_of "$d"); branch=$(hdr "$d/plan.md" branch)
+      local num prstate draft
+      IFS=$'\t' read -r num prstate draft <<<"$(pr_get "$branch")"
+      if [ -n "${num:-}" ]; then
+        local what="${draft:-$(tr '[:upper:]' '[:lower:]' <<<"${prstate:-}")}"
+        if [ "$dry" = 1 ]; then
+          msg "would finish $slug (#$num $what)"
+        else
+          st_set "$d" PQ_PR "$num"; st_set "$d" PQ_FINISHED "$(now)"
+          retitle "$d" done >/dev/null
+          msg "finished $slug - #$num $what"
+        fi
+        continue
+      fi
+      # Claimed but never launched: an interrupted tick. Pick it up where it stopped.
+      if [ -z "$(st "$d" PQ_LAUNCHED)" ]; then
+        if [ "$dry" = 1 ]; then msg "would resume the interrupted dispatch of $slug"
+        else warn "$slug: dispatch was interrupted - resuming"; dispatch_task "$d" || true; fi
+        continue
+      fi
+      case "$(pane_state "$(st "$d" PQ_PANE)")" in
+        missing) warn "$slug: its workspace is gone and no PR exists - look at it, then: pq rm $slug" ;;
+        noagent) warn "$slug: the agent exited without opening a PR - look at the pane, or: pq rm $slug" ;;
+      esac
+    done
+    rm -f "$allpr"
+  fi
+
+  # 2. Fill. `running` is the slot count: a task blocked on a permission prompt still
+  #    holds one, which is the deliberate trade for running everything in auto mode.
+  local active
+  active=$(ls -d "$PQ_HOME/running"/*/ 2>/dev/null | wc -l | tr -d ' ')
+  local free=$(( cap - active ))
+  if [ "$free" -le 0 ]; then
+    msg "$active running, cap $cap - nothing to start"
+    return 0
+  fi
+
+  local started=0 claimed
+  while [ "$free" -gt 0 ]; do
+    d=""
+    for x in "$PQ_HOME/queue"/*/; do [ -d "$x" ] && { d=${x%/}; break; }; done
+    [ -n "$d" ] || break
+    slug=$(slug_of "$d")
+    if [ "$dry" = 1 ]; then
+      msg "would dispatch $slug ($(hdr "$d/plan.md" branch))"
+      # Nothing moved, so stop rather than reporting the same task on every pass.
+      break
+    fi
+    # Claim FIRST. `wt new` takes the better part of a minute, and until the task has
+    # left queue/ a second tick would happily pick up the very same plan.
+    claimed=$(retitle "$d" running) || break
+    st_set "$claimed" PQ_CLAIMED "$(now)"
+    dispatch_task "$claimed" || warn "$slug: left in running/ half-dispatched - the next tick will retry it"
+    started=$((started + 1)); free=$((free - 1))
+  done
+
+  active=$(ls -d "$PQ_HOME/running"/*/ 2>/dev/null | wc -l | tr -d ' ')
+  local queued; queued=$(ls -d "$PQ_HOME/queue"/*/ 2>/dev/null | wc -l | tr -d ' ')
+  msg "$active running (cap $cap), $queued queued$([ "$started" -gt 0 ] && printf ', %s started' "$started")"
+}
+
 case "${1:-}" in
   add)        shift; cmd_add "$@" ;;
+  tick)       shift; cmd_tick "$@" ;;
   ls|list)    shift; cmd_ls "$@" ;;
   show)       shift; cmd_show "$@" ;;
   priority|pri) shift; cmd_priority "$@" ;;
   hold)       shift; cmd_hold "$@" ;;
   unhold)     shift; cmd_unhold "$@" ;;
   rm|remove)  shift; cmd_rm "$@" ;;
-  *) die "usage: pq {add [plan] | ls [--json] | show <task> | priority <task> N | hold <task> | unhold <task> | rm <task>}" ;;
+  *) die "usage: pq {add [plan] | ls [--json] | show <task> | tick [--cap N] [--dry-run] | priority <task> N | hold <task> | unhold <task> | rm <task>}" ;;
 esac

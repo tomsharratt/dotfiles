@@ -252,7 +252,7 @@ This also means **pausing needs no separate concept** - `pq cap 0` is the pause,
    Which gives a hard rule: **the post-launch failure case must never go back through `wt new`.** A `gone` task (agent died, work possibly on disk, no PR) is surfaced for you to look at, never silently re-dispatched - re-running provisioning under it would destroy the database its half-finished work depends on.
 
    Re-running `wt new` on a branch whose worktree already exists *is* now a supported route - it reopens rather than failing (phase 0 fixed this; it was broken). That is what makes incomplete-dispatch recovery work at all.
-3. **One tick at a time.** An atomic `mkdir` lock (with a PID file, stale if the process is gone) stops two `pq run` loops - or a hand-run `pq tick` racing the loop - from both filling to cap and overshooting. The per-task `mv` claim already prevents the same plan being dispatched twice; the lock prevents *different* plans overshooting the cap.
+3. **One tick at a time.** An atomic `mkdir` lock (with a PID file, stale if the process is gone) stops two `pq run` loops - or a hand-run `pq tick` racing the loop - from both filling to cap and overshooting. The per-task `mv` claim already prevents the same plan being dispatched twice; the lock prevents *different* plans overshooting the cap. *Built in phase 2 rather than here: a tick that spends a minute inside `wt new` is racy the moment it exists, and phase 2 is when you start running it by hand.*
 
 The net effect: stop it, start it, run a manual tick alongside it, kill the terminal - the queue converges on the next pass and no slot is ever silently lost.
 
@@ -370,8 +370,8 @@ Small, and all defensible on their own merits:
 |---|---|---|
 | 0 | ~~`wt` redis fix + `--no-agent/--no-focus/--no-dev/--json`~~ **done** | the seam, and a real bug |
 | 1 | ~~`pq add`, `pq ls`, directories~~ **done** | get plans into the queue by hand and look at them; no dispatch yet |
-| 2 | `pq tick` - claim, dispatch, reconcile - cap 1, run by hand | prove atomic claim and slot accounting while watching |
-| 3 | `pq run` loop + cap file + lock + SIGINT trap | the stop/start/restart safety you asked for |
+| 2 | ~~`pq tick` - claim, dispatch, reconcile - cap 1, run by hand~~ **done** (took the lock with it) | prove atomic claim and slot accounting while watching |
+| 3 | `pq run` loop + cap file + SIGINT trap | the stop/start/restart safety you asked for |
 | 4 | usage.json side-write + dispatch gate | needed before running it while you sleep |
 | 5 | quota prompt handling + re-prompt after reset | the last mile of unattended |
 | 6 | `after:` dependencies for epics | only when an epic actually needs it |

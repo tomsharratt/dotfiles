@@ -88,13 +88,22 @@ Each task holds an immutable `plan.md` (a settings header prepended to whatever 
 pq add [plan]         add a plan to the queue (default: the newest one Claude wrote)
 pq ls [--json]        every task, its state, and what it is waiting on
 pq show <task>        one task's header and plan
+pq tick [--cap N]     free finished slots, then fill them from the queue
 pq priority <task> N  re-order the queue
 pq hold / unhold      park a task, or put it back
 pq rm <task>          drop a task (never touches a worktree or a branch)
 ```
 
 The `NNN` prefix on a task directory is its priority and nothing else - promoting a task renames its directory, so commands take the task's slug, or any unique prefix of it.
-Dispatch (`pq tick` / `pq run`) is not built yet; see `QUEUE-PLAN.md` for the design.
+
+`pq tick` is one idempotent pass: reconcile, then fill.
+Reconcile runs first so a task that shipped hands its slot straight to the next one - any pull request, in any state, means the work has left the queue.
+Fill claims a task by moving it to `running/` *before* calling `wt new`, because that call takes the better part of a minute and an unclaimed task is one a second tick would happily pick up too.
+Each dispatch step records itself as it succeeds, so an interrupted tick is resumed rather than restarted - and resuming deliberately skips `wt new` when the pane is still there, since re-provisioning would drop the worktree's database.
+A `mkdir` lock keeps two ticks from both filling to cap.
+
+`pq tick --dry-run` shows what it would do and changes nothing.
+The loop that calls tick on an interval (`pq run`) is not built yet; see `QUEUE-PLAN.md`.
 
 ### Reclaiming resources
 
