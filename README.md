@@ -84,6 +84,11 @@ Each task holds an immutable `plan.md` (a settings header prepended to whatever 
 
 `pq add` copies the newest plan out of `~/.claude/plans`, asks Haiku for a branch name and a one-line statement of intent (Claude Code auto-names plan files, so the filename is never a usable branch), and refuses a branch that is already spoken for - `wt new` checks out an existing branch rather than failing, so two tasks sharing a name would quietly land in the same worktree.
 
+Each task records its own project, so one queue serves all of them.
+The project is wherever you were standing when you added the plan, resolved to the main checkout so adding from inside a worktree still queues against the repo the new worktree gets forked from; `--repo PATH` sets it explicitly.
+Dispatch runs `wt new` in that repo, which picks up its profile, and everything downstream is per-task from there - `pq ls` grows a `PROJECT` column as soon as the queue holds more than one.
+Branch names only have to be unique within their own project, so `tom/fix-timezone` can exist in two of them at once, and every branch lookup is keyed on the repo as well as the name.
+
 ```
 pq add [plan]         add a plan to the queue (default: the newest one Claude wrote)
 pq ls [--json]        every task, its state, and what it is waiting on

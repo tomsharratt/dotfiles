@@ -635,7 +635,8 @@ pr_load() {                             # repo branch...
     [ -n "$b" ] || continue
     ( cd "$repo" 2>/dev/null && gh pr list --head "$b" --state all --limit 1 \
         --json number,state,isDraft 2>/dev/null ) \
-      | jq -r --arg b "$b" '.[] | [$b, (.number|tostring), .state, (if .isDraft then "draft" else "" end)] | @tsv' \
+      | jq -r --arg b "$b" --arg r "$repo" \
+          '.[] | [$r, $b, (.number|tostring), .state, (if .isDraft then "draft" else "" end)] | @tsv' \
         2>/dev/null > "$PR_CACHE.$n" &
     pids[$n]=$!; n=$((n + 1))
   done
@@ -644,7 +645,15 @@ pr_load() {                             # repo branch...
   cat "$PR_CACHE".[0-9]* >> "$PR_CACHE" 2>/dev/null
   rm -f "$PR_CACHE".[0-9]*
 }
-pr_get() { awk -F'\t' -v b="$1" '$1 == b { print $2 "\t" $3 "\t" $4; exit }' "${PR_CACHE:-/dev/null}" 2>/dev/null; }
+# Keyed on repo AND branch. The cache is one file spanning every project in the
+# queue, and a branch name is only unique within its own repo - `tom/fix-timezone`
+# in supercast and in supercast-ios are different branches with the same name. On
+# the branch alone, one project's merged PR would retire the other project's task
+# and free a slot whose work never shipped.
+pr_get() {                              # repo branch
+  awk -F'\t' -v r="$1" -v b="$2" \
+    '$1 == r && $2 == b { print $3 "\t" $4 "\t" $5; exit }' "${PR_CACHE:-/dev/null}" 2>/dev/null
+}
 
 # Same table renderer as wt: every column but the last padded to its own widest
 # cell, so one long branch name does not force a fixed width on everything else.
@@ -745,10 +754,19 @@ cmd_ls() {
   done <<<"$repos"
   PR_CACHE=$allpr
 
+  # A PROJECT column, but only once the queue actually spans more than one. It is
+  # the first thing you need when it does, and a column of the same word when it
+  # doesn't. `repos` above covers only running and done tasks, so count separately.
+  local multi
+  multi=$(while IFS= read -r d; do [ -n "$d" ] && hdr "$d/plan.md" repo; done <<<"$tasks" \
+            | sed '/^$/d' | sort -u | awk 'END { print (NR > 1) }')
+
   local tbl="$PQ_HOME/.ls.$$.tsv"
   local slug branch model effort dev intent added pr num prstate draft agent needs=0
   if [ "$as_json" = 1 ]; then
     : > "$tbl"
+  elif [ "$multi" = 1 ]; then
+    printf 'TASK\tPROJECT\tSTATE\tBRANCH\tMODEL\tEFFORT\tAGENT\tPR\tAGE\n' > "$tbl"
   else
     printf 'TASK\tSTATE\tBRANCH\tMODEL\tEFFORT\tAGENT\tPR\tAGE\n' > "$tbl"
   fi
@@ -762,7 +780,7 @@ cmd_ls() {
     agent=$(agent_cell "$d" "$st")
     case "$agent" in permission|gone|exited|blocked|unknown) needs=$((needs + 1)) ;; esac
     num=""; prstate=""; draft=""
-    IFS=$'\t' read -r num prstate draft <<<"$(pr_get "$branch")"
+    IFS=$'\t' read -r num prstate draft <<<"$(pr_get "$repo" "$branch")"
     case "${prstate:-}" in
       MERGED) pr="#$num merged" ;;
       OPEN)   pr="#$num ${draft:-open}" ;;
@@ -783,8 +801,9 @@ cmd_ls() {
           pr: ($pr|str|if . then tonumber else null end),
           pr_state: ($prstate|str), pr_draft: ($draft == "draft") }' >> "$tbl"
     else
-      printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
-        "$slug" "$st" "${branch:--}" "${model:--}" "${effort:--}" \
+      printf '%s\t%s%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+        "$slug" "$([ "$multi" = 1 ] && printf '%s\t' "$(basename "${repo:--}")")" \
+        "$st" "${branch:--}" "${model:--}" "${effort:--}" \
         "$agent" "$pr" "$(age_of "$added")" >> "$tbl"
     fi
   done <<<"$tasks"
@@ -1040,7 +1059,7 @@ tick_body() {                           # cap dry
     for d in "${running[@]}"; do
       slug=$(slug_of "$d"); branch=$(hdr "$d/plan.md" branch)
       local num prstate draft
-      IFS=$'\t' read -r num prstate draft <<<"$(pr_get "$branch")"
+      IFS=$'\t' read -r num prstate draft <<<"$(pr_get "$(hdr "$d/plan.md" repo)" "$branch")"
       if [ -n "${num:-}" ]; then
         local what="${draft:-$(tr '[:upper:]' '[:lower:]' <<<"${prstate:-}")}"
         if [ "$dry" = 1 ]; then
