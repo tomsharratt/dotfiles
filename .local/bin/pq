@@ -907,21 +907,16 @@ tick_body() {                           # cap dry
 # and you can watch it. Safe to stop and start whenever: the queue's state lives
 # entirely in directories, so this process holds nothing that matters.
 #
-# Ctrl-C is honest about what it can promise. During the sleep - the overwhelmingly
-# common case - it stops immediately. During a tick it cannot truly "finish the
-# tick", because the terminal sends SIGINT to the whole process group and any `wt
-# new` running underneath dies with it. What it does instead is guarantee the parts
-# that matter: the lock is released, and a task caught mid-dispatch is left with no
-# PQ_LAUNCHED, which the next reconcile recognises and resumes. So the worst a badly
-# timed Ctrl-C costs is one repeated `wt new`.
+# Ctrl-C is a graceful stop. During the sleep - the overwhelmingly common case - it
+# returns immediately. During a tick the work in flight is shielded from the signal
+# (see `shielded`), so it genuinely runs to completion and the loop exits after it.
+# A second interrupt means you would rather not wait, and it kills the shielded child
+# too - otherwise "force" would leave a `wt new` running with nobody to record what
+# it produced. Either way nothing is lost: a task caught mid-dispatch is left with no
+# PQ_LAUNCHED, which the next reconcile recognises and resumes.
 #
 # Two `pq run` loops would not overshoot the cap - the tick lock serialises them -
 # they would just tick twice as often. Harmless enough not to be worth a second lock.
-# First interrupt asks for a graceful stop: the work already in flight is shielded
-# from the signal (see `shielded`), so it genuinely runs to completion and the loop
-# exits after it. Second interrupt means you would rather not wait - and it kills
-# the shielded child too, because otherwise "force" would leave a `wt new` running
-# with nobody to record what it produced.
 PQ_STOP=0
 on_interrupt() {
   printf '\n'
