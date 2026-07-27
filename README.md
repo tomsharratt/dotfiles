@@ -10,6 +10,7 @@ Personal dotfiles for macOS. Manages:
 - `~/.config/herdr` - Herdr config: the theme and the `prefix+t` worktree keybinding. Only `config.toml` is tracked; Herdr's sockets, logs, and session state are excluded from sync.
 - `~/.local/bin/wt` - worktree workflow backend: creates an isolated worktree (its own database, redis db, url and port) through Herdr, provisions it, and starts the dev server + Claude on it. Project-agnostic; the per-project steps live in profiles.
 - `~/.config/wt/profiles/<repo>.sh` - per-project provisioning + dev-server steps for `wt` (e.g. `supercast.sh`).
+- `~/.local/bin/pq` - plan queue: holds Claude Code plans and runs them as unattended implementer sessions, one worktree each, via `wt`.
 - `~/.claude/settings.json` - Claude Code settings. Agent status now comes from Herdr's built-in Claude integration (`herdr integration install claude`), which installs a `SessionStart` hook. Git-tracked for reference but applied manually - `install.sh` does not touch `~/.claude`.
 - `AGENTS.md` - global agent instructions, read by Claude Code via the `~/.claude/CLAUDE.md` symlink (mirrors `~/AGENTS.md`). Git-tracked for reference but applied manually - the sync scripts don't touch it.
 - Hack Nerd Font.
@@ -71,6 +72,31 @@ wt gc                reclaim resources from worktrees removed outside wt rm
 
 Human-facing output always goes to stderr, so `--json` leaves stdout clean for a caller to parse.
 `--no-dev` deliberately still provisions: the dev server is four long-running foreman processes, while provisioning is the one-off that creates the isolated database - skip that too and `wt run bin/rails test` inside the worktree fails confusingly.
+
+### Plan queue (`pq`)
+
+`pq` is a queue of Claude Code plans waiting to be run as implementer sessions, built on top of `wt` but separable from it.
+The split it exists to make: one long-lived session, in plan mode, does the thinking and produces a plan that has already answered every question; `pq` then runs those plans later, unattended, several at a time, as cheap implementer sessions that only have to execute.
+
+A task is a directory, and the directory it sits in is its state - `queue/`, `hold/`, `running/`, `done/` under `~/.local/state/pq`.
+Every transition is a `mv`, which is atomic within a filesystem, so two dispatchers cannot claim the same task.
+Each task holds an immutable `plan.md` (a settings header prepended to whatever Claude Code wrote) and a `state.env` of runtime facts, so an agent can re-read its plan at any point and never see it change underneath it.
+
+`pq add` copies the newest plan out of `~/.claude/plans`, asks Haiku for a branch name and a one-line statement of intent (Claude Code auto-names plan files, so the filename is never a usable branch), and refuses a branch that is already spoken for - `wt new` checks out an existing branch rather than failing, so two tasks sharing a name would quietly land in the same worktree.
+
+```
+pq add [plan]         add a plan to the queue (default: the newest one Claude wrote)
+pq ls [--json]        every task, its state, and what it is waiting on
+pq show <task>        one task's header and plan
+pq priority <task> N  re-order the queue
+pq hold / unhold      park a task, or put it back
+pq rm <task>          drop a task (never touches a worktree or a branch)
+```
+
+The `NNN` prefix on a task directory is its priority and nothing else - promoting a task renames its directory, so commands take the task's slug, or any unique prefix of it.
+Dispatch (`pq tick` / `pq run`) is not built yet; see `QUEUE-PLAN.md` for the design.
+
+### Reclaiming resources
 
 Herdr has no worktree-removal hook, so removing a worktree through Herdr's own UI (rather than `wt rm`) would otherwise leak its database, port, and redis db.
 `wt gc` reconciles this: it checks each recorded worktree and, for any whose directory no longer exists, runs the profile's teardown and frees the reservation.

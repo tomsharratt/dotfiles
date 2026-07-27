@@ -1,0 +1,536 @@
+#!/usr/bin/env bash
+# pq - a queue of Claude Code plans, waiting to be run as implementer sessions.
+#
+# The split this exists to make: one long-lived session, in plan mode, does the
+# thinking and produces a plan that has already answered every question. `pq` then
+# runs those plans - later, unattended, several at a time - as cheap implementer
+# sessions that only have to execute. An agent that cannot get stuck is an agent
+# that can work overnight.
+#
+# `pq` owns plans and scheduling. It does not own worktrees: it shells out to `wt`
+# for an isolated, provisioned worktree and starts its own agent in the pane that
+# comes back. The two tools are separable on purpose - `wt` is complete without
+# `pq`, and `pq` reaches it through one narrow seam (`wt new --no-agent --no-focus
+# --json`).
+#
+#   pq add [plan]        add a plan to the queue (default: the newest one Claude wrote)
+#   pq ls                every task, its state, and what it is waiting on
+#   pq show <task>       one task's header and plan
+#   pq priority <task> N re-order the queue
+#   pq hold <task>       park a task so nothing picks it up
+#   pq unhold <task>     put it back in the queue
+#   pq rm <task>         drop a task (never touches a worktree or a branch)
+#
+# Dispatch (`pq tick` / `pq run`) is not built yet - see QUEUE-PLAN.md.
+#
+# LAYOUT ─────────────────────────────────────────────────────────────────────
+# A task is a DIRECTORY, and the directory it sits in is its state:
+#
+#   $PQ_HOME/queue/020-live-chat-mentions/    waiting to be picked up
+#            hold/025-risky-refactor/         parked by you
+#            running/005-spotify-scope-fix/   dispatched
+#            done/001-live-chat-links/        a PR exists, slot freed
+#
+#   <task>/plan.md     the settings header + Claude's plan, immutable once added
+#          state.env   KEY=VALUE runtime facts, written as dispatch progresses
+#
+# Every transition is a `mv`, which is atomic within one filesystem - so two
+# dispatchers racing cannot both claim the same task, and a `mv` that fails means
+# somebody else got there first. Splitting the immutable plan from the mutable
+# state also means an agent can re-read its own plan at any point and never see it
+# change underneath it.
+#
+# The NNN prefix is the priority and nothing else. It is not an identity: promoting
+# a task renames its directory, so every command here takes the SLUG (or any unique
+# prefix of it) instead.
+
+set -uo pipefail
+
+PQ_HOME="${PQ_HOME:-${XDG_STATE_HOME:-$HOME/.local/state}/pq}"
+PLANS_DIR="${PQ_PLANS_DIR:-$HOME/.claude/plans}"
+WT="${PQ_WT:-$HOME/.local/bin/wt}"
+STATES="queue hold running done"
+
+PQ_DEFAULT_MODEL="${PQ_DEFAULT_MODEL:-sonnet}"
+PQ_DEFAULT_EFFORT="${PQ_DEFAULT_EFFORT:-xhigh}"
+PQ_NAMER_MODEL="${PQ_NAMER_MODEL:-haiku}"
+
+msg()  { printf 'pq: %s\n' "$*" >&2; }
+warn() { printf '\033[38;2;246;193;119mpq: %s\033[0m\n' "$*" >&2; }
+die()  { printf '\033[38;2;235;111;146mpq: %s\033[0m\n' "$*" >&2; exit 1; }
+
+for d in $STATES; do mkdir -p "$PQ_HOME/$d"; done
+
+# ── plan header ─────────────────────────────────────────────────────────────
+# The header is deliberately flat `key: value`, one per line, no nesting and no
+# folded blocks. It is written by this script and read by this script (in bash,
+# in a loop, on every tick), so being trivially parseable beats being expressive
+# YAML. `intent` is therefore one long line - it is read by `pq show` and pasted
+# into a PR body, never wrapped by hand.
+hdr() {                                 # plan.md key
+  [ -f "$1" ] || return 0
+  awk -v k="$2" '
+    NR == 1 && $0 == "---" { inh = 1; next }
+    inh && $0 == "---"     { exit }
+    inh {
+      i = index($0, ":")
+      if (i && substr($0, 1, i - 1) == k) {
+        v = substr($0, i + 1); sub(/^[ \t]+/, "", v); print v; exit
+      }
+    }' "$1"
+}
+
+# Read one key out of a task's runtime state without disturbing our own variables.
+# Same shape as wt's state files, so the two tools' state reads the same way.
+st() {                                  # task_dir key
+  [ -f "$1/state.env" ] || return 0
+  ( set -a; . "$1/state.env" 2>/dev/null; set +a; eval "printf '%s' \"\${$2:-}\"" ) 2>/dev/null
+}
+
+# ── task lookup ─────────────────────────────────────────────────────────────
+# "queue/020-live-chat-mentions" -> "live-chat-mentions"
+slug_of() { local b; b=$(basename "$1"); printf '%s' "${b#*-}"; }
+prio_of() { local b; b=$(basename "$1"); b=${b%%-*}; printf '%s' "$((10#$b))"; }
+
+# Every task directory, ordered by state then priority. `done` last: it is history,
+# and the top of the list should be what is live. No sort needed - the priority is a
+# zero-padded prefix, so bash's own glob ordering is already priority order.
+all_tasks() {
+  local s d
+  for s in running queue hold done; do
+    for d in "$PQ_HOME/$s"/*/; do
+      [ -d "$d" ] || continue
+      printf '%s\n' "${d%/}"
+    done
+  done
+}
+
+# Resolve what the user typed to exactly one task directory. Exact slug match wins
+# outright, so a slug that happens to prefix a longer one is still reachable;
+# otherwise a unique prefix is enough, and an ambiguous one is an error rather than
+# a guess - picking the wrong task here would queue or delete the wrong work.
+find_task() {                           # needle
+  local needle=${1:-} d s exact="" hits=()
+  [ -n "$needle" ] || die "which task? (pq ls)"
+  while IFS= read -r d; do
+    [ -n "$d" ] || continue
+    s=$(slug_of "$d")
+    [ "$s" = "$needle" ] && { exact=$d; break; }
+    case "$s" in "$needle"*) hits+=("$d") ;; esac
+  done <<<"$(all_tasks)"
+  [ -n "$exact" ] && { printf '%s' "$exact"; return 0; }
+  case "${#hits[@]}" in
+    0) die "no task matching '$needle' (pq ls)" ;;
+    1) printf '%s' "${hits[0]}" ;;
+    *) die "'$needle' matches ${#hits[@]} tasks: $(for d in "${hits[@]}"; do printf '%s ' "$(slug_of "$d")"; done)" ;;
+  esac
+}
+
+state_of() {                            # task_dir  -> queue|hold|running|done
+  local p=${1%/*}; basename "$p"
+}
+
+# Move a task between states, keeping its priority prefix. The `mv` is the state
+# transition; nothing else records it.
+retitle() {                             # task_dir new_state [new_priority]
+  local src=$1 to=$2 prio=${3:-} name
+  name=$(basename "$src")
+  [ -n "$prio" ] && name="$(printf '%03d' "$prio")-$(slug_of "$src")"
+  local dst="$PQ_HOME/$to/$name"
+  [ "$src" = "$dst" ] && { printf '%s' "$dst"; return 0; }
+  [ -e "$dst" ] && die "a task already exists at $to/$name"
+  mv "$src" "$dst" || die "could not move $src -> $dst"
+  printf '%s' "$dst"
+}
+
+# ── add ─────────────────────────────────────────────────────────────────────
+# The newest plan Claude wrote. Claude Code names these itself, from the prompt
+# that started the session, so the filename is never a task name - see name_plan.
+latest_plan() {
+  ls -t "$PLANS_DIR"/*.md 2>/dev/null | head -1
+}
+
+# Ask a small model for a branch name and a one-line statement of intent, from the
+# plan itself. Both are things a human reads later - the branch on a pull request,
+# the intent at the top of its description - and neither can be derived from the
+# filename, which is auto-generated ("floofy-hugging-dragonfly.md").
+#
+# Prints "branch<TAB>intent", or nothing if the model could not be reached or gave
+# something unusable; the caller then insists on --branch rather than inventing one.
+name_plan() {                           # plan_file
+  local raw json
+  raw=$(claude -p --model "$PQ_NAMER_MODEL" \
+    'Read this plan and reply with ONLY a JSON object, no code fence, no commentary:
+{"branch":"tom/<3-5 dash-separated lowercase words naming the task>","intent":"<2-3 sentences, one line, saying what this sets out to achieve in the author'"'"'s terms - not a description of the diff>"}' \
+    < "$1" 2>/dev/null) || return 0
+  # Be forgiving about a fenced or chatty reply: take the first {...} span.
+  json=$(sed -n 's/.*\({.*}\).*/\1/p' <<<"$(tr '\n' ' ' <<<"$raw")" | head -1)
+  [ -n "$json" ] || return 0
+  jq -er '[.branch, .intent] | @tsv' 2>/dev/null <<<"$json"
+}
+
+# A branch already spoken for is the one failure that must be caught at add time.
+# `wt new` on an existing branch deliberately CHECKS IT OUT rather than failing, so
+# two tasks sharing a name would quietly land in the same worktree and fight over
+# it. Live tasks and git both get a say; `done` deliberately does not, so a name
+# whose branch has since been reclaimed is free to be used again.
+branch_taken() {                        # branch repo
+  local branch=$1 repo=$2 d
+  while IFS= read -r d; do
+    [ -n "$d" ] || continue
+    case "$(state_of "$d")" in done) continue ;; esac
+    [ "$(hdr "$d/plan.md" branch)" = "$branch" ] && { printf 'queued as %s' "$(slug_of "$d")"; return 0; }
+  done <<<"$(all_tasks)"
+  git -C "$repo" show-ref --verify --quiet "refs/heads/$branch" && { printf 'a local git branch'; return 0; }
+  git -C "$repo" ls-remote --exit-code --heads origin "$branch" >/dev/null 2>&1 && { printf 'a remote branch'; return 0; }
+  return 1
+}
+
+cmd_add() {
+  local plan="" branch="" model=$PQ_DEFAULT_MODEL effort=$PQ_DEFAULT_EFFORT
+  local prio="" dev=false hold=0 repo=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --branch)   branch=${2:-}; shift 2 ;;
+      --model)    model=${2:-}; shift 2 ;;
+      --effort)   effort=${2:-}; shift 2 ;;
+      --priority) prio=${2:-}; shift 2 ;;
+      --repo)     repo=${2:-}; shift 2 ;;
+      --dev)      dev=true; shift ;;
+      --hold)     hold=1; shift ;;
+      -h|--help)  die "usage: pq add [plan.md] [--branch B] [--model M] [--effort E] [--priority N] [--repo PATH] [--dev] [--hold]" ;;
+      -*)         die "unknown option '$1'" ;;
+      *)          plan=$1; shift ;;
+    esac
+  done
+
+  [ -n "$plan" ] || plan=$(latest_plan)
+  [ -n "$plan" ] || die "no plan given and none found in $PLANS_DIR"
+  [ -f "$plan" ] || die "no such plan: $plan"
+
+  # The repo is wherever you are standing when you add the plan - you planned the
+  # work in it. Resolve to the MAIN checkout, so adding from inside a worktree
+  # still queues against the repo the new worktree will be forked from.
+  [ -n "$repo" ] || repo=$(git -C "$PWD" worktree list --porcelain 2>/dev/null | awk '/^worktree /{print substr($0,10); exit}')
+  [ -n "$repo" ] || die "not inside a git repo - run this from the project, or pass --repo"
+
+  msg "plan:   $plan"
+  local intent=""
+  if [ -z "$branch" ]; then
+    local named; named=$(name_plan "$plan")
+    if [ -n "$named" ]; then
+      IFS=$'\t' read -r branch intent <<<"$named"
+    fi
+    [ -n "$branch" ] || die "could not derive a branch name from the plan - pass --branch"
+  else
+    local named; named=$(name_plan "$plan")
+    [ -n "$named" ] && intent=$(cut -f2 <<<"$named")
+  fi
+
+  git check-ref-format "refs/heads/$branch" || die "invalid branch name: '$branch'"
+  local why; why=$(branch_taken "$branch" "$repo") && die "branch '$branch' is already $why"
+
+  local slug=${branch##*/}
+  slug=$(tr '[:upper:]' '[:lower:]' <<<"$slug" | tr -c 'a-z0-9-' '-' | sed -E 's/-+/-/g; s/^-|-$//g')
+  [ -n "$slug" ] || die "branch '$branch' does not reduce to a usable name"
+
+  # Default priority: the next clean step past everything already queued, so hand
+  # editing stays easy - there is always room to slot something in between.
+  if [ -z "$prio" ]; then
+    local max=0 d p
+    while IFS= read -r d; do
+      [ -n "$d" ] || continue
+      p=$(prio_of "$d"); [ "$p" -gt "$max" ] 2>/dev/null && max=$p
+    done <<<"$(all_tasks)"
+    prio=$(( (max / 10 + 1) * 10 ))
+  fi
+  [[ "$prio" =~ ^[0-9]+$ ]] || die "priority must be a number, got '$prio'"
+
+  local state=queue; [ "$hold" = 1 ] && state=hold
+  local dir="$PQ_HOME/$state/$(printf '%03d' "$prio")-$slug"
+  [ -e "$dir" ] && die "a task already exists at $state/$(basename "$dir")"
+  local d2
+  for d2 in $STATES; do
+    ls -d "$PQ_HOME/$d2"/*-"$slug" >/dev/null 2>&1 && die "a task named '$slug' already exists in $d2/"
+  done
+
+  mkdir -p "$dir" || die "could not create $dir"
+  # COPY, never move: ~/.claude/plans is Claude Code's directory and it prunes it,
+  # so the original is not ours to consume. `source` keeps the trail back.
+  {
+    printf -- '---\n'
+    printf 'repo:     %s\n'   "$repo"
+    printf 'branch:   %s\n'   "$branch"
+    printf 'model:    %s\n'   "$model"
+    printf 'effort:   %s\n'   "$effort"
+    printf 'dev:      %s\n'   "$dev"
+    printf 'intent:   %s\n'   "${intent:-}"
+    printf 'source:   %s\n'   "$plan"
+    printf 'added:    %s\n'   "$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+    printf -- '---\n\n'
+    cat "$plan"
+  } > "$dir/plan.md" || die "could not write $dir/plan.md"
+
+  msg "branch: $branch"
+  [ -n "$intent" ] && msg "intent: $intent"
+  msg "added:  $state/$(basename "$dir")  ($model, effort $effort, dev $dev)"
+}
+
+# ── ls ──────────────────────────────────────────────────────────────────────
+# Herdr knows whether each dispatched agent is working, idle or waiting on a
+# human; pq knows which pane belongs to which task. Joined by pane id rather than
+# by path, because that is what pq recorded at dispatch.
+AIDX=""
+aidx_load() {
+  local raw
+  AIDX=""
+  command -v herdr >/dev/null 2>&1 || return 0
+  raw=$(herdr agent list 2>/dev/null) || return 0
+  AIDX=$(jq -r '.result.agents[]? | [.pane_id // "", .agent_status // ""] | @tsv' 2>/dev/null <<<"$raw")
+}
+agent_for_pane() {                      # pane_id
+  [ -n "${1:-}" ] && [ -n "$AIDX" ] || return 0
+  awk -F'\t' -v p="$1" '$1 == p { print $2; exit }' <<<"$AIDX"
+}
+
+# One `gh` lookup per dispatched branch, concurrently. Only tasks that have been
+# dispatched can have a PR, so this costs nothing while the queue is just a queue.
+# statusCheckRollup is deliberately not requested: it is what makes `wt ls` slow,
+# and "is there a PR" does not need it.
+PR_CACHE=""
+pr_load() {                             # repo branch...
+  local repo=$1 b n=0; shift
+  local pids=()
+  PR_CACHE="$PQ_HOME/.pr.$$"; : > "$PR_CACHE"
+  command -v gh >/dev/null 2>&1 || return 0
+  for b in "$@"; do
+    [ -n "$b" ] || continue
+    ( cd "$repo" 2>/dev/null && gh pr list --head "$b" --state all --limit 1 \
+        --json number,state,isDraft 2>/dev/null ) \
+      | jq -r --arg b "$b" '.[] | [$b, (.number|tostring), .state, (if .isDraft then "draft" else "" end)] | @tsv' \
+        2>/dev/null > "$PR_CACHE.$n" &
+    pids[$n]=$!; n=$((n + 1))
+  done
+  [ "$n" -gt 0 ] || return 0
+  wait "${pids[@]}" 2>/dev/null
+  cat "$PR_CACHE".[0-9]* >> "$PR_CACHE" 2>/dev/null
+  rm -f "$PR_CACHE".[0-9]*
+}
+pr_get() { awk -F'\t' -v b="$1" '$1 == b { print $2 "\t" $3 "\t" $4; exit }' "${PR_CACHE:-/dev/null}" 2>/dev/null; }
+
+# Same table renderer as wt: every column but the last padded to its own widest
+# cell, so one long branch name does not force a fixed width on everything else.
+#
+# Cells must be ASCII. macOS awk's length() counts BYTES, not characters, and no
+# locale changes that (verified on awk 20200816) - so a single multi-byte character
+# anywhere in a cell silently over-pads that column by the number of extra bytes and
+# skews the whole table. Cheap to avoid, fiddly to detect, so: plain ASCII in tables.
+render_table() {                        # tsv_file
+  awk -F'\t' '
+    { rows = NR; if (NF > n) n = NF
+      for (i = 1; i <= NF; i++) { cell[NR, i] = $i; if (length($i) > w[i]) w[i] = length($i) } }
+    END {
+      for (r = 1; r <= rows; r++) {
+        line = ""
+        for (i = 1; i <= n; i++) line = line (i == n ? cell[r, i] : sprintf("%-*s  ", w[i], cell[r, i]))
+        sub(/[ \t]+$/, "", line); print line
+      }
+    }
+  ' "$1"
+}
+
+age_of() {                              # iso8601
+  local then now d
+  [ -n "${1:-}" ] || { printf -- '-'; return; }
+  then=$(date -j -u -f '%Y-%m-%dT%H:%M:%SZ' "$1" '+%s' 2>/dev/null) || { printf -- '-'; return; }
+  now=$(date -u '+%s'); d=$(( now - then ))
+  if   [ "$d" -lt 3600 ]  ; then printf '%dm' $(( d / 60 ))
+  elif [ "$d" -lt 86400 ] ; then printf '%dh' $(( d / 3600 ))
+  else                           printf '%dd' $(( d / 86400 )); fi
+}
+
+# What an agent is waiting on, in the words that decide what you do about it.
+# `pq` records why it classified a blocked agent the way it did, so the morning
+# read separates "waiting on the clock" from "waiting on you".
+agent_cell() {                          # task_dir state
+  local d=$1 st=$2 pane status blocked until_
+  [ "$st" = running ] || { printf -- '-'; return; }
+  pane=$(st "$d" PQ_PANE)
+  [ -n "$pane" ] || { printf 'starting'; return; }
+  status=$(agent_for_pane "$pane")
+  [ -n "$status" ] || { printf 'gone'; return; }
+  if [ "$status" = blocked ]; then
+    blocked=$(st "$d" PQ_BLOCKED); until_=$(st "$d" PQ_WAITING_UNTIL)
+    case "$blocked" in
+      quota) printf 'quota%s' "${until_:+ $until_}" ;;
+      "")    printf 'blocked' ;;
+      *)     printf '%s' "$blocked" ;;
+    esac
+    return
+  fi
+  printf '%s' "$status"
+}
+
+cmd_ls() {
+  local as_json=0
+  [ "${1:-}" = "--json" ] && as_json=1
+
+  local tasks; tasks=$(all_tasks)
+  [ -n "$tasks" ] || { [ "$as_json" = 1 ] && echo '[]'; msg "queue is empty - add one with: pq add"; return 0; }
+
+  # PR state only for tasks that have been dispatched, grouped per repo so each
+  # repo's lookups share a working directory.
+  local d st repo branches repos="" r
+  while IFS= read -r d; do
+    [ -n "$d" ] || continue
+    st=$(state_of "$d")
+    case "$st" in running|done) ;; *) continue ;; esac
+    repos="$repos$(hdr "$d/plan.md" repo)"$'\n'
+  done <<<"$tasks"
+  repos=$(printf '%s' "$repos" | sed '/^$/d' | sort -u)
+  aidx_load
+  local allpr="$PQ_HOME/.prall.$$"; : > "$allpr"
+  while IFS= read -r r; do
+    [ -n "$r" ] || continue
+    branches=""
+    while IFS= read -r d; do
+      [ -n "$d" ] || continue
+      st=$(state_of "$d"); case "$st" in running|done) ;; *) continue ;; esac
+      [ "$(hdr "$d/plan.md" repo)" = "$r" ] && branches="$branches $(hdr "$d/plan.md" branch)"
+    done <<<"$tasks"
+    # shellcheck disable=SC2086
+    pr_load "$r" $branches
+    cat "$PR_CACHE" >> "$allpr" 2>/dev/null; rm -f "$PR_CACHE"
+  done <<<"$repos"
+  PR_CACHE=$allpr
+
+  local tbl="$PQ_HOME/.ls.$$.tsv"
+  local slug branch model effort dev intent added pr num prstate draft agent needs=0
+  if [ "$as_json" = 1 ]; then
+    : > "$tbl"
+  else
+    printf 'TASK\tSTATE\tBRANCH\tMODEL\tEFFORT\tAGENT\tPR\tAGE\n' > "$tbl"
+  fi
+  while IFS= read -r d; do
+    [ -n "$d" ] || continue
+    st=$(state_of "$d"); slug=$(slug_of "$d")
+    branch=$(hdr "$d/plan.md" branch); model=$(hdr "$d/plan.md" model)
+    effort=$(hdr "$d/plan.md" effort); dev=$(hdr "$d/plan.md" dev)
+    intent=$(hdr "$d/plan.md" intent);  added=$(hdr "$d/plan.md" added)
+    repo=$(hdr "$d/plan.md" repo)
+    agent=$(agent_cell "$d" "$st")
+    case "$agent" in permission|gone|blocked) needs=$((needs + 1)) ;; esac
+    num=""; prstate=""; draft=""
+    IFS=$'\t' read -r num prstate draft <<<"$(pr_get "$branch")"
+    case "${prstate:-}" in
+      MERGED) pr="#$num merged" ;;
+      OPEN)   pr="#$num ${draft:-open}" ;;
+      CLOSED) pr="#$num closed" ;;
+      *)      pr="-" ;;
+    esac
+    if [ "$as_json" = 1 ]; then
+      jq -nc --arg task "$slug" --arg state "$st" --arg branch "$branch" \
+        --arg repo "$repo" --arg model "$model" --arg effort "$effort" --arg dev "$dev" \
+        --arg intent "$intent" --arg added "$added" --arg dir "$d" \
+        --arg agent "$agent" --arg pr "${num:-}" --arg prstate "${prstate:-}" \
+        --arg draft "$draft" --arg prio "$(prio_of "$d")" '
+        def str: if . == "" then null else . end;
+        { task: $task, priority: ($prio|tonumber), state: $state, dir: $dir,
+          repo: $repo, branch: $branch, model: $model, effort: $effort,
+          dev: ($dev == "true"), intent: ($intent|str), added: ($added|str),
+          agent: ($agent | if . == "-" then null else . end),
+          pr: ($pr|str|if . then tonumber else null end),
+          pr_state: ($prstate|str), pr_draft: ($draft == "draft") }' >> "$tbl"
+    else
+      printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+        "$slug" "$st" "${branch:--}" "${model:--}" "${effort:--}" \
+        "$agent" "$pr" "$(age_of "$added")" >> "$tbl"
+    fi
+  done <<<"$tasks"
+
+  if [ "$as_json" = 1 ]; then
+    jq -s '.' "$tbl"
+  else
+    render_table "$tbl"
+    local nq nr
+    nq=$(ls -d "$PQ_HOME/queue"/*/ 2>/dev/null | wc -l | tr -d ' ')
+    nr=$(ls -d "$PQ_HOME/running"/*/ 2>/dev/null | wc -l | tr -d ' ')
+    printf '\n' >&2
+    msg "$nr running, $nq queued$([ "$needs" -gt 0 ] && printf ' (%s needs you)' "$needs")"
+  fi
+  rm -f "$tbl" "$allpr"
+}
+
+# ── the small movers ────────────────────────────────────────────────────────
+cmd_show() {
+  local d; d=$(find_task "${1:-}") || exit 1
+  printf '%s  [%s]\n\n' "$(slug_of "$d")" "$(state_of "$d")"
+  local k
+  for k in repo branch model effort dev intent source added; do
+    printf '  %-8s %s\n' "$k" "$(hdr "$d/plan.md" "$k")"
+  done
+  if [ -f "$d/state.env" ]; then
+    printf '\n  runtime\n'
+    sed 's/^/    /' "$d/state.env"
+  fi
+  printf '\n%s\n\n' "$(printf '─%.0s' $(seq 1 60))"
+  # The plan itself, with our header stripped back off. Leading blank lines go too -
+  # the header is followed by one, and it would otherwise stack with the gap above.
+  # A file with no header at all just prints whole, which is the right fallback.
+  awk 'NR == 1 && $0 == "---" { inh = 1; next }
+       inh && $0 == "---" { inh = 0; next }
+       inh { next }
+       !started && $0 ~ /^[[:space:]]*$/ { next }
+       { started = 1; print }' "$d/plan.md"
+}
+
+cmd_priority() {
+  local d n; d=$(find_task "${1:-}") || exit 1; n=${2:-}
+  [[ "$n" =~ ^[0-9]+$ ]] || die "usage: pq priority <task> <number>"
+  case "$(state_of "$d")" in
+    queue|hold) ;;
+    *) die "$(slug_of "$d") is $(state_of "$d") - priority only orders what has not started" ;;
+  esac
+  local new; new=$(retitle "$d" "$(state_of "$d")" "$n")
+  msg "$(slug_of "$d") -> priority $n"
+}
+
+cmd_hold() {
+  local d; d=$(find_task "${1:-}") || exit 1
+  [ "$(state_of "$d")" = queue ] || die "$(slug_of "$d") is $(state_of "$d"), not queued"
+  retitle "$d" hold >/dev/null; msg "held $(slug_of "$d") - nothing will pick it up"
+}
+
+cmd_unhold() {
+  local d; d=$(find_task "${1:-}") || exit 1
+  [ "$(state_of "$d")" = hold ] || die "$(slug_of "$d") is $(state_of "$d"), not held"
+  retitle "$d" queue >/dev/null; msg "queued $(slug_of "$d")"
+}
+
+# Drops pq's record and nothing else. A dispatched task has a worktree, a branch
+# and possibly a database behind it, and those belong to `wt` - reclaiming them
+# here would make `pq rm` far more destructive than its name suggests.
+cmd_rm() {
+  local d; d=$(find_task "${1:-}") || exit 1
+  # Read everything we will want to say BEFORE deleting the directory that holds it.
+  local slug st branch ans
+  slug=$(slug_of "$d"); st=$(state_of "$d"); branch=$(hdr "$d/plan.md" branch)
+  printf 'pq: remove task "%s" (%s)? [y/N] ' "$slug" "$st" >&2; read -r ans || ans=n
+  [[ "${ans:-}" =~ ^[Yy]$ ]] || { msg "cancelled"; return 0; }
+  rm -rf "$d" || die "could not remove $d"
+  msg "removed $slug"
+  case "$st" in
+    running|done) warn "its worktree and branch are untouched - remove those with: wt rm $branch" ;;
+  esac
+}
+
+case "${1:-}" in
+  add)        shift; cmd_add "$@" ;;
+  ls|list)    shift; cmd_ls "$@" ;;
+  show)       shift; cmd_show "$@" ;;
+  priority|pri) shift; cmd_priority "$@" ;;
+  hold)       shift; cmd_hold "$@" ;;
+  unhold)     shift; cmd_unhold "$@" ;;
+  rm|remove)  shift; cmd_rm "$@" ;;
+  *) die "usage: pq {add [plan] | ls [--json] | show <task> | priority <task> N | hold <task> | unhold <task> | rm <task>}" ;;
+esac

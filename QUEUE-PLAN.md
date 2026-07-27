@@ -368,7 +368,7 @@ Small, and all defensible on their own merits:
 | phase | what | why here |
 |---|---|---|
 | 0 | ~~`wt` redis fix + `--no-agent/--no-focus/--no-dev/--json`~~ **done** | the seam, and a real bug |
-| 1 | `pq add`, `pq ls`, directories | get plans into the queue by hand and look at them; no dispatch yet |
+| 1 | ~~`pq add`, `pq ls`, directories~~ **done** | get plans into the queue by hand and look at them; no dispatch yet |
 | 2 | `pq tick` - claim, dispatch, reconcile - cap 1, run by hand | prove atomic claim and slot accounting while watching |
 | 3 | `pq run` loop + cap file + lock + SIGINT trap | the stop/start/restart safety you asked for |
 | 4 | usage.json side-write + dispatch gate | needed before running it while you sleep |

@@ -1023,6 +1023,11 @@ cmd_rm() {
 # header included, so the table is exactly as wide as its content needs and stays aligned
 # even when one branch name is far longer than all the others - which a fixed field width
 # does neither of.
+#
+# Cells must be ASCII. macOS awk's length() counts BYTES, not characters, and no locale
+# changes that (verified on awk 20200816) - so one multi-byte character in a cell silently
+# over-pads its column by the extra bytes and skews the table. Everything printed here is
+# ASCII today; keep it that way rather than reaching for a nicer arrow or dash.
 render_table() {                        # tsv_file
   awk -F'\t' '
     { rows = NR; if (NF > n) n = NF
