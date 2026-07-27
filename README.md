@@ -125,7 +125,7 @@ Either way nothing is lost - a task caught mid-dispatch keeps its claim without 
 
 When a Claude session runs out of its usage window it puts up a dialog - "Wait for limit to reset · Resets 8:00pm" - and every option on that dialog only dismisses it.
 Nothing resumes by itself, so an agent that hits the wall at 2am would otherwise sit there until morning holding a slot.
-Each tick reads the last lines of every running agent's pane, and when it finds the wall it dismisses the dialog and then knocks every ten minutes with "Continue with what you were doing" until the agent picks its work back up.
+Each tick reads the last lines of every running agent's pane, and when it finds the wall it dismisses the dialog, waits for the time the dialog names, and then knocks with "Continue with what you were doing" until the agent picks its work back up.
 
 Three details make that safe to leave running unattended.
 
@@ -137,9 +137,13 @@ Waiting for Herdr to say `blocked` would risk never firing at all.
 `pq` hashes the tail each tick and acts only when the wall is showing *and* the hash is unchanged since last time.
 A working agent's tail moves every few seconds, so this cannot interrupt one - which matters, because the wall's message stays in the scrollback for a while after the session recovers.
 
-**It polls rather than parsing "Resets 8:00pm".**
-The hint's format is undocumented and a bad parse would strand a task silently for hours, while a knock sent too early costs one API call that fails instantly and puts the same dialog back.
-At ten-minute intervals the worst case across a five-hour window is a few dozen no-op calls.
+**It waits for the time the dialog names, and polls only when it cannot read one.**
+The dialog carries "Resets 8:30pm", and that hint beats any other source of the same fact, because it comes from the error that walled us and so already refers to the right window - the account has both a five-hour and a weekly limit, and nothing else on hand would say which one you are behind.
+Two habits of Claude Code's formatter are worth knowing, since both will catch out anything that assumes otherwise: minutes are dropped when they are zero, so it reads `8pm` rather than `8:00pm`, and no date is printed for a reset less than 24 hours out, so a bare `1am` seen at 11pm means tomorrow.
+Beyond 24 hours it becomes `Jul 28, 8:30pm`, gaining a year only when the year differs.
+
+A hint that cannot be read is not a failure: ten-minute polling is the fallback, and it also takes over if the knock at the named time turns out to be too early.
+The one outcome ruled out is waiting on a guess, because that strands a task silently, where an early knock costs a single instantly-failing call.
 
 The wall is the only thing `pq` ever answers.
 A permission prompt is recorded as `permission` and deliberately left alone - that is the trade for running everything in auto mode - so `pq ls` separates the agents waiting on the clock from the ones waiting on you.

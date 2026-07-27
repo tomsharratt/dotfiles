@@ -463,15 +463,68 @@ pane_state() {                          # pane_id
 # interrupt one, and the wall's message stays in the scrollback for a while after
 # the session recovers, so the text alone would keep firing long after it should.
 #
-# **We do not parse "Resets 3pm" - we poll.** The hint's format is undocumented, and
-# a bad parse strands a task silently for hours. A "continue" sent too early costs
-# one API call that fails instantly and puts the same dialog back, so at ten-minute
-# intervals the worst case across a five-hour window is a few dozen no-op calls.
-# Dumber, and it cannot fail quietly.
+# **We wait for the time the dialog names, and poll only if we cannot read it.**
+# The dialog carries "Resets 8:30pm", and that hint beats any other source of the
+# same fact: it comes from the error that walled us, so it already refers to the
+# right window. The account has two (five-hour and weekly) and nothing else on hand
+# would say which one we are behind.
+#
+# Its format is fixed by Claude Code's own formatter and worth writing down, because
+# two of its habits will bite anyone who assumes otherwise: minutes are omitted when
+# they are zero ("8pm", not "8:00pm"), and no date is printed for anything less than
+# 24 hours out - so a bare "1am" seen at 11pm means tomorrow. Beyond 24 hours it
+# becomes "Jul 28, 8:30pm", and gains a year only when the year differs.
+#
+# A hint we cannot read is not a failure: PQ_QUOTA_RETRY polling is the fallback,
+# and it also takes over after a knock at the named time turns out to be too early.
+# Waiting on an unparsed guess is the only outcome worth ruling out, since that
+# strands a task silently, where a knock sent early costs one instantly-failing call.
 pane_tail() {                           # pane_id -> the last lines on screen
   [ -n "${1:-}" ] || return 0
   herdr agent read "$1" --source visible --format text 2>/dev/null \
     | jq -r '.result.read.text // ""' 2>/dev/null | tail -n "$PQ_TAIL_LINES"
+}
+
+# "Resets 8:30pm" / "Resets Jul 28, 8pm" -> epoch. Local time throughout, because
+# that is what Claude Code printed. Silence means "could not read it" and the caller
+# falls back to polling, so every branch here fails closed rather than guessing.
+parse_reset() {                         # hint text -> epoch seconds
+  local s=$1 dpart tpart e nowe
+  s=${s%%(*}                                          # drop a trailing " (PDT)"
+  s=$(sed 's/^[[:space:]]*//; s/[[:space:]]*$//' <<<"$s")
+  [ -n "$s" ] || return 1
+  # Split on the LAST comma: the with-year form is "Jan 3, 2027, 9am".
+  case "$s" in
+    *,*) dpart=$(tr -d ',' <<<"${s%,*}"); tpart=${s##*,} ;;
+    *)   dpart=""; tpart=$s ;;
+  esac
+  tpart=$(tr -d ' ' <<<"$tpart" | tr '[:lower:]' '[:upper:]')
+  case "$tpart" in *:*) ;; *) tpart=$(sed 's/\([0-9]\{1,2\}\)\([AP]M\)/\1:00\2/' <<<"$tpart") ;; esac
+  case "$tpart" in *AM|*PM) ;; *) return 1 ;; esac
+  nowe=$(date '+%s')
+  if [ -n "$dpart" ]; then
+    dpart=$(sed 's/^[[:space:]]*//; s/[[:space:]]*$//' <<<"$dpart")
+    case "$dpart" in
+      *[0-9][0-9][0-9][0-9]*) e=$(date -j -f '%b %d %Y %I:%M%p' "$dpart $tpart" '+%s' 2>/dev/null) ;;
+      *) e=$(date -j -f '%b %d %Y %I:%M%p' "$dpart $(date '+%Y') $tpart" '+%s' 2>/dev/null)
+         # No year printed means this year - unless we are reading it across new year.
+         [ -n "$e" ] && [ "$e" -lt $(( nowe - 86400 )) ] &&
+           e=$(date -j -f '%b %d %Y %I:%M%p' "$dpart $(( $(date '+%Y') + 1 )) $tpart" '+%s' 2>/dev/null) ;;
+    esac
+  else
+    e=$(date -j -f '%Y-%m-%d %I:%M%p' "$(date '+%Y-%m-%d') $tpart" '+%s' 2>/dev/null)
+    # A bare clock time is the next time the clock reads it, so 1am seen at 11pm
+    # is tomorrow. The small grace keeps a reset we have just passed from jumping.
+    [ -n "$e" ] && [ "$e" -lt $(( nowe - 300 )) ] && e=$(( e + 86400 ))
+  fi
+  [ -n "$e" ] || return 1
+  printf '%s' "$e"
+}
+
+# The hint sits at the end of a line that may well be inside a bordered box, so
+# anything trailing that cannot be part of a date is dropped.
+reset_hint() {                          # pane text -> the time the wall names
+  sed -n 's/.*[Rr]esets \(.*\)$/\1/p' <<<"$1" | tail -1 | sed 's/[^0-9A-Za-z:,() ]*$//'
 }
 
 classify_tail() {                       # text -> quota | permission | none
@@ -495,7 +548,7 @@ unstick() {                             # pane_id [text to send after]
 
 clear_block() {                         # task_dir
   local d=$1 k
-  for k in PQ_BLOCKED PQ_QUOTA_SINCE PQ_TRIES PQ_RETRY_AT PQ_GAVEUP; do st_set "$d" "$k" ""; done
+  for k in PQ_BLOCKED PQ_QUOTA_SINCE PQ_TRIES PQ_RETRY_AT PQ_GAVEUP PQ_RESETS; do st_set "$d" "$k" ""; done
 }
 
 # One running task, one tick: record what its pane is waiting on, and knock if it
@@ -527,10 +580,22 @@ check_stall() {                         # task_dir
   [ -n "$prev" ] && [ "$prev" = "$hash" ] || return 0
 
   if [ "$was" != quota ]; then
+    local hint due plan
+    hint=$(reset_hint "$text")
+    due=$(parse_reset "$hint") || due=""
+    if [ -n "$due" ] && [ "$due" -gt "$nowsec" ]; then
+      due=$(( due + 60 ))               # a minute past it, so clock skew cannot land early
+      plan="waiting until $hint"
+      st_set "$d" PQ_RESETS "$hint"
+    else
+      due=$(( nowsec + PQ_QUOTA_RETRY ))
+      plan="no reset time on screen, so knocking every $(( PQ_QUOTA_RETRY / 60 ))m"
+      st_set "$d" PQ_RESETS ""
+    fi
     st_set "$d" PQ_BLOCKED quota;  st_set "$d" PQ_QUOTA_SINCE "$(now)"
-    st_set "$d" PQ_TRIES 0;        st_set "$d" PQ_RETRY_AT "$(( nowsec + PQ_QUOTA_RETRY ))"
+    st_set "$d" PQ_TRIES 0;        st_set "$d" PQ_RETRY_AT "$due"
     unstick "$pane"
-    warn "$slug: hit the session limit - dismissed it, retrying every $(( PQ_QUOTA_RETRY / 60 ))m from now"
+    warn "$slug: hit the session limit - dismissed it, $plan"
     return 0
   fi
 
@@ -546,8 +611,12 @@ check_stall() {                         # task_dir
     return 0
   fi
 
+  # Past the named reset and still walled means the hint was optimistic, so from
+  # here it is the poll interval. PQ_RESETS goes with it - a time already gone is
+  # worse than no time at all in `pq ls`.
   tries=$(( tries + 1 ))
   st_set "$d" PQ_TRIES "$tries"; st_set "$d" PQ_RETRY_AT "$(( nowsec + PQ_QUOTA_RETRY ))"
+  st_set "$d" PQ_RESETS ""
   unstick "$pane" "Continue with what you were doing."
   msg "$slug: knocking after the session limit (attempt $tries)"
 }
@@ -630,7 +699,10 @@ agent_cell() {                          # task_dir state
   blocked=$(st "$d" PQ_BLOCKED)
   case "$blocked" in
     quota)      [ "$(st "$d" PQ_GAVEUP)" = 1 ] && printf 'walled ' || printf 'quota '
-                printf '%s' "$(age_of "$(st "$d" PQ_QUOTA_SINCE)")"; return ;;
+                # The time it comes back beats how long it has been gone, when the
+                # wall told us one. Both are ASCII, as every cell here must be.
+                blocked=$(st "$d" PQ_RESETS)
+                printf '%s' "${blocked:-$(age_of "$(st "$d" PQ_QUOTA_SINCE)")}"; return ;;
     permission) printf 'permission'; return ;;
   esac
   case "$status" in

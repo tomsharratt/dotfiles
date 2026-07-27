@@ -288,16 +288,18 @@ What the wall actually is, read out of the Claude Code binary rather than assume
 - a 429 becomes `error: "rate_limit"`, which raises a dialog whose options are `{id:"wait", label:"Wait for limit to reset", hint:"Resets 8:00pm"}` alongside an adjust/upgrade entry
 - every one of those handlers merely dismisses (`display:"skip"` / `value:"cancel"`) - **nothing schedules a resume**, which confirms the behaviour you described
 
-So each tick reads the tail of every running agent's pane, and on the wall it dismisses and then knocks every ten minutes until the agent moves again.
+So each tick reads the tail of every running agent's pane, and on the wall it dismisses, waits for the time the dialog names, and knocks until the agent moves again.
 
 ```
 for each running task with an agent and no PR:
   herdr agent read <pane> --source visible   → last 30 lines
   hash the tail, compare with last tick
   classify:
-    wall + tail unchanged → first sighting: Escape, record PQ_BLOCKED=quota
+    wall + tail unchanged → first sighting: Escape, record PQ_BLOCKED=quota,
+                            wake at the "Resets ..." the dialog names (+60s),
+                            or at now + PQ_QUOTA_RETRY if it names none
                             thereafter:     Escape + "Continue with what you were
-                                            doing.", every PQ_QUOTA_RETRY
+                                            doing.", then every PQ_QUOTA_RETRY
     permission            → record PQ_BLOCKED=permission, touch nothing
     anything else         → clear, it is fine
 ```
@@ -307,12 +309,13 @@ Four properties, each chosen against the obvious alternative:
 - **Detection is text, never Herdr's status.** The previous draft gated on `blocked` and flagged the risk that a walled pane might not report that way. It doesn't: `herdr agent explain` shows Herdr classifying from its own regexes over terminal regions, and its top rule (priority 1100, a braille spinner in the OSC title) outranks every `blocked` rule it has. A spinner is exactly what is on screen while the request that hit the wall is in flight. Claude Code *does* compute its own `{state:"blocked", needs:"rate limited - wait and retry"}` for this, but Herdr does not consume it.
 - **Liveness is the tail's hash, not a status either.** Acting needs the wall showing *and* an unchanged tail. This cuts both ways: a working agent's tail moves constantly so a knock cannot interrupt one, and the wall's message lingers in the scrollback after recovery so the text alone would keep firing.
 - **Escape, not an option.** There are at least two different limit dialogs in the binary with different option sets - one offers "Upgrade to Team plan" - so arrowing to the Nth entry bets on which one appeared. Escape is agnostic, and since every option only dismisses, it gives up nothing.
-- **Poll, don't parse "Resets 8:00pm".** The hint's format is undocumented and a bad parse strands a task silently for hours, where a knock sent too early costs one instantly-failing call and puts the same dialog back. A few dozen no-op calls across a five-hour window is the whole downside.
+- **Wake at the time the dialog names; poll only as a fallback.** The hint is the best available source of that fact, because it comes from the error that walled us and so already names the right window - the account has two, and neither the statusline's numbers nor anything else on hand would say which one we are behind. Its format is fixed by Claude Code's `Jde()`: minutes omitted when zero (`8pm`), no date under 24 hours out (so a bare `1am` at 11pm is tomorrow), `Jul 28, 8:30pm` beyond that, plus a year only when it differs. All of those parse; anything else falls back to `PQ_QUOTA_RETRY` polling, as does a named time that turns out to have been optimistic. Waiting on an unparsed guess is the only outcome ruled out, since that strands a task silently where an early knock costs one instantly-failing call.
 
 The wall is the only thing `pq` ever answers; a permission prompt is recorded and left, per the posture below.
 After `PQ_QUOTA_MAX_TRIES` (40, ~7h) a task is marked `walled` and left alone rather than knocked at all night.
 
-Tested end to end against a real Herdr pane with the real dialog text: first sighting records only, unchanged tail dismisses, the knock lands in the pane, a moving tail is left alone, a permission prompt is classified and untouched, and clearing the wall text logs the recovery.
+Tested end to end against a real Herdr pane with the real dialog text: first sighting records only, unchanged tail dismisses, the wake-up is scheduled from the named reset time and falls back to polling when the dialog names none, the knock lands in the pane, a moving tail is left alone, a permission prompt is classified and untouched, and clearing the wall text logs the recovery.
+The reset parser is checked against every form `Jde()` can emit, including the day-rollover and across-new-year cases.
 **A genuine 429 has not been through it** - that path cannot be provoked on demand.
 
 ## Permission posture
