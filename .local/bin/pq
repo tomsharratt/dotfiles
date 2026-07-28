@@ -1,0 +1,1906 @@
+#!/usr/bin/env bash
+# pq - a queue of Claude Code plans, waiting to be run as implementer sessions.
+#
+# The split this exists to make: one long-lived session, in plan mode, does the
+# thinking and produces a plan that has already answered every question. `pq` then
+# runs those plans - later, unattended, several at a time - as cheap implementer
+# sessions that only have to execute. An agent that cannot get stuck is an agent
+# that can work overnight.
+#
+# `pq` owns plans and scheduling. It does not own worktrees: it shells out to `wt`
+# for an isolated, provisioned worktree and starts its own agent in the pane that
+# comes back. The two tools are separable on purpose - `wt` is complete without
+# `pq`, and `pq` reaches it through one narrow seam (`wt new --no-agent --no-focus
+# --json`).
+#
+#   pq add [plan]        add a plan to the queue (default: the newest one Claude wrote)
+#   pq add --after T     repeatable: don't dispatch until T's PR has merged
+#   pq after <task>      list a task's blockers and what each is waiting on
+#   pq after <task> T... add blockers to a task already in the queue or held
+#   pq after <task> --clear   drop them all
+#   pq ls                every task, its state, and what it is waiting on
+#   pq show <task>       one task's header and plan
+#   pq priority <task> N re-order the queue
+#   pq hold <task>       park a task so nothing picks it up
+#   pq unhold <task>     put it back in the queue
+#   pq rm <task>         drop a task (never touches a worktree or a branch)
+#   pq tick              free finished slots, then fill them from the queue
+#   pq run               tick on an interval until you stop it
+#   pq cap [N]           how many may run at once; 0 pauses. Read every tick.
+#
+# `pq tick` is one idempotent pass, safe to run by hand at any time - including
+# alongside a running `pq run`.
+#
+# A task may name blockers: other work that must have merged before it is
+# eligible for dispatch. Blocked is derived, not stored - a blocked task sits in
+# `queue/` like any other, and fill just skips it, the same way the cap is soft
+# arithmetic rather than a drain state. Merge state comes from the forge (`gh`),
+# never from git ancestry - a squash-merged branch's tip is not an ancestor of
+# the default branch, so `git branch --merged` misses every real merge. See
+# `after_state` below for the full predicate.
+#
+# LAYOUT ─────────────────────────────────────────────────────────────────────
+# A task is a DIRECTORY, and the directory it sits in is its state:
+#
+#   $PQ_HOME/queue/020-live-chat-mentions/    waiting to be picked up
+#            hold/025-risky-refactor/         parked by you
+#            running/005-spotify-scope-fix/   dispatched
+#            done/001-live-chat-links/        a PR exists, slot freed
+#
+#   <task>/plan.md     the settings header + Claude's plan, immutable once added
+#          after       blockers: one per line, TSV  label <TAB> repo <TAB> branch
+#          state.env   KEY=VALUE runtime facts, written as dispatch progresses
+#
+# `after` is neither of the other two: `plan.md` is immutable by contract so an
+# agent re-reading its own plan never sees it change, and `state.env` is runtime
+# facts written as dispatch progresses. Blockers are your intent, edited before
+# dispatch, so they get their own file - named for the verb that writes it. An
+# absent file means no blockers.
+#
+# Every transition is a `mv`, which is atomic within one filesystem - so two
+# dispatchers racing cannot both claim the same task, and a `mv` that fails means
+# somebody else got there first. Splitting the immutable plan from the mutable
+# state also means an agent can re-read its own plan at any point and never see it
+# change underneath it.
+#
+# The NNN prefix is the priority and nothing else. It is not an identity: promoting
+# a task renames its directory, so every command here takes the SLUG (or any unique
+# prefix of it) instead.
+
+set -uo pipefail
+
+PQ_HOME="${PQ_HOME:-${XDG_STATE_HOME:-$HOME/.local/state}/pq}"
+PLANS_DIR="${PQ_PLANS_DIR:-$HOME/.claude/plans}"
+WT="${PQ_WT:-$HOME/.local/bin/wt}"
+STATES="queue hold running done"
+
+PQ_DEFAULT_MODEL="${PQ_DEFAULT_MODEL:-sonnet}"
+PQ_DEFAULT_EFFORT="${PQ_DEFAULT_EFFORT:-xhigh}"
+PQ_NAMER_MODEL="${PQ_NAMER_MODEL:-haiku}"
+
+# What the session wall looks like on screen, and how hard to knock. These are
+# Claude Code UI strings, so they will change - hence up here and overridable
+# rather than buried in the logic that uses them.
+#
+# No braces in these defaults: `${VAR:-...}` ends at the first unescaped `}`, so a
+# bounded repetition like {0,24} gets cut in half and the rest leaks out as literal
+# text. It fails as a corrupt pattern at match time, not as a syntax error here.
+PQ_QUOTA_RE="${PQ_QUOTA_RE:-limit to reset|usage limit reached|out of usage credits|hit your .*limit}"
+PQ_PERM_RE="${PQ_PERM_RE:-Do you want to |Yes, and don.t ask again|Allow once}"
+PQ_QUOTA_RETRY="${PQ_QUOTA_RETRY:-600}"           # seconds between "continue" attempts
+PQ_QUOTA_MAX_TRIES="${PQ_QUOTA_MAX_TRIES:-40}"    # ~7h at that interval, then stop knocking
+PQ_TAIL_LINES="${PQ_TAIL_LINES:-30}"
+
+# Paths that a trap has to clean up must be globals: an EXIT trap runs after the
+# function has returned, so a `local` it referenced is already out of scope - and
+# under `set -u` that turns the cleanup into an "unbound variable" error instead.
+PQ_STAGING=""; PQ_LOCK=""
+
+# A tick's one-line verdict. `pq tick` prints it directly; `pq run` collects it
+# instead, so it can drop a summary identical to the previous one and leave a log
+# of what CHANGED rather than one line per interval all night.
+PQ_SUMMARY=""; PQ_RUN=0
+
+summary() { PQ_SUMMARY=$*; [ "$PQ_RUN" = 1 ] || printf 'pq: %s\n' "$*" >&2; }
+msg()  { printf 'pq: %s\n' "$*" >&2; }
+warn() { printf '\033[38;2;246;193;119mpq: %s\033[0m\n' "$*" >&2; }
+die()  { printf '\033[38;2;235;111;146mpq: %s\033[0m\n' "$*" >&2; exit 1; }
+
+for d in $STATES; do mkdir -p "$PQ_HOME/$d"; done
+
+# ── plan header ─────────────────────────────────────────────────────────────
+# The header is deliberately flat `key: value`, one per line, no nesting and no
+# folded blocks. It is written by this script and read by this script (in bash,
+# in a loop, on every tick), so being trivially parseable beats being expressive
+# YAML. `intent` is therefore one long line - it is read by `pq show` and pasted
+# into a PR body, never wrapped by hand.
+hdr() {                                 # plan.md key
+  [ -f "$1" ] || return 0
+  awk -v k="$2" '
+    NR == 1 && $0 == "---" { inh = 1; next }
+    inh && $0 == "---"     { exit }
+    inh {
+      i = index($0, ":")
+      if (i && substr($0, 1, i - 1) == k) {
+        v = substr($0, i + 1); sub(/^[ \t]+/, "", v); print v; exit
+      }
+    }' "$1"
+}
+
+# Read one key out of a task's runtime state without disturbing our own variables.
+# Same shape as wt's state files, so the two tools' state reads the same way.
+st() {                                  # task_dir key
+  [ -f "$1/state.env" ] || return 0
+  ( set -a; . "$1/state.env" 2>/dev/null; set +a; eval "printf '%s' \"\${$2:-}\"" ) 2>/dev/null
+}
+# Upsert KEY=VALUE, preserving the other keys. Each dispatch step records itself the
+# moment it succeeds, which is what lets reconcile tell a half-finished dispatch from
+# a finished one after an interrupted tick.
+st_set() {                              # task_dir key value
+  local f="$1/state.env"
+  { grep -v "^$2=" "$f" 2>/dev/null || true; printf '%s=%s\n' "$2" "$3"; } > "$f.tmp" && mv "$f.tmp" "$f"
+}
+now() { date -u '+%Y-%m-%dT%H:%M:%SZ'; }
+epoch() { date -u '+%s'; }
+
+# ── shielded children ───────────────────────────────────────────────────────
+# Run a command in a process group of its own, so a Ctrl-C aimed at pq does not
+# take it down as collateral.
+#
+# A terminal sends SIGINT to the entire FOREGROUND PROCESS GROUP, which by default
+# includes every child pq has spawned. So a `wt new` halfway through copying a
+# database would die alongside the tick, and a minute of provisioning gets thrown
+# away and done again. Job control (`set -m`) puts a background job in its own
+# process group, and the signal then reaches only pq: the trap sets the stop flag,
+# the work already in flight runs to completion, and the loop exits after it. That
+# is what makes "stop after this tick" a real promise rather than a hopeful one.
+#
+# Everything comes back through files. Command substitution would defeat the whole
+# point by putting the child back in our process group, and `wait`'s return value
+# cannot be told apart from "interrupted" once signals are in play - so stdout and
+# the true exit status are written where they can be read afterwards. stdin is
+# /dev/null because a background process group that reads the terminal is stopped
+# with SIGTTIN, which would hang the tick.
+SHIELDED_OUT=""; SHIELDED_PID=""
+shielded() {                            # cmd...
+  local outf="$PQ_HOME/.out.$$" rcf="$PQ_HOME/.rc.$$" code
+  rm -f "$outf" "$rcf"
+  set -m
+  ( "$@" > "$outf" < /dev/null; printf '%s' "$?" > "$rcf" ) &
+  SHIELDED_PID=$!
+  set +m
+  # The trap interrupts `wait`, not the child - so wait again until it has gone.
+  while kill -0 "$SHIELDED_PID" 2>/dev/null; do wait "$SHIELDED_PID" 2>/dev/null; done
+  SHIELDED_PID=""
+  SHIELDED_OUT=$(cat "$outf" 2>/dev/null)
+  code=$(cat "$rcf" 2>/dev/null)
+  rm -f "$outf" "$rcf"
+  return "${code:-1}"
+}
+
+# ── the cap ─────────────────────────────────────────────────────────────────
+# How many tasks may be running at once. It is STATE, not an argument: it lives in
+# a file and is re-read at the top of every tick, so `pq cap 1` in the morning and
+# `pq cap 4` at bedtime take effect on the next pass of a loop that is already
+# running - no restart, no second concept for pausing. `pq cap 0` is the pause.
+#
+# The cap is soft in both directions. Fill is `while active < cap`, so lowering it
+# never kills anything: it simply starts nothing new until enough slots free up on
+# their own. There is no drain state to track, because the arithmetic already is one.
+#
+# The default is deliberately 1 rather than the 3 you will probably settle on. A
+# fresh machine, or a state dir that got wiped, should not quietly start dispatching
+# three unattended agents because nobody had said otherwise yet.
+CAP_FILE="$PQ_HOME/cap"
+cap_get() {
+  local c
+  c=$( { tr -dc '0-9' < "$CAP_FILE"; } 2>/dev/null )
+  [ -n "$c" ] || c=${PQ_DEFAULT_CAP:-1}
+  printf '%s' "$c"
+}
+cap_set() { printf '%s\n' "$1" > "$CAP_FILE"; }
+
+cmd_cap() {
+  [ $# -eq 0 ] && { printf '%s\n' "$(cap_get)"; return 0; }
+  [[ "$1" =~ ^[0-9]+$ ]] || die "usage: pq cap [N]   (0 pauses; nothing running is touched)"
+  cap_set "$1"
+  local active; active=$(ls -d "$PQ_HOME/running"/*/ 2>/dev/null | wc -l | tr -d ' ')
+  if [ "$1" = 0 ]; then
+    msg "cap 0 - paused. $active still running; nothing new will start."
+  elif [ "$active" -gt "$1" ]; then
+    msg "cap $1 - $active already running, so nothing new starts until $(( active - $1 + 1 )) of them finish."
+  else
+    msg "cap $1 - room for $(( $1 - active )) more."
+  fi
+}
+
+# ── task lookup ─────────────────────────────────────────────────────────────
+# "queue/020-live-chat-mentions" -> "live-chat-mentions"
+slug_of() { local b; b=$(basename "$1"); printf '%s' "${b#*-}"; }
+prio_of() { local b; b=$(basename "$1"); b=${b%%-*}; printf '%s' "$((10#$b))"; }
+
+# Every task directory, ordered by state then priority. `done` last: it is history,
+# and the top of the list should be what is live. No sort needed - the priority is a
+# zero-padded prefix, so bash's own glob ordering is already priority order.
+all_tasks() {
+  local s d
+  for s in running queue hold done; do
+    for d in "$PQ_HOME/$s"/*/; do
+      [ -d "$d" ] || continue
+      printf '%s\n' "${d%/}"
+    done
+  done
+}
+
+# Fill's own view of the queue: priority order, sorted NUMERICALLY rather than
+# trusting glob order. `printf '%03d'` (prio_of, retitle) is a minimum width,
+# not a fixed one, so a task at priority 1000 renders 4 characters and
+# lexicographically sorts before "500-x" - silently jumping most of the queue.
+# Built once per tick and walked, rather than re-globbing and taking the first
+# entry every pass, so an explicit list is what "first-eligible" walks.
+queue_ordered() {
+  local d
+  for d in "$PQ_HOME/queue"/*/; do
+    [ -d "$d" ] || continue
+    printf '%s\t%s\n' "$(prio_of "${d%/}")" "${d%/}"
+  done | sort -s -n -k1,1 | cut -f2-
+}
+
+# Resolve what the user typed to exactly one task directory. Exact slug match wins
+# outright, so a slug that happens to prefix a longer one is still reachable;
+# otherwise a unique prefix is enough, and an ambiguous one is an error rather than
+# a guess - picking the wrong task here would queue or delete the wrong work.
+find_task() {                           # needle
+  local needle=${1:-} d s exact="" hits=()
+  [ -n "$needle" ] || die "which task? (pq ls)"
+  while IFS= read -r d; do
+    [ -n "$d" ] || continue
+    s=$(slug_of "$d")
+    [ "$s" = "$needle" ] && { exact=$d; break; }
+    case "$s" in "$needle"*) hits+=("$d") ;; esac
+  done <<<"$(all_tasks)"
+  [ -n "$exact" ] && { printf '%s' "$exact"; return 0; }
+  case "${#hits[@]}" in
+    0) die "no task matching '$needle' (pq ls)" ;;
+    1) printf '%s' "${hits[0]}" ;;
+    *) die "'$needle' matches ${#hits[@]} tasks: $(for d in "${hits[@]}"; do printf '%s ' "$(slug_of "$d")"; done)" ;;
+  esac
+}
+
+state_of() {                            # task_dir  -> queue|hold|running|done
+  local p=${1%/*}; basename "$p"
+}
+
+# Move a task between states, keeping its priority prefix. The `mv` is the state
+# transition; nothing else records it.
+retitle() {                             # task_dir new_state [new_priority]
+  local src=$1 to=$2 prio=${3:-} name
+  name=$(basename "$src")
+  [ -n "$prio" ] && name="$(printf '%03d' "$prio")-$(slug_of "$src")"
+  local dst="$PQ_HOME/$to/$name"
+  [ "$src" = "$dst" ] && { printf '%s' "$dst"; return 0; }
+  [ -e "$dst" ] && die "a task already exists at $to/$name"
+  mv "$src" "$dst" || die "could not move $src -> $dst"
+  printf '%s' "$dst"
+}
+
+# ── after: blockers ─────────────────────────────────────────────────────────
+# A blocker is a resolved (label, repo, branch) triple, not a task reference -
+# `pq add B --after A` resolves A to its repo and branch at the moment you type
+# it. That is what makes the dependency survive `pq rm A`, survive A ageing out
+# of `done/`, and survive a slug being reused; it is also what makes a cross-repo
+# blocker work for free, and what lets a blocker name a branch that is not in
+# `pq` at all.
+
+# The branch a slug reduces to, same rule `cmd_add` uses for its own task names -
+# lowercased, non `[a-z0-9-]` squashed to `-`, runs collapsed, edges trimmed.
+branch_to_slug() {                      # branch -> a queue-safe slug
+  local s=${1##*/}
+  tr '[:upper:]' '[:lower:]' <<<"$s" | tr -c 'a-z0-9-' '-' | sed -E 's/-+/-/g; s/^-|-$//g'
+}
+
+# The `after` file, one blocker per line, or nothing if the task has none.
+after_list() {                          # task_dir
+  [ -f "$1/after" ] && cat "$1/after"
+}
+
+# Append a blocker if its (repo, branch) is not already present - that pair is
+# the real identity, not the label, so re-adding the same branch under a
+# different label is a no-op rather than a duplicate.
+after_add() {                           # task_dir label repo branch
+  local d=$1
+  awk -F'\t' -v r="$3" -v b="$4" '$2 == r && $3 == b { f = 1; exit } END { exit !f }' \
+    "$d/after" 2>/dev/null && return 0
+  printf '%s\t%s\t%s\n' "$2" "$3" "$4" >> "$d/after"
+}
+
+# The task directory, in ANY state, whose plan.md names this exact (repo,
+# branch) - or nothing. Used for cycle detection and for telling "orphan" (no
+# task anywhere owns this branch, so nothing will ever open a PR for it) apart
+# from the ordinary "waiting, not started yet" case.
+task_by_branch() {                      # repo branch
+  local d
+  while IFS= read -r d; do
+    [ -n "$d" ] || continue
+    [ "$(hdr "$d/plan.md" repo)" = "$1" ] && [ "$(hdr "$d/plan.md" branch)" = "$2" ] \
+      && { printf '%s' "$d"; return 0; }
+  done <<<"$(all_tasks)"
+  return 1
+}
+
+# A value containing '/' is a branch in the OWNER's own repo - the repo of the
+# task being given the blocker. Slugs cannot contain '/' (cmd_add strips them),
+# so the rule is unambiguous. Otherwise it is a task slug resolved through
+# find_task, which is what makes a cross-repo blocker free: the resolved task
+# carries its own repo along with it, whatever that repo is.
+resolve_after() {                       # owner_repo value -> "label\trepo\tbranch"
+  local owner_repo=$1 value=$2 t
+  case "$value" in
+    */*) printf '%s\t%s\t%s' "$(branch_to_slug "$value")" "$owner_repo" "$value" ;;
+    *)
+      t=$(find_task "$value") || return 1
+      printf '%s\t%s\t%s' "$(slug_of "$t")" "$(hdr "$t/plan.md" repo)" "$(hdr "$t/plan.md" branch)"
+      ;;
+  esac
+}
+
+# DFS from the proposed blocker (repo, branch) back through task_by_branch and
+# each task's own `after` file, looking for a path that leads back to
+# (owner_repo, owner_branch) - including the trivial self-reference, one step
+# in. Two tasks each waiting on the other would stall silently forever, and the
+# odds only grow once a big plan is auto-split into a stack of them.
+after_cycle() {                         # owner_repo owner_branch repo branch [visited task_dirs...]
+  local owner_repo=$1 owner_branch=$2 repo=$3 branch=$4 t r2 b2 v
+  [ "$repo" = "$owner_repo" ] && [ "$branch" = "$owner_branch" ] && return 0
+  t=$(task_by_branch "$repo" "$branch") || return 1
+  shift 4
+  for v in "$@"; do [ "$v" = "$t" ] && return 1; done
+  while IFS=$'\t' read -r _ r2 b2; do
+    [ -n "$r2" ] || continue
+    after_cycle "$owner_repo" "$owner_branch" "$r2" "$b2" "$t" "$@" && return 0
+  done <<<"$(after_list "$t")"
+  return 1
+}
+
+# The slugs of every task, in any state, that lists (repo, branch) as a
+# blocker. Holding or removing a task silently stalls everything after it, and
+# this is what lets `cmd_hold` and `cmd_rm` say so before they do it.
+dependents_of() {                       # repo branch
+  local d r b
+  while IFS= read -r d; do
+    [ -n "$d" ] && [ -f "$d/after" ] || continue
+    while IFS=$'\t' read -r _ r b; do
+      [ "$r" = "$1" ] && [ "$b" = "$2" ] && printf '%s\n' "$(slug_of "$d")"
+    done <<<"$(after_list "$d")"
+  done <<<"$(all_tasks)"
+}
+
+# ── add ─────────────────────────────────────────────────────────────────────
+# The newest plan Claude wrote. Claude Code names these itself, from the prompt
+# that started the session, so the filename is never a task name - see name_plan.
+latest_plan() {
+  ls -t "$PLANS_DIR"/*.md 2>/dev/null | head -1
+}
+
+# Ask a small model for a branch name and a one-line statement of intent, from the
+# plan itself. Both are things a human reads later - the branch on a pull request,
+# the intent at the top of its description - and neither can be derived from the
+# filename, which is auto-generated ("floofy-hugging-dragonfly.md").
+#
+# Prints "branch<TAB>intent", or nothing if the model could not be reached or gave
+# something unusable; the caller then insists on --branch rather than inventing one.
+name_plan() {                           # plan_file
+  local raw json
+  raw=$(claude -p --model "$PQ_NAMER_MODEL" \
+    'Read this plan and reply with ONLY a JSON object, no code fence, no commentary:
+{"branch":"tom/<3-5 dash-separated lowercase words naming the task>","intent":"<2-3 sentences, one line, saying what this sets out to achieve in the author'"'"'s terms - not a description of the diff>"}' \
+    < "$1" 2>/dev/null) || return 0
+  # Be forgiving about a fenced or chatty reply: take the first {...} span.
+  json=$(sed -n 's/.*\({.*}\).*/\1/p' <<<"$(tr '\n' ' ' <<<"$raw")" | head -1)
+  [ -n "$json" ] || return 0
+  jq -er '[.branch, .intent] | @tsv' 2>/dev/null <<<"$json"
+}
+
+# A branch already spoken for is the one failure that must be caught at add time.
+# `wt new` on an existing branch deliberately CHECKS IT OUT rather than failing, so
+# two tasks sharing a name would quietly land in the same worktree and fight over
+# it. Live tasks and git both get a say; `done` deliberately does not, so a name
+# whose branch has since been reclaimed is free to be used again.
+#
+# Three checks, cheapest first. The last one goes to the network, which is worth a
+# round trip to catch a branch pushed from somewhere else - but it is bounded, so an
+# add made offline fails fast instead of sitting on a TCP timeout, and a network we
+# could not reach reports "not taken". That is the safe direction to be wrong in:
+# the worst case is `wt new` later adopting the existing remote branch, which is a
+# thing it already knows how to do.
+branch_taken() {                        # branch repo
+  local branch=$1 repo=$2 d
+  while IFS= read -r d; do
+    [ -n "$d" ] || continue
+    case "$(state_of "$d")" in done) continue ;; esac
+    [ "$(hdr "$d/plan.md" branch)" = "$branch" ] && { printf 'queued as %s' "$(slug_of "$d")"; return 0; }
+  done <<<"$(all_tasks)"
+  git -C "$repo" show-ref --verify --quiet "refs/heads/$branch" && { printf 'a local git branch'; return 0; }
+  git -C "$repo" show-ref --verify --quiet "refs/remotes/origin/$branch" && { printf 'a known remote branch'; return 0; }
+  GIT_SSH_COMMAND="${GIT_SSH_COMMAND:-ssh -o ConnectTimeout=5 -o BatchMode=yes}" \
+    git -C "$repo" ls-remote --exit-code --heads origin "$branch" >/dev/null 2>&1 \
+    && { printf 'a remote branch'; return 0; }
+  return 1
+}
+
+cmd_add() {
+  local plan="" branch="" model=$PQ_DEFAULT_MODEL effort=$PQ_DEFAULT_EFFORT
+  local prio="" dev=false hold=0 repo="" as_json=0
+  # A string, not an array: an empty bash array expanded under `set -u` is a
+  # portability trap (fixed only in bash 4.4+), so every repeatable option in
+  # this script accumulates into a newline-joined string instead. See `repos`
+  # in cmd_ls for the same idiom.
+  local after_vals=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --branch)   branch=${2:-}; shift 2 ;;
+      --model)    model=${2:-}; shift 2 ;;
+      --effort)   effort=${2:-}; shift 2 ;;
+      --priority) prio=${2:-}; shift 2 ;;
+      --repo)     repo=${2:-}; shift 2 ;;
+      --after)    after_vals="${after_vals}${2:-}"$'\n'; shift 2 ;;
+      --dev)      dev=true; shift ;;
+      --hold)     hold=1; shift ;;
+      --json)     as_json=1; shift ;;
+      -h|--help)  die "usage: pq add [plan.md] [--branch B] [--model M] [--effort E] [--priority N] [--repo PATH] [--after task|branch]... [--dev] [--hold] [--json]" ;;
+      -*)         die "unknown option '$1'" ;;
+      *)          plan=$1; shift ;;
+    esac
+  done
+
+  [ -n "$plan" ] || plan=$(latest_plan)
+  [ -n "$plan" ] || die "no plan given and none found in $PLANS_DIR"
+  [ -f "$plan" ] || die "no such plan: $plan"
+
+  # The repo is wherever you are standing when you add the plan - you planned the
+  # work in it. Resolve to the MAIN checkout, so adding from inside a worktree
+  # still queues against the repo the new worktree will be forked from.
+  [ -n "$repo" ] || repo=$(git -C "$PWD" worktree list --porcelain 2>/dev/null | awk '/^worktree /{print substr($0,10); exit}')
+  [ -n "$repo" ] || die "not inside a git repo - run this from the project, or pass --repo"
+
+  msg "plan:   $plan"
+
+  # Reject a name we cannot use BEFORE paying for the model call. When --branch was
+  # given we already know the name, so the cheap checks come first and a duplicate
+  # add fails in milliseconds instead of after a round trip to Haiku. Without it we
+  # have no choice: the name is what we are asking for.
+  local intent="" named why
+  if [ -n "$branch" ]; then
+    git check-ref-format "refs/heads/$branch" || die "invalid branch name: '$branch'"
+    why=$(branch_taken "$branch" "$repo") && die "branch '$branch' is already $why"
+    named=$(name_plan "$plan"); [ -n "$named" ] && intent=$(cut -f2 <<<"$named")
+  else
+    named=$(name_plan "$plan")
+    [ -n "$named" ] && IFS=$'\t' read -r branch intent <<<"$named"
+    [ -n "$branch" ] || die "could not derive a branch name from the plan - pass --branch"
+    git check-ref-format "refs/heads/$branch" || die "invalid branch name: '$branch'"
+    why=$(branch_taken "$branch" "$repo") && die "branch '$branch' is already $why"
+  fi
+
+  local slug; slug=$(branch_to_slug "$branch")
+  [ -n "$slug" ] || die "branch '$branch' does not reduce to a usable name"
+
+  # Resolve every --after value to a (label, repo, branch) triple NOW, before
+  # anything is written - a bad blocker should fail the whole add, not leave a
+  # task queued with only some of what it was told to wait on. Self-reference
+  # and cycles are rejected here for the same reason `find_task` resolves the
+  # slug side of it: adding is the one place a mistake is cheap to catch.
+  local after_lines="" av label arepo abranch resolved
+  while IFS= read -r av; do
+    [ -n "$av" ] || continue
+    resolved=$(resolve_after "$repo" "$av") || die "could not resolve '$av' to a task or branch"
+    IFS=$'\t' read -r label arepo abranch <<<"$resolved"
+    [ -n "$arepo" ] && [ -n "$abranch" ] || die "could not resolve '$av' to a repo and branch"
+    [ "$arepo" = "$repo" ] && [ "$abranch" = "$branch" ] && die "a task cannot block on itself"
+    after_cycle "$repo" "$branch" "$arepo" "$abranch" \
+      && die "'$av' would create a cycle - $branch already leads back to it"
+    # The explicit $'\n' matters: command substitution strips ALL trailing
+    # newlines, so without it a single-blocker add would write an `after` file
+    # with none - and `while read` silently skips a final line that has no
+    # trailing newline, so after_state would read the file as empty and the
+    # blocker would never gate anything.
+    after_lines="${after_lines}$(printf '%s\t%s\t%s' "$label" "$arepo" "$abranch")"$'\n'
+  done <<<"$after_vals"
+
+  # Default priority: the next clean step past everything already queued, so hand
+  # editing stays easy - there is always room to slot something in between.
+  if [ -z "$prio" ]; then
+    local max=0 d p
+    while IFS= read -r d; do
+      [ -n "$d" ] || continue
+      p=$(prio_of "$d"); [ "$p" -gt "$max" ] 2>/dev/null && max=$p
+    done <<<"$(all_tasks)"
+    prio=$(( (max / 10 + 1) * 10 ))
+  fi
+  [[ "$prio" =~ ^[0-9]+$ ]] || die "priority must be a number, got '$prio'"
+
+  local state=queue; [ "$hold" = 1 ] && state=hold
+  local dir="$PQ_HOME/$state/$(printf '%03d' "$prio")-$slug"
+  [ -e "$dir" ] && die "a task already exists at $state/$(basename "$dir")"
+  local d2
+  for d2 in $STATES; do
+    ls -d "$PQ_HOME/$d2"/*-"$slug" >/dev/null 2>&1 && die "a task named '$slug' already exists in $d2/"
+  done
+
+  # Build the task somewhere the queue cannot see, then move it into place. A task
+  # directory with no plan.md would be listed by `pq ls` as a blank row, matched by
+  # `find_task`, and - once tick exists - iterated unattended with an empty `repo`,
+  # which is a `cd ""` into the wrong place. Assembling out of sight means a failed
+  # or interrupted add leaves nothing behind rather than something half-formed.
+  PQ_STAGING="$PQ_HOME/.add.$$"
+  rm -rf "$PQ_STAGING"; mkdir -p "$PQ_STAGING" || die "could not create $PQ_STAGING"
+  trap 'rm -rf "$PQ_STAGING"' EXIT
+  # COPY, never move: ~/.claude/plans is Claude Code's directory and it prunes it,
+  # so the original is not ours to consume. `source` keeps the trail back.
+  {
+    printf -- '---\n'
+    printf 'repo:     %s\n'   "$repo"
+    printf 'branch:   %s\n'   "$branch"
+    printf 'model:    %s\n'   "$model"
+    printf 'effort:   %s\n'   "$effort"
+    printf 'dev:      %s\n'   "$dev"
+    printf 'intent:   %s\n'   "${intent:-}"
+    printf 'source:   %s\n'   "$plan"
+    printf 'added:    %s\n'   "$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+    printf -- '---\n\n'
+    cat "$plan"
+  } > "$PQ_STAGING/plan.md" || die "could not write the task's plan.md"
+  [ -s "$PQ_STAGING/plan.md" ] || die "wrote an empty plan.md - refusing to queue it"
+  # Written to staging, not to $dir afterwards - the same reason plan.md is
+  # built here: a task with a plan but no `after` is exactly the kind of
+  # half-formed state this staging dance exists to rule out.
+  [ -n "$after_lines" ] && printf '%s' "$after_lines" > "$PQ_STAGING/after"
+  mv "$PQ_STAGING" "$dir" || die "could not move the new task into $state/"
+  trap - EXIT
+
+  msg "branch: $branch"
+  [ -n "$intent" ] && msg "intent: $intent"
+  msg "added:  $state/$(basename "$dir")  ($model, effort $effort, dev $dev)"
+
+  if [ -n "$after_lines" ]; then
+    pr_load_all "$(awk -F'\t' '{print $2"\t"$3}' <<<"$after_lines")"
+    local base
+    while IFS=$'\t' read -r label arepo abranch; do
+      [ -n "$label" ] || continue
+      base=$(repo_base "$arepo")
+      if [ -n "$base" ] && pr_merged_into "$arepo" "$abranch" "$base"; then
+        msg "after $label: already merged into $base - nothing to wait for"
+      else
+        msg "after $label ($abranch)"
+      fi
+    done <<<"$after_lines"
+    # NOT cleaned up here: --json below still needs this same PR_CACHE/PR_ANS
+    # for after_json to report each blocker's state, rather than reading an
+    # already-deleted cache and calling everything "unknown" right after this
+    # loop just said "already merged" from the live one.
+  fi
+
+  # The slug on stdout is the handle chaining needs - it is what makes
+  # `b=$(pq add planB.md --after "$a")` possible at all, and pq's own
+  # convention is that stdout stays machine-readable while everything a human
+  # reads goes to stderr, which is why this is additive rather than a change.
+  if [ "$as_json" = 1 ]; then
+    jq -nc --arg task "$slug" --arg state "$state" --arg branch "$branch" \
+      --arg repo "$repo" --arg model "$model" --arg effort "$effort" --arg dev "$dev" \
+      --arg intent "$intent" --arg dir "$dir" --argjson after "$(after_json "$dir")" \
+      --arg prio "$prio" '
+      def str: if . == "" then null else . end;
+      { task: $task, priority: ($prio|tonumber), state: $state, dir: $dir,
+        repo: $repo, branch: $branch, model: $model, effort: $effort,
+        dev: ($dev == "true"), intent: ($intent|str), after: $after }'
+  else
+    printf '%s\n' "$slug"
+  fi
+  rm -f "$PR_CACHE" "$PR_ANS"
+  repo_base_reset
+}
+
+# ── pane state ──────────────────────────────────────────────────────────────
+# "Is the agent still there" is three questions, not one, and answering it with
+# `herdr agent list` collapses them: that call reports only panes it FOUND an agent
+# in, so a missing pane could equally mean the workspace is gone, or that Claude
+# exited cleanly and left a shell behind, or that the session is seconds old and its
+# SessionStart hook has not reported yet. Deciding "this task is dead" on that is
+# how a live task gets written off.
+#
+# `herdr api snapshot` lists every pane, with `agent` null on the ones holding no
+# agent, so a single call separates all three:
+#
+#   pane absent from the snapshot   -> missing   the workspace itself is gone
+#   pane present, agent null        -> noagent   Claude exited; a shell is sitting there
+#   pane present, agent named       -> working | idle | blocked | unknown
+#
+PIDX=""; PIDX_OK=0
+pidx_load() {
+  local raw
+  PIDX=""; PIDX_OK=0
+  command -v herdr >/dev/null 2>&1 || return 0
+  raw=$(herdr api snapshot 2>/dev/null) || return 0
+  jq -e '.result.snapshot.panes' >/dev/null 2>&1 <<<"$raw" || return 0
+  PIDX=$(jq -r '.result.snapshot.panes[]? | [.pane_id // "", (.agent // ""), (.agent_status // "")] | @tsv' \
+    2>/dev/null <<<"$raw")
+  PIDX_OK=1
+}
+# missing | noagent | working | idle | blocked | unknown. Empty when herdr never
+# answered at all, so a stopped server reads as "no idea" rather than "all dead".
+pane_state() {                          # pane_id
+  [ "${PIDX_OK:-0}" = 1 ] || return 0
+  [ -n "${1:-}" ] || { printf 'missing'; return; }
+  awk -F'\t' -v p="$1" '
+    $1 == p { print ($2 == "" ? "noagent" : ($3 == "" ? "unknown" : $3)); found = 1; exit }
+    END { if (!found) print "missing" }' <<<"$PIDX"
+}
+
+# ── the session wall ────────────────────────────────────────────────────────
+# Claude Code turns a 429 into a dialog - "Wait for limit to reset · Resets 3pm" -
+# and every option on it only dismisses the dialog. Nothing resumes by itself. So
+# an agent that hits the wall at 2am sits there until morning unless something
+# knocks on it, and that knock is the only reason this section exists.
+#
+# Three deliberate choices, each of which the obvious alternative gets wrong.
+#
+# **Detection is the pane's TEXT, never herdr's status.** Herdr derives status from
+# its own regexes over terminal regions, and its top rule (priority 1100,
+# `osc_title_working`: a braille spinner in the window title) outranks every
+# blocked rule it has. A spinner is exactly what is on screen while the request
+# that hit the wall is still in flight. Gating on `blocked` would risk never firing.
+#
+# **Liveness is the tail's HASH, not a status either.** We act only when the wall's
+# text is on screen AND the tail has not changed since the last tick. That matters
+# in both directions: a working agent's tail moves every few seconds so this cannot
+# interrupt one, and the wall's message stays in the scrollback for a while after
+# the session recovers, so the text alone would keep firing long after it should.
+#
+# **We wait for the time the dialog names, and poll only if we cannot read it.**
+# The dialog carries "Resets 8:30pm", and that hint beats any other source of the
+# same fact: it comes from the error that walled us, so it already refers to the
+# right window. The account has two (five-hour and weekly) and nothing else on hand
+# would say which one we are behind.
+#
+# Its format is fixed by Claude Code's own formatter and worth writing down, because
+# two of its habits will bite anyone who assumes otherwise: minutes are omitted when
+# they are zero ("8pm", not "8:00pm"), and no date is printed for anything less than
+# 24 hours out - so a bare "1am" seen at 11pm means tomorrow. Beyond 24 hours it
+# becomes "Jul 28, 8:30pm", and gains a year only when the year differs.
+#
+# A hint we cannot read is not a failure: PQ_QUOTA_RETRY polling is the fallback,
+# and it also takes over after a knock at the named time turns out to be too early.
+# Waiting on an unparsed guess is the only outcome worth ruling out, since that
+# strands a task silently, where a knock sent early costs one instantly-failing call.
+pane_tail() {                           # pane_id -> the last lines on screen
+  [ -n "${1:-}" ] || return 0
+  herdr agent read "$1" --source visible --format text 2>/dev/null \
+    | jq -r '.result.read.text // ""' 2>/dev/null | tail -n "$PQ_TAIL_LINES"
+}
+
+# "Resets 8:30pm" / "Resets Jul 28, 8pm" -> epoch. Local time throughout, because
+# that is what Claude Code printed. Silence means "could not read it" and the caller
+# falls back to polling, so every branch here fails closed rather than guessing.
+parse_reset() {                         # hint text -> epoch seconds
+  local s=$1 dpart tpart e nowe
+  s=${s%%(*}                                          # drop a trailing " (PDT)"
+  s=$(sed 's/^[[:space:]]*//; s/[[:space:]]*$//' <<<"$s")
+  [ -n "$s" ] || return 1
+  # Split on the LAST comma: the with-year form is "Jan 3, 2027, 9am".
+  case "$s" in
+    *,*) dpart=$(tr -d ',' <<<"${s%,*}"); tpart=${s##*,} ;;
+    *)   dpart=""; tpart=$s ;;
+  esac
+  tpart=$(tr -d ' ' <<<"$tpart" | tr '[:lower:]' '[:upper:]')
+  case "$tpart" in *:*) ;; *) tpart=$(sed 's/\([0-9]\{1,2\}\)\([AP]M\)/\1:00\2/' <<<"$tpart") ;; esac
+  case "$tpart" in *AM|*PM) ;; *) return 1 ;; esac
+  nowe=$(date '+%s')
+  if [ -n "$dpart" ]; then
+    dpart=$(sed 's/^[[:space:]]*//; s/[[:space:]]*$//' <<<"$dpart")
+    case "$dpart" in
+      *[0-9][0-9][0-9][0-9]*) e=$(date -j -f '%b %d %Y %I:%M%p' "$dpart $tpart" '+%s' 2>/dev/null) ;;
+      *) e=$(date -j -f '%b %d %Y %I:%M%p' "$dpart $(date '+%Y') $tpart" '+%s' 2>/dev/null)
+         # No year printed means this year - unless we are reading it across new year.
+         [ -n "$e" ] && [ "$e" -lt $(( nowe - 86400 )) ] &&
+           e=$(date -j -f '%b %d %Y %I:%M%p' "$dpart $(( $(date '+%Y') + 1 )) $tpart" '+%s' 2>/dev/null) ;;
+    esac
+  else
+    e=$(date -j -f '%Y-%m-%d %I:%M%p' "$(date '+%Y-%m-%d') $tpart" '+%s' 2>/dev/null)
+    # A bare clock time is the next time the clock reads it, so 1am seen at 11pm
+    # is tomorrow. The small grace keeps a reset we have just passed from jumping.
+    [ -n "$e" ] && [ "$e" -lt $(( nowe - 300 )) ] && e=$(( e + 86400 ))
+  fi
+  [ -n "$e" ] || return 1
+  printf '%s' "$e"
+}
+
+# The hint sits at the end of a line that may well be inside a bordered box, so
+# anything trailing that cannot be part of a date is dropped.
+reset_hint() {                          # pane text -> the time the wall names
+  sed -n 's/.*[Rr]esets \(.*\)$/\1/p' <<<"$1" | tail -1 | sed 's/[^0-9A-Za-z:,() ]*$//'
+}
+
+classify_tail() {                       # text -> quota | permission | none
+  if   grep -qiE "$PQ_QUOTA_RE" <<<"$1"; then printf 'quota'
+  elif grep -qiE "$PQ_PERM_RE"  <<<"$1"; then printf 'permission'
+  else                                        printf 'none'; fi
+}
+
+# Escape rather than picking an option off the list. There are at least two
+# different limit dialogs in the binary and their option sets differ - one of them
+# offers "Upgrade to Team plan" - so arrowing to the Nth entry is a bet on which
+# dialog turned up. Escape does not care, and since every option merely dismisses,
+# it loses nothing.
+unstick() {                             # pane_id [text to send after]
+  herdr pane send-keys "$1" escape >/dev/null 2>&1 || return 1
+  [ -n "${2:-}" ] || return 0
+  sleep 1
+  herdr pane send-text "$1" "$2" >/dev/null 2>&1 \
+    && herdr pane send-keys "$1" enter >/dev/null 2>&1
+}
+
+clear_block() {                         # task_dir
+  local d=$1 k
+  for k in PQ_BLOCKED PQ_QUOTA_SINCE PQ_TRIES PQ_RETRY_AT PQ_GAVEUP PQ_RESETS; do st_set "$d" "$k" ""; done
+}
+
+# One running task, one tick: record what its pane is waiting on, and knock if it
+# is the wall. Everything else is classified and left alone - answering a dialog
+# nobody has identified is how an unattended system approves something it shouldn't.
+check_stall() {                         # task_dir
+  local d=$1 slug pane text hash prev kind was tries at nowsec
+  pane=$(st "$d" PQ_PANE); [ -n "$pane" ] || return 0
+  text=$(pane_tail "$pane"); [ -n "$text" ] || return 0
+  slug=$(slug_of "$d"); nowsec=$(epoch)
+  hash=$(cksum <<<"$text" | awk '{ print $1 }')
+  prev=$(st "$d" PQ_TAIL); st_set "$d" PQ_TAIL "$hash"
+  kind=$(classify_tail "$text")
+  was=$(st "$d" PQ_BLOCKED)
+
+  if [ "$kind" != quota ]; then
+    [ "$was" = quota ] && msg "$slug: moving again after the session limit"
+    # Only when there is something to clear: this is the overwhelmingly common
+    # branch, and each clear is five rewrites of state.env for no change at all.
+    [ -n "$was" ] && clear_block "$d"
+    # A permission prompt is recorded and deliberately never answered. That is the
+    # trade for running everything in auto mode, and it is the distinction `pq ls`
+    # draws in the morning between waiting on the clock and waiting on you.
+    [ "$kind" = permission ] && st_set "$d" PQ_BLOCKED permission
+    return 0
+  fi
+
+  # The wall is on screen, but only a screen that has stopped moving is stuck.
+  [ -n "$prev" ] && [ "$prev" = "$hash" ] || return 0
+
+  if [ "$was" != quota ]; then
+    local hint due plan
+    hint=$(reset_hint "$text")
+    due=$(parse_reset "$hint") || due=""
+    if [ -n "$due" ] && [ "$due" -gt "$nowsec" ]; then
+      due=$(( due + 60 ))               # a minute past it, so clock skew cannot land early
+      plan="waiting until $hint"
+      st_set "$d" PQ_RESETS "$hint"
+    else
+      due=$(( nowsec + PQ_QUOTA_RETRY ))
+      plan="no reset time on screen, so knocking every $(( PQ_QUOTA_RETRY / 60 ))m"
+      st_set "$d" PQ_RESETS ""
+    fi
+    st_set "$d" PQ_BLOCKED quota;  st_set "$d" PQ_QUOTA_SINCE "$(now)"
+    st_set "$d" PQ_TRIES 0;        st_set "$d" PQ_RETRY_AT "$due"
+    unstick "$pane"
+    warn "$slug: hit the session limit - dismissed it, $plan"
+    return 0
+  fi
+
+  tries=$(st "$d" PQ_TRIES); tries=${tries:-0}
+  at=$(st "$d" PQ_RETRY_AT); at=${at:-0}
+  [ "$nowsec" -ge "$at" ] || return 0
+
+  if [ "$tries" -ge "$PQ_QUOTA_MAX_TRIES" ]; then
+    [ "$(st "$d" PQ_GAVEUP)" = 1 ] || {
+      st_set "$d" PQ_GAVEUP 1
+      warn "$slug: still walled after $tries attempts - leaving it for you"
+    }
+    return 0
+  fi
+
+  # Past the named reset and still walled means the hint was optimistic, so from
+  # here it is the poll interval. PQ_RESETS goes with it - a time already gone is
+  # worse than no time at all in `pq ls`.
+  tries=$(( tries + 1 ))
+  st_set "$d" PQ_TRIES "$tries"; st_set "$d" PQ_RETRY_AT "$(( nowsec + PQ_QUOTA_RETRY ))"
+  st_set "$d" PQ_RESETS ""
+  unstick "$pane" "Continue with what you were doing."
+  msg "$slug: knocking after the session limit (attempt $tries)"
+}
+
+# One `gh` lookup per dispatched branch, concurrently. Only tasks that have been
+# dispatched can have a PR, so this costs nothing while the queue is just a queue.
+# statusCheckRollup is deliberately not requested: it is what makes `wt ls` slow,
+# and "is there a PR" does not need it.
+#
+# `--limit` is 5, not 1, and `baseRefName` is a sixth column - both purely for
+# the blocker predicate below, which needs to tell "closed, but a later PR
+# merged" apart from "closed, and nothing else was ever opened", and needs to
+# know WHICH branch a PR landed on. `pr_get` still wins on the first matching
+# row, untouched - see the comment there for why a second, later PR is safe to
+# have sitting further down the file.
+#
+# PR_ANS is the answered set: a repo+branch pair present in it means gh
+# genuinely answered "zero rows" for that branch, as opposed to gh never having
+# been asked (no `gh` installed, offline, no GitHub remote) or having failed.
+# Without this distinction "no PR yet" and "gh could not tell us" look
+# identical, and a blocker that has simply not started yet would be
+# misdiagnosed as an orphan the first time `gh` hiccups.
+PR_CACHE="" PR_ANS=""
+pr_load() {                             # repo branch...
+  local repo=$1 b n=0; shift
+  local pids=()
+  PR_CACHE="$PQ_HOME/.pr.$$"; : > "$PR_CACHE"
+  PR_ANS="$PQ_HOME/.pr.$$.ans"; : > "$PR_ANS"
+  command -v gh >/dev/null 2>&1 || return 0
+  for b in "$@"; do
+    [ -n "$b" ] || continue
+    (
+      cd "$repo" 2>/dev/null || exit 1
+      raw=$(gh pr list --head "$b" --state all --limit 5 \
+              --json number,state,isDraft,baseRefName 2>/dev/null) || exit 1
+      printf '%s\t%s\n' "$repo" "$b" > "$PR_ANS.$n"
+      jq -r --arg b "$b" --arg r "$repo" \
+         '.[] | [$r, $b, (.number|tostring), .state,
+                 (if .isDraft then "draft" else "" end), .baseRefName] | @tsv' <<<"$raw"
+    ) > "$PR_CACHE.$n" &
+    pids[$n]=$!; n=$((n + 1))
+  done
+  [ "$n" -gt 0 ] || return 0
+  wait "${pids[@]}" 2>/dev/null
+  cat "$PR_CACHE".[0-9]* >> "$PR_CACHE" 2>/dev/null
+  cat "$PR_ANS".[0-9]*   >> "$PR_ANS"   2>/dev/null
+  rm -f "$PR_CACHE".[0-9]* "$PR_ANS".[0-9]*
+}
+# Keyed on repo AND branch. The cache is one file spanning every project in the
+# queue, and a branch name is only unique within its own repo - `tom/fix-timezone`
+# in supercast and in supercast-ios are different branches with the same name. On
+# the branch alone, one project's merged PR would retire the other project's task
+# and free a slot whose work never shipped.
+pr_get() {                              # repo branch
+  awk -F'\t' -v r="$1" -v b="$2" \
+    '$1 == r && $2 == b { print $3 "\t" $4 "\t" $5; exit }' "${PR_CACHE:-/dev/null}" 2>/dev/null
+}
+
+# Every (repo, branch) pair pq needs PR/answered state for THIS pass, plus the
+# blockers of every task that has not started (queue + hold) - those branches
+# can belong to a repo nothing else in the queue touches, so they would
+# otherwise never get looked up at all.
+#
+# `scope` picks which dispatched branches count: `all` (the default) is
+# running + done, which `cmd_ls` needs for its PR column; `tick_body` passes
+# `running` instead, since reconcile only ever looks at running tasks - a
+# `done` task's own branch is otherwise a `gh` call repeated every tick,
+# forever, for history that already shipped and will never change state again.
+# A `done` task that is ALSO a blocker still gets looked up, through its
+# dependent's `after` row.
+pr_targets() {                          # [scope: all|running]
+  local scope=${1:-all} d st repo branch
+  while IFS= read -r d; do
+    [ -n "$d" ] || continue
+    st=$(state_of "$d")
+    case "$st" in
+      running)
+        repo=$(hdr "$d/plan.md" repo); branch=$(hdr "$d/plan.md" branch)
+        [ -n "$repo" ] && [ -n "$branch" ] && printf '%s\t%s\n' "$repo" "$branch"
+        ;;
+      done)
+        [ "$scope" = all ] || continue
+        repo=$(hdr "$d/plan.md" repo); branch=$(hdr "$d/plan.md" branch)
+        [ -n "$repo" ] && [ -n "$branch" ] && printf '%s\t%s\n' "$repo" "$branch"
+        ;;
+      queue|hold)
+        while IFS=$'\t' read -r _ repo branch; do
+          [ -n "$repo" ] && [ -n "$branch" ] && printf '%s\t%s\n' "$repo" "$branch"
+        done <<<"$(after_list "$d")"
+        ;;
+    esac
+  done <<<"$(all_tasks)"
+}
+
+# Group a set of (repo, branch) pairs by repo and run `pr_load` once per repo,
+# so each repo's lookups share a single `cd` - then combine into ONE PR_CACHE
+# and ONE PR_ANS spanning every repo, set once. Replaces two near-identical
+# per-repo loops that used to live in `cmd_ls` and `tick_body`; net less code,
+# and the one place both a blocker and a dispatched branch can go missing from.
+pr_load_all() {                         # pairs: "repo\tbranch" lines, e.g. $(pr_targets)
+  local pairs=$1 r branches
+  local cache="$PQ_HOME/.prall.$$" ans="$PQ_HOME/.prall.$$.ans"
+  : > "$cache"; : > "$ans"
+  if [ -n "$pairs" ]; then
+    local repos; repos=$(awk -F'\t' '{ print $1 }' <<<"$pairs" | sed '/^$/d' | sort -u)
+    while IFS= read -r r; do
+      [ -n "$r" ] || continue
+      branches=$(awk -F'\t' -v r="$r" '$1 == r { print $2 }' <<<"$pairs")
+      # shellcheck disable=SC2086
+      pr_load "$r" $branches
+      cat "$PR_CACHE" >> "$cache" 2>/dev/null
+      cat "$PR_ANS"   >> "$ans"   2>/dev/null
+      rm -f "$PR_CACHE" "$PR_ANS"
+    done <<<"$repos"
+  fi
+  PR_CACHE=$cache
+  PR_ANS=$ans
+}
+
+# ── after: the predicate ────────────────────────────────────────────────────
+# The repo's default branch, bare (e.g. "main", not "origin/main") - memoised in
+# a file for the life of one `pq` process, the same way PR_CACHE is. It has to
+# be a FILE, not a shell variable: every caller reaches this through command
+# substitution (`base=$(repo_base "$repo")`), which forks a subshell, and
+# anything that function assigned to a plain variable dies with that subshell -
+# which is also why the cache path is derived from $$ directly rather than
+# stashed in a variable first: a variable assignment here would be exactly as
+# invisible to the caller as the memoised value itself would be.
+#
+# Mirrors `wt`'s `base_ref`: the remote-tracking symbolic ref first, since that
+# is what every worktree already forks from, then `gh` for a repo `wt` has never
+# touched, then a plain `show-ref` as the last resort. Unresolvable means we
+# cannot evaluate "merged into main" at all, so the caller has to fail closed -
+# see after_state's "nobase" detail.
+repo_base() {                           # repo -> default branch name (bare), or "" if unresolvable
+  local cache="$PQ_HOME/.base.$$" repo=$1 line base b
+  [ -f "$cache" ] && line=$(awk -F'\t' -v r="$repo" '$1 == r { print; exit }' "$cache")
+  if [ -n "${line:-}" ]; then
+    base=${line#*$'\t'}; printf '%s' "$base"; [ -n "$base" ]; return
+  fi
+  base=$(git -C "$repo" symbolic-ref --quiet --short refs/remotes/origin/HEAD 2>/dev/null)
+  base=${base#origin/}
+  if [ -z "$base" ] && command -v gh >/dev/null 2>&1; then
+    base=$(cd "$repo" 2>/dev/null && gh repo view --json defaultBranchRef -q '.defaultBranchRef.name' 2>/dev/null)
+  fi
+  if [ -z "$base" ]; then
+    for b in main master; do
+      git -C "$repo" show-ref --verify --quiet "refs/remotes/origin/$b" && { base=$b; break; }
+    done
+  fi
+  printf '%s\t%s\n' "$repo" "$base" >> "$cache"
+  printf '%s' "$base"
+  [ -n "$base" ]
+}
+# Deletes the memo file directly by its (deterministic) path, rather than
+# through a variable that repo_base's own callers never actually see set -
+# checking a variable the caller's scope never received would silently skip
+# the rm every time, leaking one small file per `pq` invocation forever.
+repo_base_reset() { rm -f "$PQ_HOME/.base.$$" 2>/dev/null; }
+
+# Pure: reads only PR_CACHE. 0 when a PR for this branch merged into base.
+pr_merged_into() {                      # repo branch base
+  awk -F'\t' -v r="$1" -v b="$2" -v base="$3" '
+    $1 == r && $2 == b && $4 == "MERGED" && $6 == base { ok = 1; exit }
+    END { exit !ok }' "${PR_CACHE:-/dev/null}"
+}
+# Pure: reads only PR_ANS. 0 when gh definitively answered for this branch,
+# even if the answer was zero rows.
+pr_answered() {                         # repo branch
+  awk -F'\t' -v r="$1" -v b="$2" '
+    $1 == r && $2 == b { ok = 1; exit }
+    END { exit !ok }' "${PR_ANS:-/dev/null}"
+}
+# Pure: reads only PR_CACHE. 0 when at least one row is on file at all.
+pr_has_row() {                          # repo branch
+  awk -F'\t' -v r="$1" -v b="$2" '
+    $1 == r && $2 == b { ok = 1; exit }
+    END { exit !ok }' "${PR_CACHE:-/dev/null}"
+}
+# Pure: reads only PR_CACHE. 0 when at least one row exists and every row on
+# file for this branch is CLOSED - it can never become met on its own.
+pr_all_closed() {                       # repo branch
+  awk -F'\t' -v r="$1" -v b="$2" '
+    BEGIN { allclosed = 1 }
+    $1 == r && $2 == b { n++; if ($4 != "CLOSED") allclosed = 0 }
+    END { exit !(n > 0 && allclosed) }' "${PR_CACHE:-/dev/null}"
+}
+# Pure: reads only PR_CACHE. 0 when at least one row is an open DRAFT.
+pr_has_draft() {                        # repo branch
+  awk -F'\t' -v r="$1" -v b="$2" '
+    $1 == r && $2 == b && $5 == "draft" { ok = 1; exit }
+    END { exit !ok }' "${PR_CACHE:-/dev/null}"
+}
+
+# blocker_state <repo> <branch> <base> -> met | waiting | stalled | dead | orphan | unknown
+#
+# Not pure past this line: task_by_branch walks all_tasks() and touches disk,
+# which is why the five pr_* predicates above are split out on their own - they
+# are the seam a test can exercise without a single real task directory.
+#
+# One row per outcome in the table this mirrors, in the same order, because
+# that is the only way to keep the two in sync by inspection rather than by
+# memory:
+#   MERGED into the default branch                       -> met
+#   no PR yet, a live task owns the branch                -> waiting (normal)
+#   an OPEN row, a live task owns the branch               -> waiting (in review)
+#   a DRAFT row whose owning task has reached done         -> stalled
+#   every row is CLOSED                                    -> dead
+#   no PR, and no task in any state owns the branch        -> orphan
+#   no row and gh never answered                           -> unknown
+blocker_state() {                       # repo branch base
+  local repo=$1 branch=$2 base=$3 owner
+  pr_merged_into "$repo" "$branch" "$base" && { printf 'met'; return; }
+  if pr_has_row "$repo" "$branch"; then
+    pr_all_closed "$repo" "$branch" && { printf 'dead'; return; }
+    owner=$(task_by_branch "$repo" "$branch")
+    if pr_has_draft "$repo" "$branch" && [ -n "$owner" ] && [ "$(state_of "$owner")" = "done" ]; then
+      printf 'stalled'; return
+    fi
+    printf 'waiting'; return
+  fi
+  if pr_answered "$repo" "$branch"; then
+    owner=$(task_by_branch "$repo" "$branch")
+    [ -n "$owner" ] && { printf 'waiting'; return; }
+    printf 'orphan'; return
+  fi
+  printf 'unknown'
+}
+
+# after_state <task_dir> -> "verdict\tdetail" where verdict is
+# met | waiting <label> <n_unmet> | stalled <label> | dead <label>, and detail
+# is one of dead|orphan|stalled|nobase:<repo>|"" - the finer-grained reason a
+# caller needs for a warning message but that would overload the verdict text
+# itself. Both are printed on the SAME line, tab-separated, rather than through
+# a side-channel global: every caller reaches this through command
+# substitution, which forks a subshell, so a global this function set would
+# vanish the moment it returned - the same trap repo_base's cache sidesteps by
+# being a file instead of a variable.
+#
+# Aggregates every blocker: dead/orphan outranks stalled outranks plain
+# waiting, because the fix differs and the worse case is the one worth
+# surfacing first - a task can be both "waiting on two" and "one of them is
+# dead", and dead is the one that will never resolve on its own.
+after_state() {                         # task_dir
+  local d=$1 label repo branch base bst
+  local first_dead="" first_dead_detail="" first_stalled="" first_wait="" n_unmet=0 nobase=""
+  if [ ! -f "$d/after" ]; then printf 'met\t'; return; fi
+  while IFS=$'\t' read -r label repo branch; do
+    [ -n "$label" ] || continue
+    base=$(repo_base "$repo")
+    if [ -z "$base" ]; then
+      nobase=$repo
+      n_unmet=$((n_unmet + 1)); [ -n "$first_wait" ] || first_wait=$label
+      continue
+    fi
+    bst=$(blocker_state "$repo" "$branch" "$base")
+    case "$bst" in
+      met) ;;
+      dead|orphan)
+        n_unmet=$((n_unmet + 1))
+        if [ -z "$first_dead" ]; then first_dead=$label; first_dead_detail=$bst; fi
+        ;;
+      stalled) n_unmet=$((n_unmet + 1)); [ -n "$first_stalled" ] || first_stalled=$label ;;
+      *)       n_unmet=$((n_unmet + 1)); [ -n "$first_wait" ] || first_wait=$label ;;
+    esac
+  done <<<"$(after_list "$d")"
+  if [ -n "$first_dead" ]; then
+    printf 'dead %s\t%s' "$first_dead" "$first_dead_detail"
+  elif [ -n "$first_stalled" ]; then
+    printf 'stalled %s\tstalled' "$first_stalled"
+  elif [ "$n_unmet" -gt 0 ]; then
+    printf 'waiting %s %d\t%s' "$first_wait" "$n_unmet" "${nobase:+nobase:$nobase}"
+  else
+    printf 'met\t'
+  fi
+}
+
+# The tick-time wrapper: after_state plus the once-only warning. dead, orphan
+# and stalled all set PQ_AFTER_DEAD via the PQ_GAVEUP idiom (clear_block) -
+# warn on the transition into it, stay quiet on every tick after, and clear it
+# the moment the blocker recovers, so a reopened PR or a draft marked ready
+# re-arms the warning. An unresolvable default branch warns once under its own
+# PQ_AFTER_NOBASE key instead, because the fix is different - it names a repo,
+# not a blocker.
+#
+# `pq ls` calls after_state directly and never this: a mere listing must not
+# write to state.env or print a warning, the same way `agent_cell` never has.
+after_check() {                         # task_dir
+  local d=$1 verdict detail slug was wasnb reporepo
+  IFS=$'\t' read -r verdict detail <<<"$(after_state "$d")"
+  slug=$(slug_of "$d")
+  was=$(st "$d" PQ_AFTER_DEAD)
+  case "$verdict" in
+    dead\ *|stalled\ *)
+      if [ "$was" != 1 ]; then
+        st_set "$d" PQ_AFTER_DEAD 1
+        case "$detail" in
+          dead)    warn "$slug: blocker ${verdict#* } is dead - every PR for it is closed; merge one or clear the blocker (pq after $slug --clear)" ;;
+          orphan)  warn "$slug: blocker ${verdict#* } is an orphan - no task owns its branch, so nothing will ever open a PR for it" ;;
+          stalled) warn "$slug: blocker ${verdict#* } is stalled - its task already reached done with only a draft PR open; go look at it" ;;
+        esac
+      fi
+      ;;
+    *) [ -z "$was" ] || st_set "$d" PQ_AFTER_DEAD "" ;;
+  esac
+  case "$detail" in
+    nobase:*)
+      reporepo=${detail#nobase:}
+      wasnb=$(st "$d" PQ_AFTER_NOBASE)
+      [ "$wasnb" = 1 ] || { st_set "$d" PQ_AFTER_NOBASE 1
+        warn "$slug: could not resolve the default branch of $reporepo - its blockers stay unmet until it can"; }
+      ;;
+    *)
+      wasnb=$(st "$d" PQ_AFTER_NOBASE)
+      [ -z "$wasnb" ] || st_set "$d" PQ_AFTER_NOBASE ""
+      ;;
+  esac
+  printf '%s' "$verdict"
+}
+
+# {label, repo, branch, state} for every blocker, for cmd_ls --json and
+# cmd_add --json - assumes PR_CACHE/PR_ANS already cover every blocker's
+# (repo, branch), same as after_state assumes.
+after_json() {                          # task_dir
+  local d=$1 label repo branch base st
+  [ -f "$d/after" ] || { printf '[]'; return; }
+  local tmp="$PQ_HOME/.afterjson.$$"; : > "$tmp"
+  while IFS=$'\t' read -r label repo branch; do
+    [ -n "$label" ] || continue
+    base=$(repo_base "$repo")
+    st=$(blocker_state "$repo" "$branch" "${base:-}")
+    jq -nc --arg label "$label" --arg repo "$repo" --arg branch "$branch" --arg state "$st" \
+      '{label: $label, repo: $repo, branch: $branch, state: $state}' >> "$tmp"
+  done <<<"$(after_list "$d")"
+  jq -sc '.' "$tmp"
+  rm -f "$tmp"
+}
+
+# Same table renderer as wt: every column but the last padded to its own widest
+# cell, so one long branch name does not force a fixed width on everything else.
+#
+# Cells must be ASCII. macOS awk's length() counts BYTES, not characters, and no
+# locale changes that (verified on awk 20200816) - so a single multi-byte character
+# anywhere in a cell silently over-pads that column by the number of extra bytes and
+# skews the whole table. Cheap to avoid, fiddly to detect, so: plain ASCII in tables.
+render_table() {                        # tsv_file
+  awk -F'\t' '
+    { rows = NR; if (NF > n) n = NF
+      for (i = 1; i <= NF; i++) { cell[NR, i] = $i; if (length($i) > w[i]) w[i] = length($i) } }
+    END {
+      for (r = 1; r <= rows; r++) {
+        line = ""
+        for (i = 1; i <= n; i++) line = line (i == n ? cell[r, i] : sprintf("%-*s  ", w[i], cell[r, i]))
+        sub(/[ \t]+$/, "", line); print line
+      }
+    }
+  ' "$1"
+}
+
+age_of() {                              # iso8601
+  local then now d
+  [ -n "${1:-}" ] || { printf -- '-'; return; }
+  then=$(date -j -u -f '%Y-%m-%dT%H:%M:%SZ' "$1" '+%s' 2>/dev/null) || { printf -- '-'; return; }
+  now=$(date -u '+%s'); d=$(( now - then ))
+  if   [ "$d" -lt 3600 ]  ; then printf '%dm' $(( d / 60 ))
+  elif [ "$d" -lt 86400 ] ; then printf '%dh' $(( d / 3600 ))
+  else                           printf '%dd' $(( d / 86400 )); fi
+}
+
+# What an agent is waiting on, in the words that decide what you do about it.
+# `pq` records why it classified a blocked agent the way it did, so the morning
+# read separates "waiting on the clock" from "waiting on you".
+#
+# The column is headed AGENT, but the header comment already describes `pq ls`
+# as showing "what it is waiting on" - so a task that has not started yet gets
+# an answer here too, rather than a tenth column: `after <label>` (`+N` for
+# more) when it is only waiting, `dead <label>` or `stalled <label>` when a
+# blocker needs you instead. Calls after_state directly, never after_check - a
+# mere listing must not write to state.env or print a warning.
+agent_cell() {                          # task_dir state
+  local d=$1 st=$2 pane status blocked
+  case "$st" in
+    queue|hold)
+      [ -f "$d/after" ] || { printf -- '-'; return; }
+      local verdict lbl cnt
+      IFS=$'\t' read -r verdict _ <<<"$(after_state "$d")"
+      case "$verdict" in
+        met)  printf -- '-' ;;
+        waiting\ *)
+          lbl=${verdict#waiting }; cnt=${lbl##* }; lbl=${lbl% *}
+          if [ "$cnt" -gt 1 ] 2>/dev/null; then printf 'after %s +%d' "$lbl" "$((cnt - 1))"
+          else printf 'after %s' "$lbl"; fi
+          ;;
+        stalled\ *) printf 'stalled %s' "${verdict#stalled }" ;;
+        dead\ *)    printf 'dead %s' "${verdict#dead }" ;;
+      esac
+      return
+      ;;
+  esac
+  [ "$st" = running ] || { printf -- '-'; return; }
+  pane=$(st "$d" PQ_PANE)
+  # Claimed but not yet launched: either mid-dispatch right now, or an interrupted
+  # tick left it half-done and the next reconcile will finish it.
+  [ -n "$(st "$d" PQ_LAUNCHED)" ] || { printf 'starting'; return; }
+  status=$(pane_state "$pane")
+  case "$status" in
+    "")        printf '?';    return ;;       # herdr did not answer
+    missing)   printf 'gone'; return ;;       # workspace is gone, so nothing else applies
+  esac
+  # What pq itself read off the pane outranks whatever herdr makes of it - herdr
+  # can call a walled agent `working` off the spinner still in its title, or
+  # `noagent` if the binding lapsed, and the wall is the whole reason this column
+  # exists at 8am. Same ordering as reconcile, for the same reason.
+  blocked=$(st "$d" PQ_BLOCKED)
+  case "$blocked" in
+    quota)      [ "$(st "$d" PQ_GAVEUP)" = 1 ] && printf 'walled ' || printf 'quota '
+                # The time it comes back beats how long it has been gone, when the
+                # wall told us one. Both are ASCII, as every cell here must be.
+                blocked=$(st "$d" PQ_RESETS)
+                printf '%s' "${blocked:-$(age_of "$(st "$d" PQ_QUOTA_SINCE)")}"; return ;;
+    permission) printf 'permission'; return ;;
+  esac
+  case "$status" in
+    noagent) printf 'exited';  return ;;      # a shell is sitting where Claude was
+    unknown) printf 'unknown'; return ;;
+  esac
+  printf '%s' "$status"
+}
+
+cmd_ls() {
+  local as_json=0
+  [ "${1:-}" = "--json" ] && as_json=1
+
+  local tasks; tasks=$(all_tasks)
+  [ -n "$tasks" ] || { [ "$as_json" = 1 ] && echo '[]'; msg "queue is empty - add one with: pq add"; return 0; }
+
+  # PR state for every dispatched branch, PLUS every blocker of a task that has
+  # not started - a blocker's branch can belong to a repo nothing else in the
+  # queue touches, so pq ls would otherwise lie about it being unmet forever.
+  local d st repo
+  pidx_load
+  pr_load_all "$(pr_targets)"
+
+  # A PROJECT column, but only once the queue actually spans more than one. It is
+  # the first thing you need when it does, and a column of the same word when it
+  # doesn't. `repos` above covers only running and done tasks, so count separately.
+  local multi
+  multi=$(while IFS= read -r d; do [ -n "$d" ] && hdr "$d/plan.md" repo; done <<<"$tasks" \
+            | sed '/^$/d' | sort -u | awk 'END { print (NR > 1) }')
+
+  local tbl="$PQ_HOME/.ls.$$.tsv"
+  local slug branch model effort dev intent added pr num prstate draft agent needs=0 blocked
+  if [ "$as_json" = 1 ]; then
+    : > "$tbl"
+  elif [ "$multi" = 1 ]; then
+    printf 'TASK\tPROJECT\tSTATE\tBRANCH\tMODEL\tEFFORT\tAGENT\tPR\tAGE\n' > "$tbl"
+  else
+    printf 'TASK\tSTATE\tBRANCH\tMODEL\tEFFORT\tAGENT\tPR\tAGE\n' > "$tbl"
+  fi
+  while IFS= read -r d; do
+    [ -n "$d" ] || continue
+    st=$(state_of "$d"); slug=$(slug_of "$d")
+    branch=$(hdr "$d/plan.md" branch); model=$(hdr "$d/plan.md" model)
+    effort=$(hdr "$d/plan.md" effort); dev=$(hdr "$d/plan.md" dev)
+    intent=$(hdr "$d/plan.md" intent);  added=$(hdr "$d/plan.md" added)
+    repo=$(hdr "$d/plan.md" repo)
+    agent=$(agent_cell "$d" "$st")
+    case "$agent" in
+      permission|gone|exited|blocked|unknown) needs=$((needs + 1)) ;;
+      dead\ *|stalled\ *)                     needs=$((needs + 1)) ;;
+    esac
+    num=""; prstate=""; draft=""
+    IFS=$'\t' read -r num prstate draft <<<"$(pr_get "$repo" "$branch")"
+    case "${prstate:-}" in
+      MERGED) pr="#$num merged" ;;
+      OPEN)   pr="#$num ${draft:-open}" ;;
+      CLOSED) pr="#$num closed" ;;
+      *)      pr="-" ;;
+    esac
+    if [ "$as_json" = 1 ]; then
+      case "$(after_state "$d")" in met$'\t'*) blocked=false ;; *) blocked=true ;; esac
+      jq -nc --arg task "$slug" --arg state "$st" --arg branch "$branch" \
+        --arg repo "$repo" --arg model "$model" --arg effort "$effort" --arg dev "$dev" \
+        --arg intent "$intent" --arg added "$added" --arg dir "$d" \
+        --arg agent "$agent" --arg pr "${num:-}" --arg prstate "${prstate:-}" \
+        --arg draft "$draft" --arg prio "$(prio_of "$d")" \
+        --argjson after "$(after_json "$d")" --argjson blocked "$blocked" '
+        def str: if . == "" then null else . end;
+        { task: $task, priority: ($prio|tonumber), state: $state, dir: $dir,
+          repo: $repo, branch: $branch, model: $model, effort: $effort,
+          dev: ($dev == "true"), intent: ($intent|str), added: ($added|str),
+          agent: ($agent | if . == "-" then null else . end),
+          pr: ($pr|str|if . then tonumber else null end),
+          pr_state: ($prstate|str), pr_draft: ($draft == "draft"),
+          after: $after, blocked: $blocked }' >> "$tbl"
+    else
+      printf '%s\t%s%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+        "$slug" "$([ "$multi" = 1 ] && printf '%s\t' "$(basename "${repo:--}")")" \
+        "$st" "${branch:--}" "${model:--}" "${effort:--}" \
+        "$agent" "$pr" "$(age_of "$added")" >> "$tbl"
+    fi
+  done <<<"$tasks"
+
+  if [ "$as_json" = 1 ]; then
+    jq -s '.' "$tbl"
+  else
+    render_table "$tbl"
+    local nq nr
+    nq=$(ls -d "$PQ_HOME/queue"/*/ 2>/dev/null | wc -l | tr -d ' ')
+    nr=$(ls -d "$PQ_HOME/running"/*/ 2>/dev/null | wc -l | tr -d ' ')
+    printf '\n' >&2
+    msg "$nr running, $nq queued$([ "$needs" -gt 0 ] && printf ' (%s needs you)' "$needs")"
+  fi
+  rm -f "$tbl" "$PR_CACHE" "$PR_ANS"
+  repo_base_reset
+}
+
+# ── the small movers ────────────────────────────────────────────────────────
+cmd_show() {
+  local d; d=$(find_task "${1:-}") || exit 1
+  printf '%s  [%s]\n\n' "$(slug_of "$d")" "$(state_of "$d")"
+  local k
+  for k in repo branch model effort dev intent source added; do
+    printf '  %-8s %s\n' "$k" "$(hdr "$d/plan.md" "$k")"
+  done
+  if [ -f "$d/state.env" ]; then
+    printf '\n  runtime\n'
+    sed 's/^/    /' "$d/state.env"
+  fi
+  if [ -f "$d/after" ]; then
+    printf '\n  after\n'
+    pr_load_all "$(after_list "$d" | awk -F'\t' '{ print $2 "\t" $3 }')"
+    local label repo branch base bst
+    while IFS=$'\t' read -r label repo branch; do
+      [ -n "$label" ] || continue
+      base=$(repo_base "$repo")
+      bst=$(blocker_state "$repo" "$branch" "${base:-}")
+      printf '    %-20s %-8s %s\n' "$label" "$bst" "$branch"
+    done <<<"$(after_list "$d")"
+    rm -f "$PR_CACHE" "$PR_ANS"
+    repo_base_reset
+  fi
+  printf '\n%s\n\n' "$(printf '─%.0s' $(seq 1 60))"
+  # The plan itself, with our header stripped back off. Leading blank lines go too -
+  # the header is followed by one, and it would otherwise stack with the gap above.
+  # A file with no header at all just prints whole, which is the right fallback.
+  awk 'NR == 1 && $0 == "---" { inh = 1; next }
+       inh && $0 == "---" { inh = 0; next }
+       inh { next }
+       !started && $0 ~ /^[[:space:]]*$/ { next }
+       { started = 1; print }' "$d/plan.md"
+}
+
+cmd_priority() {
+  local d n; d=$(find_task "${1:-}") || exit 1; n=${2:-}
+  [[ "$n" =~ ^[0-9]+$ ]] || die "usage: pq priority <task> <number>"
+  case "$(state_of "$d")" in
+    queue|hold) ;;
+    *) die "$(slug_of "$d") is $(state_of "$d") - priority only orders what has not started" ;;
+  esac
+  local new; new=$(retitle "$d" "$(state_of "$d")" "$n")
+  msg "$(slug_of "$d") -> priority $n"
+}
+
+cmd_hold() {
+  local d; d=$(find_task "${1:-}") || exit 1
+  [ "$(state_of "$d")" = queue ] || die "$(slug_of "$d") is $(state_of "$d"), not queued"
+  # Read before the move: holding A silently stalls everything after it, and
+  # this is the moment to say so - same reasoning as the cmd_rm warning below.
+  local deps; deps=$(dependents_of "$(hdr "$d/plan.md" repo)" "$(hdr "$d/plan.md" branch)" | tr '\n' ' ')
+  retitle "$d" hold >/dev/null; msg "held $(slug_of "$d") - nothing will pick it up"
+  [ -z "$deps" ] || warn "$(slug_of "$d") is a blocker for: ${deps% } - holding it stalls them too"
+}
+
+cmd_unhold() {
+  local d; d=$(find_task "${1:-}") || exit 1
+  [ "$(state_of "$d")" = hold ] || die "$(slug_of "$d") is $(state_of "$d"), not held"
+  retitle "$d" queue >/dev/null; msg "queued $(slug_of "$d")"
+}
+
+# `pq after <task>` alone answers "why has this not started": per blocker, both
+# the state of the TASK that owns the branch and the state of its PR, since
+# either one can be the reason and the fix differs.
+#
+# `pq after <task> <task|branch>...` adds blockers; `--clear` drops them all.
+# Restricted to queue and hold, with cmd_priority's message shape - blockers
+# only gate what has not started.
+cmd_after() {
+  local d; d=$(find_task "${1:-}") || exit 1; shift
+
+  if [ $# -eq 0 ]; then
+    if [ ! -f "$d/after" ]; then
+      msg "$(slug_of "$d") has no blockers"
+      return 0
+    fi
+    pr_load_all "$(after_list "$d" | awk -F'\t' '{ print $2 "\t" $3 }')"
+    local label repo branch base bst owner ownerst num prstate draft prtxt desc overdict
+    while IFS=$'\t' read -r label repo branch; do
+      [ -n "$label" ] || continue
+      base=$(repo_base "$repo")
+      bst=$(blocker_state "$repo" "$branch" "${base:-}")
+      owner=$(task_by_branch "$repo" "$branch") || owner=""
+      ownerst=${owner:+$(state_of "$owner")}; ownerst=${ownerst:--}
+      IFS=$'\t' read -r num prstate draft <<<"$(pr_get "$repo" "$branch")"
+      case "${prstate:-}" in
+        MERGED) prtxt="#$num merged" ;;
+        OPEN)   prtxt="#$num ${draft:-open}" ;;
+        CLOSED) prtxt="#$num closed" ;;
+        *)      prtxt="no PR yet" ;;
+      esac
+      case "$bst" in
+        met)     desc="merged into ${base:-its default branch} - satisfied" ;;
+        waiting)
+          case "$ownerst" in
+            done|-) desc="waiting on your merge" ;;
+            hold)   desc="parked - nothing will pick it up" ;;
+            *)
+              IFS=$'\t' read -r overdict _ <<<"$(after_state "$owner")"
+              case "$overdict" in
+                waiting\ *) desc="waiting on ${overdict##* } of its own" ;;
+                *)          desc="in progress" ;;
+              esac
+              ;;
+          esac
+          ;;
+        stalled) desc="stalled - a draft PR, but its task already reached done" ;;
+        dead)    desc="dead - every PR for it is closed" ;;
+        orphan)  desc="orphan - nothing will ever open a PR for this branch" ;;
+        *)       desc="gh has not answered yet" ;;
+      esac
+      printf '  %-20s %-8s %-12s %s\n' "$label" "$ownerst" "$prtxt" "$desc"
+    done <<<"$(after_list "$d")"
+    rm -f "$PR_CACHE" "$PR_ANS"
+    repo_base_reset
+    return 0
+  fi
+
+  # Both mutating forms - clearing and adding - are restricted to what has not
+  # started, same message shape as cmd_priority: blockers only gate a task
+  # that has not been dispatched yet.
+  case "$(state_of "$d")" in
+    queue|hold) ;;
+    *) die "$(slug_of "$d") is $(state_of "$d") - blockers only gate what has not started" ;;
+  esac
+
+  if [ "$1" = --clear ]; then
+    rm -f "$d/after"
+    msg "cleared blockers on $(slug_of "$d")"
+    return 0
+  fi
+
+  local owner_repo owner_branch value resolved label repo branch base
+  owner_repo=$(hdr "$d/plan.md" repo); owner_branch=$(hdr "$d/plan.md" branch)
+  for value in "$@"; do
+    resolved=$(resolve_after "$owner_repo" "$value") || die "could not resolve '$value' to a task or branch"
+    IFS=$'\t' read -r label repo branch <<<"$resolved"
+    [ -n "$repo" ] && [ -n "$branch" ] || die "could not resolve '$value' to a repo and branch"
+    [ "$repo" = "$owner_repo" ] && [ "$branch" = "$owner_branch" ] && die "a task cannot block on itself"
+    after_cycle "$owner_repo" "$owner_branch" "$repo" "$branch" \
+      && die "'$value' would create a cycle - $(slug_of "$d") already leads back to it"
+    after_add "$d" "$label" "$repo" "$branch"
+    pr_load_all "$(printf '%s\t%s\n' "$repo" "$branch")"
+    base=$(repo_base "$repo")
+    if [ -n "$base" ] && pr_merged_into "$repo" "$branch" "$base"; then
+      msg "$(slug_of "$d") after $label: already merged into $base - nothing to wait for"
+    else
+      msg "$(slug_of "$d") after $label ($branch)"
+    fi
+  done
+  rm -f "$PR_CACHE" "$PR_ANS"
+  repo_base_reset
+}
+
+# Drops pq's record and nothing else. A dispatched task has a worktree, a branch
+# and possibly a database behind it, and those belong to `wt` - reclaiming them
+# here would make `pq rm` far more destructive than its name suggests.
+cmd_rm() {
+  local d; d=$(find_task "${1:-}") || exit 1
+  # Read everything we will want to say BEFORE deleting the directory that holds it.
+  local slug st branch repo ans deps
+  slug=$(slug_of "$d"); st=$(state_of "$d")
+  branch=$(hdr "$d/plan.md" branch); repo=$(hdr "$d/plan.md" repo)
+  deps=$(dependents_of "$repo" "$branch" | tr '\n' ' ')
+  printf 'pq: remove task "%s" (%s)? [y/N] ' "$slug" "$st" >&2; read -r ans || ans=n
+  [[ "${ans:-}" =~ ^[Yy]$ ]] || { msg "cancelled"; return 0; }
+  rm -rf "$d" || die "could not remove $d"
+  msg "removed $slug"
+  # Removing A is exactly how B gets orphaned - nothing will ever open a PR for
+  # a branch pq no longer knows about, so that is the moment to say so.
+  [ -z "$deps" ] || warn "$slug was a blocker for: ${deps% } - they now wait on a branch nothing owns"
+  case "$st" in
+    running|done) warn "its worktree and branch are untouched - remove those with: wt rm $branch" ;;
+  esac
+}
+
+# ── dispatch ────────────────────────────────────────────────────────────────
+# What every implementer is told. Short and fixed: the plan carries the work, this
+# carries only the contract - how to finish, and how to fail without stalling.
+#
+# The two exits matter more than anything else here. pq frees a slot when a pull
+# request exists, so an agent that finishes cleanly and simply stops has deadlocked
+# the queue: done, idle, and holding its slot until morning. Leaving that to each
+# plan to remember would mean one forgetful plan costs a whole night, so it lives
+# here where it cannot be forgotten.
+#
+# Deliberately free of single quotes - it is wrapped in them below so it survives
+# being re-parsed by the pane's shell, and the inline check in dispatch_task
+# enforces that before anything is sent.
+dispatch_prompt() {                     # plan_path
+  printf '%s' "Read $1 and carry it out. \
+Before opening a pull request, run /code-review on your diff and act on what it finds. \
+Then commit, push, and open a pull request whose description opens with the intent line \
+from the plan header, followed by what you actually did. \
+If you get stuck, or the plan turns out not to fit, commit what you have, push, and open \
+a DRAFT pull request whose description explains what blocked you, then stop. \
+Never wait for input - there is nobody watching."
+}
+
+# Start the agent for a task, resuming from wherever a previous tick got to. Each
+# step records itself the instant it succeeds, so this is safe to re-enter: an
+# interrupted dispatch picks up rather than starting over.
+#
+# Re-entry deliberately does NOT re-run `wt new` when the pane is still there. It
+# would work - wt reopens an existing worktree rather than failing - but it also
+# re-runs provisioning, and supercast's provisioning DROPS AND RECREATES the
+# database. That is harmless before an agent has touched anything and destructive
+# afterwards, so the cheap path is also the safe one.
+# A shell function rather than an inline `cd ... && wt`, so `shielded` can run it as
+# a single command. Functions are visible in the subshell it backgrounds; a `cd`
+# baked into a command substitution would not be.
+wt_new_in() {                           # repo wt-args...
+  local repo=$1; shift
+  cd "$repo" || return 1
+  "$WT" new "$@"
+}
+
+dispatch_task() {                       # task_dir  -> 0 launched, 1 failed
+  local d=$1 repo branch model effort dev pane wtjson cmdline prompt
+  repo=$(hdr "$d/plan.md" repo);     branch=$(hdr "$d/plan.md" branch)
+  model=$(hdr "$d/plan.md" model);   effort=$(hdr "$d/plan.md" effort)
+  dev=$(hdr "$d/plan.md" dev)
+  [ -n "$repo" ] && [ -n "$branch" ] || { warn "$(slug_of "$d"): plan.md has no repo/branch"; return 1; }
+  [ -d "$repo" ] || { warn "$(slug_of "$d"): repo $repo is gone"; return 1; }
+
+  pane=$(st "$d" PQ_PANE)
+  if [ -z "$pane" ] || [ "$(pane_state "$pane")" = missing ]; then
+    local devflag=--no-dev; [ "$dev" = true ] && devflag=""
+    # `wt new` on a brand-new branch forks from the local origin/HEAD with no
+    # fetch first, so a stale checkout can hand a task whose blocker just
+    # merged a base that predates the very commit it waited for - `pq` says "A
+    # merged, go" and `wt` forks from an origin/master that does not contain A.
+    # Bounded and non-fatal: this runs outside `shielded`, so an unreachable
+    # remote must not sit on a TCP timeout and stall the tick with a free slot.
+    GIT_SSH_COMMAND="${GIT_SSH_COMMAND:-ssh -o ConnectTimeout=5 -o BatchMode=yes}" \
+      git -C "$repo" fetch --quiet origin 2>/dev/null \
+      || warn "$(slug_of "$d"): could not fetch $repo - the worktree may fork from a stale base"
+    msg "$(slug_of "$d"): preparing worktree for $branch"
+    # Shielded: this is the slow one - a full database copy - and the one worth
+    # letting finish when you Ctrl-C. wt's own progress still goes to stderr and
+    # straight to the user; only its stdout (the JSON) is captured.
+    # shellcheck disable=SC2086
+    shielded wt_new_in "$repo" --no-agent --no-focus $devflag --json "$branch" \
+      || { warn "$(slug_of "$d"): wt new failed"; return 1; }
+    wtjson=$SHIELDED_OUT
+    pane=$(jq -r '.root_pane_id // empty' <<<"$wtjson" 2>/dev/null)
+    [ -n "$pane" ] || { warn "$(slug_of "$d"): wt returned no pane"; return 1; }
+    st_set "$d" PQ_WORKTREE "$(jq -r '.path // ""'         <<<"$wtjson")"
+    st_set "$d" PQ_WORKSPACE "$(jq -r '.workspace_id // ""' <<<"$wtjson")"
+    st_set "$d" PQ_PANE      "$pane"
+    st_set "$d" PQ_URL       "$(jq -r '.url // ""'          <<<"$wtjson")"
+    st_set "$d" PQ_PORT      "$(jq -r '.port // ""'         <<<"$wtjson")"
+  else
+    msg "$(slug_of "$d"): worktree already prepared, resuming at the agent"
+  fi
+
+  prompt=$(dispatch_prompt "$d/plan.md")
+  case "$prompt$d" in
+    *"'"*) warn "$(slug_of "$d"): prompt or path contains a quote - refusing to send"; return 1 ;;
+  esac
+  cmdline=$(printf "claude --model %s --effort %s '%s'" "${model:-$PQ_DEFAULT_MODEL}" "${effort:-$PQ_DEFAULT_EFFORT}" "$prompt")
+  herdr pane send-text "$pane" "$cmdline" >/dev/null 2>&1 \
+    && herdr pane send-keys "$pane" enter >/dev/null 2>&1 \
+    || { warn "$(slug_of "$d"): could not start the agent in $pane"; return 1; }
+  st_set "$d" PQ_LAUNCHED "$(now)"
+  msg "$(slug_of "$d"): running ${model:-$PQ_DEFAULT_MODEL}/${effort:-$PQ_DEFAULT_EFFORT} in $pane"
+  return 0
+}
+
+# ── tick ────────────────────────────────────────────────────────────────────
+# One idempotent pass: free what has finished, finish what was interrupted, then
+# fill whatever room that left. Reconcile runs BEFORE the cap is counted, so a task
+# that shipped during the last interval hands its slot straight to the next one.
+# One tick at a time. The per-task `mv` already stops the same plan being claimed
+# twice, but two ticks running concurrently would each see the same free slots and
+# between them overshoot the cap. mkdir is the atomic primitive; a lock whose owner
+# is gone is stale and reclaimed.
+#
+# Taken and released around each tick rather than held for the life of the process,
+# because `pq run` ticks in a loop - a lock released only at exit would make every
+# tick after the first find the lock held, by itself, forever.
+take_lock() {                           # -> 0 took it, 1 someone else has it
+  local owner
+  PQ_LOCK="$PQ_HOME/.tick.lock"
+  if ! mkdir "$PQ_LOCK" 2>/dev/null; then
+    owner=$(cat "$PQ_LOCK/pid" 2>/dev/null)
+    if [ -n "$owner" ] && kill -0 "$owner" 2>/dev/null; then PQ_LOCK=""; return 1; fi
+    warn "clearing a stale tick lock"
+    rm -rf "$PQ_LOCK"; mkdir "$PQ_LOCK" 2>/dev/null || die "could not take the tick lock"
+  fi
+  printf '%s' "$$" > "$PQ_LOCK/pid"
+  # The EXIT trap is the backstop for an abnormal exit; the normal path releases below.
+  trap 'rm -rf "$PQ_LOCK"' EXIT
+  return 0
+}
+release_lock() {
+  [ -n "${PQ_LOCK:-}" ] && rm -rf "$PQ_LOCK"
+  PQ_LOCK=""; trap - EXIT; return 0
+}
+
+cmd_tick() {
+  local cap="" dry=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --cap)     cap=${2:-}; shift 2 ;;
+      --dry-run) dry=1; shift ;;
+      -*)        die "unknown option '$1' (usage: pq tick [--cap N] [--dry-run])" ;;
+      *)         die "unexpected argument '$1'" ;;
+    esac
+  done
+  # Re-read the cap every tick, so `pq cap 0` takes effect on the next pass of a
+  # loop that is already running. An explicit --cap overrides for this tick only and
+  # deliberately does not write the file.
+  [ -n "$cap" ] || cap=$(cap_get)
+  [[ "$cap" =~ ^[0-9]+$ ]] || die "--cap must be a number, got '$cap'"
+
+  # A one-shot tick needs the handler too, not just the loop: dispatch shields its
+  # slow child from SIGINT, so without a trap here a Ctrl-C would kill pq and leave
+  # that `wt new` running orphaned, with nobody left to record what it produced.
+  [ "$PQ_RUN" = 1 ] || trap on_interrupt INT TERM
+
+  if ! take_lock; then
+    msg "another tick is running (pid $(cat "$PQ_HOME/.tick.lock/pid" 2>/dev/null)) - nothing to do"
+    return 0
+  fi
+  tick_body "$cap" "$dry"
+  local rc=$?
+  release_lock
+  return $rc
+}
+
+tick_body() {                           # cap dry
+  local cap=$1 dry=$2
+  pidx_load
+
+  # PR state for the whole tick, loaded ONCE: every RUNNING task's branch (for
+  # reconcile below), plus every blocker of a task that has not started (for
+  # the eligibility check that follows fill). `done` is deliberately excluded -
+  # reconcile never looks at it, so a done task's own branch would otherwise be
+  # a `gh` call repeated every tick, forever, for history that cannot change
+  # state again. One combined cache means a dependency that merged during the
+  # last interval is visible to the SAME lookup reconcile just paid for, not a
+  # second round trip a tick later.
+  pr_load_all "$(pr_targets running)"
+
+  # 1. Reconcile. A pull request - in any state - means the work left the queue, so
+  #    the slot is free whether it merged, is in review, or was opened as a draft
+  #    because the agent got stuck. Judging what to do about it is yours.
+  local d slug branch repo running=()
+  while IFS= read -r d; do
+    [ -n "$d" ] || continue
+    running+=("$d")
+  done <<<"$(for x in "$PQ_HOME/running"/*/; do [ -d "$x" ] && printf '%s\n' "${x%/}"; done)"
+
+  if [ "${#running[@]}" -gt 0 ]; then
+    for d in "${running[@]}"; do
+      slug=$(slug_of "$d"); branch=$(hdr "$d/plan.md" branch)
+      local num prstate draft
+      IFS=$'\t' read -r num prstate draft <<<"$(pr_get "$(hdr "$d/plan.md" repo)" "$branch")"
+      if [ -n "${num:-}" ]; then
+        local what="${draft:-$(tr '[:upper:]' '[:lower:]' <<<"${prstate:-}")}"
+        if [ "$dry" = 1 ]; then
+          msg "would finish $slug (#$num $what)"
+        else
+          st_set "$d" PQ_PR "$num"; st_set "$d" PQ_FINISHED "$(now)"
+          retitle "$d" done >/dev/null
+          msg "finished $slug - #$num $what"
+        fi
+        continue
+      fi
+      # Claimed but never launched: an interrupted tick. Pick it up where it stopped.
+      if [ -z "$(st "$d" PQ_LAUNCHED)" ]; then
+        if [ "$dry" = 1 ]; then msg "would resume the interrupted dispatch of $slug"
+        else warn "$slug: dispatch was interrupted - resuming"; dispatch_task "$d" || true; fi
+        continue
+      fi
+      # The wall check runs for every state but `missing`, deliberately including
+      # `noagent`. Whether herdr currently has an agent bound to the pane is the
+      # same kind of dependency the detection itself avoids - a walled session that
+      # momentarily reads as `noagent` would otherwise be written off as exited and
+      # never knocked on.
+      local pstate; pstate=$(pane_state "$(st "$d" PQ_PANE)")
+      [ "$dry" = 1 ] || [ "$pstate" = missing ] || check_stall "$d"
+      case "$pstate" in
+        missing) warn "$slug: its workspace is gone and no PR exists - look at it, then: pq rm $slug" ;;
+        noagent) [ "$(st "$d" PQ_BLOCKED)" = quota ] \
+                   || warn "$slug: the agent exited without opening a PR - look at the pane, or: pq rm $slug" ;;
+      esac
+    done
+  fi
+
+  # 1.5 Blockers - runs for every task that has not started, queue AND hold,
+  # so a chain stalled on a stuck agent's draft is flagged even while parked.
+  # This runs AFTER reconcile and BEFORE fill, so a dependency that merged
+  # during the interval that just ended unblocks its dependent on the same
+  # tick that noticed, and it warms the per-task verdict fill reuses below
+  # rather than recomputing it.
+  local afterpass="$PQ_HOME/.after.$$"; : > "$afterpass"
+  for d in "$PQ_HOME/queue"/*/ "$PQ_HOME/hold"/*/; do
+    [ -d "$d" ] || continue
+    d=${d%/}
+    [ -f "$d/after" ] || continue
+    printf '%s\t%s\n' "$d" "$(after_check "$d")" >> "$afterpass"
+  done
+  local waiting; waiting=$(awk -F'\t' '$2 !~ /^met/ { n++ } END { print n + 0 }' "$afterpass")
+
+  # 2. Fill. `running` is the slot count: a task blocked on a permission prompt still
+  #    holds one, which is the deliberate trade for running everything in auto mode.
+  local active
+  active=$(ls -d "$PQ_HOME/running"/*/ 2>/dev/null | wc -l | tr -d ' ')
+  local free=$(( cap - active ))
+
+  # Build the queue ONCE, in priority order, then walk it - skipping whatever
+  # is not eligible - rather than re-globbing and taking the first entry every
+  # pass, which only worked because a claimed task leaves queue/. --dry-run
+  # reports every would-dispatch AND every would-skip with its reason, so a
+  # queue that is entirely blocked reads differently from an empty one.
+  local started=0 would=0 claimed verdict lbl n
+  local ordered; ordered=$(queue_ordered)
+  if [ -n "$ordered" ]; then
+    while IFS= read -r d; do
+      [ -n "$d" ] || continue
+      slug=$(slug_of "$d")
+      if [ "$free" -le 0 ]; then
+        [ "$dry" = 1 ] && msg "would skip $slug - cap reached"
+        continue
+      fi
+      verdict=$(awk -F'\t' -v d="$d" '$1 == d { print $2; exit }' "$afterpass")
+      case "${verdict:-met}" in
+        met) ;;
+        waiting\ *)
+          if [ "$dry" = 1 ]; then
+            lbl=${verdict#waiting }; n=${lbl##* }; lbl=${lbl% *}
+            msg "would skip $slug - waiting on $lbl ($n unmet)"
+          fi
+          continue ;;
+        stalled\ *)
+          [ "$dry" = 1 ] && msg "would skip $slug - blocker ${verdict#stalled } is stalled"
+          continue ;;
+        dead\ *)
+          [ "$dry" = 1 ] && msg "would skip $slug - blocker ${verdict#dead } is dead"
+          continue ;;
+      esac
+      if [ "$dry" = 1 ]; then
+        msg "would dispatch $slug ($(hdr "$d/plan.md" branch))"
+        # A separate counter from $started: --dry-run changes nothing, and a
+        # summary that says "N started" when nothing moved is the one line a
+        # human actually reads before trusting the rest of it.
+        would=$((would + 1)); free=$((free - 1))
+        continue
+      fi
+      # Claim FIRST. `wt new` takes the better part of a minute, and until the task has
+      # left queue/ a second tick would happily pick up the very same plan.
+      claimed=$(retitle "$d" running) || continue
+      st_set "$claimed" PQ_CLAIMED "$(now)"
+      dispatch_task "$claimed" || warn "$slug: left in running/ half-dispatched - the next tick will retry it"
+      started=$((started + 1)); free=$((free - 1))
+    done <<<"$ordered"
+  fi
+
+  rm -f "$afterpass" "$PR_CACHE" "$PR_ANS"
+  repo_base_reset
+
+  active=$(ls -d "$PQ_HOME/running"/*/ 2>/dev/null | wc -l | tr -d ' ')
+  local queued; queued=$(ls -d "$PQ_HOME/queue"/*/ 2>/dev/null | wc -l | tr -d ' ')
+  summary "$active running (cap $cap), $queued queued\
+$([ "$started" -gt 0 ] && printf ', %s started' "$started")\
+$([ "$would" -gt 0 ] && printf ', %s would start' "$would")\
+$([ "$waiting" -gt 0 ] && printf ', %s waiting on a merge' "$waiting")"
+}
+
+# ── run ─────────────────────────────────────────────────────────────────────
+# Tick, sleep, repeat - meant to sit in a Herdr space where it inherits the socket
+# and you can watch it. Safe to stop and start whenever: the queue's state lives
+# entirely in directories, so this process holds nothing that matters.
+#
+# Ctrl-C is a graceful stop. During the sleep - the overwhelmingly common case - it
+# returns immediately. During a tick the work in flight is shielded from the signal
+# (see `shielded`), so it genuinely runs to completion and the loop exits after it.
+# A second interrupt means you would rather not wait, and it kills the shielded child
+# too - otherwise "force" would leave a `wt new` running with nobody to record what
+# it produced. Either way nothing is lost: a task caught mid-dispatch is left with no
+# PQ_LAUNCHED, which the next reconcile recognises and resumes.
+#
+# Two `pq run` loops would not overshoot the cap - the tick lock serialises them -
+# they would just tick twice as often. Harmless enough not to be worth a second lock.
+PQ_STOP=0
+on_interrupt() {
+  printf '\n'
+  if [ "$PQ_STOP" = 1 ]; then
+    if [ -n "$SHIELDED_PID" ]; then
+      msg "stopping now - abandoning the work in flight; the next tick will retry it"
+      kill -TERM -"$SHIELDED_PID" 2>/dev/null || kill -TERM "$SHIELDED_PID" 2>/dev/null
+    else
+      msg "stopping now"
+    fi
+    release_lock; exit 130
+  fi
+  PQ_STOP=1
+  if [ -n "$SHIELDED_PID" ]; then
+    msg "finishing the work in flight, then stopping (Ctrl-C again to abandon it)"
+  else
+    msg "stopping after this tick (Ctrl-C again to stop now)"
+  fi
+}
+
+# sleep in the background and `wait` on it, so the trap runs the moment a signal
+# arrives rather than after the sleep has run its course. A bare `sleep` is only
+# interruptible when the signal reaches it too, which is not true of `kill -INT`.
+nap() {                                 # seconds
+  local pid
+  sleep "$1" & pid=$!
+  wait "$pid" 2>/dev/null
+  kill "$pid" 2>/dev/null
+  return 0
+}
+
+cmd_run() {
+  local interval=120 cap=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --interval) interval=${2:-}; shift 2 ;;
+      --cap)      cap=${2:-}; shift 2 ;;
+      -*)         die "unknown option '$1' (usage: pq run [--interval SECONDS] [--cap N])" ;;
+      *)          die "unexpected argument '$1'" ;;
+    esac
+  done
+  [[ "$interval" =~ ^[0-9]+$ ]] && [ "$interval" -ge 5 ] || die "--interval must be a number of seconds, at least 5"
+  # --cap here SETS the cap rather than overriding for one pass, since this is the
+  # long-running thing: what you pass at startup should be what `pq cap` reports.
+  [ -n "$cap" ] && { [[ "$cap" =~ ^[0-9]+$ ]] || die "--cap must be a number"; cap_set "$cap"; }
+
+  PQ_RUN=1
+  trap on_interrupt INT TERM
+  msg "running every ${interval}s at cap $(cap_get) - change it any time with 'pq cap N', Ctrl-C to stop"
+
+  local last=""
+  while :; do
+    # Suppress a summary identical to the last one, so an idle night leaves a log of
+    # what changed rather than hundreds of lines saying nothing happened.
+    PQ_SUMMARY=""
+    cmd_tick || true
+    if [ -n "$PQ_SUMMARY" ] && [ "$PQ_SUMMARY" != "$last" ]; then
+      printf 'pq: [%s] %s\n' "$(date '+%H:%M')" "$PQ_SUMMARY" >&2
+      last=$PQ_SUMMARY
+    fi
+    [ "$PQ_STOP" = 1 ] && break
+    nap "$interval"
+    [ "$PQ_STOP" = 1 ] && break
+  done
+  release_lock
+  msg "stopped - $(ls -d "$PQ_HOME/running"/*/ 2>/dev/null | wc -l | tr -d ' ') still running, queue untouched"
+}
+
+# Wrapped so the script can be sourced without dispatching - `test/pq-after.sh`
+# sources this file to reach the predicate directly. An `if` rather than a
+# trailing `[ ... ] && main "$@"`: that form makes a sourced script return
+# non-zero, which would kill any test running under `set -e`.
+main() {
+  case "${1:-}" in
+    add)        shift; cmd_add "$@" ;;
+    after)      shift; cmd_after "$@" ;;
+    tick)       shift; cmd_tick "$@" ;;
+    run)        shift; cmd_run "$@" ;;
+    cap)        shift; cmd_cap "$@" ;;
+    ls|list)    shift; cmd_ls "$@" ;;
+    show)       shift; cmd_show "$@" ;;
+    priority|pri) shift; cmd_priority "$@" ;;
+    hold)       shift; cmd_hold "$@" ;;
+    unhold)     shift; cmd_unhold "$@" ;;
+    rm|remove)  shift; cmd_rm "$@" ;;
+    *) die "usage: pq {add [plan] [--after task|branch]... [--json] | after <task> [<task|branch>... | --clear] | ls [--json] | show <task> | tick [--cap N] [--dry-run] | run [--interval S] [--cap N] | cap [N] | priority <task> N | hold <task> | unhold <task> | rm <task>}" ;;
+  esac
+}
+if [ "${BASH_SOURCE[0]}" = "$0" ]; then main "$@"; fi

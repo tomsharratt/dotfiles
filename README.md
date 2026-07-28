@@ -10,6 +10,7 @@ Personal dotfiles for macOS. Manages:
 - `~/.config/herdr` - Herdr config: the theme and the `prefix+t` worktree keybinding. Only `config.toml` is tracked; Herdr's sockets, logs, and session state are excluded from sync.
 - `~/.local/bin/wt` - worktree workflow backend: creates an isolated worktree (its own database, redis db, url and port) through Herdr, provisions it, and starts the dev server + Claude on it. Project-agnostic; the per-project steps live in profiles.
 - `~/.config/wt/profiles/<repo>.sh` - per-project provisioning + dev-server steps for `wt` (e.g. `supercast.sh`).
+- `~/.local/bin/pq` - plan queue: holds Claude Code plans and runs them as unattended implementer sessions, one worktree each, via `wt`.
 - `~/.claude/settings.json` - Claude Code settings. Agent status now comes from Herdr's built-in Claude integration (`herdr integration install claude`), which installs a `SessionStart` hook. Git-tracked for reference but applied manually - `install.sh` does not touch `~/.claude`.
 - `AGENTS.md` - global agent instructions, read by Claude Code via the `~/.claude/CLAUDE.md` symlink (mirrors `~/AGENTS.md`). Git-tracked for reference but applied manually - the sync scripts don't touch it.
 - Hack Nerd Font.
@@ -52,11 +53,140 @@ Commands:
 ```
 wt new [name]        create/open an isolated worktree, provision, start dev + Claude
 wt dev  <path>       run a worktree's dev server (this is the dev pane's command)
+wt run  [cmd...]     run a command with the worktree's isolated env loaded
+wt open [name]       open the worktree's dev url in the browser
 wt provision <path>  re-run provisioning for a worktree (idempotent)
 wt rm  [name]        tear a worktree down (drop db, free port, remove worktree)
 wt ls                list worktrees with their allocated port / redis / url / db
 wt gc                reclaim resources from worktrees removed outside wt rm
 ```
+
+`wt new` layers three things on top of "prepare a worktree", and each can be dropped so the command can be driven by a script rather than by `prefix+t`:
+
+```
+--no-agent   don't start Claude in the root pane
+--no-dev     provision, but don't boot the dev server
+--no-focus   leave focus where it is
+--json       print the worktree's facts (path, pane ids, port, url) to stdout
+```
+
+Human-facing output always goes to stderr, so `--json` leaves stdout clean for a caller to parse.
+`--no-dev` deliberately still provisions: the dev server is four long-running foreman processes, while provisioning is the one-off that creates the isolated database - skip that too and `wt run bin/rails test` inside the worktree fails confusingly.
+
+### Plan queue (`pq`)
+
+`pq` is a queue of Claude Code plans waiting to be run as implementer sessions, built on top of `wt` but separable from it.
+The split it exists to make: one long-lived session, in plan mode, does the thinking and produces a plan that has already answered every question; `pq` then runs those plans later, unattended, several at a time, as cheap implementer sessions that only have to execute.
+
+A task is a directory, and the directory it sits in is its state - `queue/`, `hold/`, `running/`, `done/` under `~/.local/state/pq`.
+Every transition is a `mv`, which is atomic within a filesystem, so two dispatchers cannot claim the same task.
+Each task holds an immutable `plan.md` (a settings header prepended to whatever Claude Code wrote) and a `state.env` of runtime facts, so an agent can re-read its plan at any point and never see it change underneath it.
+
+`pq add` copies the newest plan out of `~/.claude/plans`, asks Haiku for a branch name and a one-line statement of intent (Claude Code auto-names plan files, so the filename is never a usable branch), and refuses a branch that is already spoken for - `wt new` checks out an existing branch rather than failing, so two tasks sharing a name would quietly land in the same worktree.
+
+Each task records its own project, so one queue serves all of them.
+The project is wherever you were standing when you added the plan, resolved to the main checkout so adding from inside a worktree still queues against the repo the new worktree gets forked from; `--repo PATH` sets it explicitly.
+Dispatch runs `wt new` in that repo, which picks up its profile, and everything downstream is per-task from there - `pq ls` grows a `PROJECT` column as soon as the queue holds more than one.
+Branch names only have to be unique within their own project, so `tom/fix-timezone` can exist in two of them at once, and every branch lookup is keyed on the repo as well as the name.
+
+```
+pq add [plan]            add a plan to the queue (default: the newest one Claude wrote)
+pq add --after T         repeatable, at add time: don't dispatch until T's PR has merged
+pq after <task>          list a task's blockers and what each is waiting on
+pq after <task> T...     add blockers to a task still in queue/ or hold/
+pq after <task> --clear  drop them all
+pq ls [--json]           every task, its state, and what it is waiting on
+pq show <task>           one task's header and plan
+pq tick [--cap N]        free finished slots, then fill them from the queue
+pq run [--interval S]    tick on an interval until you stop it
+pq cap [N]               how many may run at once; 0 pauses
+pq priority <task> N     re-order the queue
+pq hold / unhold         park a task, or put it back
+pq rm <task>             drop a task (never touches a worktree or a branch)
+```
+
+The `NNN` prefix on a task directory is its priority and nothing else - promoting a task renames its directory, so commands take the task's slug, or any unique prefix of it.
+
+#### Blockers
+
+Large work wants to be split into several small plans, each a reviewable PR, where the second usually cannot start until the first has shipped.
+`pq add B --after A` (or `pq after B A` once both are queued) says exactly that: B is not eligible for dispatch until A's PR has merged into A's repo's default branch.
+
+Blocked is derived, not stored - a blocked task sits in `queue/` like any other and fill just skips it, the same way the cap is soft arithmetic rather than a drain state.
+A task's blockers live in a third file, `after`, alongside `plan.md` and `state.env`: one blocker per line, `label<TAB>repo<TAB>branch`.
+A blocker is a resolved `(label, repo, branch)` triple, not a task reference - it is captured at the moment you type it, so it survives `pq rm A`, survives A ageing out of `done/`, and survives a slug being reused.
+That is also what makes a cross-repo blocker work for free, and lets a blocker name a branch that was never added to `pq` at all.
+
+Merge state comes from the forge, never from git ancestry: a squash-merged branch's tip is not an ancestor of its default branch, so `git branch --merged` misses every real merge.
+`pq` asks `gh` instead, and only trusts a `MERGED` pull request whose base is genuinely the repo's default branch - merged into some other branch does not count.
+
+`pq add` prints the new task's slug on stdout - everything else it prints is for a human, on stderr - which is what makes chaining a one-liner:
+
+```
+a=$(pq add planA.md)
+b=$(pq add planB.md --after "$a")
+c=$(pq add planC.md --after "$b")
+```
+
+`pq after <task>` answers "why has this not started": per blocker, both the state of the task that owns the branch and the state of its pull request, since either one can be the reason and the fix differs.
+A blocker that has already merged is fine to add - `pq` says so rather than refusing.
+Self-reference and cycles are rejected at the moment you try to create them.
+
+Three situations short-circuit the ordinary wait and warn once, because they read as healthy waiting until you look closer: a **dead** blocker (every pull request for it is closed), an **orphan** (nothing owns that branch, so nothing will ever open one), and a **stalled** chain (the owning task already reached `done` with only a draft PR open - a stuck agent, not a chain in review).
+None of the three auto-holds anything; fill already costs no slot on a blocked task, and `pq` does not re-order your work on its own judgement.
+
+`pq tick` is one idempotent pass: reconcile, then fill.
+Reconcile runs first so a task that shipped hands its slot straight to the next one - any pull request, in any state, means the work has left the queue.
+Fill claims a task by moving it to `running/` *before* calling `wt new`, because that call takes the better part of a minute and an unclaimed task is one a second tick would happily pick up too.
+Each dispatch step records itself as it succeeds, so an interrupted tick is resumed rather than restarted - and resuming deliberately skips `wt new` when the pane is still there, since re-provisioning would drop the worktree's database.
+A `mkdir` lock keeps two ticks from both filling to cap.
+
+`pq tick --dry-run` shows what it would do and changes nothing.
+
+`pq run` sits in a Herdr space and ticks on an interval, so it inherits the socket and you can watch it.
+It prints a summary only when one differs from the last, so an idle night leaves a log of what changed rather than a line per interval.
+
+The cap is **state, not an argument**: it lives in a file that is re-read at the top of every tick, so `pq cap 1` in the morning and `pq cap 4` at bedtime take effect on the next pass with no restart.
+`pq cap 0` is the pause, which is why pausing needs no separate concept.
+Caps are soft - lowering one never kills anything, it just starts nothing new until enough slots free up.
+The default is 1, deliberately: a fresh machine should not start dispatching several unattended agents because nobody had said otherwise yet.
+
+Ctrl-C is a graceful shutdown: during the sleep it stops immediately, and during a tick it lets the work in flight finish first.
+That needs a little care, because a terminal signals the whole foreground process group - so by default a `wt new` halfway through copying a database would die alongside the tick.
+`pq` gives that child a process group of its own, which leaves the signal going only where it should: provisioning completes, the dispatch finishes, and then the loop exits.
+
+A second Ctrl-C abandons the work in flight, killing that child too, so "force" does not leave a `wt new` running with nobody to record what it produced.
+Either way nothing is lost - a task caught mid-dispatch keeps its claim without a launch record, which the next reconcile recognises and resumes.
+
+#### Hitting the session limit
+
+When a Claude session runs out of its usage window it puts up a dialog - "Wait for limit to reset · Resets 8:00pm" - and every option on that dialog only dismisses it.
+Nothing resumes by itself, so an agent that hits the wall at 2am would otherwise sit there until morning holding a slot.
+Each tick reads the last lines of every running agent's pane, and when it finds the wall it dismisses the dialog, waits for the time the dialog names, and then knocks with "Continue with what you were doing" until the agent picks its work back up.
+
+Three details make that safe to leave running unattended.
+
+**Detection is the pane's text, not Herdr's status.**
+Herdr derives agent status from its own regexes over the terminal, and its highest-priority rule reads a spinner in the window title as `working` - which is exactly what is on screen while the request that hit the wall is still in flight.
+Waiting for Herdr to say `blocked` would risk never firing at all.
+
+**Only a screen that has stopped moving counts as stuck.**
+`pq` hashes the tail each tick and acts only when the wall is showing *and* the hash is unchanged since last time.
+A working agent's tail moves every few seconds, so this cannot interrupt one - which matters, because the wall's message stays in the scrollback for a while after the session recovers.
+
+**It waits for the time the dialog names, and polls only when it cannot read one.**
+The dialog carries "Resets 8:30pm", and that hint beats any other source of the same fact, because it comes from the error that walled us and so already refers to the right window - the account has both a five-hour and a weekly limit, and nothing else on hand would say which one you are behind.
+Two habits of Claude Code's formatter are worth knowing, since both will catch out anything that assumes otherwise: minutes are dropped when they are zero, so it reads `8pm` rather than `8:00pm`, and no date is printed for a reset less than 24 hours out, so a bare `1am` seen at 11pm means tomorrow.
+Beyond 24 hours it becomes `Jul 28, 8:30pm`, gaining a year only when the year differs.
+
+A hint that cannot be read is not a failure: ten-minute polling is the fallback, and it also takes over if the knock at the named time turns out to be too early.
+The one outcome ruled out is waiting on a guess, because that strands a task silently, where an early knock costs a single instantly-failing call.
+
+The wall is the only thing `pq` ever answers.
+A permission prompt is recorded as `permission` and deliberately left alone - that is the trade for running everything in auto mode - so `pq ls` separates the agents waiting on the clock from the ones waiting on you.
+After forty unanswered knocks a task is marked `walled` and left, rather than knocking all night.
+
+### Reclaiming resources
 
 Herdr has no worktree-removal hook, so removing a worktree through Herdr's own UI (rather than `wt rm`) would otherwise leak its database, port, and redis db.
 `wt gc` reconciles this: it checks each recorded worktree and, for any whose directory no longer exists, runs the profile's teardown and frees the reservation.
