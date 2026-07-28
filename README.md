@@ -92,6 +92,8 @@ Branch names only have to be unique within their own project, so `tom/fix-timezo
 ```
 pq add [plan]            add a plan to the queue (default: the newest one Claude wrote)
 pq add --after T         repeatable, at add time: don't dispatch until T's PR has merged
+pq add --split           split a plan into a stack of standalone parts, wired with --after
+pq add --split-dir D     queue an already-split directory, skipping the split step
 pq after <task>          list a task's blockers and what each is waiting on
 pq after <task> T...     add blockers to a task still in queue/ or hold/
 pq after <task> --clear  drop them all
@@ -157,6 +159,22 @@ That needs a little care, because a terminal signals the whole foreground proces
 
 A second Ctrl-C abandons the work in flight, killing that child too, so "force" does not leave a `wt new` running with nobody to record what it produced.
 Either way nothing is lost - a task caught mid-dispatch keeps its claim without a launch record, which the next reconcile recognises and resumes.
+
+#### Splitting a large plan
+
+A plan-mode session naturally produces a plan for a whole feature, but a whole feature is almost never one pull request worth reviewing.
+`pq add plan.md --split` runs one Opus session that reads the plan, decides where the real seams are, and writes one standalone plan per part plus a dependency graph - then queues every part through the ordinary `pq add` path, with `--after` already wired from the graph.
+The result is a stack of small, individually reviewable PRs where nothing downstream starts until you have merged what it depends on, and a plan that turns out to be wrong is wrong for one PR rather than for a whole night.
+
+The load-bearing constraint is that parts wait for merges, never for branches - no part is ever built on top of a sibling's branch.
+Each part starts from the default branch with its declared dependencies already merged, and every part is written for an agent that sees only that one file: it never mentions another part, its filename, or its branch.
+`pq` validates this before anything is queued - full coverage of the original plan, no missing or forgotten parts, no cycles, and no part referencing a sibling by name - and refuses to queue anything if a check fails.
+
+The split artifacts land in `$PQ_HOME/splits/<plan>-<stamp>/`: the source plan, one `NN-short-slug.md` per part, and `graph.tsv` recording which parts must merge before which others.
+Before queueing anything, `pq` shows a table of the parts, their wave (how many merges deep they are), their branch, and what each waits on, then asks to confirm - `-y` skips the prompt, but `--json` does not, so a caller after machine-readable output never gets tasks queued unlooked-at.
+Declining leaves the split directory on disk and costs nothing: `pq add --split-dir <dir>` resumes from it later, without paying for the Opus session again, which is what makes hand-editing a part before it ships a first-class path.
+
+`--after` on the split itself only applies to the root parts - the ones with no dependency inside the split - since `pq after`'s own reporting already surfaces the rest of the chain to anyone asking why a downstream part hasn't started.
 
 #### Hitting the session limit
 

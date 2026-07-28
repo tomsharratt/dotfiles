@@ -15,6 +15,8 @@
 #
 #   pq add [plan]        add a plan to the queue (default: the newest one Claude wrote)
 #   pq add --after T     repeatable: don't dispatch until T's PR has merged
+#   pq add --split       split a plan into a stack of standalone parts, wired with --after
+#   pq add --split-dir D queue an already-split directory, skipping the split step
 #   pq after <task>      list a task's blockers and what each is waiting on
 #   pq after <task> T... add blockers to a task already in the queue or held
 #   pq after <task> --clear   drop them all
@@ -55,10 +57,16 @@
 #            hold/025-risky-refactor/         parked by you
 #            running/005-spotify-scope-fix/   dispatched
 #            done/001-live-chat-links/        a PR exists, slot freed
+#            splits/live-chat-mentions-20260728-141230/   a plan mid-split, or one left over
 #
 #   <task>/plan.md     the settings header + Claude's plan, immutable once added
 #          after       blockers: one per line, TSV  label <TAB> repo <TAB> branch
 #          state.env   KEY=VALUE runtime facts, written as dispatch progresses
+#
+#   <split>/source.md  the plan being split, copied in
+#          repo        one line: the checkout the splitter read, for --split-dir to check against
+#          graph.tsv   one line per part: filename <TAB> comma-separated filenames that must merge first
+#          NN-*.md     the parts themselves, written by the splitter
 #
 # `after` is neither of the other two: `plan.md` is immutable by contract so an
 # agent re-reading its own plan never sees it change, and `state.env` is runtime
@@ -86,6 +94,8 @@ STATES="queue hold running done"
 PQ_DEFAULT_MODEL="${PQ_DEFAULT_MODEL:-sonnet}"
 PQ_DEFAULT_EFFORT="${PQ_DEFAULT_EFFORT:-xhigh}"
 PQ_NAMER_MODEL="${PQ_NAMER_MODEL:-haiku}"
+PQ_SPLITTER_MODEL="${PQ_SPLITTER_MODEL:-opus}"
+PQ_SPLITTER_EFFORT="${PQ_SPLITTER_EFFORT:-xhigh}"
 
 # What the session wall looks like on screen, and how hard to knock. These are
 # Claude Code UI strings, so they will change - hence up here and overridable
@@ -398,12 +408,18 @@ latest_plan() {
 #
 # Prints "branch<TAB>intent", or nothing if the model could not be reached or gave
 # something unusable; the caller then insists on --branch rather than inventing one.
-name_plan() {                           # plan_file
-  local raw json
-  raw=$(claude -p --model "$PQ_NAMER_MODEL" \
-    'Read this plan and reply with ONLY a JSON object, no code fence, no commentary:
-{"branch":"tom/<3-5 dash-separated lowercase words naming the task>","intent":"<2-3 sentences, one line, saying what this sets out to achieve in the author'"'"'s terms - not a description of the diff>"}' \
-    < "$1" 2>/dev/null) || return 0
+#
+# The optional second argument is a comma-separated avoid list: branches already
+# spoken for by a sibling part in the same split, appended as one more sentence
+# rather than a second prompt - `do_split` retries a collision once with this set,
+# before giving up on that part.
+name_plan() {                           # plan_file [avoid: comma-separated branches already taken]
+  local raw json avoid=${2:-} prompt
+  prompt='Read this plan and reply with ONLY a JSON object, no code fence, no commentary:
+{"branch":"tom/<3-5 dash-separated lowercase words naming the task>","intent":"<2-3 sentences, one line, saying what this sets out to achieve in the author'"'"'s terms - not a description of the diff>"}'
+  [ -n "$avoid" ] && prompt="$prompt
+The branch must differ from these, which are already taken: $avoid"
+  raw=$(claude -p --model "$PQ_NAMER_MODEL" "$prompt" < "$1" 2>/dev/null) || return 0
   # Be forgiving about a fenced or chatty reply: take the first {...} span.
   json=$(sed -n 's/.*\({.*}\).*/\1/p' <<<"$(tr '\n' ' ' <<<"$raw")" | head -1)
   [ -n "$json" ] || return 0
@@ -437,34 +453,70 @@ branch_taken() {                        # branch repo
   return 1
 }
 
+# Which of $STATES already has a task directory ending in -$slug, or nothing.
+# `done` counts here, unlike `branch_taken`'s live-task check above: a slug is
+# the whole directory name rather than a branch, so a stale `done/NNN-foo`
+# still blocks a fresh `foo` from being created at all. Shared by `cmd_add`'s
+# own uniqueness sweep and `split_name_collision`, so the two rules cannot
+# silently drift apart.
+slug_taken_in() {                       # slug -> the state name, or nothing
+  local slug=$1 d2
+  for d2 in $STATES; do
+    ls -d "$PQ_HOME/$d2"/*-"$slug" >/dev/null 2>&1 && { printf '%s' "$d2"; return 0; }
+  done
+  return 1
+}
+
 cmd_add() {
   local plan="" branch="" model=$PQ_DEFAULT_MODEL effort=$PQ_DEFAULT_EFFORT
-  local prio="" dev=false hold=0 repo="" as_json=0
+  local prio="" prio_explicit=0 dev=false hold=0 repo="" repo_explicit=0 as_json=0
   # A string, not an array: an empty bash array expanded under `set -u` is a
   # portability trap (fixed only in bash 4.4+), so every repeatable option in
   # this script accumulates into a newline-joined string instead. See `repos`
   # in cmd_ls for the same idiom.
   local after_vals=""
+  # `intent` moves above the parse loop so `--intent` can set it before the
+  # naming step decides whether it still needs to ask Haiku. `split` and
+  # `split_dir` MUST stay local here too: `do_split` recurses back into this
+  # very function once per part, through bash's ordinary dynamic scope, and it
+  # is these two `local`s - shadowing whatever the recursive call passed - that
+  # stop that recursion rather than forking every part into its own split.
+  local intent="" intent_explicit=0 split=0 split_dir="" yes=0
   while [ $# -gt 0 ]; do
     case "$1" in
-      --branch)   branch=${2:-}; shift 2 ;;
-      --model)    model=${2:-}; shift 2 ;;
-      --effort)   effort=${2:-}; shift 2 ;;
-      --priority) prio=${2:-}; shift 2 ;;
-      --repo)     repo=${2:-}; shift 2 ;;
-      --after)    after_vals="${after_vals}${2:-}"$'\n'; shift 2 ;;
-      --dev)      dev=true; shift ;;
-      --hold)     hold=1; shift ;;
-      --json)     as_json=1; shift ;;
-      -h|--help)  die "usage: pq add [plan.md] [--branch B] [--model M] [--effort E] [--priority N] [--repo PATH] [--after task|branch]... [--dev] [--hold] [--json]" ;;
-      -*)         die "unknown option '$1'" ;;
-      *)          plan=$1; shift ;;
+      --branch)    branch=${2:-}; shift 2 ;;
+      --model)     model=${2:-}; shift 2 ;;
+      --effort)    effort=${2:-}; shift 2 ;;
+      --priority)  prio=${2:-}; prio_explicit=1; shift 2 ;;
+      --repo)      repo=${2:-}; repo_explicit=1; shift 2 ;;
+      --after)     after_vals="${after_vals}${2:-}"$'\n'; shift 2 ;;
+      --intent)    intent=${2:-}; intent_explicit=1; shift 2 ;;
+      --split)     split=1; shift ;;
+      --split-dir) split_dir=${2:-}; shift 2 ;;
+      -y|--yes)    yes=1; shift ;;
+      --dev)       dev=true; shift ;;
+      --hold)      hold=1; shift ;;
+      --json)      as_json=1; shift ;;
+      -h|--help)   die "usage: pq add [plan.md] [--branch B] [--model M] [--effort E] [--priority N] [--repo PATH] [--after task|branch]... [--intent TEXT] [--split | --split-dir DIR] [-y] [--dev] [--hold] [--json]" ;;
+      -*)          die "unknown option '$1'" ;;
+      *)           plan=$1; shift ;;
     esac
   done
 
-  [ -n "$plan" ] || plan=$(latest_plan)
-  [ -n "$plan" ] || die "no plan given and none found in $PLANS_DIR"
-  [ -f "$plan" ] || die "no such plan: $plan"
+  [ -n "$branch" ] && { [ "$split" = 1 ] || [ -n "$split_dir" ]; } && \
+    die "--split queues N branches of its own - --branch has no meaning with it"
+  [ -n "$plan" ] && [ -n "$split_dir" ] && \
+    die "--split-dir carries its own source.md - don't also pass a plan file"
+  [ "$split" = 1 ] && [ -n "$split_dir" ] && \
+    die "--split and --split-dir are mutually exclusive - pick one"
+
+  if [ -n "$split_dir" ]; then
+    [ -d "$split_dir" ] || die "no such split directory: $split_dir"
+  else
+    [ -n "$plan" ] || plan=$(latest_plan)
+    [ -n "$plan" ] || die "no plan given and none found in $PLANS_DIR"
+    [ -f "$plan" ] || die "no such plan: $plan"
+  fi
 
   # The repo is wherever you are standing when you add the plan - you planned the
   # work in it. Resolve to the MAIN checkout, so adding from inside a worktree
@@ -472,20 +524,55 @@ cmd_add() {
   [ -n "$repo" ] || repo=$(git -C "$PWD" worktree list --porcelain 2>/dev/null | awk '/^worktree /{print substr($0,10); exit}')
   [ -n "$repo" ] || die "not inside a git repo - run this from the project, or pass --repo"
 
+  # Default priority: the next clean step past everything already queued, so hand
+  # editing stays easy - there is always room to slot something in between.
+  #
+  # Computed here, before the split gate below, so a fresh `--split` with no
+  # explicit --priority still hands `split_queue` a REAL starting value for
+  # its ascending-by-10 assignment - not an empty $prio that happens to
+  # produce the same ordering only because each part is queued before the
+  # next part's own independent default gets computed.
+  if [ -z "$prio" ]; then
+    local max=0 d p
+    while IFS= read -r d; do
+      [ -n "$d" ] || continue
+      p=$(prio_of "$d"); [ "$p" -gt "$max" ] 2>/dev/null && max=$p
+    done <<<"$(all_tasks)"
+    prio=$(( (max / 10 + 1) * 10 ))
+  fi
+  [[ "$prio" =~ ^[0-9]+$ ]] || die "priority must be a number, got '$prio'"
+
+  if [ -n "$split_dir" ] || [ "$split" = 1 ]; then
+    do_split
+    return $?
+  fi
+
   msg "plan:   $plan"
 
   # Reject a name we cannot use BEFORE paying for the model call. When --branch was
   # given we already know the name, so the cheap checks come first and a duplicate
   # add fails in milliseconds instead of after a round trip to Haiku. Without it we
   # have no choice: the name is what we are asking for.
-  local intent="" named why
+  #
+  # Both branches skip the naming call once `--intent` was explicitly given -
+  # a part queued from `do_split` supplies both --branch and --intent, and
+  # every part in a split paying for Haiku a second time here would double
+  # the naming cost for nothing. Gated on `intent_explicit`, not merely on
+  # `intent` being non-empty: a part whose own intent from the model came
+  # back genuinely empty must not read as "not given yet" and re-ask.
+  local named why
   if [ -n "$branch" ]; then
     git check-ref-format "refs/heads/$branch" || die "invalid branch name: '$branch'"
     why=$(branch_taken "$branch" "$repo") && die "branch '$branch' is already $why"
-    named=$(name_plan "$plan"); [ -n "$named" ] && intent=$(cut -f2 <<<"$named")
+    if [ "$intent_explicit" != 1 ]; then
+      named=$(name_plan "$plan"); [ -n "$named" ] && intent=$(cut -f2 <<<"$named")
+    fi
   else
     named=$(name_plan "$plan")
-    [ -n "$named" ] && IFS=$'\t' read -r branch intent <<<"$named"
+    if [ -n "$named" ]; then
+      branch=$(cut -f1 <<<"$named")
+      [ "$intent_explicit" = 1 ] || intent=$(cut -f2 <<<"$named")
+    fi
     [ -n "$branch" ] || die "could not derive a branch name from the plan - pass --branch"
     git check-ref-format "refs/heads/$branch" || die "invalid branch name: '$branch'"
     why=$(branch_taken "$branch" "$repo") && die "branch '$branch' is already $why"
@@ -516,25 +603,10 @@ cmd_add() {
     after_lines="${after_lines}$(printf '%s\t%s\t%s' "$label" "$arepo" "$abranch")"$'\n'
   done <<<"$after_vals"
 
-  # Default priority: the next clean step past everything already queued, so hand
-  # editing stays easy - there is always room to slot something in between.
-  if [ -z "$prio" ]; then
-    local max=0 d p
-    while IFS= read -r d; do
-      [ -n "$d" ] || continue
-      p=$(prio_of "$d"); [ "$p" -gt "$max" ] 2>/dev/null && max=$p
-    done <<<"$(all_tasks)"
-    prio=$(( (max / 10 + 1) * 10 ))
-  fi
-  [[ "$prio" =~ ^[0-9]+$ ]] || die "priority must be a number, got '$prio'"
-
   local state=queue; [ "$hold" = 1 ] && state=hold
   local dir="$PQ_HOME/$state/$(printf '%03d' "$prio")-$slug"
   [ -e "$dir" ] && die "a task already exists at $state/$(basename "$dir")"
-  local d2
-  for d2 in $STATES; do
-    ls -d "$PQ_HOME/$d2"/*-"$slug" >/dev/null 2>&1 && die "a task named '$slug' already exists in $d2/"
-  done
+  local taken_in; taken_in=$(slug_taken_in "$slug") && die "a task named '$slug' already exists in $taken_in/"
 
   # Build the task somewhere the queue cannot see, then move it into place. A task
   # directory with no plan.md would be listed by `pq ls` as a blank row, matched by
@@ -607,6 +679,488 @@ cmd_add() {
   fi
   rm -f "$PR_CACHE" "$PR_ANS"
   repo_base_reset
+}
+
+# ── splitting a plan ─────────────────────────────────────────────────────────
+# `pq add --split` runs one Opus session that reads a whole-feature plan and
+# writes one standalone plan per seam plus a dependency graph, then queues
+# every part through the ordinary `cmd_add` path with its blockers wired -
+# same header, same `branch_taken` guard, same staging dance, same `after`
+# file a hand-typed add would get. The load-bearing constraint: parts wait for
+# MERGES, never for branches - no part is ever built on a sibling's branch.
+# `--after` handles that on the scheduling side; this section's validation is
+# the other half, since it is what keeps the part text honest about it.
+#
+# `do_split` reads `cmd_add`'s locals through bash's dynamic scope (`plan`,
+# `repo`, `repo_explicit`, `model`, `effort`, `dev`, `hold`, `prio`,
+# `after_vals`, `as_json`, `yes`, `split_dir`) and is only ever called from
+# there - hence no arguments of its own.
+
+# The prompt the splitter session is given, passed as an argv element (unlike
+# `dispatch_prompt`, never typed into a pane's shell) so it has no quote
+# restriction.
+splitter_prompt() {                     # repo
+  cat <<EOF
+Read ./source.md - it is a plan for a whole feature. The repository it describes is at $1, readable but never writable. Read whatever you need there to find the real seams in the plan.
+
+Write into the current directory ONLY:
+- One file per part: NN-short-slug.md, numbered in build order starting at 01, lowercase words separated by dashes.
+- graph.tsv: one line per part, tab-separated - filename<TAB>comma-separated filenames of the parts that must have MERGED before this one can start. Leave the second field empty for a part that can start now.
+
+How to choose the split:
+- Each part is a pull request a human would enjoy reviewing: one coherent change, complete in itself.
+- Each part must leave the default branch working and shippable once merged. No part may need a later part to compile, pass tests, or behave correctly. A feature flag defaulting off is fine; a half-migrated schema is not.
+- Use as FEW parts as possible while that stays true. Two to six is the usual answer, never more than twelve. If the plan is already one coherent shippable change, write a single part.
+- Declare a dependency only where one really exists: an interface, schema, migration, or helper another part introduces, or two parts that would edit the same code and collide. Parts with no real dependency must have none declared - that is what lets them run in parallel.
+- Between the parts, cover ALL of source.md: do not drop scope, do not add scope, do not leave anything to "a follow-up".
+
+How to write each part - it will be executed by an agent that sees ONLY that one file: it has never read source.md and cannot see any other part.
+- Never mention another part, its filename, or its number, and never say "the previous plan". Where a part relies on earlier work, state it as a fact about the code it will find - e.g. "the mentions table already has a notified_at column" - never as a reference to another plan or file.
+- Every part starts from the default branch with its declared dependencies already merged. Never tell a part to branch from, rebase onto, or cherry-pick another part's branch.
+- Same shape as the plan you read: a Context section, the specific files to change, the existing functions and patterns to reuse, and a verification section. Real paths, confirmed to exist.
+- Do not start a part's file with '---' - no YAML front matter.
+EOF
+}
+
+# The `pq add --split-dir ...` line to hand back whenever a split stops short
+# of queueing everything - declined, or a validation failure, or a part that
+# failed to queue mid-pass. Carries every one of cmd_add's own locals that
+# isn't already the tool's default, so following this line verbatim does not
+# silently drop --model/--effort/--dev/--hold/--priority/--after the way a
+# bare `--split-dir DIR --repo REPO` would.
+split_resume_hint() {                   # sd
+  local hint="pq add --split-dir $1 --repo $repo" av
+  [ "$model" = "$PQ_DEFAULT_MODEL" ]   || hint="$hint --model $model"
+  [ "$effort" = "$PQ_DEFAULT_EFFORT" ] || hint="$hint --effort $effort"
+  [ "$dev" = true ]      && hint="$hint --dev"
+  [ "$hold" = 1 ]        && hint="$hint --hold"
+  # Gated on prio_explicit, not merely on $prio being non-empty: cmd_add now
+  # always computes a real default before do_split runs (so split_queue's own
+  # ascending-by-10 logic has something real to start from), and printing
+  # that computed default back as an explicit --priority would pin a number
+  # the user never asked for - which could collide with whatever queued in
+  # the meantime by the time they actually resume.
+  [ "$prio_explicit" = 1 ] && hint="$hint --priority $prio"
+  while IFS= read -r av; do
+    [ -n "$av" ] || continue
+    hint="$hint --after $av"
+  done <<<"$after_vals"
+  printf '%s' "$hint"
+}
+
+# total_cost_usd duration_ms -> " (\$0.71, 2m48s)", or "" if neither is known.
+fmt_cost() {                            # cost_usd duration_ms
+  local cost=${1:-} dur=${2:-} out=""
+  [ -n "$cost" ] && out="\$$(printf '%.2f' "$cost" 2>/dev/null || printf '%s' "$cost")"
+  if [ -n "$dur" ]; then
+    local secs=$(( dur / 1000 ))
+    out="${out:+$out, }$(( secs / 60 ))m$(( secs % 60 ))s"
+  fi
+  [ -n "$out" ] && printf ' (%s)' "$out"
+}
+
+# The reason a branch or slug cannot be used for a new part, or nothing -
+# `branch_taken` plus `slug_taken_in` (the same $STATES sweep `cmd_add` itself
+# runs), plus a sibling already named earlier in THIS split.
+split_name_collision() {                # branch slug named_file
+  local branch=$1 slug=$2 named_file=$3 why taken_in collider
+  why=$(branch_taken "$branch" "$repo") && { printf '%s' "$why"; return; }
+  taken_in=$(slug_taken_in "$slug") \
+    && { printf "a task named '%s' already exists in %s/" "$slug" "$taken_in"; return; }
+  collider=$(awk -F'\t' -v b="$branch" -v s="$slug" '$2 == b || $3 == s { print $1; exit }' \
+               "$named_file" 2>/dev/null)
+  [ -n "$collider" ] && printf 'the same branch or name as %s, already named earlier in this split' "$collider"
+}
+
+# Validate the parts and the graph, before any naming and before anything is
+# queued. `awk` throughout, never `while read` - a model-written graph.tsv can
+# arrive with no trailing tab and no final newline at all (verified against
+# the real CLI), and `while read` silently drops a final line with no newline
+# where `awk` reads it correctly - the same regression `after` already has a
+# test for (test/pq-after.sh:242).
+split_validate() {                      # sd -> dies on any violation
+  local sd=$1
+  local g="$sd/graph.tsv" n bad part mdfiles gnames extra missing dupes unknown selfdep hit
+
+  [ -s "$g" ] || die "the splitter wrote no graph.tsv (or an empty one) - see $sd/splitter.err"
+
+  n=$(awk -F'\t' '$1 != "" { c++ } END { print c + 0 }' "$g")
+  [ "$n" -ge 1 ] && [ "$n" -le 12 ] || \
+    die "graph.tsv names $n part(s) - must be 1-12; trim and re-run with: $(split_resume_hint "$sd")"
+
+  bad=$(awk -F'\t' '$1 != "" && $1 !~ /^[0-9][0-9]-[a-z0-9-]+\.md$/ { print $1 }' "$g")
+  [ -z "$bad" ] || die "graph.tsv names a badly-formed part filename: $(tr '\n' ' ' <<<"$bad")($sd)"
+
+  while IFS= read -r part; do
+    [ -n "$part" ] || continue
+    [ -f "$sd/$part" ] || die "graph.tsv names $part, which does not exist in $sd"
+    [ -s "$sd/$part" ] || die "$sd/$part is empty"
+  done <<<"$(awk -F'\t' '$1 != "" { print $1 }' "$g")"
+
+  # Bidirectionally complete: every *.md but source.md is in the graph exactly
+  # once, and the graph names nothing else - a part file the graph forgot is
+  # silent scope loss, which is the failure that costs a whole feature.
+  #
+  # Dupes MUST be checked before the `comm` pair below: `comm` walks two
+  # SORTED streams in lockstep, so a name listed twice in graph.tsv but once
+  # on disk exhausts mdfiles a line early and comm reports the second copy as
+  # "file2-only" - misdiagnosing a duplicate as a missing file.
+  mdfiles=$( (cd "$sd" && ls -- *.md 2>/dev/null) | grep -vx 'source.md' | sort)
+  gnames=$(awk -F'\t' '$1 != "" { print $1 }' "$g" | sort)
+  dupes=$(printf '%s\n' "$gnames" | uniq -d)
+  [ -z "$dupes" ] || die "graph.tsv lists these parts more than once: $(tr '\n' ' ' <<<"$dupes") ($sd)"
+  extra=$(comm -23 <(printf '%s\n' "$mdfiles") <(printf '%s\n' "$gnames") 2>/dev/null)
+  [ -z "$extra" ] || die "these part files exist but graph.tsv never lists them: $(tr '\n' ' ' <<<"$extra") ($sd)"
+  missing=$(comm -13 <(printf '%s\n' "$mdfiles") <(printf '%s\n' "$gnames") 2>/dev/null)
+  [ -z "$missing" ] || die "graph.tsv names files that don't exist: $(tr '\n' ' ' <<<"$missing") ($sd)"
+
+  unknown=$(awk -F'\t' '
+    { names[NR] = $1; depsraw[NR] = $2; if ($1 != "") valid[$1] = 1 }
+    END {
+      for (i = 1; i <= NR; i++) {
+        if (names[i] == "") continue
+        d = split(depsraw[i], arr, ",")
+        for (j = 1; j <= d; j++) {
+          dep = arr[j]; gsub(/^[ \t]+|[ \t]+$/, "", dep)
+          if (dep != "" && !(dep in valid)) print names[i] ": " dep
+        }
+      }
+    }' "$g")
+  [ -z "$unknown" ] || die "graph.tsv names a dependency that is not itself a listed part - $unknown ($sd)"
+
+  selfdep=$(awk -F'\t' '
+    $1 != "" {
+      d = split($2, arr, ",")
+      for (j = 1; j <= d; j++) {
+        dep = arr[j]; gsub(/^[ \t]+|[ \t]+$/, "", dep)
+        if (dep == $1) print $1
+      }
+    }' "$g")
+  [ -z "$selfdep" ] || die "graph.tsv has a part depending on itself: $(tr '\n' ' ' <<<"$selfdep") ($sd)"
+
+  while IFS= read -r part; do
+    [ -n "$part" ] || continue
+    [ "$(head -1 "$sd/$part")" != "---" ] || \
+      die "$part starts with '---' - that fence is reserved for cmd_add's own header ($sd)"
+    # Anchored to EXACTLY two leading digits so a real repo path like
+    # db/migrate/20260728141230-add-columns.md cannot trip it - an
+    # implementer only ever sees its own plan.md, so a cross-reference is an
+    # instruction it cannot follow, and that anchoring is what makes this
+    # safe to be a hard error rather than a warning.
+    hit=$(grep -nE '(^|[^0-9])[0-9][0-9]-[a-z0-9-]+\.md' "$sd/$part" 2>/dev/null || true)
+    [ -z "$hit" ] || die "$part references another part by filename - an implementer never sees a sibling: $hit"
+  done <<<"$(awk -F'\t' '$1 != "" { print $1 }' "$g")"
+}
+
+# level<TAB>part<TAB>deps, sorted by level then part name - sorting by level
+# IS a valid topological order, since every part outranks each of its
+# dependencies. `tsort` is not usable here: on this machine it prints
+# "tsort: cycle in data" and still exits 0, so it cannot report a cycle -
+# iterative relaxation gives the wave number and the cycle check together.
+#
+# NEVER calls `die`: the caller reaches this through `leveled=$(split_levels
+# ...)`, which forks a subshell, and an `exit` in there would kill only that
+# subshell and let the split limp on none the wiser. A cycle is reported on
+# stdout instead, with a non-zero return, for `do_split` - which is not
+# subshelled - to `die` on.
+split_levels() {                        # sd -> prints the leveled TSV, or "CYCLE ..." + return 1
+  local sd=$1
+  local g="$sd/graph.tsv" n out
+  n=$(awk -F'\t' '$1 != "" { c++ } END { print c + 0 }' "$g")
+  out=$(awk -F'\t' -v n="$n" '
+    $1 != "" { name[NR] = $1; deps[NR] = $2; level[$1] = 1 }
+    END {
+      changed = 1
+      for (pass = 1; pass <= n && changed; pass++) {
+        changed = 0
+        for (i = 1; i <= NR; i++) {
+          if (name[i] == "") continue
+          d = split(deps[i], arr, ",")
+          for (j = 1; j <= d; j++) {
+            dep = arr[j]; gsub(/^[ \t]+|[ \t]+$/, "", dep)
+            if (dep == "") continue
+            want = level[dep] + 1
+            if (want > level[name[i]]) { level[name[i]] = want; changed = 1 }
+          }
+        }
+      }
+      if (changed) {
+        cyc = ""
+        for (i = 1; i <= NR; i++) if (name[i] != "" && level[name[i]] > n) cyc = cyc " " name[i]
+        print "CYCLE" cyc
+        exit
+      }
+      for (i = 1; i <= NR; i++) {
+        if (name[i] == "") continue
+        # Rebuilt trimmed and re-joined, not the raw field: a splitter that
+        # writes "a.md, b.md" (a space after the comma - the prompt only
+        # says "comma-separated", never "no spaces") must not leak that
+        # space into the printed deps column, since split_queue splits this
+        # same field on "," and looks each piece up verbatim.
+        d = split(deps[i], arr, ",")
+        clean = ""
+        for (j = 1; j <= d; j++) {
+          dep = arr[j]; gsub(/^[ \t]+|[ \t]+$/, "", dep)
+          if (dep == "") continue
+          clean = (clean == "" ? dep : clean "," dep)
+        }
+        printf "%d\t%s\t%s\n", level[name[i]], name[i], clean
+      }
+    }' "$g")
+  case "$out" in
+    CYCLE*) printf '%s' "$out"; return 1 ;;
+  esac
+  sort -k1,1n -k2,2 <<<"$out"
+}
+
+# Name every part, in topological (level) order, collecting part<TAB>branch
+# <TAB>slug<TAB>intent into $sd/.named.tsv. Serial and slow on purpose - one
+# Haiku round trip per part, plus `branch_taken`'s bounded `ls-remote` per
+# branch, adds roughly 15-30s for a six-part split. That is the intended
+# cost: the `ls-remote` is what catches a branch pushed from another machine,
+# and skipping it to save the round trips would only move that failure to
+# `wt new` at 2am, where it silently adopts the existing branch instead.
+#
+# A collision - with git, with a live task, or with a sibling already named
+# in this pass - gets one retry with an avoid list; a second is a hard error
+# naming both parts, with nothing queued. A part that yields no name at all
+# is also a hard error: `cmd_add`'s "pass --branch" advice has no meaning
+# inside a split.
+split_name_parts() {                    # sd leveled_tsv
+  local sd=$1 leveled=$2
+  local named_file="$sd/.named.tsv"
+  : > "$named_file"
+  local level part deps named branch intent slug reason avoid try
+  while IFS=$'\t' read -r level part deps; do
+    [ -n "$part" ] || continue
+    avoid=""
+    for try in 1 2; do
+      named=$(name_plan "$sd/$part" "$avoid")
+      [ -n "$named" ] || die "$part: could not derive a branch name and intent - naming failed"
+      IFS=$'\t' read -r branch intent <<<"$named"
+      [ -n "$branch" ] || die "$part: could not derive a branch name - naming failed"
+      git check-ref-format "refs/heads/$branch" || die "$part: invalid branch name '$branch'"
+      slug=$(branch_to_slug "$branch")
+      [ -n "$slug" ] || die "$part: branch '$branch' does not reduce to a usable name"
+
+      reason=$(split_name_collision "$branch" "$slug" "$named_file")
+      if [ -z "$reason" ]; then
+        printf '%s\t%s\t%s\t%s\n' "$part" "$branch" "$slug" "$intent" >> "$named_file"
+        break
+      fi
+      if [ "$try" = 2 ]; then
+        die "$part: branch '$branch' collides - $reason - retried once, still colliding; nothing queued"
+      fi
+      warn "$part: branch '$branch' collides - $reason - retrying with an avoid-list"
+      avoid="${avoid:+$avoid,}$branch"
+    done
+  done <<<"$leveled"
+}
+
+# Shown before anything is queued, then "[y/N]" unless `-y`. Built as a TSV
+# and passed to the existing `render_table`, so columns pad to their widest
+# cell like `pq ls` and `wt ls` - every cell here is ASCII by construction
+# (the filename charset check and `check-ref-format`), which `render_table`
+# requires, since macOS `awk`'s `length()` counts bytes.
+#
+# All of it goes to stderr: `pq add --split`'s stdout contract is the slugs
+# (or, with --json, the JSON array), the same as an ordinary `pq add`'s
+# stdout is just the slug - a caller piping this for a slug list must never
+# see the table.
+split_confirm() {                       # sd leveled_tsv named_file cost_str -> 0 confirmed, 1 declined
+  local sd=$1 leveled=$2 named_file=$3 cost_str=${4:-}
+  local tbl="$PQ_HOME/.splitconfirm.$$"
+  printf 'PART\tWAVE\tBRANCH\tAFTER\n' > "$tbl"
+  local level part deps branch after_disp nparts nwaves ans
+  while IFS=$'\t' read -r level part deps; do
+    [ -n "$part" ] || continue
+    branch=$(awk -F'\t' -v p="$part" '$1 == p { print $2; exit }' "$named_file")
+    after_disp="-"
+    [ -n "$deps" ] && after_disp=${deps//,/, }
+    printf '%s\t%s\t%s\t%s\n' "$part" "$level" "$branch" "$after_disp" >> "$tbl"
+  done <<<"$leveled"
+
+  nparts=$(( $(wc -l < "$tbl" | tr -d ' ') - 1 ))
+  nwaves=$(awk -F'\t' 'NR > 1 && $2 + 0 > max { max = $2 + 0 } END { print max + 0 }' "$tbl")
+
+  msg "split $(basename "$sd") into $nparts parts, $nwaves waves$cost_str"
+  printf '\n' >&2
+  render_table "$tbl" >&2
+  printf '\n' >&2
+  rm -f "$tbl"
+
+  [ "$nwaves" -gt 1 ] && msg "wave 2 runs in parallel once wave 1 has merged"
+
+  [ "$yes" = 1 ] && return 0
+  printf 'pq: queue all %s? [y/N] ' "$nparts" >&2
+  read -r ans || ans=n
+  [[ "${ans:-}" =~ ^[Yy]$ ]]
+}
+
+# Pass 2: queue every part through the ordinary `cmd_add`, in topological
+# order, each through a command substitution - which isolates `die` to that
+# subshell, so one bad part stops the split without unwinding what already
+# queued. Sequential by construction, which is what makes `cmd_add`'s shared
+# `$PQ_HOME/.add.$$` staging path safe to reuse across the recursive calls:
+# `$$` names the top-level process even inside a subshell, and never changes.
+#
+# `--after` on the split itself applies to ROOT parts only - the ones with no
+# dependency inside the split. That is transitively correct: `cmd_after`'s
+# existing "waiting on X of its own" branch already surfaces the rest of the
+# chain to anyone asking why a downstream part hasn't started.
+split_queue() {                         # sd leveled_tsv named_file
+  local sd=$1 leveled=$2 named_file=$3
+  local slugmap="$PQ_HOME/.splitslugs.$$"; : > "$slugmap"
+  local objects="$PQ_HOME/.splitjson.$$"; : > "$objects"
+  local devflag=""; [ "$dev" = true ] && devflag=--dev
+  local holdflag=""; [ "$hold" = 1 ] && holdflag=--hold
+  local cur_prio=$prio
+  local n=0 total level part deps row branch intent afterflags dep depslug prioflag task out rc av
+
+  # $leveled already has exactly one line per part - no need to touch
+  # graph.tsv again for a count already sitting in an argument this function
+  # was handed.
+  total=$(wc -l <<<"$leveled" | tr -d ' ')
+
+  while IFS=$'\t' read -r level part deps; do
+    [ -n "$part" ] || continue
+    n=$((n + 1))
+    row=$(awk -F'\t' -v p="$part" '$1 == p { print; exit }' "$named_file")
+    IFS=$'\t' read -r _ branch _ intent <<<"$row"
+
+    # Each part's own dependencies resolve to slugs recorded in EARLIER
+    # iterations of this same loop - guaranteed to exist because the leveled
+    # order is a valid topological order. A root part (no deps) instead gets
+    # the split-level --after values, resolved by the recursive cmd_add call
+    # exactly like any other --after.
+    afterflags=""
+    if [ -n "$deps" ]; then
+      while IFS= read -r dep; do
+        [ -n "$dep" ] || continue
+        depslug=$(awk -F'\t' -v p="$dep" '$1 == p { print $2; exit }' "$slugmap")
+        [ -n "$depslug" ] || die "internal error: $part depends on $dep, which was not queued before it ($sd)"
+        afterflags="$afterflags--after
+$depslug
+"
+      done <<<"$(tr ',' '\n' <<<"$deps")"
+    else
+      while IFS= read -r av; do
+        [ -n "$av" ] || continue
+        afterflags="$afterflags--after
+$av
+"
+      done <<<"$after_vals"
+    fi
+
+    prioflag=""
+    if [ -n "$cur_prio" ]; then
+      prioflag="--priority $cur_prio"
+      cur_prio=$(( cur_prio + 10 ))
+    fi
+
+    # shellcheck disable=SC2086  # devflag/holdflag/prioflag/afterflags are
+    # deliberately unquoted - see the identical idiom at pq:1573 for $devflag.
+    out=$(cmd_add "$sd/$part" --repo "$repo" --branch "$branch" --intent "$intent" \
+            --model "$model" --effort "$effort" $devflag $holdflag \
+            $prioflag $afterflags --json)
+    rc=$?
+    if [ "$rc" != 0 ]; then
+      [ "$n" -gt 1 ] && warn "already queued, untouched: $(cut -f2 "$slugmap" | tr '\n' ' ')"
+      # Not a bare blind retry: re-running --split-dir re-names every part
+      # from scratch, and a part already queued above could get renamed to a
+      # DIFFERENT branch on that pass (branch_taken forces a retry once its
+      # own name collides with the live task it just created) - so check
+      # `pq ls` before trusting it did not duplicate what already queued.
+      die "$part failed to queue ($n of $total) - finish the rest with: $(split_resume_hint "$sd")  (check pq ls first - re-naming could duplicate what's already queued)"
+    fi
+
+    task=$(jq -r '.task // empty' <<<"$out")
+    [ -n "$task" ] || die "internal error: $part queued but returned no task slug ($sd)"
+    printf '%s\t%s\n' "$part" "$task" >> "$slugmap"
+    printf '%s\n' "$out" >> "$objects"
+    [ "$as_json" = 1 ] || printf '%s\n' "$task"
+  done <<<"$leveled"
+
+  [ "$as_json" = 1 ] && jq -s '.' "$objects"
+  rm -f "$slugmap" "$objects"
+}
+
+do_split() {
+  local sd stamp stem cost_str=""
+
+  if [ -n "$split_dir" ]; then
+    sd=$split_dir
+    [ -f "$sd/source.md" ] || die "$sd has no source.md - not a split directory"
+    local recorded; recorded=$(cat "$sd/repo" 2>/dev/null)
+    # `--repo` passed explicitly is how you say "yes, I mean it" - parts name
+    # real files in a specific checkout, so re-running a stale split against
+    # the wrong repo would queue parts describing files that do not exist,
+    # and nothing downstream would catch it. Auto-resolved from cwd, a
+    # mismatch is far more likely an accident: you are standing in the wrong
+    # place, not choosing to override.
+    if [ -n "$recorded" ] && [ "$recorded" != "$repo" ] && [ "$repo_explicit" != 1 ]; then
+      die "$sd was split against $recorded, not $repo - cd there, or pass --repo to confirm you mean it"
+    fi
+    msg "resuming split from $sd"
+  else
+    stem=$(basename "$plan"); stem=${stem%.md}
+    stem=$(branch_to_slug "$stem")
+    stamp=$(date -u '+%Y%m%d-%H%M%S')
+    # $$ as well as the timestamp: the stamp alone is only second-granularity,
+    # and two `--split`s of the same plan stem within one second would
+    # otherwise collide on the same directory - `mkdir -p` would not even
+    # fail, it would just let a second Opus session write into the first
+    # one's files mid-flight. $$ is unique per process, so this rules that
+    # out the same way the staging path elsewhere in this file does.
+    sd="$PQ_HOME/splits/${stem}-${stamp}-$$"
+    mkdir -p "$sd" || die "could not create $sd"
+    # COPY, never move - same reason cmd_add copies rather than moves out of
+    # $PLANS_DIR: it is Claude Code's directory and it prunes it.
+    cp "$plan" "$sd/source.md" || die "could not copy the plan into $sd"
+    printf '%s\n' "$repo" > "$sd/repo"
+
+    local before after rc is_error cost dur denials
+    # Snapshotted before and after: `--tools` cannot scope `Write` to one
+    # directory, and `--add-dir` grants the repo to every allowed tool, so the
+    # prompt's instruction not to write there is not a guarantee - this is
+    # the only net there is.
+    before=$(git -C "$repo" status --porcelain 2>/dev/null)
+    msg "splitting $(basename "$plan") with $PQ_SPLITTER_MODEL - this takes a few minutes"
+    ( cd "$sd" && claude -p --model "$PQ_SPLITTER_MODEL" --effort "$PQ_SPLITTER_EFFORT" \
+        --add-dir "$repo" --tools "Read,Grep,Glob,Write" \
+        --permission-mode acceptEdits --output-format json "$(splitter_prompt "$repo")" ) \
+      < /dev/null > "$sd/splitter.json" 2> "$sd/splitter.err"
+    rc=$?
+    after=$(git -C "$repo" status --porcelain 2>/dev/null)
+    [ "$before" = "$after" ] \
+      || warn "the splitter left $repo dirty - it was only meant to read from it: $(tr '\n' ' ' <<<"$after")"
+
+    is_error=$(jq -r '.is_error // empty'        "$sd/splitter.json" 2>/dev/null)
+    cost=$(jq -r      '.total_cost_usd // empty' "$sd/splitter.json" 2>/dev/null)
+    dur=$(jq -r       '.duration_ms // empty'    "$sd/splitter.json" 2>/dev/null)
+    denials=$(jq -r   '.permission_denials // empty' "$sd/splitter.json" 2>/dev/null)
+    [ -z "$denials" ] || [ "$denials" = "[]" ] || warn "the splitter reached for something denied: $denials"
+    if [ "$rc" != 0 ] || [ "$is_error" = "true" ]; then
+      die "the splitter session failed - see $sd/splitter.err and $sd/splitter.json"
+    fi
+    cost_str=$(fmt_cost "$cost" "$dur")
+  fi
+
+  split_validate "$sd"
+  local leveled
+  if ! leveled=$(split_levels "$sd"); then
+    die "graph.tsv has a dependency cycle involving:${leveled#CYCLE} ($sd)"
+  fi
+
+  split_name_parts "$sd" "$leveled"
+  local named_file="$sd/.named.tsv"
+
+  if ! split_confirm "$sd" "$leveled" "$named_file" "$cost_str"; then
+    msg "declined - nothing queued. Edit parts under $sd, then resume with: $(split_resume_hint "$sd")"
+    return 0
+  fi
+
+  split_queue "$sd" "$leveled" "$named_file"
 }
 
 # ── pane state ──────────────────────────────────────────────────────────────
@@ -2120,7 +2674,7 @@ main() {
     hold)       shift; cmd_hold "$@" ;;
     unhold)     shift; cmd_unhold "$@" ;;
     rm|remove)  shift; cmd_rm "$@" ;;
-    *) die "usage: pq {add [plan] [--after task|branch]... [--json] | after <task> [<task|branch>... | --clear] | ls [--json] | show <task> | tick [--cap N] [--dry-run] | run [--interval S] [--cap N] | cap [N] | priority <task> N | hold <task> | unhold <task> | rm <task>}" ;;
+    *) die "usage: pq {add [plan] [--after task|branch]... [--split | --split-dir DIR] [-y] [--json] | after <task> [<task|branch>... | --clear] | ls [--json] | show <task> | tick [--cap N] [--dry-run] | run [--interval S] [--cap N] | cap [N] | priority <task> N | hold <task> | unhold <task> | rm <task>}" ;;
   esac
 }
 if [ "${BASH_SOURCE[0]}" = "$0" ]; then main "$@"; fi
