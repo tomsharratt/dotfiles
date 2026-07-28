@@ -21,6 +21,7 @@
 #   wt open [name]       open the worktree's dev url in the browser
 #   wt provision <path>  (re)run the project's provisioning for a worktree (idempotent)
 #   wt rm  [name]        tear the worktree down (drop db, free port, remove worktree)
+#        -y, --yes       answer both prompts yes (needed to run unattended)
 #   wt ls                every worktree: port, age, agent state, PR/CI state, url
 #   wt gc                reclaim resources from worktrees that no longer exist
 #   wt gc --merged       also reclaim worktrees whose PR has merged (needs gh)
@@ -989,6 +990,15 @@ cmd_provision() {
 
 cmd_rm() {
   need_herdr
+  local yes=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -y|--yes) yes=1; shift ;;
+      --)       shift; break ;;
+      -*)       die "unknown option '$1' (usage: wt rm [-y] [name])" ;;
+      *)        break ;;
+    esac
+  done
   local name=${1:-} repo rn path sf ans del=n
   repo=$(main_worktree "$PWD"); [ -n "$repo" ] || die "not inside a git repo"
   [ -n "$name" ] || name=$(cur_branch "$PWD")
@@ -1010,11 +1020,25 @@ cmd_rm() {
   # Ask both questions up front. Closing the workspace (reap_one's last step) tears
   # down the pane this command is running in whenever we're removing the worktree we're
   # sitting in - so nothing after that close is guaranteed to run: no prompts, no
-  # cleanup. Everything that must happen has to happen before it.
-  printf 'wt: remove worktree "%s" (branch, db, port all go)? [y/N] ' "$name" >&2; read -r ans || ans=n
+  # cleanup. Everything that must happen has to happen before it. -y/--yes answers
+  # both y without asking, which is also what makes this callable from a script: a
+  # closed stdin with no --yes must fail loudly rather than `read` seeing EOF, reading
+  # it as "n", and cancelling with exit 0 - a silent no-op that reads as success.
+  if [ "$yes" = 1 ]; then
+    ans=y
+  else
+    [ -t 0 ] || die "no tty to confirm removal of '$name' - rerun with -y/--yes"
+    printf 'wt: remove worktree "%s" (branch, db, port all go)? [y/N] ' "$name" >&2
+    read -r ans || ans=n
+  fi
   [[ "${ans:-}" =~ ^[Yy]$ ]] || { msg "cancelled"; return 0; }
-  printf 'wt: also delete the git branch "%s"? [y/N] ' "$name" >&2; read -r ans || ans=n
-  [[ "${ans:-}" =~ ^[Yy]$ ]] && del=y
+  if [ "$yes" = 1 ]; then
+    del=y
+  else
+    printf 'wt: also delete the git branch "%s"? [y/N] ' "$name" >&2
+    read -r ans || ans=n
+    [[ "${ans:-}" =~ ^[Yy]$ ]] && del=y
+  fi
 
   reap_one "$repo" "$rn" "$name" "$path" "$del"
 }
@@ -1116,5 +1140,5 @@ case "${1:-}" in
   rm|remove)  shift; cmd_rm "$@" ;;
   ls|list)    shift; cmd_ls "$@" ;;
   gc)         shift; cmd_gc "$@" ;;
-  *) die "usage: wt {new [--no-agent] [--no-dev] [--no-focus] [--json] [name] | dev <path> | run [cmd...] | open [name] | provision <path> | rm [name] | ls | gc [--merged] [--sweep] [-y]}" ;;
+  *) die "usage: wt {new [--no-agent] [--no-dev] [--no-focus] [--json] [name] | dev <path> | run [cmd...] | open [name] | provision <path> | rm [-y] [name] | ls | gc [--merged] [--sweep] [-y]}" ;;
 esac

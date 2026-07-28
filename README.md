@@ -56,7 +56,7 @@ wt dev  <path>       run a worktree's dev server (this is the dev pane's command
 wt run  [cmd...]     run a command with the worktree's isolated env loaded
 wt open [name]       open the worktree's dev url in the browser
 wt provision <path>  re-run provisioning for a worktree (idempotent)
-wt rm  [name]        tear a worktree down (drop db, free port, remove worktree)
+wt rm  [-y] [name]   tear a worktree down (drop db, free port, remove worktree)
 wt ls                list worktrees with their allocated port / redis / url / db
 wt gc                reclaim resources from worktrees removed outside wt rm
 ```
@@ -186,11 +186,34 @@ The wall is the only thing `pq` ever answers.
 A permission prompt is recorded as `permission` and deliberately left alone - that is the trade for running everything in auto mode - so `pq ls` separates the agents waiting on the clock from the ones waiting on you.
 After forty unanswered knocks a task is marked `walled` and left, rather than knocking all night.
 
+#### Tearing a task down
+
+Once a `done` task's pull request has genuinely merged into its repo's default branch - checked against the forge, the same predicate blockers use, not `wt gc --merged`'s looser "state == MERGED" - `pq` tears it down: the worktree, its database, its port, its redis index, its puma-dev entry, and the Herdr workspace holding its agent's pane.
+That is the same `wt rm` you would have run by hand, driven unattended.
+
+`pq` never touches a worktree it did not create.
+A task whose PR closed without merging is left exactly as `wt rm` would have found it - the work never shipped, so what to do with it stays your call.
+
+Two things hold a teardown off, both checked only once the merge is confirmed:
+
+- the agent is still going - Herdr reports `working` or `blocked` for its pane
+- `pq` is itself running inside that task's own Herdr workspace, where closing it would kill the pane mid-teardown
+
+`pq ls` shows a held task as `held agent`, `held here`, or `held nobase` (its repo's default branch could not be resolved), and a closed-without-merging one as `closed`.
+A task with nothing left to reclaim shows `-`, the same as any other task that needs nothing from you.
+There is no off switch, for the same reason `pq` has none for dispatch-hours or the usage gate: one mechanism, not two.
+
 ### Reclaiming resources
 
 Herdr has no worktree-removal hook, so removing a worktree through Herdr's own UI (rather than `wt rm`) would otherwise leak its database, port, and redis db.
 `wt gc` reconciles this: it checks each recorded worktree and, for any whose directory no longer exists, runs the profile's teardown and frees the reservation.
 `wt new` runs it automatically, so orphans are always reclaimed on the next task - run `wt gc` yourself any time to clean up immediately.
+
+`wt gc --merged` goes further and reclaims worktrees whose PR has merged, the case the orphan pass structurally cannot see since a shipped worktree is still a perfectly valid git worktree.
+It lists what it intends to take before taking it, and skips a repo whose PR state it could not read.
+
+`wt gc --sweep` reclaims project-owned resources (databases, puma-dev entries) whose worktree is gone entirely, so no state file points at them any more.
+It previews what it would reclaim first, since - unlike the other two passes - it deletes on a naming pattern rather than on a recorded fact.
 
 ## Requirements
 

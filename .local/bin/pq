@@ -39,6 +39,15 @@
 # the default branch, so `git branch --merged` misses every real merge. See
 # `after_state` below for the full predicate.
 #
+# `pq` also tears its own tasks down, the other end of that same `wt` seam: once
+# a done task's PR has genuinely merged into its repo's default branch - checked
+# against the forge, never `wt gc --merged`'s looser "state == MERGED" - `pq`
+# runs the equivalent of `wt rm` on it, unattended. It never touches a worktree
+# it did not create, never merges or closes a pull request, and a task whose PR
+# closed without merging is left exactly as `wt rm` would have found it. The one
+# thing that holds a teardown off is the agent still going, or `pq` itself
+# sitting in the workspace about to be closed - see `reap_task` below.
+#
 # LAYOUT ─────────────────────────────────────────────────────────────────────
 # A task is a DIRECTORY, and the directory it sits in is its state:
 #
@@ -876,10 +885,17 @@ pr_get() {                              # repo branch
 # `scope` picks which dispatched branches count: `all` (the default) is
 # running + done, which `cmd_ls` needs for its PR column; `tick_body` passes
 # `running` instead, since reconcile only ever looks at running tasks - a
-# `done` task's own branch is otherwise a `gh` call repeated every tick,
+# `done` task's own branch would otherwise be a `gh` call repeated every tick,
 # forever, for history that already shipped and will never change state again.
 # A `done` task that is ALSO a blocker still gets looked up, through its
 # dependent's `after` row.
+#
+# The exception is a done task the reap pass still has a verdict to reach:
+# `reap_watching` says so for as long as none of `PQ_MERGED`, `PQ_CLOSED`,
+# `PQ_REAPED` is set, which is exactly the window where the answer can still
+# change. A merged task stamps `PQ_MERGED` and drops out (only local checks
+# remain - no more reason to ask `gh`); a closed one stamps `PQ_CLOSED` and
+# drops out; a worktree already gone stamps `PQ_REAPED` and drops out.
 pr_targets() {                          # [scope: all|running]
   local scope=${1:-all} d st repo branch
   while IFS= read -r d; do
@@ -891,7 +907,7 @@ pr_targets() {                          # [scope: all|running]
         [ -n "$repo" ] && [ -n "$branch" ] && printf '%s\t%s\n' "$repo" "$branch"
         ;;
       done)
-        [ "$scope" = all ] || continue
+        [ "$scope" = all ] || reap_watching "$d" || continue
         repo=$(hdr "$d/plan.md" repo); branch=$(hdr "$d/plan.md" branch)
         [ -n "$repo" ] && [ -n "$branch" ] && printf '%s\t%s\n' "$repo" "$branch"
         ;;
@@ -1208,6 +1224,18 @@ agent_cell() {                          # task_dir state
       esac
       return
       ;;
+    done)
+      # Deliberately silent for a reaped task, or one never held at all - `-`
+      # keeps meaning "nothing here wants you". A closed-without-merging task
+      # never gets a PQ_REAP_HELD (reap_task returns before ever computing a
+      # hold reason for it) but still needs a decision from you, same as a
+      # hold does - so it gets its own word rather than reading as settled.
+      local reason
+      if [ -n "$(st "$d" PQ_CLOSED)" ]; then printf 'closed'; return; fi
+      reason=$(st "$d" PQ_REAP_HELD)
+      if [ -n "$reason" ]; then printf 'held %s' "$reason"; else printf -- '-'; fi
+      return
+      ;;
   esac
   [ "$st" = running ] || { printf -- '-'; return; }
   pane=$(st "$d" PQ_PANE)
@@ -1278,8 +1306,8 @@ cmd_ls() {
     repo=$(hdr "$d/plan.md" repo)
     agent=$(agent_cell "$d" "$st")
     case "$agent" in
-      permission|gone|exited|blocked|unknown) needs=$((needs + 1)) ;;
-      dead\ *|stalled\ *)                     needs=$((needs + 1)) ;;
+      permission|gone|exited|blocked|unknown|closed) needs=$((needs + 1)) ;;
+      dead\ *|stalled\ *|held\ *)                     needs=$((needs + 1)) ;;
     esac
     num=""; prstate=""; draft=""
     IFS=$'\t' read -r num prstate draft <<<"$(pr_get "$repo" "$branch")"
@@ -1291,11 +1319,14 @@ cmd_ls() {
     esac
     if [ "$as_json" = 1 ]; then
       case "$(after_state "$d")" in met$'\t'*) blocked=false ;; *) blocked=true ;; esac
+      local merged reaped held
+      merged=$(st "$d" PQ_MERGED); reaped=$(st "$d" PQ_REAPED); held=$(st "$d" PQ_REAP_HELD)
       jq -nc --arg task "$slug" --arg state "$st" --arg branch "$branch" \
         --arg repo "$repo" --arg model "$model" --arg effort "$effort" --arg dev "$dev" \
         --arg intent "$intent" --arg added "$added" --arg dir "$d" \
         --arg agent "$agent" --arg pr "${num:-}" --arg prstate "${prstate:-}" \
         --arg draft "$draft" --arg prio "$(prio_of "$d")" \
+        --arg merged "$merged" --arg reaped "$reaped" --arg held "$held" \
         --argjson after "$(after_json "$d")" --argjson blocked "$blocked" '
         def str: if . == "" then null else . end;
         { task: $task, priority: ($prio|tonumber), state: $state, dir: $dir,
@@ -1304,7 +1335,8 @@ cmd_ls() {
           agent: ($agent | if . == "-" then null else . end),
           pr: ($pr|str|if . then tonumber else null end),
           pr_state: ($prstate|str), pr_draft: ($draft == "draft"),
-          after: $after, blocked: $blocked }' >> "$tbl"
+          after: $after, blocked: $blocked,
+          merged: ($merged|str), reaped: ($reaped|str), held: ($held|str) }' >> "$tbl"
     else
       printf '%s\t%s%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
         "$slug" "$([ "$multi" = 1 ] && printf '%s\t' "$(basename "${repo:--}")")" \
@@ -1489,10 +1521,11 @@ cmd_after() {
 cmd_rm() {
   local d; d=$(find_task "${1:-}") || exit 1
   # Read everything we will want to say BEFORE deleting the directory that holds it.
-  local slug st branch repo ans deps
+  local slug st branch repo ans deps reaped
   slug=$(slug_of "$d"); st=$(state_of "$d")
   branch=$(hdr "$d/plan.md" branch); repo=$(hdr "$d/plan.md" repo)
   deps=$(dependents_of "$repo" "$branch" | tr '\n' ' ')
+  reaped=$(st "$d" PQ_REAPED)
   printf 'pq: remove task "%s" (%s)? [y/N] ' "$slug" "$st" >&2; read -r ans || ans=n
   [[ "${ans:-}" =~ ^[Yy]$ ]] || { msg "cancelled"; return 0; }
   rm -rf "$d" || die "could not remove $d"
@@ -1501,7 +1534,8 @@ cmd_rm() {
   # a branch pq no longer knows about, so that is the moment to say so.
   [ -z "$deps" ] || warn "$slug was a blocker for: ${deps% } - they now wait on a branch nothing owns"
   case "$st" in
-    running|done) warn "its worktree and branch are untouched - remove those with: wt rm $branch" ;;
+    running|done)
+      [ -n "$reaped" ] || warn "its worktree and branch are untouched - remove those with: wt rm $branch" ;;
   esac
 }
 
@@ -1539,11 +1573,13 @@ Never wait for input - there is nobody watching."
 # afterwards, so the cheap path is also the safe one.
 # A shell function rather than an inline `cd ... && wt`, so `shielded` can run it as
 # a single command. Functions are visible in the subshell it backgrounds; a `cd`
-# baked into a command substitution would not be.
-wt_new_in() {                           # repo wt-args...
+# baked into a command substitution would not be. It also stands in for a `--repo`
+# flag `wt` doesn't have: `wt` takes its repo from `$PWD`, so both dispatch and
+# reap need this same `cd` first.
+wt_in() {                               # repo wt-subcommand args...
   local repo=$1; shift
   cd "$repo" || return 1
-  "$WT" new "$@"
+  "$WT" "$@"
 }
 
 dispatch_task() {                       # task_dir  -> 0 launched, 1 failed
@@ -1571,7 +1607,7 @@ dispatch_task() {                       # task_dir  -> 0 launched, 1 failed
     # letting finish when you Ctrl-C. wt's own progress still goes to stderr and
     # straight to the user; only its stdout (the JSON) is captured.
     # shellcheck disable=SC2086
-    shielded wt_new_in "$repo" --no-agent --no-focus $devflag --json "$branch" \
+    shielded wt_in "$repo" new --no-agent --no-focus $devflag --json "$branch" \
       || { warn "$(slug_of "$d"): wt new failed"; return 1; }
     wtjson=$SHIELDED_OUT
     pane=$(jq -r '.root_pane_id // empty' <<<"$wtjson" 2>/dev/null)
@@ -1596,6 +1632,159 @@ dispatch_task() {                       # task_dir  -> 0 launched, 1 failed
   st_set "$d" PQ_LAUNCHED "$(now)"
   msg "$(slug_of "$d"): running ${model:-$PQ_DEFAULT_MODEL}/${effort:-$PQ_DEFAULT_EFFORT} in $pane"
   return 0
+}
+
+# ── reap ────────────────────────────────────────────────────────────────────
+# `pq` frees a slot the moment a pull request exists, in any state, and stops
+# caring - everything the task was built on survives: the worktree, its database,
+# its port, its redis index, its puma-dev entry, and the Herdr workspace holding
+# the agent's pane. Reclaiming all of that used to be a human errand, `wt rm` by
+# hand or `wt gc --merged` if you remembered it existed. This is the other end of
+# dispatch: once a task's PR has genuinely merged into the repo's default branch,
+# and only then, `pq` tears down what it built - the same `wt rm` you would have
+# run yourself, driven unattended.
+#
+# `pq` still never touches a worktree it did not create, never merges or closes a
+# pull request, and never force-pushes. A task whose PR never merges (every PR
+# closed, or none at all) is left exactly as `wt rm` would have found it - you
+# decide what to do with unshipped work.
+
+# The whole pass's precondition. `PIDX_OK` means Herdr answered the snapshot, so
+# the agent check below is real rather than a blank. `HERDR_ENV` plus a live
+# `HERDR_SOCKET_PATH` (mirroring wt's own `in_herdr`) mean `pq` is itself inside a
+# Herdr pane, which `wt rm`'s `need_herdr` requires and which is where `pq run` is
+# meant to live anyway. These are not the same condition - the server can be
+# answering while `pq` runs from a plain terminal, and that combination would fail
+# inside `wt rm` on every tick. A teardown deferred to the morning costs nothing,
+# so skip rather than guess.
+reap_ok() {
+  [ "${PIDX_OK:-0}" = 1 ] || return 1
+  [ "${HERDR_ENV:-}" = 1 ] || return 1
+  [ -S "${HERDR_SOCKET_PATH:-/nonexistent}" ] || return 1
+  return 0
+}
+
+# True while a done task still needs a `gh` answer - none of `PQ_MERGED`,
+# `PQ_CLOSED`, `PQ_REAPED` is set. This is what keeps `pr_targets running` from
+# repeating a `gh` call forever once the verdict is in: a merged-but-held task
+# stops watching (the verdict is already known; only local checks remain), a
+# closed one stops for good, and a reaped one has nothing left to ask about.
+reap_watching() {                       # task_dir
+  [ -z "$(st "$1" PQ_MERGED)" ] && [ -z "$(st "$1" PQ_CLOSED)" ] && [ -z "$(st "$1" PQ_REAPED)" ]
+}
+
+# Tear one task down, once its PR has genuinely merged - 0 only when a teardown
+# actually happened this pass, 2 when `--dry-run` would have done one (nothing
+# is stamped either way), 1 for everything else. `tick_body` counts 0 as torn
+# down and 2 as would-tear-down, the same split fill keeps between `started`
+# and `would`.
+#
+# `dry` gates every write site individually rather than short-circuiting at the
+# top: which of the three `--dry-run` messages applies depends on the hold
+# reason, and that has to be computed before it can be printed.
+reap_task() {                           # task_dir dry -> 0 torn down, 2 would (dry-run), 1 otherwise
+  local d=$1 dry=$2 slug repo branch base wt merged=0 reason="" explanation="" was
+
+  slug=$(slug_of "$d")
+
+  # 1. Already reaped or closed - nothing left to do.
+  { [ -n "$(st "$d" PQ_REAPED)" ] || [ -n "$(st "$d" PQ_CLOSED)" ]; } && return 1
+
+  # 2. The worktree is already gone - a hand-run `wt rm`, or `wt gc`, got there
+  #    first. Stamp and stop watching without invoking `wt` at all.
+  wt=$(st "$d" PQ_WORKTREE)
+  if [ -z "$wt" ] || [ ! -d "$wt" ]; then
+    if [ "$dry" = 1 ]; then
+      msg "would stop watching $slug - its worktree is already gone"
+    else
+      st_set "$d" PQ_REAPED "$(now)"
+      msg "$slug: worktree already gone - no longer watching"
+    fi
+    return 1
+  fi
+
+  repo=$(hdr "$d/plan.md" repo); branch=$(hdr "$d/plan.md" branch)
+  [ -d "$repo" ] || { warn "$slug: repo $repo is gone - fix that, then the next tick will retry"; return 1; }
+
+  # 3. Resolve the merge verdict once, from the PR cache the tick already paid
+  #    for (pr_targets running now covers every watched done task's branch too).
+  if [ -n "$(st "$d" PQ_MERGED)" ]; then
+    merged=1
+  else
+    base=$(repo_base "$repo")
+    if [ -z "$base" ]; then
+      # Resolved first, ahead of the predicates below: with no base
+      # pr_merged_into can never match and pr_all_closed will not fire on a
+      # MERGED row, so without this the task would poll gh every tick forever.
+      reason=nobase
+    elif pr_merged_into "$repo" "$branch" "$base"; then
+      merged=1
+      [ "$dry" = 1 ] || st_set "$d" PQ_MERGED "$(now)"
+    elif pr_all_closed "$repo" "$branch"; then
+      # Terminal, so the stamp makes this warning once-only by itself.
+      if [ "$dry" = 1 ]; then
+        msg "would leave $slug alone - every PR closed without merging"
+      else
+        st_set "$d" PQ_CLOSED "$(now)"
+        warn "$slug: every PR for it closed without merging - left alone, worktree untouched"
+      fi
+      return 1
+    else
+      return 1                          # still in review - no hold, just not yet
+    fi
+  fi
+
+  # 4. Two holds, both only once merged (just now, or on an earlier pass).
+  if [ "$merged" = 1 ]; then
+    # The guard that matters most: closing the Herdr workspace pq is itself
+    # running in would kill this pane partway through the teardown. Guarded on
+    # HERDR_WORKSPACE_ID being non-empty so two blank strings can never match.
+    if [ -n "${HERDR_WORKSPACE_ID:-}" ] && [ "$(st "$d" PQ_WORKSPACE)" = "$HERDR_WORKSPACE_ID" ]; then
+      reason=here
+    else
+      case "$(pane_state "$(st "$d" PQ_PANE)")" in
+        working|blocked) reason=agent ;;
+      esac
+    fi
+  fi
+
+  # 5. One place writes PQ_REAP_HELD, for all three reasons - stamp and warn on
+  #    the transition into it, clear it the moment the hold recovers.
+  case "$reason" in
+    agent)  explanation="the agent is still going" ;;
+    here)   explanation="pq is running inside this task's own workspace" ;;
+    nobase) explanation="could not resolve $repo's default branch" ;;
+  esac
+  was=$(st "$d" PQ_REAP_HELD)
+  if [ "$dry" = 1 ]; then
+    if [ -n "$reason" ]; then
+      msg "would leave $slug alone - $explanation"
+      return 1
+    fi
+    # 2, not 0: nothing actually happened (dry-run stamps nothing), but this is
+    # distinct from "nothing to do" - it is what lets tick_body count a
+    # would-be teardown into its summary, the same way fill tracks `would`
+    # separately from `started`.
+    msg "would tear down $slug ($branch)"
+    return 2
+  fi
+  if [ -n "$reason" ]; then
+    [ "$was" = "$reason" ] || { st_set "$d" PQ_REAP_HELD "$reason"
+      warn "$slug: merged, but holding - $explanation"; }
+    return 1
+  fi
+  [ -z "$was" ] || st_set "$d" PQ_REAP_HELD ""
+
+  # 6. Tear it down - the same `wt rm` you would have run yourself. Shielded for
+  #    the same reason `wt new` is: it drops a database, and a Ctrl-C mid-drop
+  #    should not leave that half-done.
+  if shielded wt_in "$repo" rm --yes "$branch"; then
+    st_set "$d" PQ_REAPED "$(now)"
+    msg "$slug: merged - tore down $branch"
+    return 0
+  fi
+  warn "$slug: wt rm failed - run by hand: wt rm -y $branch"
+  return 1
 }
 
 # ── tick ────────────────────────────────────────────────────────────────────
@@ -1720,6 +1909,35 @@ tick_body() {                           # cap dry
     done
   fi
 
+  # 1.25 Reap - tear down what merged, once the agent has stopped and pq is not
+  # itself sitting in the workspace about to be closed. Runs after reconcile, so
+  # a task that just moved from running/ to done/ this same tick is torn down on
+  # the same pass, using the PR row `pr_targets running` already loaded for it
+  # above - and before the blocker pass, though the two are independent (done
+  # tasks vs. queue/hold tasks, neither reads the other's cache).
+  local n_torn=0 would_torn=0 reap_note= rc
+  if reap_ok; then
+    for d in "$PQ_HOME/done"/*/; do
+      [ -d "$d" ] || continue
+      d=${d%/}
+      reap_task "$d" "$dry"; rc=$?
+      case "$rc" in
+        0) n_torn=$((n_torn + 1)) ;;
+        2) would_torn=$((would_torn + 1)) ;;
+      esac
+    done
+  else
+    # The gate can stay closed for a while - say so once something in done/ is
+    # actually waiting on it, rather than every night it merely holds history.
+    for d in "$PQ_HOME/done"/*/; do
+      [ -d "$d" ] || continue
+      d=${d%/}
+      if reap_watching "$d" || { [ -n "$(st "$d" PQ_MERGED)" ] && [ -z "$(st "$d" PQ_REAPED)" ]; }; then
+        reap_note=", teardown needs a herdr pane"; break
+      fi
+    done
+  fi
+
   # 1.5 Blockers - runs for every task that has not started, queue AND hold,
   # so a chain stalled on a stuck agent's draft is flagged even while parked.
   # This runs AFTER reconcile and BEFORE fill, so a dependency that merged
@@ -1797,7 +2015,9 @@ tick_body() {                           # cap dry
   summary "$active running (cap $cap), $queued queued\
 $([ "$started" -gt 0 ] && printf ', %s started' "$started")\
 $([ "$would" -gt 0 ] && printf ', %s would start' "$would")\
-$([ "$waiting" -gt 0 ] && printf ', %s waiting on a merge' "$waiting")"
+$([ "$waiting" -gt 0 ] && printf ', %s waiting on a merge' "$waiting")\
+$([ "$n_torn" -gt 0 ] && printf ', %s torn down' "$n_torn")\
+$([ "$would_torn" -gt 0 ] && printf ', %s would tear down' "$would_torn")$reap_note"
 }
 
 # ── run ─────────────────────────────────────────────────────────────────────
