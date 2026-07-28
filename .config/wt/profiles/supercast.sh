@@ -195,7 +195,7 @@ wt_sweep() {
 }
 
 wt_teardown() {
-  local db; db=$(_wt_db)
+  local db pf; db=$(_wt_db); pf="${TMPDIR:-/tmp}/wt-${WT_SLUG}.Procfile"
   # -e first: `rm -f` succeeds on a path that was never there, so without the test this
   # reports removing an entry that never existed (every worktree created outside wt).
   [ -e "$HOME/.puma-dev/$WT_SLUG" ] && rm -f "$HOME/.puma-dev/$WT_SLUG" \
@@ -206,4 +206,6 @@ wt_teardown() {
     redis-cli -n "$WT_REDIS" flushdb >/dev/null 2>&1 && msg "flushed redis db $WT_REDIS"
   fi
   _wt_dropdb "$db" && msg "dropped database $db"
+  # wt_dev writes this outside the repo (see there); nothing else removes it.
+  [ -e "$pf" ] && rm -f "$pf"
 }

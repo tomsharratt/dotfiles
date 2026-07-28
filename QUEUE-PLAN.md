@@ -356,12 +356,12 @@ Joined from the directory (status), `state.env` (facts), `herdr api snapshot` (l
 
 Worth stating as a rule, because it is what makes an unattended tool safe to leave running:
 
-- never removes a worktree, drops a database, or deletes a branch - reclaiming stays `wt gc`, driven by you
+- tears down its own tasks, and only after a merge it verified against the forge - it never touches a worktree it did not create, and reclaiming anything else stays `wt gc`, driven by you
 - never merges or closes a PR
 - never force-pushes
 - never answers a prompt it does not recognise
 
-`pq` creates worktrees and moves its own files. That is the whole blast radius.
+`pq` creates worktrees, tears down the ones it created once their PR has genuinely merged, and moves its own files. That is the whole blast radius.
 
 ## Changes needed in `wt`
 

@@ -20,13 +20,22 @@ HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 PQ_HOME=$(mktemp -d)
 export PQ_HOME
 
-# Stub `claude` and `gh` so nothing here ever makes a real network call.
-# name_plan already tolerates `claude` failing (its own `|| return 0`), and an
-# unanswered `gh` is exactly the "gh never answered" row in the outcomes
-# table - so the stub failing closed is realistic, not a workaround. `gh`
-# additionally answers ONE canned row, for the one test below that needs a
-# real MERGED PR to flow through the actual pr_load -> jq pipeline rather than
-# a hand-primed cache.
+# Stub `claude`, `gh`, and `herdr` so nothing here ever makes a real network (or
+# real-herdr-socket) call. name_plan already tolerates `claude` failing (its own
+# `|| return 0`), and an unanswered `gh` is exactly the "gh never answered" row
+# in the outcomes table - so the stub failing closed is realistic, not a
+# workaround. `gh` additionally answers ONE canned row, for the one test below
+# that needs a real MERGED PR to flow through the actual pr_load -> jq pipeline
+# rather than a hand-primed cache.
+#
+# `herdr` matters even though this file never asserts anything about agent
+# status: `tick_body` calls `pidx_load` at its very top on every real machine
+# this happens to run on (this repo's own dev box included), which shells out
+# to a REAL `herdr` if one is on PATH. Without a stub, this suite's outcome
+# would depend on whether Herdr happens to be running - answering "no agents"
+# either way, but nondeterministically so. `dead 2>/dev/null` on the socket
+# check keeps `api snapshot` looking like an unreachable server rather than a
+# hang.
 STUBBIN=$(mktemp -d)
 printf '#!/bin/sh\nexit 1\n' > "$STUBBIN/claude"
 cat > "$STUBBIN/gh" <<'EOF'
@@ -39,7 +48,14 @@ case "$*" in
 esac
 exit 1
 EOF
-chmod +x "$STUBBIN/claude" "$STUBBIN/gh"
+cat > "$STUBBIN/herdr" <<'EOF'
+#!/bin/sh
+case "$*" in
+  "api snapshot") echo '{"result":{"snapshot":{"panes":[]}}}'; exit 0 ;;
+esac
+exit 1
+EOF
+chmod +x "$STUBBIN/claude" "$STUBBIN/gh" "$STUBBIN/herdr"
 export PATH="$STUBBIN:$PATH"
 
 # shellcheck source=/dev/null
