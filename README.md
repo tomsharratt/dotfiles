@@ -90,18 +90,50 @@ Dispatch runs `wt new` in that repo, which picks up its profile, and everything 
 Branch names only have to be unique within their own project, so `tom/fix-timezone` can exist in two of them at once, and every branch lookup is keyed on the repo as well as the name.
 
 ```
-pq add [plan]         add a plan to the queue (default: the newest one Claude wrote)
-pq ls [--json]        every task, its state, and what it is waiting on
-pq show <task>        one task's header and plan
-pq tick [--cap N]     free finished slots, then fill them from the queue
-pq run [--interval S] tick on an interval until you stop it
-pq cap [N]            how many may run at once; 0 pauses
-pq priority <task> N  re-order the queue
-pq hold / unhold      park a task, or put it back
-pq rm <task>          drop a task (never touches a worktree or a branch)
+pq add [plan]            add a plan to the queue (default: the newest one Claude wrote)
+pq add --after T         repeatable, at add time: don't dispatch until T's PR has merged
+pq after <task>          list a task's blockers and what each is waiting on
+pq after <task> T...     add blockers to a task still in queue/ or hold/
+pq after <task> --clear  drop them all
+pq ls [--json]           every task, its state, and what it is waiting on
+pq show <task>           one task's header and plan
+pq tick [--cap N]        free finished slots, then fill them from the queue
+pq run [--interval S]    tick on an interval until you stop it
+pq cap [N]               how many may run at once; 0 pauses
+pq priority <task> N     re-order the queue
+pq hold / unhold         park a task, or put it back
+pq rm <task>             drop a task (never touches a worktree or a branch)
 ```
 
 The `NNN` prefix on a task directory is its priority and nothing else - promoting a task renames its directory, so commands take the task's slug, or any unique prefix of it.
+
+#### Blockers
+
+Large work wants to be split into several small plans, each a reviewable PR, where the second usually cannot start until the first has shipped.
+`pq add B --after A` (or `pq after B A` once both are queued) says exactly that: B is not eligible for dispatch until A's PR has merged into A's repo's default branch.
+
+Blocked is derived, not stored - a blocked task sits in `queue/` like any other and fill just skips it, the same way the cap is soft arithmetic rather than a drain state.
+A task's blockers live in a third file, `after`, alongside `plan.md` and `state.env`: one blocker per line, `label<TAB>repo<TAB>branch`.
+A blocker is a resolved `(label, repo, branch)` triple, not a task reference - it is captured at the moment you type it, so it survives `pq rm A`, survives A ageing out of `done/`, and survives a slug being reused.
+That is also what makes a cross-repo blocker work for free, and lets a blocker name a branch that was never added to `pq` at all.
+
+Merge state comes from the forge, never from git ancestry: a squash-merged branch's tip is not an ancestor of its default branch, so `git branch --merged` misses every real merge.
+`pq` asks `gh` instead, and only trusts a `MERGED` pull request whose base is genuinely the repo's default branch - merged into some other branch does not count.
+
+`pq add` prints the new task's slug on stdout - everything else it prints is for a human, on stderr - which is what makes chaining a one-liner:
+
+```
+a=$(pq add planA.md)
+b=$(pq add planB.md --after "$a")
+c=$(pq add planC.md --after "$b")
+```
+
+`pq after <task>` answers "why has this not started": per blocker, both the state of the task that owns the branch and the state of its pull request, since either one can be the reason and the fix differs.
+A blocker that has already merged is fine to add - `pq` says so rather than refusing.
+Self-reference and cycles are rejected at the moment you try to create them.
+
+Three situations short-circuit the ordinary wait and warn once, because they read as healthy waiting until you look closer: a **dead** blocker (every pull request for it is closed), an **orphan** (nothing owns that branch, so nothing will ever open one), and a **stalled** chain (the owning task already reached `done` with only a draft PR open - a stuck agent, not a chain in review).
+None of the three auto-holds anything; fill already costs no slot on a blocked task, and `pq` does not re-order your work on its own judgement.
 
 `pq tick` is one idempotent pass: reconcile, then fill.
 Reconcile runs first so a task that shipped hands its slot straight to the next one - any pull request, in any state, means the work has left the queue.
