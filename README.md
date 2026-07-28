@@ -82,7 +82,8 @@ A task is a directory, and the directory it sits in is its state - `queue/`, `ho
 Every transition is a `mv`, which is atomic within a filesystem, so two dispatchers cannot claim the same task.
 Each task holds an immutable `plan.md` (a settings header prepended to whatever Claude Code wrote) and a `state.env` of runtime facts, so an agent can re-read its plan at any point and never see it change underneath it.
 
-`pq add` copies the newest plan out of `~/.claude/plans`, asks Haiku for a branch name and a one-line statement of intent (Claude Code auto-names plan files, so the filename is never a usable branch), and refuses a branch that is already spoken for - `wt new` checks out an existing branch rather than failing, so two tasks sharing a name would quietly land in the same worktree.
+`pq add` with no plan, at a terminal, shows the ten most recently touched plans in `~/.claude/plans` and lets you pick one rather than silently guessing - see "Picking a plan" below.
+Either way, it then asks Haiku for a branch name and a one-line statement of intent (Claude Code auto-names plan files, so the filename is never a usable branch), and refuses a branch that is already spoken for - `wt new` checks out an existing branch rather than failing, so two tasks sharing a name would quietly land in the same worktree.
 
 Each task records its own project, so one queue serves all of them.
 The project is wherever you were standing when you added the plan, resolved to the main checkout so adding from inside a worktree still queues against the repo the new worktree gets forked from; `--repo PATH` sets it explicitly.
@@ -90,7 +91,7 @@ Dispatch runs `wt new` in that repo, which picks up its profile, and everything 
 Branch names only have to be unique within their own project, so `tom/fix-timezone` can exist in two of them at once, and every branch lookup is keyed on the repo as well as the name.
 
 ```
-pq add [plan]            add a plan to the queue (default: the newest one Claude wrote)
+pq add [plan]            add a plan to the queue (no plan, at a terminal: pick one)
 pq add --after T         repeatable, at add time: don't dispatch until T's PR has merged
 pq add --split           split a plan into a stack of standalone parts, wired with --after
 pq add --split-dir D     queue an already-split directory, skipping the split step
@@ -108,6 +109,19 @@ pq rm <task>             drop a task (never touches a worktree or a branch)
 ```
 
 The `NNN` prefix on a task directory is its priority and nothing else - promoting a task renames its directory, so commands take the task's slug, or any unique prefix of it.
+
+#### Picking a plan
+
+A bare `pq add` at a terminal shows the ten most recently touched plans in `~/.claude/plans`, each with its age and its title - the first `# H1` in the file, since Claude Code names the file itself from your opening prompt and that name is rarely what the plan is actually about.
+"Most recently touched" means whichever is newer, mtime or birth time, so a plan edited this morning outranks one merely created today, and a plan restored by `cp -p`, `rsync -a`, or a git checkout doesn't fall to the bottom on a stale mtime.
+
+Pick a number - Enter takes the most recent - and it previews the plan before asking `use this plan? [y/N]`; answering `n` returns to the number prompt rather than aborting the whole command.
+Once you confirm, it asks the two things that actually shape how a task runs: whether to split it into a stack of small PRs, and which of the tasks already queued, held, or running it should wait on.
+
+Passing a flag the wizard would otherwise ask about skips just that one question - `pq add --split` picks a plan and skips straight past the split question (it still asks about blockers), `pq add --after some-task` picks a plan and skips straight past the blocker question (it still asks about splitting).
+
+`-y` and no tty (a script, a cron run, an agent) skip the picker altogether and take the newest plan without asking anything - exactly what `pq add` has always done.
+A plan path given explicitly skips the picker too, but uses exactly that plan rather than the newest one - also unchanged from before.
 
 #### Blockers
 

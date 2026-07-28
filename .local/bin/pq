@@ -13,7 +13,7 @@
 # `pq`, and `pq` reaches it through one narrow seam (`wt new --no-agent --no-focus
 # --json`).
 #
-#   pq add [plan]        add a plan to the queue (default: the newest one Claude wrote)
+#   pq add [plan]        add a plan to the queue (no plan, at a terminal: pick one)
 #   pq add --after T     repeatable: don't dispatch until T's PR has merged
 #   pq add --split       split a plan into a stack of standalone parts, wired with --after
 #   pq add --split-dir D queue an already-split directory, skipping the split step
@@ -96,6 +96,12 @@ PQ_DEFAULT_EFFORT="${PQ_DEFAULT_EFFORT:-xhigh}"
 PQ_NAMER_MODEL="${PQ_NAMER_MODEL:-haiku}"
 PQ_SPLITTER_MODEL="${PQ_SPLITTER_MODEL:-opus}"
 PQ_SPLITTER_EFFORT="${PQ_SPLITTER_EFFORT:-xhigh}"
+PQ_PICK_LIMIT="${PQ_PICK_LIMIT:-10}"       # how many recent plans pick_plan lists
+# A non-positive limit would break "Enter takes 1" - the table would have
+# zero rows, yet Enter still defaults to a row 1 that can't exist - so this
+# one, unlike its neighbours, is worth guarding against a bad override.
+[[ "$PQ_PICK_LIMIT" =~ ^[0-9]+$ ]] && [ "$PQ_PICK_LIMIT" -ge 1 ] || PQ_PICK_LIMIT=10
+PQ_PICK_PREVIEW="${PQ_PICK_PREVIEW:-12}"   # lines of a plan pick_plan previews
 
 # What the session wall looks like on screen, and how hard to knock. These are
 # Claude Code UI strings, so they will change - hence up here and overridable
@@ -395,11 +401,24 @@ dependents_of() {                       # repo branch
 }
 
 # ── add ─────────────────────────────────────────────────────────────────────
-# The newest plan Claude wrote. Claude Code names these itself, from the prompt
-# that started the session, so the filename is never a task name - see name_plan.
-latest_plan() {
-  ls -t "$PLANS_DIR"/*.md 2>/dev/null | head -1
+# The newest plan Claude wrote, now or ever edited. Claude Code names these
+# itself, from the prompt that started the session, so the filename is never
+# a task name - see name_plan.
+
+# epoch<TAB>path, newest first. The sort key is max(mtime, birth time), not
+# plain mtime: a plan created days ago and edited this morning must sort
+# above one created this morning and left alone, and a file restored by
+# `cp -p`, `rsync -a`, or a git checkout carries an old mtime with a new
+# birth time. A filesystem with no birth time reports 0 for %B, which the
+# max simply ignores. Only top-level *.md - a hand-made subdirectory under
+# $PLANS_DIR stays invisible, exactly as `ls -t "$PLANS_DIR"/*.md` always was.
+recent_plans() {                        # -> epoch<TAB>path, newest first
+  stat -f '%m%t%B%t%N' "$PLANS_DIR"/*.md 2>/dev/null \
+    | awk -F'\t' '{ print ($1 > $2 ? $1 : $2) "\t" $3 }' \
+    | sort -t$'\t' -k1,1nr -k2,2
 }
+
+latest_plan() { recent_plans | head -1 | cut -f2-; }
 
 # Ask a small model for a branch name and a one-line statement of intent, from the
 # plan itself. Both are things a human reads later - the branch on a pull request,
@@ -467,6 +486,196 @@ slug_taken_in() {                       # slug -> the state name, or nothing
   return 1
 }
 
+# ── picking a plan and its options ──────────────────────────────────────────
+# `pq add` with no plan, at a terminal, shows what it is about to queue rather
+# than guessing silently - see cmd_add's own gate for exactly when this fires.
+
+# The first line with real content, leading blanks skipped, a leading `#`
+# marker stripped whether it is one or several. H1 for every plan Claude Code
+# writes today; the first non-blank line is the fallback for anything without
+# one.
+plan_title() {                          # plan_file -> its title
+  awk '
+    /^[[:space:]]*$/ { next }
+    { sub(/^#+[ \t]*/, ""); print; exit }
+  ' "$1"
+}
+
+# A string made safe for render_table, which requires plain ASCII: macOS
+# awk's length() counts BYTES, not characters, so one multi-byte character
+# over-pads its column and skews the whole table. Order matters - squeeze
+# \t, \n, \r to spaces FIRST, because a surviving tab or newline does not
+# merely skew a column, it splits the row into phantom ones. Then drop
+# everything outside \40-\176, collapse runs of spaces, trim, and truncate
+# to width with a trailing ".." so a cut title never reads as the whole one.
+cell() {                                # text width -> ASCII-safe, truncated
+  local text=$1 width=$2 out
+  out=$(tr '\t\n\r' '   ' <<<"$text" | tr -cd '\40-\176' | tr -s ' ')
+  out=$(sed -e 's/^ *//' -e 's/ *$//' <<<"$out")
+  [ "${#out}" -gt "$width" ] && out="${out:0:$(( width - 2 ))}.."
+  printf '%s' "$out"
+}
+
+# Exit codes carry meaning, the way reap_task's already do: 0 chose one (its
+# path on stdout), 1 declined/`q`/EOF, 2 nothing in $PLANS_DIR to pick from -
+# the caller falls through to the existing "none found" error on that one.
+# Everything a human reads goes to stderr: pick_plan is consumed by a command
+# substitution, and any leakage on stdout would silently corrupt $plan, the
+# `source:` header, and the staged plan.md.
+pick_plan() {
+  local rows total n=0 tbl epoch path title
+  rows=$(recent_plans)
+  [ -n "$rows" ] || return 2
+  total=$(wc -l <<<"$rows" | tr -d ' ')
+
+  tbl="$PQ_HOME/.pick.$$.tsv"
+  printf '#\tAGE\tPLAN\tSUMMARY\n' > "$tbl"
+  while IFS=$'\t' read -r epoch path; do
+    [ -n "$path" ] || continue
+    n=$((n + 1))
+    [ "$n" -gt "$PQ_PICK_LIMIT" ] && { n=$((n - 1)); break; }
+    title=$(plan_title "$path")
+    printf '%s\t%s\t%s\t%s\n' "$n" "$(age_since "$epoch")" \
+      "$(cell "$(basename "$path" .md)" 30)" "$(cell "$title" 60)" >> "$tbl"
+  done <<<"$rows"
+
+  local ans row sel_path total_lines ans2 rule
+  rule=$(printf -- '─%.0s' $(seq 1 60))
+  while :; do
+    msg "$n most recent of $total"
+    printf '\n' >&2
+    render_table "$tbl" >&2
+    printf '\n' >&2
+    printf 'pq: pick a plan [1-%s, Enter for 1, q to quit] ' "$n" >&2
+    read -r ans || { rm -f "$tbl"; return 1; }
+    [ -z "$ans" ] && ans=1
+    case "$ans" in
+      q|Q) rm -f "$tbl"; return 1 ;;
+    esac
+    # Capped at 9 digits so a huge number never reaches the arithmetic tests
+    # below: bash's [ -lt ]/[ -gt ] error out (a false "false") on an integer
+    # past its native range, which would flip this whole OR-chain to skip the
+    # reject instead of triggering it.
+    if ! [[ "$ans" =~ ^[0-9]{1,9}$ ]] || [ "$ans" -lt 1 ] || [ "$ans" -gt "$n" ]; then
+      warn "not a number from 1 to $n"
+      continue
+    fi
+
+    row=$(sed -n "${ans}p" <<<"$rows")
+    IFS=$'\t' read -r _ sel_path <<<"$row"
+
+    total_lines=$(wc -l < "$sel_path" | tr -d ' ')
+    printf '%s\n' "$rule" >&2
+    head -n "$PQ_PICK_PREVIEW" "$sel_path" >&2
+    printf '%s\n' "$rule" >&2
+    [ "$total_lines" -gt "$PQ_PICK_PREVIEW" ] && msg "showing first $PQ_PICK_PREVIEW of $total_lines lines"
+
+    printf 'pq: use this plan? [y/N] ' >&2
+    read -r ans2 || { rm -f "$tbl"; return 1; }
+    if [[ "$ans2" =~ ^[Yy]$ ]]; then
+      rm -f "$tbl"
+      printf '%s' "$sel_path"
+      return 0
+    fi
+  done
+}
+
+# `after_vals` is cmd_add's own local, reached through bash's dynamic scope
+# exactly as do_split reaches `plan`/`repo`/etc (pq's "add" header comment) -
+# so, like add_wizard below, this function must NEVER declare `after_vals`
+# `local`. A stray `local` here would shadow the caller's variable: every
+# answer would appear to work and be silently discarded. Called as a bare
+# statement for the same reason - `x=$(pick_after)` forks a subshell and
+# throws the mutation away. Writes nothing to stdout; its prompts and table,
+# like pick_plan's, go to stderr.
+pick_after() {
+  local d st slug branch repo n=0 full
+  full="$PQ_HOME/.pickafter.$$.tsv"
+  : > "$full"
+  while IFS= read -r d; do
+    [ -n "$d" ] || continue
+    st=$(state_of "$d")
+    case "$st" in queue|hold|running) ;; *) continue ;; esac
+    n=$((n + 1))
+    slug=$(slug_of "$d"); branch=$(hdr "$d/plan.md" branch); repo=$(hdr "$d/plan.md" repo)
+    printf '%s\t%s\t%s\t%s\t%s\n' "$n" "$st" "$slug" "${repo:--}" "${branch:--}" >> "$full"
+  done <<<"$(all_tasks)"
+  [ "$n" -gt 0 ] || { rm -f "$full"; return 0; }
+
+  # A PROJECT column only once the candidates actually span more than one
+  # repo - same rule and idiom cmd_ls uses. PROJECT is the only column here
+  # that needs `cell`: slugs are [a-z0-9-], branches have passed
+  # check-ref-format, and state names are literals, so those three are ASCII
+  # by construction - a repo path is arbitrary and the one column where the
+  # byte-counting skew documented on `cell` would actually land.
+  local multi tbl i
+  multi=$(cut -f4 "$full" | sort -u | awk 'END { print (NR > 1) }')
+  tbl="$PQ_HOME/.pickafterdisp.$$.tsv"
+  if [ "$multi" = 1 ]; then
+    printf '#\tSTATE\tTASK\tPROJECT\tBRANCH\n' > "$tbl"
+    while IFS=$'\t' read -r i st slug repo branch; do
+      printf '%s\t%s\t%s\t%s\t%s\n' "$i" "$st" "$slug" "$(cell "$(basename "$repo")" 20)" "$branch" >> "$tbl"
+    done < "$full"
+  else
+    printf '#\tSTATE\tTASK\tBRANCH\n' > "$tbl"
+    awk -F'\t' '{ print $1"\t"$2"\t"$3"\t"$5 }' "$full" >> "$tbl"
+  fi
+
+  msg "$n tasks this could wait on"
+  printf '\n' >&2
+  render_table "$tbl" >&2
+  printf '\n' >&2
+  rm -f "$tbl"
+
+  local ans norm entry bad valid
+  while :; do
+    printf 'pq: block on which? [1-%s, comma separated, Enter for none] ' "$n" >&2
+    read -r ans || { rm -f "$full"; return 0; }
+    [ -z "$ans" ] && { rm -f "$full"; return 0; }
+    norm=$(tr ',' ' ' <<<"$ans")
+    bad=0; valid=""
+    # shellcheck disable=SC2086  # word-splitting $norm on whitespace is the point
+    for entry in $norm; do
+      if [[ "$entry" =~ ^[0-9]{1,9}$ ]] && [ "$entry" -ge 1 ] && [ "$entry" -le "$n" ]; then
+        valid="$valid $entry"
+      else
+        bad=1; break
+      fi
+    done
+    if [ "$bad" = 1 ] || [ -z "${valid// /}" ]; then
+      warn "each entry must be a number from 1 to $n"
+      continue
+    fi
+    break
+  done
+
+  local seen="" num s
+  # shellcheck disable=SC2086  # word-splitting $valid on whitespace is the point
+  for num in $valid; do
+    s=$(awk -F'\t' -v i="$num" '$1 == i { print $3; exit }' "$full")
+    case " $seen " in *" $s "*) continue ;; esac
+    seen="$seen $s"
+    after_vals="${after_vals}${s}"$'\n'
+  done
+  rm -f "$full"
+}
+
+# The two questions that shape how a task runs, asked right after pick_plan
+# actually chose something - see cmd_add's `interactive` gate. `split` and
+# `split_dir` are reached the same way `after_vals` is above, through bash's
+# dynamic scope - do_split already relies on the identical mechanism (see the
+# warning on cmd_add's own locals) - so this function must never declare
+# `split`, `split_dir`, or `after_explicit` `local` either.
+add_wizard() {
+  if [ "$split" != 1 ] && [ -z "$split_dir" ]; then
+    local ans
+    printf 'pq: split into a stack of parts? [y/N] ' >&2
+    read -r ans || ans=n
+    [[ "${ans:-}" =~ ^[Yy]$ ]] && split=1
+  fi
+  [ "$after_explicit" = 1 ] || pick_after
+}
+
 cmd_add() {
   local plan="" branch="" model=$PQ_DEFAULT_MODEL effort=$PQ_DEFAULT_EFFORT
   local prio="" prio_explicit=0 dev=false hold=0 repo="" repo_explicit=0 as_json=0
@@ -474,14 +683,16 @@ cmd_add() {
   # portability trap (fixed only in bash 4.4+), so every repeatable option in
   # this script accumulates into a newline-joined string instead. See `repos`
   # in cmd_ls for the same idiom.
-  local after_vals=""
+  local after_vals="" after_explicit=0
   # `intent` moves above the parse loop so `--intent` can set it before the
   # naming step decides whether it still needs to ask Haiku. `split` and
   # `split_dir` MUST stay local here too: `do_split` recurses back into this
   # very function once per part, through bash's ordinary dynamic scope, and it
   # is these two `local`s - shadowing whatever the recursive call passed - that
   # stop that recursion rather than forking every part into its own split.
-  local intent="" intent_explicit=0 split=0 split_dir="" yes=0
+  # `interactive` is the same idea for add_wizard: it fires the wizard once,
+  # never on the recursive calls do_split and split_queue make into cmd_add.
+  local intent="" intent_explicit=0 split=0 split_dir="" yes=0 interactive=0
   while [ $# -gt 0 ]; do
     case "$1" in
       --branch)    branch=${2:-}; shift 2 ;;
@@ -489,7 +700,7 @@ cmd_add() {
       --effort)    effort=${2:-}; shift 2 ;;
       --priority)  prio=${2:-}; prio_explicit=1; shift 2 ;;
       --repo)      repo=${2:-}; repo_explicit=1; shift 2 ;;
-      --after)     after_vals="${after_vals}${2:-}"$'\n'; shift 2 ;;
+      --after)     after_vals="${after_vals}${2:-}"$'\n'; after_explicit=1; shift 2 ;;
       --intent)    intent=${2:-}; intent_explicit=1; shift 2 ;;
       --split)     split=1; shift ;;
       --split-dir) split_dir=${2:-}; shift 2 ;;
@@ -513,6 +724,20 @@ cmd_add() {
   if [ -n "$split_dir" ]; then
     [ -d "$split_dir" ] || die "no such split directory: $split_dir"
   else
+    # The interactive picker fires only when nothing else already answered
+    # "which plan": an explicit path still wins (so a plain `pq add plan.md`,
+    # and every recursive cmd_add call do_split makes, never reach it), `-y`
+    # already means "don't ask me" (and is now the only way to get today's
+    # zero-prompt behaviour at a terminal), and no tty is what keeps
+    # `a=$(pq add)` working in a script, a cron run, or an agent.
+    if [ -z "$plan" ] && [ "$yes" != 1 ] && [ -t 0 ]; then
+      local picked
+      picked=$(pick_plan)
+      case $? in
+        0) plan=$picked; interactive=1 ;;
+        1) die "no plan chosen" ;;
+      esac                              # 2: nothing to pick, fall through
+    fi
     [ -n "$plan" ] || plan=$(latest_plan)
     [ -n "$plan" ] || die "no plan given and none found in $PLANS_DIR"
     [ -f "$plan" ] || die "no such plan: $plan"
@@ -523,6 +748,18 @@ cmd_add() {
   # still queues against the repo the new worktree will be forked from.
   [ -n "$repo" ] || repo=$(git -C "$PWD" worktree list --porcelain 2>/dev/null | awk '/^worktree /{print substr($0,10); exit}')
   [ -n "$repo" ] || die "not inside a git repo - run this from the project, or pass --repo"
+
+  # The wizard runs only for a plan the picker actually chose, and must run
+  # before the priority default and the split gate below, so $split is
+  # decided before do_split would need it.
+  [ "$interactive" = 1 ] && add_wizard
+
+  # The --branch/--split guard above ran before the wizard could have set
+  # split=1 by answering its own question - re-check the same rule now that
+  # the wizard has had its say, or "split into a stack of parts? y" would
+  # silently drop an explicit --branch instead of refusing it.
+  [ -n "$branch" ] && [ "$split" = 1 ] && \
+    die "--split queues N branches of its own - --branch has no meaning with it"
 
   # Default priority: the next clean step past everything already queued, so hand
   # editing stays easy - there is always room to slot something in between.
@@ -1739,14 +1976,26 @@ render_table() {                        # tsv_file
   ' "$1"
 }
 
-age_of() {                              # iso8601
-  local then now d
+# epoch_seconds -> 12m / 3h / 5d. Shared by age_of below and the plan picker,
+# which already has an epoch from `stat` and must not go via a formatted
+# string: `stat -f '%Sm'` renders in LOCAL time while age_of's caller below
+# parses with `date -j -u`, so a round trip through a string would be
+# silently off by the UTC offset. The d < 0 clamp is for a future mtime - a
+# restored or clock-skewed file - which would otherwise render "-1m".
+age_since() {                           # epoch_seconds -> 12m / 3h / 5d
+  local now d
   [ -n "${1:-}" ] || { printf -- '-'; return; }
-  then=$(date -j -u -f '%Y-%m-%dT%H:%M:%SZ' "$1" '+%s' 2>/dev/null) || { printf -- '-'; return; }
-  now=$(date -u '+%s'); d=$(( now - then ))
+  now=$(date -u '+%s'); d=$(( now - $1 )); [ "$d" -lt 0 ] && d=0
   if   [ "$d" -lt 3600 ]  ; then printf '%dm' $(( d / 60 ))
   elif [ "$d" -lt 86400 ] ; then printf '%dh' $(( d / 3600 ))
   else                           printf '%dd' $(( d / 86400 )); fi
+}
+
+age_of() {                              # iso8601
+  local then
+  [ -n "${1:-}" ] || { printf -- '-'; return; }
+  then=$(date -j -u -f '%Y-%m-%dT%H:%M:%SZ' "$1" '+%s' 2>/dev/null) || { printf -- '-'; return; }
+  age_since "$then"
 }
 
 # What an agent is waiting on, in the words that decide what you do about it.
