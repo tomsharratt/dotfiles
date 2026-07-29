@@ -1,0 +1,467 @@
+#!/usr/bin/env bash
+# wv - drive a booted simulator's or emulator's web view from the command line:
+# evaluate JavaScript in it and print the result, or take a screenshot. Exists
+# because there is otherwise no way to read a value (a layout measurement, a
+# viewport size) back out of a WKWebView or Android WebView without a GUI
+# inspector.
+#
+#   wv eval '<js>'      evaluate a JS expression in the booted device's web
+#                       view, print the result
+#   wv shot [path]      screenshot the booted device (default: a path it
+#                       prints)
+#
+# wv NEVER RESOLVES A DEVICE ITSELF. It reads WT_IOS_UDID or ANDROID_SERIAL
+# (plus DEVELOPER_DIR and the platform SDK on PATH) straight from the
+# environment - exactly what the supercast-ios / supercast-android wt
+# profiles' own wt_env exports - so the normal way to run this is
+# `wt run wv eval '...'`, never `wv` on its own. Device selection belongs to
+# the profile; driving whatever device it selected belongs here - the same
+# split `wt` already makes between itself and its profiles. Exactly one of the
+# two variables must be set: neither means there is nothing to drive, both
+# means wv cannot tell which device you meant, and either way it fails naming
+# both variables rather than silently guessing a platform.
+#
+# THE ONE NON-OBVIOUS FACT: Hotwire Native only sets isInspectable = true on
+# its WKWebView under `#if DEBUG` (hotwire-native-ios's WebView.swift). A
+# Release build's web view cannot be attached to at all - so an empty page
+# list from either platform almost always means "wrong build", not "broken
+# proxy". Check that before debugging the proxy.
+#
+# Both platforms end up speaking the same request/response JSON over a
+# WebSocket - ios_webkit_debug_proxy deliberately mimics the same /json HTTP
+# surface Chrome's own remote-debugging protocol uses - so that half is
+# written once, in Node, and handed the resolved platform/port/expression
+# through its environment (see write_eval_js) rather than as argv.
+#
+# Node is resolved LAST, after every argument and environment check, so
+# test/wv-args.sh can exercise all of those with no device, no proxy, and no
+# Node on PATH at all. Resolution order: $WV_NODE, then `node` on PATH, then
+# asdf's shim - the order an unattended `pq` session (a thinner PATH than an
+# interactive shell) needs. WV_NODE is the only environment variable this
+# script adds; there is no platform-override variable or flag, because the
+# two device variables above already carry that information.
+set -uo pipefail
+
+SELF=$(basename "$0")
+msg() { printf 'wv: %s\n' "$*" >&2; }
+die() { printf 'wv: %s\n' "$*" >&2; exit 1; }
+
+usage() {
+  printf 'usage: %s eval '"'"'<js>'"'"'      evaluate a JS expression in the web view, print the result\n' "$SELF" >&2
+  printf '       %s shot [path]      screenshot the device (default: a path it prints)\n' "$SELF" >&2
+}
+
+# Both mobile profiles hardcode this exact host - supercast-ios's DEBUG_SUFFIX
+# and supercast-android's BASE_URL_SUFFIX are both "supercast.test", and only
+# the subdomain is runtime-selectable (see their own wt_env comments). Used
+# purely to prefer the right page when more than one is inspectable.
+WV_APP_HOST_DEFAULT="app.supercast.test"
+
+# Both profiles' wt_provision already record "the backend the app actually
+# talks to" as WT_URL in the worktree's state file, and `wt run` sources that
+# state file under `set -a` before running wt_env - so WT_URL is usually
+# already exported into this process by the time wv runs. Prefer it (it is
+# the single source of truth the profiles themselves maintain); fall back to
+# the literal above only for a worktree that has never been provisioned yet.
+wv_app_host() {
+  if [ -n "${WT_URL:-}" ]; then
+    local host=${WT_URL#*://}
+    host=${host%%/*}
+    host=${host%%:*}
+    [ -n "$host" ] && { printf '%s' "$host"; return 0; }
+  fi
+  printf '%s' "$WV_APP_HOST_DEFAULT"
+}
+
+# ── platform ─────────────────────────────────────────────────────────────────
+# Which device to drive comes from whichever of these two the caller's profile
+# exported via wt_env - never resolved here. Prints "ios" or "android" on
+# stdout; on failure it has already called die (so the exit code, not the
+# print, is what a caller must check).
+wv_platform() {
+  local ios=${WT_IOS_UDID:-} android=${ANDROID_SERIAL:-}
+  if [ -n "$ios" ] && [ -n "$android" ]; then
+    die "both WT_IOS_UDID and ANDROID_SERIAL are set - wv can't tell which device you mean; run it through 'wt run' from a single worktree, not two at once"
+  fi
+  if [ -z "$ios" ] && [ -z "$android" ]; then
+    die "neither WT_IOS_UDID nor ANDROID_SERIAL is set - run wv through 'wt run' from an iOS or Android worktree (its profile exports one of them), not directly"
+  fi
+  if [ -n "$ios" ]; then printf 'ios'; else printf 'android'; fi
+}
+
+# ── interpreter ──────────────────────────────────────────────────────────────
+# $WV_NODE, then node on PATH, then asdf's shim - see header. Prints the
+# resolved path on stdout; on failure it has already called die.
+resolve_node() {
+  if [ -n "${WV_NODE:-}" ]; then
+    [ -f "$WV_NODE" ] && [ -x "$WV_NODE" ] \
+      || die "WV_NODE is set to '$WV_NODE' but that is not an executable file"
+    printf '%s' "$WV_NODE"
+    return 0
+  fi
+  if command -v node >/dev/null 2>&1; then
+    command -v node
+    return 0
+  fi
+  if [ -x "$HOME/.asdf/shims/node" ]; then
+    printf '%s' "$HOME/.asdf/shims/node"
+    return 0
+  fi
+  die "no node interpreter found (checked \$WV_NODE, PATH, and ~/.asdf/shims/node)"
+}
+
+# ── cleanup ──────────────────────────────────────────────────────────────────
+# One trap for everything a run might have started, so a one-shot command
+# never requires a daemon to already be running (wt run needs this to just
+# work) and never leaves one behind either.
+IWDP_STARTED=0 IWDP_JOINED=0
+ANDROID_FWD_STARTED=0 ANDROID_FWD_PORT=""
+WV_TMP_JS=""
+wv_cleanup() {
+  if [ "$IWDP_STARTED" = 1 ] || [ "$IWDP_JOINED" = 1 ]; then
+    iwdp_lock
+    local count; count=$(cat "$IWDP_COUNT_FILE" 2>/dev/null || echo 1)
+    count=$((count - 1))
+    if [ "$count" -le 0 ]; then
+      rm -f "$IWDP_COUNT_FILE"
+      iwdp_kill_listener
+    else
+      echo "$count" > "$IWDP_COUNT_FILE"
+    fi
+    iwdp_unlock
+  fi
+  if [ "$ANDROID_FWD_STARTED" = 1 ] && [ -n "$ANDROID_FWD_PORT" ]; then
+    adb -s "$ANDROID_SERIAL" forward --remove "tcp:$ANDROID_FWD_PORT" >/dev/null 2>&1
+  fi
+  [ -n "$WV_TMP_JS" ] && rm -f "$WV_TMP_JS"
+}
+trap wv_cleanup EXIT
+
+# ── iOS: ios_webkit_debug_proxy ──────────────────────────────────────────────
+IWDP_PORT=9221
+# The simulator is not on usbmuxd (that's for physical devices over USB), so it
+# needs the proxy's documented "null" device selector to attach to whichever
+# simulator is booted instead of scanning for a real one. Taken from
+# ios_webkit_debug_proxy's own --help/README (-c null:PORT,:RANGE), NOT
+# verified against a running proxy on this machine - it isn't installed here
+# yet (`brew install ios-webkit-debug-proxy`). Confirm against
+# `ios_webkit_debug_proxy --help` before relying on it - including whether it
+# can be told to attach to $WT_IOS_UDID specifically rather than "whichever
+# simulator is booted": `wv eval` cannot scope to a particular simulator the
+# way `wv shot` does (via `simctl ... "$WT_IOS_UDID"`) unless it can.
+IWDP_SIM_SELECTOR="null:$IWDP_PORT,:$((IWDP_PORT + 1))-$((IWDP_PORT + 100))"
+
+# The simulator (and so the proxy attached to it) is shared across every
+# worktree by design (see supercast-ios.sh's own header), so two concurrent
+# `wv eval` calls from two different worktrees are a real case, not a
+# hypothetical one, to get right: whichever invocation happened to start the
+# proxy must not kill it out from under one still using it. IWDP_COUNT_FILE
+# tracks how many wv invocations are relying on a wv-started proxy; a proxy
+# that was already running and NOT wv-managed (no count file) is never
+# touched at all, in either direction. The mkdir lock is the same atomic,
+# no-dependency idiom pq's own tick-lock uses.
+IWDP_LOCK_DIR="${TMPDIR:-/tmp}/wv-iwdp.lock"
+IWDP_COUNT_FILE="${TMPDIR:-/tmp}/wv-iwdp.count"
+
+iwdp_lock() {
+  local waited=0
+  while ! mkdir "$IWDP_LOCK_DIR" 2>/dev/null; do
+    [ "$waited" -ge 10 ] && die "could not acquire the ios_webkit_debug_proxy lock ($IWDP_LOCK_DIR) - remove it by hand if nothing is using it"
+    sleep 1; waited=$((waited + 1))
+  done
+}
+iwdp_unlock() { rmdir "$IWDP_LOCK_DIR" 2>/dev/null || true; }
+
+# Looked up by port rather than by a remembered pid: an invocation that
+# JOINED an already-running wv-managed proxy (rather than starting it) never
+# had a pid of its own to remember, but may still be the one that ends up
+# cleaning up when the shared count reaches zero.
+iwdp_kill_listener() {
+  local pid; pid=$(lsof -ti "tcp:$IWDP_PORT" 2>/dev/null | head -1)
+  [ -n "$pid" ] && kill "$pid" 2>/dev/null
+}
+
+# Start the proxy only if nothing is already listening on its port, joining
+# the refcount of one that's already running if (and only if) it is
+# wv-managed - a one-shot command that required a proxy started by hand
+# would not be usable from `wt run`.
+start_iwdp() {
+  command -v ios_webkit_debug_proxy >/dev/null 2>&1 \
+    || die "ios_webkit_debug_proxy not found on PATH - install it: brew install ios-webkit-debug-proxy"
+  iwdp_lock
+  if lsof -ti "tcp:$IWDP_PORT" >/dev/null 2>&1; then
+    if [ -f "$IWDP_COUNT_FILE" ]; then
+      local count; count=$(cat "$IWDP_COUNT_FILE" 2>/dev/null || echo 1)
+      echo $((count + 1)) > "$IWDP_COUNT_FILE"
+      IWDP_JOINED=1
+    fi
+    iwdp_unlock
+    return 0
+  fi
+  ios_webkit_debug_proxy -c "$IWDP_SIM_SELECTOR" >/dev/null 2>&1 &
+  IWDP_STARTED=1
+  echo 1 > "$IWDP_COUNT_FILE"
+  local waited=0
+  while ! lsof -ti "tcp:$IWDP_PORT" >/dev/null 2>&1; do
+    if [ "$waited" -ge 10 ]; then
+      rm -f "$IWDP_COUNT_FILE"
+      iwdp_unlock
+      die "ios_webkit_debug_proxy did not start listening on :$IWDP_PORT within 10s"
+    fi
+    sleep 1; waited=$((waited + 1))
+  done
+  iwdp_unlock
+}
+
+# ── Android: adb forward to the WebView devtools socket ─────────────────────
+ANDROID_FWD_BASE_PORT=9339
+
+start_adb_forward() {
+  command -v adb >/dev/null 2>&1 || die "adb not found on PATH - run this via 'wt run' from an Android worktree"
+  local sock p
+  # The devtools socket is an abstract unix socket, named webview_devtools_remote_<pid>;
+  # /proc/net/unix prints its name with a leading '@' to mark it abstract, which
+  # adb's own localabstract: forward target then wants stripped back off.
+  #
+  # Takes the FIRST matching socket. supercast-android's own wt_open force-stops
+  # only its own package before installing, which narrows but doesn't guarantee
+  # there is only ever one debuggable WebView process on the device - if that
+  # ever becomes a real problem, the fix is the same "prefer the app's own
+  # host, fail on genuine ambiguity" the page-selection step below already does,
+  # extended to enumerate every matching socket rather than just the first.
+  sock=$(adb -s "$ANDROID_SERIAL" shell cat /proc/net/unix 2>/dev/null \
+    | tr -d '\r' | awk '/webview_devtools_remote/ { print $NF; exit }')
+  [ -n "$sock" ] || die "no webview_devtools_remote socket found on $ANDROID_SERIAL - is the app running, and is its WebView debuggable?"
+  sock=${sock#@}
+  for ((p = ANDROID_FWD_BASE_PORT; p < ANDROID_FWD_BASE_PORT + 200; p++)); do
+    lsof -ti "tcp:$p" >/dev/null 2>&1 && continue
+    ANDROID_FWD_PORT=$p
+    break
+  done
+  [ -n "$ANDROID_FWD_PORT" ] || die "no free local port found for adb forward"
+  adb -s "$ANDROID_SERIAL" forward "tcp:$ANDROID_FWD_PORT" "localabstract:$sock" \
+    || die "adb forward to $sock failed"
+  ANDROID_FWD_STARTED=1
+}
+
+# ── the shared protocol client ───────────────────────────────────────────────
+# Both ios_webkit_debug_proxy and Android's WebView devtools socket serve the
+# same /json HTTP listing (id, url, webSocketDebuggerUrl, ...) and the same
+# Chrome DevTools Protocol JSON over that WebSocket, so this is written once
+# and handed WV_PLATFORM/WV_HTTP_PORT/WV_APP_HOST/WV_EXPR through the
+# environment rather than as argv.
+write_eval_js() {
+  cat <<'NODE_EOF'
+const CONNECT_TIMEOUT_MS = 10000;
+const EVAL_TIMEOUT_MS = 20000;
+
+// Races a promise against a deadline instead of leaving a lost reply (a
+// dropped connection, a target that never answers) to hang the script
+// forever - fatal for a tool meant to run inside an unattended pq session
+// with no one watching to Ctrl-C it.
+function withTimeout(promise, ms, label) {
+  return new Promise((resolve, reject) => {
+    const t = setTimeout(() => reject(new Error(`timed out after ${ms}ms waiting for ${label}`)), ms);
+    promise.then(
+      (v) => { clearTimeout(t); resolve(v); },
+      (e) => { clearTimeout(t); reject(e); }
+    );
+  });
+}
+
+async function main() {
+  const platform = process.env.WV_PLATFORM;
+  const port = process.env.WV_HTTP_PORT;
+  const appHost = process.env.WV_APP_HOST;
+  const expr = process.env.WV_EXPR;
+  // WebKit's Runtime.evaluate names this emulateUserGesture; CDP (Android)
+  // names the same thing userGesture - the two protocols were confirmed to
+  // differ here rather than assumed to share a spelling.
+  const gestureKey = platform === 'ios' ? 'emulateUserGesture' : 'userGesture';
+
+  const res = await fetch(`http://127.0.0.1:${port}/json`);
+  if (!res.ok) throw new Error(`could not list inspectable pages on :${port} (HTTP ${res.status})`);
+  const pages = await res.json();
+  if (!Array.isArray(pages) || pages.length === 0) {
+    throw new Error(
+      'no inspectable pages found - a Release build is not inspectable at all ' +
+      '(see this script\'s header); check the running build is Debug'
+    );
+  }
+
+  // Prefer a page on the app's own host. Failing to match at all is failing
+  // the preference, not just its tie-break - falling through to some
+  // unrelated page (a system webview, a second debug app) would silently
+  // return the wrong data, so this fails exactly the same way "more than one
+  // still matches" does below, rather than guessing.
+  const onHost = pages.filter((p) => {
+    try { return new URL(p.url).hostname === appHost; } catch { return false; }
+  });
+  if (onHost.length === 0) {
+    const lines = pages.map((p) => `  ${p.id}  ${p.url}`).join('\n');
+    throw new Error(`no inspectable page matches host "${appHost}" - candidates:\n${lines}`);
+  }
+  if (onHost.length > 1) {
+    const lines = onHost.map((p) => `  ${p.id}  ${p.url}`).join('\n');
+    throw new Error(`more than one inspectable page matches - which one?\n${lines}`);
+  }
+  const page = onHost[0];
+  if (!page.webSocketDebuggerUrl) throw new Error(`page ${page.id} has no webSocketDebuggerUrl`);
+
+  const ws = new WebSocket(page.webSocketDebuggerUrl);
+  try {
+    await withTimeout(
+      new Promise((resolve, reject) => {
+        ws.addEventListener('open', () => resolve(), { once: true });
+        ws.addEventListener('error', (e) => reject(new Error(e.message || 'websocket connection failed')), { once: true });
+      }),
+      CONNECT_TIMEOUT_MS,
+      'the websocket to open'
+    );
+
+    let nextId = 1;
+    let targetId = null;
+    const pending = new Map();
+
+    function settle(msg) {
+      if (msg.id == null) return; // an event, not a reply
+      const p = pending.get(msg.id);
+      if (!p) return;
+      pending.delete(msg.id);
+      if (msg.error) p.reject(new Error(msg.error.message || JSON.stringify(msg.error)));
+      else p.resolve(msg.result);
+    }
+    // A dropped connection after the open handshake (an app relaunch mid-eval,
+    // a transient device hiccup) must fail whatever is still waiting rather
+    // than rely on EVAL_TIMEOUT_MS alone to notice.
+    function failAllPending(reason) {
+      for (const p of pending.values()) p.reject(reason);
+      pending.clear();
+    }
+
+    // Since iOS 12.2 the WebKit inspector wraps page traffic in the Target
+    // domain (Target.targetCreated / Target.sendMessageToTarget /
+    // Target.dispatchMessageFromTarget) - a bare Runtime.evaluate gets no
+    // reply at all when that wrapping is in play. Handle both shapes rather
+    // than assuming either: a page that never sends Target.targetCreated
+    // just proceeds with targetId still null (Android's CDP, or a bare-shape
+    // WebKit target).
+    ws.addEventListener('message', (ev) => {
+      let outer;
+      try { outer = JSON.parse(ev.data); } catch { return; }
+      if (outer.method === 'Target.targetCreated') {
+        targetId = outer.params?.targetInfo?.targetId ?? targetId;
+        return;
+      }
+      if (outer.method === 'Target.dispatchMessageFromTarget') {
+        let inner;
+        try { inner = JSON.parse(outer.params.message); } catch { return; }
+        settle(inner);
+        return;
+      }
+      settle(outer);
+    });
+    ws.addEventListener('close', () => failAllPending(new Error('websocket closed before a reply arrived')));
+    ws.addEventListener('error', (e) => failAllPending(new Error(e.message || 'websocket error')));
+
+    function rpc(method, params) {
+      return new Promise((resolve, reject) => {
+        const id = nextId++;
+        pending.set(id, { resolve, reject });
+        const payload = { id, method, params };
+        if (targetId) {
+          ws.send(JSON.stringify({
+            method: 'Target.sendMessageToTarget',
+            params: { targetId, message: JSON.stringify(payload) },
+          }));
+        } else {
+          ws.send(JSON.stringify(payload));
+        }
+      });
+    }
+
+    // Give a possible Target.targetCreated a moment to arrive before sending
+    // anything, so the keyboard animation of the caller's own JS cannot race
+    // this handshake either.
+    await new Promise((resolve) => setTimeout(resolve, 250));
+
+    const result = await withTimeout(
+      rpc('Runtime.evaluate', { expression: expr, returnByValue: true, [gestureKey]: true }),
+      EVAL_TIMEOUT_MS,
+      'Runtime.evaluate to reply'
+    );
+
+    if (result?.exceptionDetails) {
+      throw new Error(result.exceptionDetails.text || 'evaluation threw');
+    }
+    const value = result?.result;
+    if (value && Object.prototype.hasOwnProperty.call(value, 'value')) {
+      console.log(typeof value.value === 'string' ? value.value : JSON.stringify(value.value));
+    } else if (value?.description) {
+      console.log(value.description);
+    } else {
+      console.log('undefined');
+    }
+  } finally {
+    ws.close();
+  }
+}
+
+// process.exitCode, never process.exit(): calling exit() can tear the
+// process down before libuv finishes draining a large console.log to a pipe
+// (empirically, anything over one pipe buffer's worth truncates silently) -
+// letting the event loop drain naturally once `finally` above has closed the
+// socket avoids that.
+main().catch((e) => {
+  console.error(`wv: ${e.message}`);
+  process.exitCode = 1;
+});
+NODE_EOF
+}
+
+# ── commands ─────────────────────────────────────────────────────────────────
+cmd_eval() {
+  [ $# -le 1 ] || die "eval takes exactly one expression - quote it: wv eval 'a && b'"
+  local expr=${1:-}
+  [ -n "$expr" ] || die "eval needs a JS expression, e.g.: wv eval 'location.href'"
+  local platform; platform=$(wv_platform) || exit 1
+  local node; node=$(resolve_node) || exit 1
+  local port
+  case "$platform" in
+    ios)     start_iwdp; port=$IWDP_PORT ;;
+    android) start_adb_forward; port=$ANDROID_FWD_PORT ;;
+  esac
+  WV_TMP_JS=$(mktemp "${TMPDIR:-/tmp}/wv-eval.XXXXXX") \
+    || die "could not create a temporary file for the eval script"
+  write_eval_js > "$WV_TMP_JS"
+  WV_PLATFORM="$platform" WV_HTTP_PORT="$port" WV_APP_HOST="$(wv_app_host)" WV_EXPR="$expr" \
+    "$node" "$WV_TMP_JS"
+}
+
+cmd_shot() {
+  [ $# -le 1 ] || die "usage: $SELF shot [path]"
+  local path=${1:-}
+  local platform; platform=$(wv_platform) || exit 1
+  [ -n "$path" ] || path="${TMPDIR:-/tmp}/wv-shot-$(date +%Y%m%d%H%M%S).png"
+  case "$platform" in
+    ios)
+      command -v xcrun >/dev/null 2>&1 || die "xcrun not found on PATH - run this via 'wt run' from an iOS worktree"
+      xcrun simctl io "$WT_IOS_UDID" screenshot "$path" || die "simctl screenshot failed"
+      ;;
+    android)
+      command -v adb >/dev/null 2>&1 || die "adb not found on PATH - run this via 'wt run' from an Android worktree"
+      adb -s "$ANDROID_SERIAL" exec-out screencap -p > "$path" || die "adb screencap failed"
+      ;;
+  esac
+  printf '%s\n' "$path"
+}
+
+case "${1:-}" in
+  eval) shift; cmd_eval "$@" ;;
+  shot) shift; cmd_shot "$@" ;;
+  *)
+    usage
+    [ -n "${1:-}" ] && msg "unknown subcommand '$1'"
+    exit 1
+    ;;
+esac

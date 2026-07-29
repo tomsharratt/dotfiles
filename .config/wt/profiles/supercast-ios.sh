@@ -60,9 +60,34 @@ _wt_ios_sim() {
 # agree on the same DerivedData. The repo name is in the path deliberately:
 # wt_sweep reclaims on a name pattern, and scoping it to this repo is what stops
 # this profile ever claiming another project's build output.
+#
+# Also exports WT_IOS_UDID: device selection belongs to this profile (see
+# _wt_ios_sim), so anything driving that device - `wt run wv eval '...'`, say -
+# gets told which one rather than resolving it again itself. No simulator being
+# resolvable yet is a normal state (e.g. before the first `wt open`), not a
+# failure, so this must still return 0 in that case - same trap
+# supercast-android's own wt_env documents for ANDROID_SERIAL.
+#
+# Deliberately NOT _wt_ios_sim: that helper also falls back to the first
+# device merely NAMED $WT_IOS_DEVICE when nothing is booted, which is exactly
+# right for wt_open (it needs a udid to boot) but wrong here - anything
+# reading WT_IOS_UDID only drives an already-running device, and naming one
+# that isn't booted yet would make an empty page list read as "wrong build"
+# (see wv's own header) when the real fix is just "wt open first".
+#
+# Also unsets ANDROID_SERIAL: `wt run` exports straight into the calling
+# shell (not a subshell), so switching from an Android worktree to this one
+# in the same terminal without opening a new shell would otherwise leave a
+# stale ANDROID_SERIAL sitting alongside the new WT_IOS_UDID - which is
+# exactly the "both set" case wv treats as unrecoverable ambiguity.
 wt_env() {
   export DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer
   export WT_IOS_DERIVED_DATA="$HOME/Library/Developer/Xcode/DerivedData/wt-$WT_REPO_NAME-$WT_SLUG"
+  unset ANDROID_SERIAL
+  local udid
+  udid=$(_wt_simctl list devices booted -j 2>/dev/null | jq -r '.devices[][] | .udid' 2>/dev/null | head -1)
+  [ -n "$udid" ] && export WT_IOS_UDID="$udid"
+  return 0
 }
 
 wt_provision() {
