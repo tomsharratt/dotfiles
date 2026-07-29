@@ -53,14 +53,17 @@ _wt_android_sdk() {
 # wt_provision, wt_open, wt_dev AND `wt run` (e.g. `wt run adb shell ...`), so all
 # of them agree on the same SDK and the same running device.
 #
-# Also unsets WT_IOS_UDID: `wt run` exports straight into the calling shell
-# (not a subshell), so switching from an iOS worktree to this one in the same
-# terminal without opening a new shell would otherwise leave a stale
-# WT_IOS_UDID sitting alongside the new ANDROID_SERIAL - which reads to `wv`
-# as "both set", an unrecoverable ambiguity, even though the user only ever
-# meant this one.
+# Also unsets WT_IOS_UDID and its own ANDROID_SERIAL before resolving fresh:
+# `wt run` exports straight into the calling shell (not a subshell), so
+# switching from an iOS worktree to this one in the same terminal without
+# opening a new shell would otherwise leave a stale WT_IOS_UDID sitting
+# alongside the new ANDROID_SERIAL - which reads to `wv` as "both set", an
+# unrecoverable ambiguity, even though the user only ever meant this one.
+# Unsetting ANDROID_SERIAL too, not just conditionally overwriting it below,
+# closes the same staleness gap for an emulator that was running, then shut
+# down, without a fresh shell in between.
 wt_env() {
-  unset WT_IOS_UDID
+  unset WT_IOS_UDID ANDROID_SERIAL
   local sdk; sdk=$(_wt_android_sdk)
   [ -n "$sdk" ] || { warn "no sdk.dir in $WT_REPO/local.properties and ANDROID_HOME is unset"; return 1; }
   export ANDROID_HOME="$sdk" ANDROID_SDK_ROOT="$sdk"
