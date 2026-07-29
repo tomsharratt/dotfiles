@@ -7,7 +7,7 @@ set -uo pipefail
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 
 rc=0
-for f in "$HERE"/pq-*.sh; do
+for f in "$HERE"/pq-*.sh "$HERE"/wt-*.sh; do
   [ -f "$f" ] || continue
   printf -- '── %s ──\n' "$(basename "$f")"
   bash "$f" || rc=1
