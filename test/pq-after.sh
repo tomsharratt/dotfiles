@@ -99,7 +99,12 @@ reset_tasks() {
 # work.
 mk_task() {                              # state prio slug repo branch -> task_dir
   local st=$1 prio=$2 slug=$3 repo=$4 branch=$5
-  local dir="$PQ_HOME/$st/$(printf '%03d' "$prio")-$slug"
+  # $prio is relative order, not a stamp - it is offset into the real
+  # (non-urgent) range so a fixture never accidentally reads as --urgent.
+  # $((10#$prio)) rather than a bare $prio: inside $(( )) a leading-zero
+  # literal like 020 is octal, exactly the bug this fixture must not
+  # reintroduce.
+  local dir="$PQ_HOME/$st/$(printf '%014d' $(( 20260101000000 + 10#$prio )))-$slug"
   mkdir -p "$dir"
   {
     printf -- '---\n'
@@ -269,17 +274,19 @@ case "$verdict" in waiting\ *) ok ;; *) bad "a trailing-newline-less after file 
 deps=$(dependents_of "$REPO" tom/no-newline-blocker)
 eq "$deps" "no-newline-dependent" "dependents_of must not drop the last line either"
 
-echo "== queue_ordered sorts priority >= 1000 numerically, not by glob ==" >&2
+echo "== queue_ordered: an urgent task sorts ahead of every normal one, and two normal stamps sort chronologically ==" >&2
 reset_tasks
-mk_task queue 1000 prio-1000 "$REPO" tom/prio-1000 >/dev/null
-mk_task queue 500 prio-500 "$REPO" tom/prio-500 >/dev/null
-# printf '%03d' is a MINIMUM width - 1000 renders as 4 digits ("1000-...") and
-# would lexicographically sort before "500-..." under glob order, jumping most
-# of the queue. queue_ordered must sort on the numeric value instead.
-first_slug=$(slug_of "$(queue_ordered | head -1)")
-last_slug=$(slug_of "$(queue_ordered | tail -1)")
-eq "$first_slug" "prio-500" "priority 500 must dispatch before priority 1000"
-eq "$last_slug" "prio-1000" "priority 1000 must sort after priority 500, not before it"
+# A bare mkdir, not mk_task: queue_ordered never reads plan.md, and a real
+# stamp under PQ_STAMP_REAL is exactly what an urgent task looks like on disk.
+mkdir -p "$PQ_HOME/queue/$(printf '%014d' 1)-prio-urgent"
+mk_task queue 20 prio-later "$REPO" tom/prio-later >/dev/null
+mk_task queue 10 prio-earlier "$REPO" tom/prio-earlier >/dev/null
+first_slug=$(slug_of "$(queue_ordered | sed -n 1p)")
+mid_slug=$(slug_of "$(queue_ordered | sed -n 2p)")
+last_slug=$(slug_of "$(queue_ordered | sed -n 3p)")
+eq "$first_slug" "prio-urgent"  "an urgent stamp must sort ahead of every normal one"
+eq "$mid_slug"   "prio-earlier" "the earlier normal stamp must come before the later one"
+eq "$last_slug"  "prio-later"   "the later normal stamp must sort last"
 
 echo "== a chain of three, middle link unmerged ==" >&2
 reset_tasks

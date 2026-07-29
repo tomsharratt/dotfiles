@@ -86,7 +86,12 @@ reset_tasks
 # test/pq-reap.sh's mk_done, just parameterised over the state.
 mk_task() {                             # state prio slug repo branch -> task_dir
   local state=$1 prio=$2 slug=$3 repo=$4 branch=$5
-  local dir="$PQ_HOME/$state/$(printf '%03d' "$prio")-$slug"
+  # $prio is relative order, not a stamp - it is offset into the real
+  # (non-urgent) range so a fixture never accidentally reads as --urgent.
+  # $((10#$prio)) rather than a bare $prio: inside $(( )) a leading-zero
+  # literal like 020 is octal, exactly the bug this fixture must not
+  # reintroduce - and this file's own call sites pass 010/020/030/040/005.
+  local dir="$PQ_HOME/$state/$(printf '%014d' $(( 20260101000000 + 10#$prio )))-$slug"
   mkdir -p "$dir"
   {
     printf -- '---\n'
