@@ -46,6 +46,10 @@
 #   wt_env         export the worktree's isolated env (db / redis / url / port);
 #                  shared by wt_dev and `wt run` so the server and one-off
 #                  commands (console, rake, tests) all agree on the same db
+#   wt_open        take over `wt open` outright (build, install and launch an app
+#                  on a device, say) rather than just naming a url; receives any
+#                  extra `wt open` args and its exit status becomes wt open's.
+#                  When defined, wt_open_url is ignored.
 #   wt_open_url    print the url `wt open` should launch (default: WT_URL);
 #                  receives any extra `wt open` args (e.g. a login email)
 #   wt_teardown    release external resources on `wt rm` (best-effort)
@@ -258,7 +262,7 @@ alloc_redis() {
 # database of a project that is not even being swept.
 load_profile() {
   local repo=$1 name=$2 f
-  unset -f wt_provision wt_dev wt_env wt_open_url wt_teardown wt_sweep 2>/dev/null || true
+  unset -f wt_provision wt_dev wt_env wt_open wt_open_url wt_teardown wt_sweep 2>/dev/null || true
   # Every tunable a profile may set is reset here for the same reason the functions are:
   # `wt ls` and `wt gc` load one profile after another in a single process, and a value
   # left behind by the previous repo is indistinguishable from one this repo chose.
@@ -953,10 +957,16 @@ cmd_run() {
 # with none we fall back to the worktree's base url. `wt open` uses the current
 # worktree, or `wt open <name>` names one; any further args pass through to
 # wt_open_url (e.g. `wt open my-task someone@example.com` to pre-fill a login).
+#
+# A profile may instead define wt_open, which takes the command over outright
+# (see below) - `wt open --launch-only` on the current worktree is what the name
+# resolution has to keep working for, so a leading `-` is treated as a
+# pass-through arg rather than a branch name. Git refs cannot begin with `-`, so
+# nothing legitimate is shadowed.
 cmd_open() {
   local name=${1:-} repo repo_name url path
   repo=$(main_worktree "$PWD"); [ -n "$repo" ] || die "not inside a git worktree"
-  if [ -n "$name" ]; then shift; else name=$(cur_branch "$PWD"); fi
+  if [ -n "$name" ] && [ "${name#-}" = "$name" ]; then shift; else name=$(cur_branch "$PWD"); fi
   [ -n "$name" ] || die "no worktree name given (and not on a branch)"
   repo_name=$(basename "$repo")
   load_profile "$repo" "$repo_name"
@@ -965,6 +975,14 @@ cmd_open() {
   path=$(repo_worktrees "$repo" | awk -F'\t' -v b="$name" '$2 == b { print $1; exit }')
   load_state_for_path "${path:-$PWD}" "$repo_name" "$name" \
     || die "no saved state for '$name' - run 'wt provision' first"
+  # A profile whose "open" is an action rather than a url (build, install and launch an
+  # app on a device) defines wt_open and owns the command outright. NOT captured in
+  # $(...) like wt_open_url: a build is long and noisy and has to stream to the terminal,
+  # and its exit status has to become `wt open`'s.
+  if declare -F wt_open >/dev/null; then
+    run_profile_fn wt_open "$@"
+    return $?
+  fi
   if declare -F wt_open_url >/dev/null; then
     url=$(run_profile_fn wt_open_url "$@")
   else
@@ -1131,14 +1149,21 @@ cmd_ls() {
   return 0
 }
 
-case "${1:-}" in
-  new)        shift; cmd_new "$@" ;;
-  dev)        shift; cmd_dev "$@" ;;
-  run)        shift; cmd_run "$@" ;;
-  open)       shift; cmd_open "$@" ;;
-  provision)  shift; cmd_provision "$@" ;;
-  rm|remove)  shift; cmd_rm "$@" ;;
-  ls|list)    shift; cmd_ls "$@" ;;
-  gc)         shift; cmd_gc "$@" ;;
-  *) die "usage: wt {new [--no-agent] [--no-dev] [--no-focus] [--json] [name] | dev <path> | run [cmd...] | open [name] | provision <path> | rm [-y] [name] | ls | gc [--merged] [--sweep] [-y]}" ;;
-esac
+# Wrapped so the script can be sourced without dispatching - test/wt-open.sh sources
+# this file to reach load_profile directly. An `if` rather than a trailing
+# `[ ... ] && main "$@"`: that form makes a sourced script return non-zero, which
+# would kill any test running under `set -e`.
+main() {
+  case "${1:-}" in
+    new)        shift; cmd_new "$@" ;;
+    dev)        shift; cmd_dev "$@" ;;
+    run)        shift; cmd_run "$@" ;;
+    open)       shift; cmd_open "$@" ;;
+    provision)  shift; cmd_provision "$@" ;;
+    rm|remove)  shift; cmd_rm "$@" ;;
+    ls|list)    shift; cmd_ls "$@" ;;
+    gc)         shift; cmd_gc "$@" ;;
+    *) die "usage: wt {new [--no-agent] [--no-dev] [--no-focus] [--json] [name] | dev <path> | run [cmd...] | open [name] | provision <path> | rm [-y] [name] | ls | gc [--merged] [--sweep] [-y]}" ;;
+  esac
+}
+if [ "${BASH_SOURCE[0]}" = "$0" ]; then main "$@"; fi

@@ -9,7 +9,7 @@ Personal dotfiles for macOS. Manages:
 - `~/.config/tmux` - tmux config (Rose Pine theme; splits inherit the pane's directory).
 - `~/.config/herdr` - Herdr config: the theme and the `prefix+t` worktree keybinding. Only `config.toml` is tracked; Herdr's sockets, logs, and session state are excluded from sync.
 - `~/.local/bin/wt` - worktree workflow backend: creates an isolated worktree (its own database, redis db, url and port) through Herdr, provisions it, and starts the dev server + Claude on it. Project-agnostic; the per-project steps live in profiles.
-- `~/.config/wt/profiles/<repo>.sh` - per-project provisioning + dev-server steps for `wt` (e.g. `supercast.sh`).
+- `~/.config/wt/profiles/<repo>.sh` - per-project provisioning + dev-server steps for `wt` (e.g. `supercast.sh`, `supercast-ios.sh`, `supercast-android.sh`).
 - `~/.local/bin/pq` - plan queue: holds Claude Code plans and runs them as unattended implementer sessions, one worktree each, via `wt`.
 - `~/.claude/settings.json` - Claude Code settings. Agent status now comes from Herdr's built-in Claude integration (`herdr integration install claude`), which installs a `SessionStart` hook. Git-tracked for reference but applied manually - `install.sh` does not touch `~/.claude`.
 - `AGENTS.md` - global agent instructions, read by Claude Code via the `~/.claude/CLAUDE.md` symlink (mirrors `~/AGENTS.md`). Git-tracked for reference but applied manually - the sync scripts don't touch it.
@@ -35,7 +35,7 @@ The trade-off: status is shown only for agents running inside a Herdr pane.
 Isolation is per project, described by a *profile*.
 `wt` itself is project-agnostic: it resolves the branch, allocates a free port and redis db index, and calls the profile's steps.
 Profiles are discovered at `<repo>/.wt/profile.sh` (committed with the project) or `~/.config/wt/profiles/<repo>.sh` (personal, tracked here).
-A profile declares which resources to allocate and defines `wt_provision`, `wt_dev`, and `wt_teardown`.
+A profile declares which resources to allocate and defines `wt_provision`, `wt_dev`, `wt_open`, and `wt_teardown`.
 A repo with no profile still gets a worktree + Claude - it just has no dev server.
 
 For `supercast` (`~/.config/wt/profiles/supercast.sh`) each worktree gets:
@@ -48,13 +48,25 @@ So `wt new premier-video` and `wt new spotify-reconcile` can run side by side, e
 The app needs no changes for this: its `database.yml`, `sidekiq.rb`, and `development.rb`/`session_store.rb` already honor `DATABASE_URL` / `REDIS_URL` / `LOCAL_DOMAIN`, and `config.hosts.clear` allows any `*.test` host.
 The profile injects the port by generating a per-worktree Procfile (the tracked `Procfile.dev` pins the web port to 3000), written outside the repo so the checkout stays clean.
 
+For the two mobile repos (`~/.config/wt/profiles/supercast-ios.sh`, `supercast-android.sh`) there is nothing to isolate per worktree, because both apps build a fixed bundle id/applicationId - a second install on the same device just replaces the first.
+So instead of per-worktree isolation, each profile targets the one shared simulator or emulator, and the last `wt open` wins: it builds that worktree's branch, installs it, and launches it, so "look at this branch on a device" is a single command, and rerunning it is the reload.
+There is no *device* lifecycle tied to a worktree, so neither profile ever creates or removes a simulator/emulator on `wt new`/`wt rm`.
+supercast-android has nothing else to reclaim either, so it defines no `wt_teardown`/`wt_sweep` at all; supercast-ios still builds into a per-worktree DerivedData directory, so it keeps both, purely to free that disk space.
+Since there's no bundler or watcher to keep running, the dev tab for a mobile worktree is instead a stream of that app's device logs, which keeps working across every later `wt open`.
+Both apps are thin Hotwire native shells that point at the canonical `https://app.supercast.test`, not at a per-worktree backend, so the canonical Rails app needs to actually be running for either to show real content - `wt open` warns, but does not fail, when it isn't.
+
 Commands:
 
 ```
 wt new [name]        create/open an isolated worktree, provision, start dev + Claude
 wt dev  <path>       run a worktree's dev server (this is the dev pane's command)
 wt run  [cmd...]     run a command with the worktree's isolated env loaded
-wt open [name]       open the worktree's dev url in the browser
+wt open [name]       open the worktree's dev url in the browser, or hand the
+                     command to the profile's own open action (build, install
+                     and launch on a device) when it defines one instead of a url
+                     (the mobile profiles' own open action accepts --launch-only/
+                     -l to skip the build and just relaunch - this is a convention
+                     of those two profiles, not a flag `wt` itself parses)
 wt provision <path>  re-run provisioning for a worktree (idempotent)
 wt rm  [-y] [name]   tear a worktree down (drop db, free port, remove worktree)
 wt ls                list worktrees with their allocated port / redis / url / db
