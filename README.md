@@ -197,6 +197,10 @@ A part belongs to exactly one repository, because a part is one pull request; wo
 `--repo PATH` is repeatable and is the escape hatch for the discovery, not the normal path: passing it once still lets the scan contribute, which is how you fix a wrong cwd without silently turning multi-repo splitting off, and only passing it two or more times narrows the set to exactly those repos.
 `-y` accepts the splitter's repo assignment sight unseen - the confirmation table, which grows a `REPO` column once a split actually spans more than one repository, always prints to stderr before that early return, so it is the audit trail even when nothing pauses to ask.
 
+Running `pq add --split` from `~/projects` itself - a directory that holds several checkouts but is not a checkout of anything - works the same way in reverse: instead of scanning the primary's siblings, `pq` discovers `~/projects`' own immediate children that are git repositories and offers those as the candidate set.
+There is no primary in that case, deliberately: nothing among a container's children is privileged as a default the splitter can fall back into, so every part's repository assignment becomes required rather than optional, and a part left unassigned fails validation instead of silently landing wherever the primary would have been.
+The same `--repo PATH` naming a directory instead of a checkout triggers this from anywhere, not only from inside the container itself.
+
 #### Hitting the session limit
 
 When a Claude session runs out of its usage window it puts up a dialog - "Wait for limit to reset · Resets 8:00pm" - and every option on that dialog only dismisses it.

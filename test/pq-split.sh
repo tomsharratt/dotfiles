@@ -109,6 +109,19 @@ case "$model" in
           printf '02-mr-b.md\t\t%s\n' "$label2"
         } > graph.tsv
         ;;
+      # No-primary/container mode: unlike every fixture above, BOTH parts
+      # name their repo explicitly - an empty third field has nothing to
+      # fall back to here, so the fixture itself must stay honest about that.
+      *"FIXTURE: container"*)
+        labela=$(basename "$CONTAINERA")
+        labelb=$(basename "$CONTAINERB")
+        printf 'MARKER: ctr-a\nDo A.\n' > 01-a.md
+        printf 'MARKER: ctr-b\nDo B.\n' > 02-b.md
+        {
+          printf '01-a.md\t\t%s\n' "$labela"
+          printf '02-b.md\t\t%s\n' "$labelb"
+        } > graph.tsv
+        ;;
     esac
     printf '{"is_error":false,"total_cost_usd":0.42,"duration_ms":12345,"permission_denials":[]}\n'
     ;;
@@ -136,6 +149,9 @@ case "$model" in
       *"MARKER: mr-branchcheck"*) printf '{"branch":"tom/mr-branchcheck-thing","intent":"Branch-check part."}\n' ;;
       *"MARKER: mr-a"*)       printf '{"branch":"tom/mr-a-thing","intent":"Part A."}\n' ;;
       *"MARKER: mr-b"*)       printf '{"branch":"tom/mr-b-thing","intent":"Part B."}\n' ;;
+      *"MARKER: ctr-a"*)      printf '{"branch":"tom/ctr-a-thing","intent":"A."}\n' ;;
+      *"MARKER: ctr-b"*)      printf '{"branch":"tom/ctr-b-thing","intent":"B."}\n' ;;
+      *"MARKER: ctr-solo"*)   printf '{"branch":"tom/ctr-solo-thing","intent":"Do the one thing."}\n' ;;
       *) printf '{}\n' ;;
     esac
     ;;
@@ -158,7 +174,7 @@ eq() {                                   # got want msg
   [ "$1" = "$2" ] && ok || bad "$3 (got '$1', want '$2')"
 }
 
-cleanup() { rm -rf "$PQ_HOME" "$STUBBIN" "$PQ_REPOS_DIR" "${SIBLINGROOT:-}" "${REPO:-}" "${REPO2:-}"; }
+cleanup() { rm -rf "$PQ_HOME" "$STUBBIN" "$PQ_REPOS_DIR" "${SIBLINGROOT:-}" "${REPO:-}" "${REPO2:-}" "${CONTAINERROOT:-}"; }
 trap cleanup EXIT
 
 # ── two throwaway git repos ─────────────────────────────────────────────────
@@ -180,6 +196,20 @@ git -C "$REPO2" -c user.email=test@test -c user.name=test commit -q --allow-empt
 mkdir -p "$REPO2/.git/refs/remotes/origin"
 git -C "$REPO2" update-ref refs/remotes/origin/master refs/heads/master
 git -C "$REPO2" symbolic-ref refs/remotes/origin/HEAD refs/remotes/origin/master
+
+# CONTAINERROOT is itself NOT a git repo - it only holds two checkouts as
+# peers, for the container/no-primary discovery mode: cwd (or an explicit
+# --repo) naming a directory like this, rather than a repo, is what triggers
+# it. Exported so the claude stub's "FIXTURE: container" case (which needs
+# each child's real basename, exactly like $REPO2 above) can read them.
+CONTAINERROOT=$(mktemp -d)
+CONTAINERA=$(mktemp -d "$CONTAINERROOT/childA.XXXXXX")
+git init -q -b master "$CONTAINERA"
+git -C "$CONTAINERA" -c user.email=test@test -c user.name=test commit -q --allow-empty -m init
+CONTAINERB=$(mktemp -d "$CONTAINERROOT/childB.XXXXXX")
+git init -q -b master "$CONTAINERB"
+git -C "$CONTAINERB" -c user.email=test@test -c user.name=test commit -q --allow-empty -m init
+export CONTAINERA CONTAINERB
 
 reset_tasks() {
   rm -rf "$PQ_HOME/queue" "$PQ_HOME/hold" "$PQ_HOME/running" "$PQ_HOME/done"
@@ -203,6 +233,37 @@ new_split_dir_repos() {                  # name [repo2_label=repo2] -> prints th
   rm -rf "$sd"; mkdir -p "$sd"
   printf '# source plan\n\nSomething.\n' > "$sd/source.md"
   printf '%s\t%s\n%s\t%s\n' "$(basename "$REPO")" "$REPO" "$label" "$REPO2" > "$sd/repos"
+  printf '%s' "$sd"
+}
+
+# The no-primary variant: row 1 is the empty-label sentinel do_split writes
+# for a container split (see do_split), followed by CONTAINERA and
+# CONTAINERB - so a hand-built container split dir never needs the splitter
+# stub either.
+new_split_dir_container() {              # name -> prints the dir path
+  local sd="$PQ_HOME/splits/$1"
+  rm -rf "$sd"; mkdir -p "$sd"
+  printf '# source plan\n\nSomething.\n' > "$sd/source.md"
+  {
+    printf '\t%s\n' "$CONTAINERROOT"
+    printf '%s\t%s\n' "$(basename "$CONTAINERA")" "$CONTAINERA"
+    printf '%s\t%s\n' "$(basename "$CONTAINERB")" "$CONTAINERB"
+  } > "$sd/repos"
+  printf '%s' "$sd"
+}
+
+# The degenerate case: a no-primary split whose container only ever had ONE
+# child - multi=0 in practice, but the label is still required (there is
+# still no primary), which is exactly what makes this case worth its own
+# fixture rather than assuming it behaves like new_split_dir_container's.
+new_split_dir_container_one() {          # name -> prints the dir path
+  local sd="$PQ_HOME/splits/$1"
+  rm -rf "$sd"; mkdir -p "$sd"
+  printf '# source plan\n\nSomething.\n' > "$sd/source.md"
+  {
+    printf '\t%s\n' "$CONTAINERONE"
+    printf '%s\t%s\n' "$(basename "$CONTAINERONECHILD")" "$CONTAINERONECHILD"
+  } > "$sd/repos"
   printf '%s' "$sd"
 }
 
@@ -752,6 +813,171 @@ rc=$?
 [ "$rc" -eq 0 ] && ok || bad "a raw branch --after should still work on a single-repo split: $(cat "$PQ_HOME/.err")"
 t=$(find_task do-solo-thing)
 eq "$(cut -f3 "$t/after" 2>/dev/null)" "tom/some-raw-branch" "the root part's after line records the raw branch"
+
+# ── container/no-primary mode: cwd (or --repo) naming a directory that is
+# NOT itself a git repo, only a container of several ────────────────────────
+
+echo "== container mode: --repo pointing at a non-repo container discovers its children, no primary ==" >&2
+reset_tasks
+PLANC="$PQ_HOME/.container-plan.md"
+printf 'FIXTURE: container\n\nA plan.\n' > "$PLANC"
+# PQ_REPOS_DIR is globally pinned to an empty directory above so ordinary
+# sibling-scan tests stay single-repo - repo_candidates_container reads that
+# same override, so it must be cleared here or the container scan would look
+# in the wrong place entirely and find nothing.
+out=$(PQ_REPOS_DIR= main add "$PLANC" --repo "$CONTAINERROOT" --split -y 2>"$PQ_HOME/.err")
+rc=$?
+[ "$rc" -eq 0 ] && ok || bad "container-mode split should succeed: $(cat "$PQ_HOME/.err")"
+t_a=$(find_task ctr-a-thing); t_b=$(find_task ctr-b-thing)
+eq "$(hdr "$t_a/plan.md" repo)" "$(cd "$CONTAINERA" && pwd -P)" "part A lands in childA"
+eq "$(hdr "$t_b/plan.md" repo)" "$(cd "$CONTAINERB" && pwd -P)" "part B lands in childB"
+
+echo "== container mode: cwd itself (not --repo) being a non-repo container triggers discovery ==" >&2
+reset_tasks
+PLANCWD="$PQ_HOME/.container-cwd-plan.md"
+printf 'FIXTURE: container\n\nA plan.\n' > "$PLANCWD"
+out=$(cd "$CONTAINERROOT" && PQ_REPOS_DIR= main add "$PLANCWD" --split -y 2>"$PQ_HOME/.err")
+rc=$?
+[ "$rc" -eq 0 ] && ok || bad "running from cwd=container should discover its children: $(cat "$PQ_HOME/.err")"
+t_a=$(find_task ctr-a-thing)
+eq "$(hdr "$t_a/plan.md" repo)" "$(cd "$CONTAINERA" && pwd -P)" "part A lands in childA when discovered from cwd"
+
+echo "== container mode: an empty repo field dies - there is no primary to default to ==" >&2
+reset_tasks
+SDEMPTY=$(new_split_dir_container container-emptyfield)
+labela=$(basename "$CONTAINERA")
+printf 'MARKER: ctr-a\nA.\n' > "$SDEMPTY/01-a.md"
+printf 'MARKER: ctr-b\nB.\n' > "$SDEMPTY/02-b.md"
+{
+  printf '01-a.md\t\t%s\n' "$labela"
+  printf '02-b.md\t\n'
+} > "$SDEMPTY/graph.tsv"
+if ( main add --split-dir "$SDEMPTY" -y ) >/dev/null 2>"$PQ_HOME/.err"; then
+  bad "an empty repo field in a no-primary split should die"
+else
+  ok
+fi
+case "$(cat "$PQ_HOME/.err")" in
+  *"no primary"*) ok ;;
+  *) bad "should explain there is no primary to default to (got: $(cat "$PQ_HOME/.err"))" ;;
+esac
+eq "$(queue_count)" "0" "empty repo field in no-primary split: nothing queued"
+
+echo "== container mode with exactly one child: still requires an explicit label; multi=0 hides the repo hint and REPO column ==" >&2
+CONTAINERONE=$(mktemp -d)
+CONTAINERONECHILD=$(mktemp -d "$CONTAINERONE/onlychild.XXXXXX")
+git init -q -b master "$CONTAINERONECHILD"
+git -C "$CONTAINERONECHILD" -c user.email=test@test -c user.name=test commit -q --allow-empty -m init
+reset_tasks
+: > "$CALL_LOG"
+SDONE=$(new_split_dir_container_one container-onechild)
+labelone=$(basename "$CONTAINERONECHILD")
+printf 'MARKER: ctr-solo\nDo the one thing.\n' > "$SDONE/01-solo.md"
+printf '01-solo.md\t\t%s\n' "$labelone" > "$SDONE/graph.tsv"
+out=$(main add --split-dir "$SDONE" -y 2>"$PQ_HOME/.err")
+rc=$?
+[ "$rc" -eq 0 ] && ok || bad "single-child container split should still succeed: $(cat "$PQ_HOME/.err")"
+case "$(awk -F'\t' '$1 == "haiku" { print }' "$CALL_LOG")" in
+  *"lands in the"*) bad "a split that only ever uses ONE repo should not carry the repo hint even in no-primary mode" ;;
+  *) ok ;;
+esac
+case "$(cat "$PQ_HOME/.err")" in
+  *"REPO"*) bad "single-repo-in-practice split should not show a REPO column" ;;
+  *) ok ;;
+esac
+rm -rf "$CONTAINERONE"
+
+echo "== container mode: zero child repos dies clearly ==" >&2
+EMPTYCONTAINER=$(mktemp -d)
+mkdir -p "$EMPTYCONTAINER/not-a-repo"
+reset_tasks
+PLANEMPTY="$PQ_HOME/.container-empty-plan.md"
+printf 'FIXTURE: container\n\nA plan.\n' > "$PLANEMPTY"
+if ( PQ_REPOS_DIR= main add "$PLANEMPTY" --repo "$EMPTYCONTAINER" --split -y ) >/dev/null 2>"$PQ_HOME/.err"; then
+  bad "a container with no git-repo children should die"
+else
+  ok
+fi
+case "$(cat "$PQ_HOME/.err")" in
+  *"no git repositories"*) ok ;;
+  *) bad "should explain no git repositories were found (got: $(cat "$PQ_HOME/.err"))" ;;
+esac
+rm -rf "$EMPTYCONTAINER"
+
+echo "== repo_candidates_container: PQ_REPOS_MAX truncation warns naming every repo it dropped ==" >&2
+SCANC=$(mktemp -d)
+madec=()
+for i in 1 2 3 4; do
+  d=$(mktemp -d "$SCANC/kid$i.XXXXXX")
+  git init -q -b master "$d"
+  git -C "$d" -c user.email=test@test -c user.name=test commit -q --allow-empty -m init
+  madec+=("$d")
+done
+warnc=$(PQ_REPOS_DIR="$SCANC" PQ_REPOS_MAX=3 repo_candidates_container "$SCANC" 2>&1 >/dev/null)
+resultc=$(PQ_REPOS_DIR="$SCANC" PQ_REPOS_MAX=3 repo_candidates_container "$SCANC" 2>/dev/null)
+eq "$(wc -l <<<"$resultc" | tr -d ' ')" "3" "kept exactly PQ_REPOS_MAX (3) - no primary consuming a slot"
+case "$warnc" in
+  *"PQ_REPOS_MAX"*) ok ;;
+  *) bad "should warn naming PQ_REPOS_MAX (got: $warnc)" ;;
+esac
+droppedcountc=0
+for d in "${madec[@]}"; do
+  case "$warnc" in *"$(basename "$d")"*) droppedcountc=$((droppedcountc + 1)) ;; esac
+done
+eq "$droppedcountc" "1" "the warning names exactly the one repo that got dropped (4 found, keep 3)"
+rm -rf "$SCANC"
+
+echo "== container mode: a raw-branch --after is refused even with NO explicit --repo (no primary at all) ==" >&2
+reset_tasks
+PLANRAW="$PQ_HOME/.container-rawafter-plan.md"
+printf 'FIXTURE: container\n\nA plan.\n' > "$PLANRAW"
+if ( PQ_REPOS_DIR= main add "$PLANRAW" --repo "$CONTAINERROOT" --split --after tom/some-raw-branch -y ) >/dev/null 2>&1; then
+  bad "a raw branch --after should be refused in container/no-primary mode"
+else
+  ok
+fi
+eq "$(queue_count)" "0" "raw-branch --after in container mode: nothing queued"
+
+echo "== container mode: resuming with --repo has no effect and warns ==" >&2
+reset_tasks
+SDRESUME=$(new_split_dir_container container-resume-repo-noop)
+labela=$(basename "$CONTAINERA"); labelb=$(basename "$CONTAINERB")
+printf 'MARKER: ctr-a\nA.\n' > "$SDRESUME/01-a.md"
+printf 'MARKER: ctr-b\nB.\n' > "$SDRESUME/02-b.md"
+{
+  printf '01-a.md\t\t%s\n' "$labela"
+  printf '02-b.md\t\t%s\n' "$labelb"
+} > "$SDRESUME/graph.tsv"
+out=$(main add --split-dir "$SDRESUME" --repo "$REPO" -y 2>"$PQ_HOME/.err")
+rc=$?
+[ "$rc" -eq 0 ] && ok || bad "resuming a no-primary split with an extraneous --repo should still succeed: $(cat "$PQ_HOME/.err")"
+case "$(cat "$PQ_HOME/.err")" in
+  *"no effect"*) ok ;;
+  *) bad "should warn that --repo has no effect on a no-primary resume (got: $(cat "$PQ_HOME/.err"))" ;;
+esac
+t_a=$(find_task ctr-a-thing)
+# Unlike the fresh-split cases above, new_split_dir_container records
+# $CONTAINERA verbatim (no scan through `git worktree list` to resolve it),
+# so the recorded path here is the raw mktemp path, not its /private/var
+# realpath - the comparison must match what was actually stored.
+eq "$(hdr "$t_a/plan.md" repo)" "$CONTAINERA" "the --repo given at resume did NOT override childA's recorded path"
+
+echo "== a plain (non-split) add from a directory that is not a git repo still dies clearly ==" >&2
+reset_tasks
+NOTAREPO=$(mktemp -d)
+PLAINPLAN="$PQ_HOME/.notarepo-plan.md"
+printf '# plan\n\nJust one thing.\n' > "$PLAINPLAN"
+if ( cd "$NOTAREPO" && main add "$PLAINPLAN" -y ) >/dev/null 2>"$PQ_HOME/.err"; then
+  bad "a plain add from a non-repo directory should die"
+else
+  ok
+fi
+case "$(cat "$PQ_HOME/.err")" in
+  *"not inside a git repo"*) ok ;;
+  *) bad "should die with the original 'not inside a git repo' message (got: $(cat "$PQ_HOME/.err"))" ;;
+esac
+eq "$(queue_count)" "0" "plain add from non-repo dir: nothing queued"
+rm -rf "$NOTAREPO"
 
 printf '\n%d passed, %d failed\n' "$pass" "$fail" >&2
 [ "$fail" -eq 0 ]
