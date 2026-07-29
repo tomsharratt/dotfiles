@@ -18,10 +18,24 @@ HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 PQ_HOME=$(mktemp -d)
 export PQ_HOME
 
+# The default scan root for `repo_candidates`: permanently empty, so every
+# case below that does not deliberately opt into multi-repo scanning stays
+# single-repo regardless of what else happens to be sitting in $TMPDIR.
+PQ_REPOS_DIR=$(mktemp -d)
+export PQ_REPOS_DIR
+
 STUBBIN=$(mktemp -d)
 SPLIT_COUNTER="$PQ_HOME/.opus-calls"
 export SPLIT_COUNTER
 : > "$SPLIT_COUNTER"
+
+# Every `claude` invocation, one line of model<TAB>args, when CALL_LOG is set -
+# a test asserts against this rather than the stub's return value when what
+# matters is what the CALLER was told (an --add-dir per candidate, the repo
+# hint in a naming prompt), not what it got back.
+CALL_LOG="$PQ_HOME/.call-log"
+export CALL_LOG
+: > "$CALL_LOG"
 
 # Dispatches on --model. `opus` writes a fixture part set + graph.tsv into
 # cwd, keyed off ./source.md's marker line, and counts its own calls so a
@@ -29,6 +43,11 @@ export SPLIT_COUNTER
 # stdin and returns that part's {"branch":..,"intent":..}, keyed off its own
 # marker line - two marker pairs additionally look at argv for the avoid-list
 # sentence `name_plan` appends on retry, to drive the collision path.
+#
+# The multirepo fixtures read $REPO2 straight from the environment rather
+# than hard-coding a label: a scanned or explicitly-named repo's label is its
+# real basename (`repo_candidates`/the explicit `--repo` path both derive it
+# that way), and $REPO2 is a fresh `mktemp -d` each run.
 cat > "$STUBBIN/claude" <<'STUBEOF'
 #!/usr/bin/env bash
 all_args="$*"
@@ -39,6 +58,7 @@ while [ $# -gt 0 ]; do
     *) shift ;;
   esac
 done
+[ -n "${CALL_LOG:-}" ] && printf '%s\t%s\n' "$model" "$(tr '\n' ' ' <<<"$all_args")" >> "$CALL_LOG"
 
 case "$model" in
   opus)
@@ -61,6 +81,34 @@ case "$model" in
         printf 'MARKER: solo\nDo the one thing.\n' > 01-solo.md
         printf '01-solo.md\t\n' > graph.tsv
         ;;
+      # The more specific "multirepo-*" fixtures MUST be checked before the
+      # bare "FIXTURE: multirepo" pattern below - a `case` pattern match is
+      # first-match-wins, and `*"FIXTURE: multirepo"*` is also a substring of
+      # "FIXTURE: multirepo-badlabel" and "FIXTURE: multirepo-dirty".
+      *"FIXTURE: multirepo-badlabel"*)
+        printf 'MARKER: mr-a\nDo the primary part.\n' > 01-mr-a.md
+        printf '01-mr-a.md\t\ttotally-not-a-repo\n' > graph.tsv
+        ;;
+      *"FIXTURE: multirepo-dirty"*)
+        label2=$(basename "$REPO2")
+        printf 'MARKER: mr-a\nDo the primary part.\n'  > 01-mr-a.md
+        printf 'MARKER: mr-b\nDo the other part.\n'    > 02-mr-b.md
+        {
+          printf '01-mr-a.md\t\n'
+          printf '02-mr-b.md\t\t%s\n' "$label2"
+        } > graph.tsv
+        # Left behind on purpose: the splitter was only meant to read here.
+        touch "$REPO2/oops-the-splitter-wrote-here.txt"
+        ;;
+      *"FIXTURE: multirepo"*)
+        label2=$(basename "$REPO2")
+        printf 'MARKER: mr-a\nDo the primary part.\n'  > 01-mr-a.md
+        printf 'MARKER: mr-b\nDo the other part.\n'    > 02-mr-b.md
+        {
+          printf '01-mr-a.md\t\n'
+          printf '02-mr-b.md\t\t%s\n' "$label2"
+        } > graph.tsv
+        ;;
     esac
     printf '{"is_error":false,"total_cost_usd":0.42,"duration_ms":12345,"permission_denials":[]}\n'
     ;;
@@ -82,6 +130,12 @@ case "$model" in
         else printf '{"branch":"tom/collide","intent":"Part B."}\n'; fi ;;
       *"MARKER: forever-a"*)  printf '{"branch":"tom/collide-forever","intent":"Part A."}\n' ;;
       *"MARKER: forever-b"*)  printf '{"branch":"tom/collide-forever","intent":"Part B."}\n' ;;
+      *"MARKER: mr-server"*)  printf '{"branch":"tom/mr-server-thing","intent":"Server part."}\n' ;;
+      *"MARKER: mr-client"*)  printf '{"branch":"tom/mr-client-thing","intent":"Client part."}\n' ;;
+      *"MARKER: mr-solo2col"*) printf '{"branch":"tom/mr-solo2col-thing","intent":"One repo, one part."}\n' ;;
+      *"MARKER: mr-branchcheck"*) printf '{"branch":"tom/mr-branchcheck-thing","intent":"Branch-check part."}\n' ;;
+      *"MARKER: mr-a"*)       printf '{"branch":"tom/mr-a-thing","intent":"Part A."}\n' ;;
+      *"MARKER: mr-b"*)       printf '{"branch":"tom/mr-b-thing","intent":"Part B."}\n' ;;
       *) printf '{}\n' ;;
     esac
     ;;
@@ -104,7 +158,7 @@ eq() {                                   # got want msg
   [ "$1" = "$2" ] && ok || bad "$3 (got '$1', want '$2')"
 }
 
-cleanup() { rm -rf "$PQ_HOME" "$STUBBIN" "${REPO:-}" "${REPO2:-}"; }
+cleanup() { rm -rf "$PQ_HOME" "$STUBBIN" "$PQ_REPOS_DIR" "${SIBLINGROOT:-}" "${REPO:-}" "${REPO2:-}"; }
 trap cleanup EXIT
 
 # ── two throwaway git repos ─────────────────────────────────────────────────
@@ -115,7 +169,12 @@ mkdir -p "$REPO/.git/refs/remotes/origin"
 git -C "$REPO" update-ref refs/remotes/origin/master refs/heads/master
 git -C "$REPO" symbolic-ref refs/remotes/origin/HEAD refs/remotes/origin/master
 
-REPO2=$(mktemp -d)
+# REPO2 lives under its own SIBLINGROOT, not under $PQ_REPOS_DIR - so it is
+# invisible to the scan by default, and only the cases that mean to test
+# discovery point PQ_REPOS_DIR at SIBLINGROOT for that one invocation.
+SIBLINGROOT=$(mktemp -d)
+REPO2=$(mktemp -d "$SIBLINGROOT/repo2.XXXXXX")
+export REPO2
 git init -q -b master "$REPO2"
 git -C "$REPO2" -c user.email=test@test -c user.name=test commit -q --allow-empty -m init
 mkdir -p "$REPO2/.git/refs/remotes/origin"
@@ -134,6 +193,16 @@ new_split_dir() {                        # name -> prints the dir path
   rm -rf "$sd"; mkdir -p "$sd"
   printf '# source plan\n\nSomething.\n' > "$sd/source.md"
   printf '%s\n' "$REPO" > "$sd/repo"
+  printf '%s' "$sd"
+}
+
+# The repos-file variant: REPO as the primary, REPO2 under a caller-chosen
+# label - so a hand-built multi-repo split dir never needs the splitter stub.
+new_split_dir_repos() {                  # name [repo2_label=repo2] -> prints the dir path
+  local sd="$PQ_HOME/splits/$1" label=${2:-repo2}
+  rm -rf "$sd"; mkdir -p "$sd"
+  printf '# source plan\n\nSomething.\n' > "$sd/source.md"
+  printf '%s\t%s\n%s\t%s\n' "$(basename "$REPO")" "$REPO" "$label" "$REPO2" > "$sd/repos"
   printf '%s' "$sd"
 }
 
@@ -434,6 +503,255 @@ eq "$(queue_count)" "0" "repo mismatch: nothing queued"
 reset_tasks
 if ( cd "$REPO2" && main add --split-dir "$SD" --repo "$REPO2" -y ) >/dev/null 2>&1; then ok
 else bad "an EXPLICIT --repo should override the mismatch guard"; fi
+
+# ── multi-repo splits ────────────────────────────────────────────────────────
+
+echo "== multi-repo: 3-column graph.tsv assigns parts across repos; cross-repo after resolves to the dependency's own repo ==" >&2
+reset_tasks
+SD=$(new_split_dir_repos multirepo-basic repo2)
+printf 'MARKER: mr-server\nDo the server part.\n' > "$SD/01-server.md"
+printf 'MARKER: mr-client\nDo the client part.\n' > "$SD/02-client.md"
+printf '01-server.md\t\n02-client.md\t01-server.md\trepo2\n' > "$SD/graph.tsv"
+out=$(main add --split-dir "$SD" --repo "$REPO" -y 2>"$PQ_HOME/.err")
+rc=$?
+[ "$rc" -eq 0 ] && ok || bad "a 3-column multi-repo split should succeed: $(cat "$PQ_HOME/.err")"
+t_server=$(find_task mr-server-thing); t_client=$(find_task mr-client-thing)
+eq "$(hdr "$t_server/plan.md" repo)" "$REPO" "the empty-label (primary) part lands in REPO"
+eq "$(hdr "$t_client/plan.md" repo)" "$REPO2" "the repo2-labeled part lands in REPO2"
+eq "$(cut -f1 "$t_client/after" 2>/dev/null)" "mr-server-thing" "the client part waits on the server part"
+eq "$(cut -f2 "$t_client/after" 2>/dev/null)" "$REPO" "the after line's repo field is the dependency's OWN repo, not the client's"
+
+echo "== multi-repo: an unknown repository label in graph.tsv dies with nothing queued ==" >&2
+reset_tasks
+SD=$(new_split_dir_repos multirepo-badlabel repo2)
+printf 'MARKER: mr-server\nA.\n' > "$SD/01-a.md"
+printf '01-a.md\t\tnonexistent-label\n' > "$SD/graph.tsv"
+( main add --split-dir "$SD" --repo "$REPO" -y ) >/dev/null 2>&1 && bad "an unknown repo label should be rejected" || ok
+eq "$(queue_count)" "0" "unknown repo label: nothing queued"
+
+echo "== multi-repo: a plain 2-column graph.tsv still lands everything in the primary ==" >&2
+reset_tasks
+SD=$(new_split_dir_repos multirepo-2col repo2)
+printf 'MARKER: mr-solo2col\nOne repo, one part.\n' > "$SD/01-solo2col.md"
+printf '01-solo2col.md\t\n' > "$SD/graph.tsv"
+out=$(main add --split-dir "$SD" --repo "$REPO" -y 2>"$PQ_HOME/.err")
+rc=$?
+[ "$rc" -eq 0 ] && ok || bad "a 2-column graph.tsv alongside a repos file should still work: $(cat "$PQ_HOME/.err")"
+t=$(find_task mr-solo2col-thing)
+eq "$(hdr "$t/plan.md" repo)" "$REPO" "no third field at all still means the primary"
+
+echo "== a legacy split directory (repo file only, no repos) still resumes, and repos gets materialized ==" >&2
+reset_tasks
+SD=$(new_split_dir legacy-resume)
+printf 'MARKER: solo\nDo the one thing.\n' > "$SD/01-solo.md"
+printf '01-solo.md\t\n' > "$SD/graph.tsv"
+[ -f "$SD/repos" ] && bad "should not have a repos file yet" || ok
+out=$(main add --split-dir "$SD" --repo "$REPO" -y 2>"$PQ_HOME/.err")
+rc=$?
+[ "$rc" -eq 0 ] && ok || bad "resuming a legacy (repo-only) split dir should still work: $(cat "$PQ_HOME/.err")"
+eq "$out" "do-solo-thing" "it should still queue the one part"
+[ -s "$SD/repos" ] && ok || bad "resuming should materialize a repos file"
+eq "$(cut -f2 "$SD/repos" | head -1)" "$REPO" "the materialized repos file's primary path is REPO"
+
+echo "== multi-repo: branch_taken is checked against the PART'S OWN repo, not the primary ==" >&2
+reset_tasks
+git -C "$REPO" branch tom/mr-branchcheck-thing >/dev/null
+SD=$(new_split_dir_repos multirepo-branchcheck repo2)
+printf 'MARKER: mr-branchcheck\nClaims a branch that exists in REPO but not REPO2.\n' > "$SD/01-bc.md"
+printf '01-bc.md\t\trepo2\n' > "$SD/graph.tsv"
+out=$(main add --split-dir "$SD" --repo "$REPO" -y 2>"$PQ_HOME/.err")
+rc=$?
+[ "$rc" -eq 0 ] && ok || bad "a part assigned to REPO2 must not be refused for a branch only live in REPO: $(cat "$PQ_HOME/.err")"
+eq "$out" "mr-branchcheck-thing" "it should queue under its own name"
+git -C "$REPO" branch -D tom/mr-branchcheck-thing >/dev/null 2>&1
+
+echo "== multi-repo: the confirm table's REPO column appears only once a split spans more than one repo ==" >&2
+reset_tasks
+SD=$(new_split_dir_repos multirepo-column repo2)
+printf 'MARKER: mr-server\nA.\n' > "$SD/01-server.md"
+printf 'MARKER: mr-client\nB.\n' > "$SD/02-client.md"
+printf '01-server.md\t\n02-client.md\t01-server.md\trepo2\n' > "$SD/graph.tsv"
+main add --split-dir "$SD" --repo "$REPO" -y >/dev/null 2>"$PQ_HOME/.err"
+case "$(cat "$PQ_HOME/.err")" in
+  *"REPO"*) ok ;;
+  *) bad "a multi-repo split's confirm table should show a REPO column (got: $(cat "$PQ_HOME/.err"))" ;;
+esac
+# The column must show the label actually recorded in $sd/repos ("repo2"),
+# never basename($REPO2) (a random "repo2.XXXXXX" mktemp name) - a
+# regression test for the label being recomputed instead of read.
+case "$(cat "$PQ_HOME/.err")" in
+  *"repo2"*) ok ;;
+  *) bad "the REPO column should show the recorded label 'repo2' (got: $(cat "$PQ_HOME/.err"))" ;;
+esac
+case "$(cat "$PQ_HOME/.err")" in
+  *"$(basename "$REPO2")"*) bad "the REPO column should not show REPO2's basename instead of its recorded label (got: $(cat "$PQ_HOME/.err"))" ;;
+  *) ok ;;
+esac
+
+reset_tasks
+SD2=$(new_split_dir single-repo-column)
+printf 'MARKER: solo\nDo the one thing.\n' > "$SD2/01-solo.md"
+printf '01-solo.md\t\n' > "$SD2/graph.tsv"
+main add --split-dir "$SD2" --repo "$REPO" -y >/dev/null 2>"$PQ_HOME/.err"
+case "$(cat "$PQ_HOME/.err")" in
+  *"REPO"*) bad "a single-repo split's confirm table should not show a REPO column (got: $(cat "$PQ_HOME/.err"))" ;;
+  *) ok ;;
+esac
+
+echo "== multi-repo: the namer gets the repo hint only on a multi-repo split ==" >&2
+reset_tasks
+: > "$CALL_LOG"
+SD=$(new_split_dir_repos multirepo-hint repo2)
+printf 'MARKER: mr-server\nA.\n' > "$SD/01-server.md"
+printf 'MARKER: mr-client\nB.\n' > "$SD/02-client.md"
+printf '01-server.md\t\n02-client.md\t01-server.md\trepo2\n' > "$SD/graph.tsv"
+main add --split-dir "$SD" --repo "$REPO" -y >/dev/null 2>&1
+case "$(awk -F'\t' '$1 == "haiku" { print }' "$CALL_LOG")" in
+  *"lands in the repo2 repository"*) ok ;;
+  *) bad "a multi-repo split's naming call should carry the repo hint with the recorded label 'repo2', not a recomputed basename" ;;
+esac
+
+reset_tasks
+: > "$CALL_LOG"
+SD2=$(new_split_dir single-repo-hint)
+printf 'MARKER: solo\nDo the one thing.\n' > "$SD2/01-solo.md"
+printf '01-solo.md\t\n' > "$SD2/graph.tsv"
+main add --split-dir "$SD2" --repo "$REPO" -y >/dev/null 2>&1
+case "$(awk -F'\t' '$1 == "haiku" { print }' "$CALL_LOG")" in
+  *"lands in the"*) bad "a single-repo split's naming call should not carry the repo hint" ;;
+  *) ok ;;
+esac
+
+echo "== repo_candidates: a purpose-built scan root with two repos, a plain dir, and a dotted dir returns exactly the two, primary first ==" >&2
+SCAN9=$(mktemp -d)
+RA=$(mktemp -d "$SCAN9/repoA.XXXXXX")
+git init -q -b master "$RA"
+git -C "$RA" -c user.email=test@test -c user.name=test commit -q --allow-empty -m init
+RB=$(mktemp -d "$SCAN9/repoB.XXXXXX")
+git init -q -b master "$RB"
+git -C "$RB" -c user.email=test@test -c user.name=test commit -q --allow-empty -m init
+mkdir -p "$SCAN9/plaindir"
+mkdir -p "$SCAN9/.dotted"
+result9=$(PQ_REPOS_DIR="$SCAN9" repo_candidates "$REPO")
+eq "$(wc -l <<<"$result9" | tr -d ' ')" "3" "primary plus the two real git repos - the plain dir and the dotted dir are excluded"
+eq "$(cut -f2 <<<"$result9" | sed -n 1p)" "$REPO" "the primary is listed first"
+labels9=$(cut -f1 <<<"$result9" | tail -n +2 | tr '\n' ' ')
+case "$labels9" in
+  *"$(basename "$RA")"*"$(basename "$RB")"*) ok ;;
+  *) bad "both scanned repos should be present, sorted by label (got: $labels9)" ;;
+esac
+rm -rf "$SCAN9"
+
+echo "== multi-repo: explicit --repo (two or more) restricts the candidate set - a label outside it dies ==" >&2
+reset_tasks
+PLANMR="$PQ_HOME/.multirepo-badlabel-plan.md"
+printf 'FIXTURE: multirepo-badlabel\n\nA plan.\n' > "$PLANMR"
+if ( main add "$PLANMR" --repo "$REPO" --repo "$REPO2" --split -y ) >/dev/null 2>&1; then
+  bad "a label outside the explicit --repo set should be rejected"
+else
+  ok
+fi
+eq "$(queue_count)" "0" "bad label with explicit --repo set: nothing queued"
+
+echo "== multi-repo: a SINGLE --repo does not restrict the set - the scan still contributes ==" >&2
+reset_tasks
+PLANMR2="$PQ_HOME/.multirepo-plan.md"
+printf 'FIXTURE: multirepo\n\nA plan.\n' > "$PLANMR2"
+out=$(PQ_REPOS_DIR="$SIBLINGROOT" main add "$PLANMR2" --repo "$REPO" --split -y 2>"$PQ_HOME/.err")
+rc=$?
+[ "$rc" -eq 0 ] && ok || bad "a scanned sibling should still queue with a single --repo: $(cat "$PQ_HOME/.err")"
+t_a=$(find_task mr-a-thing); t_b=$(find_task mr-b-thing)
+eq "$(hdr "$t_a/plan.md" repo)" "$REPO" "the primary part lands in REPO"
+# repo_candidates resolves each scanned entry through `git worktree list
+# --porcelain`, which realpath's it - on macOS that turns /var/folders/...
+# into /private/var/folders/..., so the comparison must go through the same
+# resolution rather than against $REPO2's own unresolved mktemp path.
+eq "$(hdr "$t_b/plan.md" repo)" "$(cd "$REPO2" && pwd -P)" "the scanned sibling part lands in REPO2"
+
+echo "== a non-split pq add with two --repo values is rejected ==" >&2
+reset_tasks
+if ( main add "/nonexistent-plan-file-xyz.md" --repo "$REPO" --repo "$REPO2" -y ) >/dev/null 2>&1; then
+  bad "a non-split add with two --repo values should be rejected"
+else
+  ok
+fi
+eq "$(queue_count)" "0" "non-split, two --repo: nothing queued"
+
+echo "== multi-repo: --add-dir is passed once per candidate ==" >&2
+reset_tasks
+: > "$CALL_LOG"
+PLANMR3="$PQ_HOME/.multirepo-plan3.md"
+printf 'FIXTURE: multirepo\n\nA plan.\n' > "$PLANMR3"
+main add "$PLANMR3" --repo "$REPO" --repo "$REPO2" --split -y >/dev/null 2>&1
+opusargs=$(awk -F'\t' '$1 == "opus" { print $2; exit }' "$CALL_LOG")
+addcount=$(grep -o -- '--add-dir' <<<"$opusargs" | wc -l | tr -d ' ')
+eq "$addcount" "2" "one --add-dir per candidate (primary + REPO2)"
+
+echo "== multi-repo: a candidate left dirty by the splitter is warned about, naming that repo ==" >&2
+reset_tasks
+PLANMR4="$PQ_HOME/.multirepo-dirty-plan.md"
+printf 'FIXTURE: multirepo-dirty\n\nA plan.\n' > "$PLANMR4"
+main add "$PLANMR4" --repo "$REPO" --repo "$REPO2" --split -y >/dev/null 2>"$PQ_HOME/.err"
+case "$(cat "$PQ_HOME/.err")" in
+  *"$REPO2"*"dirty"*) ok ;;
+  *) bad "leaving REPO2 dirty should warn naming REPO2 (got: $(cat "$PQ_HOME/.err"))" ;;
+esac
+rm -f "$REPO2/oops-the-splitter-wrote-here.txt"
+
+echo "== repo_candidates: PQ_REPOS_MAX truncation warns naming every repo it dropped ==" >&2
+SCAN15=$(mktemp -d)
+made15=()
+for i in 1 2 3 4; do
+  d=$(mktemp -d "$SCAN15/extra$i.XXXXXX")
+  git init -q -b master "$d"
+  git -C "$d" -c user.email=test@test -c user.name=test commit -q --allow-empty -m init
+  made15+=("$d")
+done
+warn15=$(PQ_REPOS_DIR="$SCAN15" PQ_REPOS_MAX=3 repo_candidates "$REPO" 2>&1 >/dev/null)
+result15=$(PQ_REPOS_DIR="$SCAN15" PQ_REPOS_MAX=3 repo_candidates "$REPO" 2>/dev/null)
+eq "$(wc -l <<<"$result15" | tr -d ' ')" "3" "primary plus 2 kept (PQ_REPOS_MAX=3)"
+case "$warn15" in
+  *"PQ_REPOS_MAX"*) ok ;;
+  *) bad "should warn naming PQ_REPOS_MAX (got: $warn15)" ;;
+esac
+droppedcount=0
+for d in "${made15[@]}"; do
+  case "$warn15" in *"$(basename "$d")"*) droppedcount=$((droppedcount + 1)) ;; esac
+done
+eq "$droppedcount" "2" "the warning names exactly the repos that got dropped"
+rm -rf "$SCAN15"
+
+echo "== a split-level --after containing / is refused when 2+ --repo are given explicitly ==" >&2
+reset_tasks
+PLANMR16="$PQ_HOME/.multirepo-rawafter-plan.md"
+printf 'FIXTURE: multirepo\n\nA plan.\n' > "$PLANMR16"
+if ( main add "$PLANMR16" --repo "$REPO" --repo "$REPO2" --split --after tom/some-raw-branch -y ) >/dev/null 2>&1; then
+  bad "a raw branch --after should be refused when --repo is given 2+ times"
+else
+  ok
+fi
+eq "$(queue_count)" "0" "raw-branch --after with explicit multi-repo: nothing queued"
+
+echo "== ...but NOT refused merely because a resumed split's repos file already has more than one candidate ==" >&2
+reset_tasks
+SD=$(new_split_dir_repos multirepo-rawafter-resume repo2)
+printf 'MARKER: mr-server\nA.\n' > "$SD/01-server.md"
+printf '01-server.md\t\n' > "$SD/graph.tsv"
+out=$(main add --split-dir "$SD" --repo "$REPO" --after tom/some-raw-branch -y 2>"$PQ_HOME/.err")
+rc=$?
+[ "$rc" -eq 0 ] && ok \
+  || bad "resuming with only ONE --repo must not trip the multi-repo refusal just because \$sd/repos already has two candidates: $(cat "$PQ_HOME/.err")"
+
+echo "== ...and still accepted on a single-repo split ==" >&2
+reset_tasks
+SD2=$(new_split_dir single-repo-rawafter)
+printf 'MARKER: solo\nDo the one thing.\n' > "$SD2/01-solo.md"
+printf '01-solo.md\t\n' > "$SD2/graph.tsv"
+out=$(main add --split-dir "$SD2" --repo "$REPO" --after tom/some-raw-branch -y 2>"$PQ_HOME/.err")
+rc=$?
+[ "$rc" -eq 0 ] && ok || bad "a raw branch --after should still work on a single-repo split: $(cat "$PQ_HOME/.err")"
+t=$(find_task do-solo-thing)
+eq "$(cut -f3 "$t/after" 2>/dev/null)" "tom/some-raw-branch" "the root part's after line records the raw branch"
 
 printf '\n%d passed, %d failed\n' "$pass" "$fail" >&2
 [ "$fail" -eq 0 ]
