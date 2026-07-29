@@ -98,7 +98,12 @@ reset_tasks
 # "already gone").
 mk_done() {                             # prio slug repo branch worktree_path -> task_dir
   local prio=$1 slug=$2 repo=$3 branch=$4 wt=$5
-  local dir="$PQ_HOME/done/$(printf '%03d' "$prio")-$slug"
+  # $prio is relative order, not a stamp - it is offset into the real
+  # (non-urgent) range so a fixture never accidentally reads as --urgent.
+  # $((10#$prio)) rather than a bare $prio: inside $(( )) a leading-zero
+  # literal like 020 is octal, exactly the bug this fixture must not
+  # reintroduce.
+  local dir="$PQ_HOME/done/$(printf '%014d' $(( 20260101000000 + 10#$prio )))-$slug"
   mkdir -p "$dir"
   {
     printf -- '---\n'

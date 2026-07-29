@@ -295,9 +295,9 @@ case "$after_admin" in
   *) bad "admin should wait on both parser and notify (got '$after_admin')" ;;
 esac
 
-p1=$(prio_of "$t_schema"); p2=$(prio_of "$t_parser"); p3=$(prio_of "$t_notify"); p4=$(prio_of "$t_admin")
+p1=$(stamp_of "$t_schema"); p2=$(stamp_of "$t_parser"); p3=$(stamp_of "$t_notify"); p4=$(stamp_of "$t_admin")
 [ "$p1" -lt "$p2" ] && [ "$p2" -le "$p3" ] && [ "$p3" -lt "$p4" ] && ok \
-  || bad "priorities should ascend in topological order (got $p1 $p2 $p3 $p4)"
+  || bad "stamps should ascend in topological order (got $p1 $p2 $p3 $p4)"
 
 case "$err" in *"3 waves"*) ok ;; *) bad "the diamond should report 3 waves (got: $err)" ;; esac
 case "$err" in *'$0.42'*) ok ;; *) bad "the cost report should surface total_cost_usd (got: $err)" ;; esac
@@ -355,12 +355,10 @@ rc=$?
 eq "$declined_out" "" "declining should print nothing to stdout"
 eq "$(queue_count)" "0" "declining should queue nothing"
 eq "$(wc -l < "$SPLIT_COUNTER" | tr -d ' ')" "1" "opus should have run exactly once so far"
-# Regression: cmd_add now always computes a real default priority before
-# do_split runs (so split_queue's own ascending-by-10 logic has a real
-# starting point) - the printed resume hint must not turn that computed
-# default into an explicit --priority the user never asked for.
+# Regression: the printed resume hint must not fabricate --urgent when the
+# split itself was never given one.
 case "$(cat "$PQ_HOME/.err")" in
-  *"--priority"*) bad "the resume hint must not fabricate --priority when none was given" ;;
+  *"--urgent"*) bad "the resume hint must not fabricate --urgent when none was given" ;;
   *) ok ;;
 esac
 
@@ -375,15 +373,15 @@ echo "== a single-part split queues exactly one task with no after file ==" >&2
 t=$(find_task do-solo-thing)
 [ -f "$t/after" ] && bad "a single part has nothing to wait on - no after file" || ok
 
-echo "== the resume hint DOES carry an explicit --priority when one was given ==" >&2
+echo "== the resume hint DOES carry an explicit --urgent when one was given ==" >&2
 reset_tasks
 : > "$SPLIT_COUNTER"
 PLAN2="$PQ_HOME/.solo-plan2.md"
 printf 'FIXTURE: solo\n\nOne small thing.\n' > "$PLAN2"
-main add "$PLAN2" --repo "$REPO" --split --priority 500 < /dev/null 2>"$PQ_HOME/.err" >/dev/null
+main add "$PLAN2" --repo "$REPO" --split --urgent < /dev/null 2>"$PQ_HOME/.err" >/dev/null
 case "$(cat "$PQ_HOME/.err")" in
-  *"--priority 500"*) ok ;;
-  *) bad "an explicitly-given --priority should survive into the resume hint (got: $(cat "$PQ_HOME/.err"))" ;;
+  *"--urgent"*) ok ;;
+  *) bad "an explicitly-given --urgent should survive into the resume hint (got: $(cat "$PQ_HOME/.err"))" ;;
 esac
 
 echo "== a graph.tsv with no trailing tab and no final newline still gates as 'no deps' ==" >&2

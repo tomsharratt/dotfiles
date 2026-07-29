@@ -92,6 +92,7 @@ Branch *lookups* are keyed on the repo as well as the name, but a task's slug is
 
 ```
 pq add [plan]            add a plan to the queue (no plan, at a terminal: pick one)
+pq add --urgent          allocate from a reserved range, ahead of every real date
 pq add --after T         repeatable, at add time: don't dispatch until T's PR has merged
 pq add --repo PATH       repeatable, only with --split/--split-dir: name the repos a split may use
 pq add --split           split a plan into a stack of standalone parts, wired with --after
@@ -104,12 +105,13 @@ pq show <task>           one task's header and plan
 pq tick [--cap N]        free finished slots, then fill them from the queue
 pq run [--interval S]    tick on an interval until you stop it
 pq cap [N]               how many may run at once; 0 pauses
-pq priority <task> N     re-order the queue
+pq urgent <task>         move it to the very front of the queue
+pq later <task>          move it to the very back of the queue
 pq hold / unhold         park a task, or put it back
 pq rm <task>             drop a task (never touches a worktree or a branch)
 ```
 
-The `NNN` prefix on a task directory is its priority and nothing else - promoting a task renames its directory, so commands take the task's slug, or any unique prefix of it.
+The fourteen-digit prefix on a task directory is a UTC timestamp and nothing else - promoting a task (`pq urgent`, `pq later`) renames its directory, so commands take the task's slug, or any unique prefix of it.
 
 #### Picking a plan
 
@@ -123,6 +125,16 @@ Passing a flag the wizard would otherwise ask about skips just that one question
 
 `-y` and no tty (a script, a cron run, an agent) skip the picker altogether and take the newest plan without asking anything - exactly what `pq add` has always done.
 A plan path given explicitly skips the picker too, but uses exactly that plan rather than the newest one - also unchanged from before.
+
+#### Order
+
+The queue is add-order, oldest first - a task's position is exactly when it was added, nothing more.
+`--urgent` allocates from a reserved range below any real date, so an urgent task always sorts ahead of every ordinary one.
+Two urgent tasks are still ordered oldest first between themselves, by the order they were made urgent.
+`pq urgent <task>` and `pq later <task>` are the only two moves - "do this next" and "not yet".
+There is no number to slot between two tasks, because plans are added in the order they should run, so there was never anything to insert between them.
+The fourteen-digit prefix is a fixed-width UTC timestamp, which is what makes bash's own glob order agree with numeric order - `pq ls` and the queue's actual dispatch order are the same order, as long as every task directory carries that prefix.
+A lingering directory from before this scheme won't - that is what the one-time migration is for.
 
 #### Blockers
 
