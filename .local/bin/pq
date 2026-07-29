@@ -57,16 +57,21 @@
 #            hold/025-risky-refactor/         parked by you
 #            running/005-spotify-scope-fix/   dispatched
 #            done/001-live-chat-links/        a PR exists, slot freed
-#            splits/live-chat-mentions-20260728-141230/   a plan mid-split, or one left over
+#            splits/live-chat-mentions-20260728-141230-83421/   a plan mid-split, or one left over
 #
 #   <task>/plan.md     the settings header + Claude's plan, immutable once added
 #          after       blockers: one per line, TSV  label <TAB> repo <TAB> branch
 #          state.env   KEY=VALUE runtime facts, written as dispatch progresses
 #
-#   <split>/source.md  the plan being split, copied in
-#          repo        one line: the checkout the splitter read, for --split-dir to check against
-#          graph.tsv   one line per part: filename <TAB> comma-separated filenames that must merge first
-#          NN-*.md     the parts themselves, written by the splitter
+#   <split>/source.md     the plan being split, copied in
+#          repos          the repo inventory the splitter was shown: TSV  label <TAB> path, primary first - what --split-dir checks against
+#                         (a split written before this file's field was called `repo` - one bare line, the primary only - and do_split still reads it as a fallback)
+#                         (row 1 can instead be a no-primary sentinel - an empty label, a container directory's path - when the plan was split from a directory that is not itself a repo; see repo_candidates_container)
+#          graph.tsv      one line per part: filename <TAB> comma-separated filenames that must merge first <TAB> repo label (empty for the primary, REQUIRED when there is none)
+#          NN-*.md        the parts themselves, written by the splitter
+#          splitter.json  the splitter session's own JSON output - cost, duration, permission denials
+#          splitter.err   the splitter session's stderr, read on failure
+#          .named.tsv     part <TAB> branch <TAB> slug <TAB> intent, written once naming succeeds
 #
 # `after` is neither of the other two: `plan.md` is immutable by contract so an
 # agent re-reading its own plan never sees it change, and `state.env` is runtime
@@ -102,6 +107,14 @@ PQ_PICK_LIMIT="${PQ_PICK_LIMIT:-10}"       # how many recent plans pick_plan lis
 # one, unlike its neighbours, is worth guarding against a bad override.
 [[ "$PQ_PICK_LIMIT" =~ ^[0-9]+$ ]] && [ "$PQ_PICK_LIMIT" -ge 1 ] || PQ_PICK_LIMIT=10
 PQ_PICK_PREVIEW="${PQ_PICK_PREVIEW:-12}"   # lines of a plan pick_plan previews
+PQ_REPOS_MAX="${PQ_REPOS_MAX:-12}"         # cap on repo_candidates'/repo_candidates_container's scanned inventory
+# Same reasoning as PQ_PICK_LIMIT above: a non-numeric override makes the
+# `-gt` truncation check below throw and, under `set -uo pipefail` (no -e),
+# silently take the false branch - disabling the cap rather than erroring -
+# and a non-positive one drives `head -n` with a zero or negative count,
+# which BSD and GNU head disagree on.
+[[ "$PQ_REPOS_MAX" =~ ^[0-9]+$ ]] && [ "$PQ_REPOS_MAX" -ge 1 ] || PQ_REPOS_MAX=12
+PQ_REPOS_DIR="${PQ_REPOS_DIR:-}"           # scan root override; default is the primary's dirname, or a container split's own path
 
 # What the session wall looks like on screen, and how hard to knock. These are
 # Claude Code UI strings, so they will change - hence up here and overridable
@@ -432,12 +445,20 @@ latest_plan() { recent_plans | head -1 | cut -f2-; }
 # spoken for by a sibling part in the same split, appended as one more sentence
 # rather than a second prompt - `do_split` retries a collision once with this set,
 # before giving up on that part.
-name_plan() {                           # plan_file [avoid: comma-separated branches already taken]
-  local raw json avoid=${2:-} prompt
+#
+# The optional third argument is the repo label a multi-repo split part lands
+# in - a task's slug is a single global namespace (`slug_taken_in` sweeps every
+# state), so an iOS part and an Android part of the same feature would
+# otherwise both want the same branch. Appended as one more sentence, exactly
+# like the avoid list, and omitted entirely for a single-repo split.
+name_plan() {                           # plan_file [avoid: comma-separated branches already taken] [repo_label]
+  local raw json avoid=${2:-} label=${3:-} prompt
   prompt='Read this plan and reply with ONLY a JSON object, no code fence, no commentary:
 {"branch":"tom/<3-5 dash-separated lowercase words naming the task>","intent":"<2-3 sentences, one line, saying what this sets out to achieve in the author'"'"'s terms - not a description of the diff>"}'
   [ -n "$avoid" ] && prompt="$prompt
 The branch must differ from these, which are already taken: $avoid"
+  [ -n "$label" ] && prompt="$prompt
+This part lands in the $label repository, so make the branch name say which one if the task's own words would not already distinguish it from the same work elsewhere."
   raw=$(claude -p --model "$PQ_NAMER_MODEL" "$prompt" < "$1" 2>/dev/null) || return 0
   # Be forgiving about a fenced or chatty reply: take the first {...} span.
   json=$(sed -n 's/.*\({.*}\).*/\1/p' <<<"$(tr '\n' ' ' <<<"$raw")" | head -1)
@@ -684,6 +705,11 @@ cmd_add() {
   # this script accumulates into a newline-joined string instead. See `repos`
   # in cmd_ls for the same idiom.
   local after_vals="" after_explicit=0
+  # `repo` stays the FIRST value given, so every existing single-repo path is
+  # untouched; `repo_vals` is the full repeatable set, read by do_split to
+  # decide whether the scan still contributes (see the asymmetry documented
+  # on do_split's own --repo handling).
+  local repo_vals=""
   # `intent` moves above the parse loop so `--intent` can set it before the
   # naming step decides whether it still needs to ask Haiku. `split` and
   # `split_dir` MUST stay local here too: `do_split` recurses back into this
@@ -699,7 +725,7 @@ cmd_add() {
       --model)     model=${2:-}; shift 2 ;;
       --effort)    effort=${2:-}; shift 2 ;;
       --priority)  prio=${2:-}; prio_explicit=1; shift 2 ;;
-      --repo)      repo=${2:-}; repo_explicit=1; shift 2 ;;
+      --repo)      repo_vals="${repo_vals}${2:-}"$'\n'; [ -n "$repo" ] || repo=${2:-}; repo_explicit=1; shift 2 ;;
       --after)     after_vals="${after_vals}${2:-}"$'\n'; after_explicit=1; shift 2 ;;
       --intent)    intent=${2:-}; intent_explicit=1; shift 2 ;;
       --split)     split=1; shift ;;
@@ -708,7 +734,7 @@ cmd_add() {
       --dev)       dev=true; shift ;;
       --hold)      hold=1; shift ;;
       --json)      as_json=1; shift ;;
-      -h|--help)   die "usage: pq add [plan.md] [--branch B] [--model M] [--effort E] [--priority N] [--repo PATH] [--after task|branch]... [--intent TEXT] [--split | --split-dir DIR] [-y] [--dev] [--hold] [--json]" ;;
+      -h|--help)   die "usage: pq add [plan.md] [--branch B] [--model M] [--effort E] [--priority N] [--repo PATH]... [--after task|branch]... [--intent TEXT] [--split | --split-dir DIR] [-y] [--dev] [--hold] [--json]" ;;
       -*)          die "unknown option '$1'" ;;
       *)           plan=$1; shift ;;
     esac
@@ -720,6 +746,14 @@ cmd_add() {
     die "--split-dir carries its own source.md - don't also pass a plan file"
   [ "$split" = 1 ] && [ -n "$split_dir" ] && \
     die "--split and --split-dir are mutually exclusive - pick one"
+
+  # A second --repo only means something when parts can land in different
+  # repos - a plain add queues one task in one repo, so a repeated --repo
+  # there is a mistake worth catching rather than silently taking the first.
+  local repo_n=0 rv
+  while IFS= read -r rv; do [ -n "$rv" ] || continue; repo_n=$((repo_n + 1)); done <<<"$repo_vals"
+  [ "$repo_n" -gt 1 ] && [ "$split" != 1 ] && [ -z "$split_dir" ] && \
+    die "--repo is repeatable only with --split or --split-dir - a plain add takes exactly one"
 
   if [ -n "$split_dir" ]; then
     [ -d "$split_dir" ] || die "no such split directory: $split_dir"
@@ -746,8 +780,14 @@ cmd_add() {
   # The repo is wherever you are standing when you add the plan - you planned the
   # work in it. Resolve to the MAIN checkout, so adding from inside a worktree
   # still queues against the repo the new worktree will be forked from.
+  #
+  # A failure to resolve is NOT fatal here: it only IS fatal for a plain add,
+  # which genuinely needs one repo - a --split can still work if cwd is
+  # itself a container of several checkouts rather than a repo, which is
+  # exactly what do_split's own container-mode scan handles. Whether this is
+  # a split may not be decided yet (the wizard below can still turn it into
+  # one), so the die is deferred past the split gate rather than dropped.
   [ -n "$repo" ] || repo=$(git -C "$PWD" worktree list --porcelain 2>/dev/null | awk '/^worktree /{print substr($0,10); exit}')
-  [ -n "$repo" ] || die "not inside a git repo - run this from the project, or pass --repo"
 
   # The wizard runs only for a plan the picker actually chose, and must run
   # before the priority default and the split gate below, so $split is
@@ -760,6 +800,13 @@ cmd_add() {
   # silently drop an explicit --branch instead of refusing it.
   [ -n "$branch" ] && [ "$split" = 1 ] && \
     die "--split queues N branches of its own - --branch has no meaning with it"
+
+  # Same reasoning, same fix: a repeatable --repo given alongside a plan the
+  # picker chose interactively must not be rejected just because the wizard
+  # hadn't yet answered "split into a stack of parts?" when the first check
+  # ran - $repo_n itself does not change, only $split does.
+  [ "$repo_n" -gt 1 ] && [ "$split" != 1 ] && [ -z "$split_dir" ] && \
+    die "--repo is repeatable only with --split or --split-dir - a plain add takes exactly one"
 
   # Default priority: the next clean step past everything already queued, so hand
   # editing stays easy - there is always room to slot something in between.
@@ -780,9 +827,15 @@ cmd_add() {
   [[ "$prio" =~ ^[0-9]+$ ]] || die "priority must be a number, got '$prio'"
 
   if [ -n "$split_dir" ] || [ "$split" = 1 ]; then
+    # cwd not being a repo is do_split's problem now, not ours - it either
+    # resolves a container path (see repo_candidates_container) or dies with
+    # a more specific message than we could give here.
+    [ -n "$repo" ] || repo=$PWD
     do_split
     return $?
   fi
+
+  [ -n "$repo" ] || die "not inside a git repo - run this from the project, or pass --repo"
 
   msg "plan:   $plan"
 
@@ -918,6 +971,100 @@ cmd_add() {
   repo_base_reset
 }
 
+# ── the repo inventory ───────────────────────────────────────────────────────
+# Discovered, not declared: a plan already names the repositories or directories
+# it touches, so the splitter only needs to know what is checked out and can
+# work out the rest. Candidates default to the git checkouts sitting alongside
+# the primary - siblings under its own parent directory - unless PQ_REPOS_DIR
+# names a different scan root.
+repo_candidates() {                     # primary_repo -> label<TAB>path, primary first, rest sorted by label
+  local primary=$1 root entry label resolved
+  root="${PQ_REPOS_DIR:-$(dirname "$primary")}"
+
+  printf '%s\t%s\n' "$(basename "$primary")" "$primary"
+  local seen_paths=$'\n'"$primary"$'\n' seen_labels=$'\n'"$(basename "$primary")"$'\n'
+
+  # Each entry resolves to its MAIN checkout via the same `git worktree list
+  # --porcelain` idiom cmd_add already uses on the primary (line ~751), so a
+  # linked worktree collapses onto its parent instead of counting twice.
+  local found=""
+  for entry in "$root"/*/; do
+    [ -d "$entry" ] || continue
+    entry=${entry%/}
+    case "$(basename "$entry")" in .*) continue ;; esac
+    resolved=$(git -C "$entry" worktree list --porcelain 2>/dev/null \
+                 | awk '/^worktree /{print substr($0,10); exit}')
+    [ -n "$resolved" ] || continue                     # not a git repo at all
+    case "$seen_paths" in *$'\n'"$resolved"$'\n'*) continue ;; esac
+    label=$(basename "$resolved")
+    case "$seen_labels" in *$'\n'"$label"$'\n'*) continue ;; esac
+    seen_paths="$seen_paths$resolved"$'\n'
+    seen_labels="$seen_labels$label"$'\n'
+    found="$found$label"$'\t'"$resolved"$'\n'
+  done
+  [ -n "$found" ] || return 0
+  # `found` already ends in `$'\n'` from the loop above, and `<<<` appends
+  # its OWN trailing newline unconditionally - so the here-string doubles up
+  # and `sort` sees one extra, empty final "line", which sorts to the front
+  # (empty precedes everything) and would otherwise surface as a phantom
+  # candidate. `sed` drops it the same way `cmd_ls`'s `multi` check does.
+  found=$(sort -t$'\t' -k1,1 <<<"$found" | sed '/^$/d')
+
+  # A silent truncation here would read as "the splitter considered
+  # everything" when it did not - so past PQ_REPOS_MAX, name every repo dropped.
+  local total; total=$(( $(grep -c . <<<"$found") + 1 ))
+  if [ "$total" -gt "$PQ_REPOS_MAX" ]; then
+    local keep=$(( PQ_REPOS_MAX - 1 )) dropped
+    dropped=$(tail -n +"$(( keep + 1 ))" <<<"$found" | cut -f1 | tr '\n' ' ')
+    found=$(head -n "$keep" <<<"$found")
+    warn "found $total candidate repos, more than PQ_REPOS_MAX ($PQ_REPOS_MAX) - dropped: $dropped - pass --repo explicitly to include one of these"
+  fi
+  printf '%s' "$found"
+}
+
+# Same discovery, for a plan added from a directory that is NOT itself a git
+# repo - a container holding several checkouts as peers (e.g. `~/projects`).
+# There is no primary among them: nothing here is privileged as the default a
+# part can land in without the plan saying so. Kept separate from
+# repo_candidates rather than folded into one function with a mode flag: the
+# two differ in scan root (a container scans itself, not its parent), in
+# dedup seeding (no primary to seed against), and in truncation math (no
+# primary consuming a slot) - similar shapes, different enough contracts that
+# sharing one signature would need more branching than the duplication costs.
+repo_candidates_container() {           # dir -> label<TAB>path, sorted by label
+  local dir=$1 root entry label resolved
+  root="${PQ_REPOS_DIR:-$dir}"
+
+  local seen_paths=$'\n' seen_labels=$'\n'
+  local found=""
+  for entry in "$root"/*/; do
+    [ -d "$entry" ] || continue
+    entry=${entry%/}
+    case "$(basename "$entry")" in .*) continue ;; esac
+    resolved=$(git -C "$entry" worktree list --porcelain 2>/dev/null \
+                 | awk '/^worktree /{print substr($0,10); exit}')
+    [ -n "$resolved" ] || continue                     # not a git repo at all
+    case "$seen_paths" in *$'\n'"$resolved"$'\n'*) continue ;; esac
+    label=$(basename "$resolved")
+    case "$seen_labels" in *$'\n'"$label"$'\n'*) continue ;; esac
+    seen_paths="$seen_paths$resolved"$'\n'
+    seen_labels="$seen_labels$label"$'\n'
+    found="$found$label"$'\t'"$resolved"$'\n'
+  done
+  [ -n "$found" ] || return 0
+  # Same here-string double-newline trap as repo_candidates above.
+  found=$(sort -t$'\t' -k1,1 <<<"$found" | sed '/^$/d')
+
+  local total; total=$(grep -c . <<<"$found")
+  if [ "$total" -gt "$PQ_REPOS_MAX" ]; then
+    local keep=$PQ_REPOS_MAX dropped
+    dropped=$(tail -n +"$(( keep + 1 ))" <<<"$found" | cut -f1 | tr '\n' ' ')
+    found=$(head -n "$keep" <<<"$found")
+    warn "found $total candidate repos under $dir, more than PQ_REPOS_MAX ($PQ_REPOS_MAX) - dropped: $dropped - pass --repo explicitly to include one of these"
+  fi
+  printf '%s' "$found"
+}
+
 # ── splitting a plan ─────────────────────────────────────────────────────────
 # `pq add --split` runs one Opus session that reads a whole-feature plan and
 # writes one standalone plan per seam plus a dependency graph, then queues
@@ -929,31 +1076,67 @@ cmd_add() {
 # the other half, since it is what keeps the part text honest about it.
 #
 # `do_split` reads `cmd_add`'s locals through bash's dynamic scope (`plan`,
-# `repo`, `repo_explicit`, `model`, `effort`, `dev`, `hold`, `prio`,
+# `repo`, `repo_explicit`, `repo_vals`, `model`, `effort`, `dev`, `hold`, `prio`,
 # `after_vals`, `as_json`, `yes`, `split_dir`) and is only ever called from
 # there - hence no arguments of its own.
 
 # The prompt the splitter session is given, passed as an argv element (unlike
 # `dispatch_prompt`, never typed into a pane's shell) so it has no quote
 # restriction.
-splitter_prompt() {                     # repo
+splitter_prompt() {                     # candidates: label<TAB>path, primary first (or an empty-label sentinel row when there is no primary - see do_split)
+  local candidates=$1 repo_block example primary_label primary_path repo_sentence field_sentence row1
+  row1=$(head -1 <<<"$candidates")
+  # `cut`, not `read`: a sentinel row starts with a literal tab (empty
+  # label), and bash's `read` treats a tab as "IFS whitespace" even when IFS
+  # holds nothing else - it strips that LEADING tab before splitting, so
+  # `IFS=$'\t' read` would shift the path into `primary_label` and leave
+  # `primary_path` empty. `cut` never trims field boundaries, so it reads an
+  # empty first field correctly.
+  primary_label=$(cut -f1 <<<"$row1"); primary_path=$(cut -f2 <<<"$row1")
+  # `$1 != ""` guards against a phantom trailing record: `candidates` can
+  # itself end in `$'\n'` (the explicit multi-repo `--repo` path builds it
+  # that way), and `<<<` appends its OWN newline unconditionally on top -
+  # doubling up into one empty final "line" that would otherwise print as a
+  # bare "- : " bullet in the prompt. It also naturally excludes the
+  # no-primary sentinel row itself, which is not a repository to read from.
+  repo_block=$(awk -F'\t' '$1 != "" { printf "- %s: %s\n", $1, $2 }' <<<"$candidates")
+
+  if [ -n "$primary_label" ]; then
+    repo_sentence="The primary is $primary_label ($primary_path). Use it unless source.md clearly places some of the work in one of the others - never assign a part to a repository the plan does not talk about."
+    field_sentence="the label of the repository this part belongs to, EMPTY for the primary"
+    example=$(printf '01-tip-fee-config.md\t\n02-tip-fee-ios.md\t01-tip-fee-config.md\tios\n03-tip-fee-android.md\t01-tip-fee-config.md\tandroid')
+  else
+    repo_sentence="There is no primary here - these repositories are peers, none of them a default. EVERY part must name which one it belongs to; never assign a part to a repository the plan does not talk about."
+    field_sentence="the label of the repository this part belongs to - REQUIRED, there is no primary to leave it empty for"
+    example=$(printf '01-tip-fee-config.md\t\tconfig\n02-tip-fee-ios.md\t01-tip-fee-config.md\tios\n03-tip-fee-android.md\t01-tip-fee-config.md\tandroid')
+  fi
+
   cat <<EOF
-Read ./source.md - it is a plan for a whole feature. The repository it describes is at $1, readable but never writable. Read whatever you need there to find the real seams in the plan.
+Read ./source.md - it is a plan for a whole feature. These repositories are checked out and readable, but never writable - read whatever you need from any of them to find the real seams in the plan:
+
+$repo_block
+
+$repo_sentence
 
 Write into the current directory ONLY:
 - One file per part: NN-short-slug.md, numbered in build order starting at 01, lowercase words separated by dashes.
-- graph.tsv: one line per part, tab-separated - filename<TAB>comma-separated filenames of the parts that must have MERGED before this one can start. Leave the second field empty for a part that can start now.
+- graph.tsv: one line per part, tab-separated - filename<TAB>comma-separated filenames of the parts that must have MERGED before this one can start<TAB>$field_sentence. Leave the second field empty for a part that can start now.
+
+Field discipline matters here: a root part (no dependencies) still needs an EMPTY middle field even when it names a repository in the third - a model that writes filename<TAB>label instead is read as a dependency named "label", and the split dies on "unknown dependency" once this session has already been paid for. A worked example, two dependent parts and one without:
+
+$example
 
 How to choose the split:
 - Each part is a pull request a human would enjoy reviewing: one coherent change, complete in itself.
-- Each part must leave the default branch working and shippable once merged. No part may need a later part to compile, pass tests, or behave correctly. A feature flag defaulting off is fine; a half-migrated schema is not.
-- Use as FEW parts as possible while that stays true. Two to six is the usual answer, never more than twelve. If the plan is already one coherent shippable change, write a single part.
-- Declare a dependency only where one really exists: an interface, schema, migration, or helper another part introduces, or two parts that would edit the same code and collide. Parts with no real dependency must have none declared - that is what lets them run in parallel.
+- Each part must leave its own repository's default branch working and shippable once merged. No part may need a later part to compile, pass tests, or behave correctly. A feature flag defaulting off is fine; a half-migrated schema is not.
+- A part belongs to exactly ONE repository, because a part is one pull request. Work that genuinely spans two repositories is two parts.
+- Use as FEW parts as possible while that stays true, WITHIN each repository - two to six per repository is the usual answer, never more than twelve in total. If the plan is already one coherent shippable change, write a single part.
+- Declare a dependency only where one really exists: an interface, schema, migration, or helper another part introduces, or two parts that would edit the same code and collide. This holds across repositories too - a client part that needs an endpoint, field, or flag a server part introduces depends on that server part. Parts with no real dependency must have none declared - that is what lets them run in parallel.
 - Between the parts, cover ALL of source.md: do not drop scope, do not add scope, do not leave anything to "a follow-up".
 
 How to write each part - it will be executed by an agent that sees ONLY that one file: it has never read source.md and cannot see any other part.
 - Never mention another part, its filename, or its number, and never say "the previous plan". Where a part relies on earlier work, state it as a fact about the code it will find - e.g. "the mentions table already has a notified_at column" - never as a reference to another plan or file.
-- Every part starts from the default branch with its declared dependencies already merged. Never tell a part to branch from, rebase onto, or cherry-pick another part's branch.
+- Every part starts from its own repository's default branch with its declared dependencies already merged. Never tell a part to branch from, rebase onto, or cherry-pick another part's branch.
 - Same shape as the plan you read: a Context section, the specific files to change, the existing functions and patterns to reuse, and a verification section. Real paths, confirmed to exist.
 - Do not start a part's file with '---' - no YAML front matter.
 EOF
@@ -999,9 +1182,15 @@ fmt_cost() {                            # cost_usd duration_ms
 # The reason a branch or slug cannot be used for a new part, or nothing -
 # `branch_taken` plus `slug_taken_in` (the same $STATES sweep `cmd_add` itself
 # runs), plus a sibling already named earlier in THIS split.
-split_name_collision() {                # branch slug named_file
-  local branch=$1 slug=$2 named_file=$3 why taken_in collider
-  why=$(branch_taken "$branch" "$repo") && { printf '%s' "$why"; return; }
+#
+# `part_repo` is an explicit argument rather than `$repo` off dynamic scope,
+# so each part's `branch_taken` check runs against ITS OWN repo - a part
+# assigned to a second repo claiming a branch already live in the primary
+# must queue, not be refused. `slug_taken_in` stays global on purpose: a slug
+# is a whole directory name, not a per-repo concept.
+split_name_collision() {                # branch slug named_file part_repo
+  local branch=$1 slug=$2 named_file=$3 part_repo=$4 why taken_in collider
+  why=$(branch_taken "$branch" "$part_repo") && { printf '%s' "$why"; return; }
   taken_in=$(slug_taken_in "$slug") \
     && { printf "a task named '%s' already exists in %s/" "$slug" "$taken_in"; return; }
   collider=$(awk -F'\t' -v b="$branch" -v s="$slug" '$2 == b || $3 == s { print $1; exit }' \
@@ -1075,6 +1264,61 @@ split_validate() {                      # sd -> dies on any violation
     }' "$g")
   [ -z "$selfdep" ] || die "graph.tsv has a part depending on itself: $(tr '\n' ' ' <<<"$selfdep") ($sd)"
 
+  # The third field: every non-empty one must be a label repo_candidates (or
+  # an explicit --repo set) actually offered the splitter - a model does not
+  # get to invent a repository. Classic two-file awk: $sd/repos read first
+  # into a lookup, graph.tsv checked against it second.
+  # A label is valid only with a non-empty path alongside it - a row like
+  # "somelabel<TAB>" (a blank path, from a hand-edited file) must not read as
+  # a real repository, or split_levels would resolve it to an empty string
+  # and reintroduce the exact empty-middle-field hazard `deps` staying last
+  # was written to avoid.
+  local badrepo
+  badrepo=$(awk -F'\t' '
+    NR == FNR { if ($1 != "" && $2 != "") valid[$1] = 1; next }
+    $1 != "" && $3 != "" && !($3 in valid) { print $1 ": " $3 }
+  ' "$sd/repos" "$g")
+  [ -z "$badrepo" ] || die "graph.tsv names a repository label that is not in $sd/repos - $badrepo ($sd)"
+
+  # Row 1 of $sd/repos is either the primary (a real label) or a no-primary
+  # sentinel do_split writes for a container split - empty label, the
+  # container path alongside it (see do_split). A row with BOTH fields empty
+  # is neither - a hand-edited file that lost its first line - and reading it
+  # as "no primary" would let every part's empty third field slide by
+  # unnoticed instead of dying here, where the mistake is easy to see.
+  # `cut`, not `read`: a sentinel row starts with a literal tab (empty
+  # label), and `read` strips a LEADING tab as "IFS whitespace" before
+  # splitting even when IFS holds nothing else, which would shift the path
+  # into row1_label and leave row1_path empty - the opposite of what this
+  # check needs. `cut` never trims field boundaries.
+  local row1 row1_label row1_path
+  row1=$(head -1 "$sd/repos")
+  row1_label=$(cut -f1 <<<"$row1"); row1_path=$(cut -f2 <<<"$row1")
+  if [ -z "$row1_label" ]; then
+    [ -n "$row1_path" ] || die "$sd/repos' first row is blank - it must be either the primary (label<TAB>path) or a no-primary sentinel (<TAB>container-path) ($sd)"
+    local noassign
+    noassign=$(awk -F'\t' '$1 != "" && $3 == "" { print $1 }' "$g")
+    [ -z "$noassign" ] || die "graph.tsv leaves the repository field empty for $(tr '\n' ' ' <<<"$noassign") - there is no primary in this split, so every part must name one ($sd)"
+  fi
+
+  # Every path the graph actually USES (not every candidate offered - an
+  # unrelated sibling costs nothing precisely because nothing ever checks it)
+  # must still exist and be a git repo - $sd/repos is a plain hand-editable
+  # TSV, and a part queued against a path that moved or was never a repo
+  # would fail unattended, far from where the mistake was made.
+  local usedpaths up
+  usedpaths=$(awk -F'\t' '
+    NR == FNR { path[$1] = $2; if (NR == 1) primary = $2; next }
+    $1 != "" { r = ($3 == "" ? primary : path[$3]); if (r != "") seen[r] = 1 }
+    END { for (p in seen) print p }
+  ' "$sd/repos" "$g")
+  while IFS= read -r up; do
+    [ -n "$up" ] || continue
+    [ -d "$up" ] || die "$sd/repos names $up, which no longer exists ($sd)"
+    git -C "$up" rev-parse --is-inside-work-tree >/dev/null 2>&1 \
+      || die "$sd/repos names $up, which is not a git repository ($sd)"
+  done <<<"$usedpaths"
+
   while IFS= read -r part; do
     [ -n "$part" ] || continue
     [ "$(head -1 "$sd/$part")" != "---" ] || \
@@ -1089,23 +1333,49 @@ split_validate() {                      # sd -> dies on any violation
   done <<<"$(awk -F'\t' '$1 != "" { print $1 }' "$g")"
 }
 
-# level<TAB>part<TAB>deps, sorted by level then part name - sorting by level
-# IS a valid topological order, since every part outranks each of its
-# dependencies. `tsort` is not usable here: on this machine it prints
-# "tsort: cycle in data" and still exits 0, so it cannot report a cycle -
-# iterative relaxation gives the wave number and the cycle check together.
+# level<TAB>part<TAB>repo(path)<TAB>label<TAB>deps, sorted by level then part
+# name - sorting by level IS a valid topological order, since every part
+# outranks each of its dependencies. `tsort` is not usable here: on this
+# machine it prints "tsort: cycle in data" and still exits 0, so it cannot
+# report a cycle - iterative relaxation gives the wave number and the cycle
+# check together.
+#
+# `label` is graph.tsv's own third field verbatim (or the primary's own
+# label when that field is empty) - never recomputed as `basename(repo)`,
+# which would show the wrong name the moment `$sd/repos` gives a repo a
+# label that differs from its directory's basename (a hand-edited file is a
+# first-class input, same as graph.tsv itself).
+#
+# `deps` stays LAST: it is the only field that can be empty (a root part),
+# and every consumer reads a row with `IFS=$'\t' read` - bash treats a tab as
+# "IFS whitespace" even when IFS holds nothing else, so a run of TWO adjacent
+# tabs (an empty field with non-empty neighbours on both sides) collapses to
+# one delimiter and silently shifts every field after it left. `repo` and
+# `label` are never empty (they resolve to the primary at worst - or, when
+# there is no primary, `split_validate` has already died on any part whose
+# third field was empty, so `path[$3]`/`$3` are the only branches a
+# no-primary split ever actually takes here), so putting them third and
+# fourth and leaving `deps` trailing keeps every row `read`-safe.
 #
 # NEVER calls `die`: the caller reaches this through `leveled=$(split_levels
 # ...)`, which forks a subshell, and an `exit` in there would kill only that
 # subshell and let the split limp on none the wiser. A cycle is reported on
 # stdout instead, with a non-zero return, for `do_split` - which is not
 # subshelled - to `die` on.
-split_levels() {                        # sd -> prints the leveled TSV, or "CYCLE ..." + return 1
+split_levels() {                        # sd -> prints level<TAB>part<TAB>repo(path)<TAB>label<TAB>deps, or "CYCLE ..." + return 1
   local sd=$1
   local g="$sd/graph.tsv" n out
   n=$(awk -F'\t' '$1 != "" { c++ } END { print c + 0 }' "$g")
+  # Two files, classic NR==FNR split: $sd/repos loads the label -> path map
+  # (and the primary, its first row) before graph.tsv's third field is
+  # resolved against it - an empty third field becomes the primary.
   out=$(awk -F'\t' -v n="$n" '
-    $1 != "" { name[NR] = $1; deps[NR] = $2; level[$1] = 1 }
+    NR == FNR { path[$1] = $2; if (FNR == 1) { primary = $2; primlabel = $1 } next }
+    $1 != "" {
+      name[NR] = $1; deps[NR] = $2; level[$1] = 1
+      repo[$1] = ($3 == "" ? primary : path[$3])
+      lbl[$1]  = ($3 == "" ? primlabel : $3)
+    }
     END {
       changed = 1
       for (pass = 1; pass <= n && changed; pass++) {
@@ -1141,9 +1411,9 @@ split_levels() {                        # sd -> prints the leveled TSV, or "CYCL
           if (dep == "") continue
           clean = (clean == "" ? dep : clean "," dep)
         }
-        printf "%d\t%s\t%s\n", level[name[i]], name[i], clean
+        printf "%d\t%s\t%s\t%s\t%s\n", level[name[i]], name[i], repo[name[i]], lbl[name[i]], clean
       }
-    }' "$g")
+    }' "$sd/repos" "$g")
   case "$out" in
     CYCLE*) printf '%s' "$out"; return 1 ;;
   esac
@@ -1163,16 +1433,20 @@ split_levels() {                        # sd -> prints the leveled TSV, or "CYCL
 # naming both parts, with nothing queued. A part that yields no name at all
 # is also a hard error: `cmd_add`'s "pass --branch" advice has no meaning
 # inside a split.
-split_name_parts() {                    # sd leveled_tsv
-  local sd=$1 leveled=$2
+split_name_parts() {                    # sd leveled_tsv multi
+  local sd=$1 leveled=$2 multi=$3
   local named_file="$sd/.named.tsv"
   : > "$named_file"
-  local level part deps named branch intent slug reason avoid try
-  while IFS=$'\t' read -r level part deps; do
+  local level part repopath label deps named branch intent slug reason avoid try
+  while IFS=$'\t' read -r level part repopath label deps; do
     [ -n "$part" ] || continue
     avoid=""
     for try in 1 2; do
-      named=$(name_plan "$sd/$part" "$avoid")
+      if [ "$multi" = 1 ]; then
+        named=$(name_plan "$sd/$part" "$avoid" "$label")
+      else
+        named=$(name_plan "$sd/$part" "$avoid")
+      fi
       [ -n "$named" ] || die "$part: could not derive a branch name and intent - naming failed"
       IFS=$'\t' read -r branch intent <<<"$named"
       [ -n "$branch" ] || die "$part: could not derive a branch name - naming failed"
@@ -1180,7 +1454,7 @@ split_name_parts() {                    # sd leveled_tsv
       slug=$(branch_to_slug "$branch")
       [ -n "$slug" ] || die "$part: branch '$branch' does not reduce to a usable name"
 
-      reason=$(split_name_collision "$branch" "$slug" "$named_file")
+      reason=$(split_name_collision "$branch" "$slug" "$named_file" "$repopath")
       if [ -z "$reason" ]; then
         printf '%s\t%s\t%s\t%s\n' "$part" "$branch" "$slug" "$intent" >> "$named_file"
         break
@@ -1196,25 +1470,38 @@ split_name_parts() {                    # sd leveled_tsv
 
 # Shown before anything is queued, then "[y/N]" unless `-y`. Built as a TSV
 # and passed to the existing `render_table`, so columns pad to their widest
-# cell like `pq ls` and `wt ls` - every cell here is ASCII by construction
+# cell like `pq ls` and `wt ls` - every cell but REPO is ASCII by construction
 # (the filename charset check and `check-ref-format`), which `render_table`
-# requires, since macOS `awk`'s `length()` counts bytes.
+# requires, since macOS `awk`'s `length()` counts bytes - REPO alone goes
+# through `cell()`.
 #
 # All of it goes to stderr: `pq add --split`'s stdout contract is the slugs
 # (or, with --json, the JSON array), the same as an ordinary `pq add`'s
 # stdout is just the slug - a caller piping this for a slug list must never
 # see the table.
-split_confirm() {                       # sd leveled_tsv named_file cost_str -> 0 confirmed, 1 declined
-  local sd=$1 leveled=$2 named_file=$3 cost_str=${4:-}
+split_confirm() {                       # sd leveled_tsv named_file cost_str multi -> 0 confirmed, 1 declined
+  local sd=$1 leveled=$2 named_file=$3 cost_str=${4:-} multi=${5:-0}
   local tbl="$PQ_HOME/.splitconfirm.$$"
-  printf 'PART\tWAVE\tBRANCH\tAFTER\n' > "$tbl"
-  local level part deps branch after_disp nparts nwaves ans
-  while IFS=$'\t' read -r level part deps; do
+  # A REPO column, but only once the parts actually span more than one -
+  # same rule and idiom cmd_ls and pick_after use for their own PROJECT
+  # column. It is the only cell here that needs `cell()`: part filenames and
+  # branches are ASCII by construction, a repo LABEL might not be.
+  if [ "$multi" = 1 ]; then
+    printf 'PART\tWAVE\tREPO\tBRANCH\tAFTER\n' > "$tbl"
+  else
+    printf 'PART\tWAVE\tBRANCH\tAFTER\n' > "$tbl"
+  fi
+  local level part repopath label deps branch after_disp nparts nwaves ans
+  while IFS=$'\t' read -r level part repopath label deps; do
     [ -n "$part" ] || continue
     branch=$(awk -F'\t' -v p="$part" '$1 == p { print $2; exit }' "$named_file")
     after_disp="-"
     [ -n "$deps" ] && after_disp=${deps//,/, }
-    printf '%s\t%s\t%s\t%s\n' "$part" "$level" "$branch" "$after_disp" >> "$tbl"
+    if [ "$multi" = 1 ]; then
+      printf '%s\t%s\t%s\t%s\t%s\n' "$part" "$level" "$(cell "$label" 20)" "$branch" "$after_disp" >> "$tbl"
+    else
+      printf '%s\t%s\t%s\t%s\n' "$part" "$level" "$branch" "$after_disp" >> "$tbl"
+    fi
   done <<<"$leveled"
 
   nparts=$(( $(wc -l < "$tbl" | tr -d ' ') - 1 ))
@@ -1252,14 +1539,14 @@ split_queue() {                         # sd leveled_tsv named_file
   local devflag=""; [ "$dev" = true ] && devflag=--dev
   local holdflag=""; [ "$hold" = 1 ] && holdflag=--hold
   local cur_prio=$prio
-  local n=0 total level part deps row branch intent afterflags dep depslug prioflag task out rc av
+  local n=0 total level part repopath label deps row branch intent afterflags dep depslug prioflag task out rc av
 
   # $leveled already has exactly one line per part - no need to touch
   # graph.tsv again for a count already sitting in an argument this function
   # was handed.
   total=$(wc -l <<<"$leveled" | tr -d ' ')
 
-  while IFS=$'\t' read -r level part deps; do
+  while IFS=$'\t' read -r level part repopath label deps; do
     [ -n "$part" ] || continue
     n=$((n + 1))
     row=$(awk -F'\t' -v p="$part" '$1 == p { print; exit }' "$named_file")
@@ -1297,7 +1584,10 @@ $av
 
     # shellcheck disable=SC2086  # devflag/holdflag/prioflag/afterflags are
     # deliberately unquoted - see the identical idiom at pq:1573 for $devflag.
-    out=$(cmd_add "$sd/$part" --repo "$repo" --branch "$branch" --intent "$intent" \
+    # Each part's OWN repo, resolved by split_levels - never the shared
+    # `$repo`, which is only ever the primary (or, in a no-primary container
+    # split, not a repo at all).
+    out=$(cmd_add "$sd/$part" --repo "$repopath" --branch "$branch" --intent "$intent" \
             --model "$model" --effort "$effort" $devflag $holdflag \
             $prioflag $afterflags --json)
     rc=$?
@@ -1323,20 +1613,72 @@ $av
 }
 
 do_split() {
-  local sd stamp stem cost_str=""
+  local sd stamp stem cost_str="" candidates
+
+  # How many --repo values THIS invocation gave, regardless of branch -
+  # repeatable --repo is the escape hatch, not the normal path (Decisions),
+  # so this is the one signal that the user - not merely the scan - is
+  # declaring more than one repo is in play.
+  local repo_n=0 rv
+  while IFS= read -r rv; do [ -n "$rv" ] && repo_n=$((repo_n + 1)); done <<<"$repo_vals"
 
   if [ -n "$split_dir" ]; then
     sd=$split_dir
     [ -f "$sd/source.md" ] || die "$sd has no source.md - not a split directory"
-    local recorded; recorded=$(cat "$sd/repo" 2>/dev/null)
-    # `--repo` passed explicitly is how you say "yes, I mean it" - parts name
-    # real files in a specific checkout, so re-running a stale split against
-    # the wrong repo would queue parts describing files that do not exist,
-    # and nothing downstream would catch it. Auto-resolved from cwd, a
-    # mismatch is far more likely an accident: you are standing in the wrong
-    # place, not choosing to override.
-    if [ -n "$recorded" ] && [ "$recorded" != "$repo" ] && [ "$repo_explicit" != 1 ]; then
-      die "$sd was split against $recorded, not $repo - cd there, or pass --repo to confirm you mean it"
+
+    if [ -s "$sd/repos" ]; then
+      candidates=$(cat "$sd/repos")
+    else
+      # Pre-multi-repo split directory: a single recorded repo is a
+      # single-candidate inventory, so every split written before this
+      # change still resumes.
+      local legacy; legacy=$(cat "$sd/repo" 2>/dev/null)
+      [ -n "$legacy" ] && candidates=$(printf '%s\t%s' "$(basename "$legacy")" "$legacy")
+    fi
+    [ -n "$candidates" ] || die "$sd has no repo or repos file - not a split directory"
+
+    # `cut`, not `read`: a no-primary sentinel row starts with a literal tab
+    # (empty label), and `read` strips a LEADING tab as "IFS whitespace"
+    # before splitting even when IFS holds nothing else - it would shift the
+    # container path into recorded_label and leave recorded_path empty,
+    # misreading a container split as an ordinary one with a real primary.
+    local row1 recorded_label recorded_path
+    row1=$(head -1 <<<"$candidates")
+    recorded_label=$(cut -f1 <<<"$row1"); recorded_path=$(cut -f2 <<<"$row1")
+    if [ -n "$recorded_label" ]; then
+      # `--repo` passed explicitly is how you say "yes, I mean it" - parts name
+      # real files in a specific checkout, so re-running a stale split against
+      # the wrong repo would queue parts describing files that do not exist,
+      # and nothing downstream would catch it. Auto-resolved from cwd, a
+      # mismatch is far more likely an accident: you are standing in the wrong
+      # place, not choosing to override. Only the PRIMARY is ever compared
+      # against cwd - the rest of a recorded multi-repo set is untouched.
+      if [ -n "$recorded_path" ] && [ "$recorded_path" != "$repo" ] && [ "$repo_explicit" != 1 ]; then
+        die "$sd was split against $recorded_path, not $repo - cd there, or pass --repo to confirm you mean it"
+      fi
+
+      # $sd/repos is authoritative on resume - it is not re-scanned or
+      # re-collected from --repo, so a SECOND (or later) --repo here has no
+      # effect beyond the first, which only ever overrides the primary.
+      [ "$repo_n" -gt 1 ] && \
+        warn "resuming ignores every --repo past the first - $sd/repos already fixes the rest of the set"
+
+      local newlabel oldtail; newlabel=$(basename "$repo")
+      oldtail=$(tail -n +2 <<<"$candidates")
+      case $'\n'"$oldtail" in
+        *$'\n'"$newlabel"$'\t'*)
+          die "the overriding --repo's label ('$newlabel') collides with an already-recorded repo in $sd/repos - rename one, or edit the file directly" ;;
+      esac
+      candidates=$(printf '%s\t%s\n' "$newlabel" "$repo"; printf '%s' "$oldtail")
+      printf '%s\n' "$candidates" > "$sd/repos"
+    else
+      # No-primary/container split (row 1 is the empty-label sentinel
+      # do_split writes for one): there is no primary slot to compare cwd
+      # against or override - $sd/repos is already the complete, fixed set
+      # every part's label was validated against, so --repo has no effect
+      # here beyond a warning.
+      [ "$repo_n" -ge 1 ] && \
+        warn "resuming a no-primary split - --repo has no effect here, $sd/repos already fixes the set; edit it directly to change which repositories are in play"
     fi
     msg "resuming split from $sd"
   else
@@ -1354,23 +1696,125 @@ do_split() {
     # COPY, never move - same reason cmd_add copies rather than moves out of
     # $PLANS_DIR: it is Claude Code's directory and it prunes it.
     cp "$plan" "$sd/source.md" || die "could not copy the plan into $sd"
-    printf '%s\n' "$repo" > "$sd/repo"
 
-    local before after rc is_error cost dur denials
-    # Snapshotted before and after: `--tools` cannot scope `Write` to one
-    # directory, and `--add-dir` grants the repo to every allowed tool, so the
-    # prompt's instruction not to write there is not a guarantee - this is
-    # the only net there is.
-    before=$(git -C "$repo" status --porcelain 2>/dev/null)
+    # Repeatable --repo is the escape hatch, not the normal path: a single
+    # --repo is how you fix a wrong cwd, and it must not silently turn
+    # multi-repo splitting off - the scan still contributes unless TWO OR
+    # MORE were given, in which case the set is exactly those.
+    if [ "$repo_n" -ge 2 ]; then
+      candidates=""
+      while IFS= read -r rv; do
+        [ -n "$rv" ] || continue
+        case $'\n'"$candidates" in *$'\n'"$(basename "$rv")"$'\t'*)
+          die "--repo '$rv' and another --repo share the label '$(basename "$rv")' - the splitter cannot tell them apart" ;;
+        esac
+        candidates="${candidates}$(basename "$rv")"$'\t'"$rv"$'\n'
+      done <<<"$repo_vals"
+    elif git -C "$repo" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+      candidates=$(repo_candidates "$repo")
+    else
+      # $repo is not itself a git repo - a container directory holding
+      # several checkouts as peers (cmd_add sets it to $PWD for exactly this
+      # case when cwd isn't a repo, or an explicit --repo named the
+      # container directly). Scan ITS OWN children rather than a parent's,
+      # and record NO primary: row 1 of $sd/repos becomes a sentinel - an
+      # empty label alongside the container path - so every consumer
+      # downstream (splitter_prompt, split_validate, the resume branch
+      # above) can tell a container split apart from an ordinary one with
+      # one cheap check: is row 1's label empty?
+      [ -d "$repo" ] || die "no such directory: $repo"
+      local containerset containerpath
+      containerset=$(repo_candidates_container "$repo")
+      [ -n "$containerset" ] || \
+        die "$repo is not a git repository and has no git repositories under it - pass --repo to name one explicitly"
+      # Resolved the same way every child is (git-worktree resolution is a
+      # no-op outside a repo, so `cd && pwd -P` is the equivalent for a plain
+      # directory) - nothing compares this path against anything today, but
+      # $sd/repos is hand-editable, and an unresolved row 1 next to resolved
+      # children is exactly the macOS /var-vs-/private/var mismatch waiting
+      # for whoever adds that comparison next.
+      containerpath=$(cd "$repo" && pwd -P)
+      candidates=$(printf '\t%s\n' "$containerpath"; printf '%s' "$containerset")
+    fi
+    printf '%s\n' "$candidates" > "$sd/repos"
+  fi
+
+  # A raw branch is ambiguous once there is no privileged default it could
+  # resolve against - it resolves against the OWNER's repo (resolve_after),
+  # and for a root part that owner is now the part's own repo, not
+  # necessarily a primary.
+  #
+  # Two DIFFERENT ways to reach that: an EXPLICIT --repo count of 2+
+  # (Decisions' escape hatch), or a no-primary container split, where every
+  # repo is a peer and a root part could land in ANY of them. Neither is
+  # gated on how many candidates the scan happened to turn up: repo_candidates
+  # scans the primary's own parent directory by default, which commonly holds
+  # several unrelated checkouts, and an unrelated candidate is supposed to
+  # cost nothing (Decisions) - it must not turn an ordinary single-repo
+  # `--split --after some/branch` into a hard refusal just because a sibling
+  # happens to sit next to the primary. `no_primary` is read off the
+  # FINALIZED $candidates (row 1's label), after both the resume and fresh
+  # branches above have converged on one - the one point where either path's
+  # sentinel row is already settled. The narrower, real danger - the
+  # splitter actually assigning a root part elsewhere without the user
+  # having asked for that - is the confirmation table's job to catch, same
+  # as any other repo assignment a human, not validation, has to judge.
+  # `cut`, not `read`: same leading-tab trap as everywhere else a sentinel
+  # row's label needs checking - `read` would strip it and read the
+  # container's PATH as a non-empty "label", hiding a no-primary split from
+  # this exact check.
+  local no_primary=0 primlbl
+  primlbl=$(cut -f1 <<<"$(head -1 <<<"$candidates")")
+  [ -n "$primlbl" ] || no_primary=1
+
+  if [ "$repo_n" -ge 2 ] || [ "$no_primary" = 1 ]; then
+    local av
+    while IFS= read -r av; do
+      [ -n "$av" ] || continue
+      case "$av" in
+        */*) die "--after '$av' is a raw branch - ambiguous across a multi-repo split, since it resolves against a repo this split hasn't assigned yet. Name a task slug instead (it carries its own repo), or queue without it and add the blocker afterwards with: pq after <part> $av" ;;
+      esac
+    done <<<"$after_vals"
+  fi
+
+  if [ -z "$split_dir" ]; then
+    local rc is_error cost dur denials
+    local statusdir="$PQ_HOME/.splitstatus.$$" lbl lpath
+    # A real array, not the newline-joined-string idiom used for repeatable
+    # CLI options elsewhere in this file: those values are all guaranteed
+    # space-free by construction (branch names, digits, literal flags), but a
+    # checkout's path is not, and unquoted word-splitting would cut a path
+    # like "My Drive/supercast" in two. `candidates` always has at least one
+    # real (non-sentinel) row - the primary, or a container split's first
+    # discovered child - so this array is never empty - the bash-3.2
+    # "unbound variable on an empty array" trap under `set -u` cannot bite
+    # here.
+    local add_dir_args=()
+    mkdir -p "$statusdir"
+    # Snapshotted before and after, for every candidate: `--tools` cannot
+    # scope `Write` to one directory, and `--add-dir` grants the repo to
+    # every allowed tool, so the prompt's instruction not to write there is
+    # not a guarantee - this is the only net there is.
+    while IFS=$'\t' read -r lbl lpath; do
+      [ -n "$lbl" ] || continue
+      git -C "$lpath" status --porcelain 2>/dev/null > "$statusdir/$lbl.before"
+      add_dir_args+=(--add-dir "$lpath")
+    done <<<"$candidates"
+
     msg "splitting $(basename "$plan") with $PQ_SPLITTER_MODEL - this takes a few minutes"
     ( cd "$sd" && claude -p --model "$PQ_SPLITTER_MODEL" --effort "$PQ_SPLITTER_EFFORT" \
-        --add-dir "$repo" --tools "Read,Grep,Glob,Write" \
-        --permission-mode acceptEdits --output-format json "$(splitter_prompt "$repo")" ) \
+        "${add_dir_args[@]}" --tools "Read,Grep,Glob,Write" \
+        --permission-mode acceptEdits --output-format json "$(splitter_prompt "$candidates")" ) \
       < /dev/null > "$sd/splitter.json" 2> "$sd/splitter.err"
     rc=$?
-    after=$(git -C "$repo" status --porcelain 2>/dev/null)
-    [ "$before" = "$after" ] \
-      || warn "the splitter left $repo dirty - it was only meant to read from it: $(tr '\n' ' ' <<<"$after")"
+
+    while IFS=$'\t' read -r lbl lpath; do
+      [ -n "$lbl" ] || continue
+      git -C "$lpath" status --porcelain 2>/dev/null > "$statusdir/$lbl.after"
+      cmp -s "$statusdir/$lbl.before" "$statusdir/$lbl.after" \
+        || warn "the splitter left $lpath dirty - it was only meant to read from it: $(tr '\n' ' ' < "$statusdir/$lbl.after")"
+    done <<<"$candidates"
+    rm -rf "$statusdir"
 
     is_error=$(jq -r '.is_error // empty'        "$sd/splitter.json" 2>/dev/null)
     cost=$(jq -r      '.total_cost_usd // empty' "$sd/splitter.json" 2>/dev/null)
@@ -1389,10 +1833,17 @@ do_split() {
     die "graph.tsv has a dependency cycle involving:${leveled#CYCLE} ($sd)"
   fi
 
-  split_name_parts "$sd" "$leveled"
+  # Computed once, here, and threaded through both consumers below - the
+  # repo hint only matters once a part could otherwise collide with the same
+  # task words used for a sibling in another repo, so a single-repo split's
+  # naming call stays byte-identical to today's, and the confirm table's
+  # REPO column appears on the same condition.
+  local multi; multi=$(cut -f3 <<<"$leveled" | sort -u | awk 'END { print (NR > 1) }')
+
+  split_name_parts "$sd" "$leveled" "$multi"
   local named_file="$sd/.named.tsv"
 
-  if ! split_confirm "$sd" "$leveled" "$named_file" "$cost_str"; then
+  if ! split_confirm "$sd" "$leveled" "$named_file" "$cost_str" "$multi"; then
     msg "declined - nothing queued. Edit parts under $sd, then resume with: $(split_resume_hint "$sd")"
     return 0
   fi

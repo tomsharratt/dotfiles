@@ -88,11 +88,12 @@ Either way, it then asks Haiku for a branch name and a one-line statement of int
 Each task records its own project, so one queue serves all of them.
 The project is wherever you were standing when you added the plan, resolved to the main checkout so adding from inside a worktree still queues against the repo the new worktree gets forked from; `--repo PATH` sets it explicitly.
 Dispatch runs `wt new` in that repo, which picks up its profile, and everything downstream is per-task from there - `pq ls` grows a `PROJECT` column as soon as the queue holds more than one.
-Branch names only have to be unique within their own project, so `tom/fix-timezone` can exist in two of them at once, and every branch lookup is keyed on the repo as well as the name.
+Branch *lookups* are keyed on the repo as well as the name, but a task's slug is a single global namespace, so two live tasks can never share a branch leaf even across two different projects - `tom/fix-timezone` cannot be queued in both at once.
 
 ```
 pq add [plan]            add a plan to the queue (no plan, at a terminal: pick one)
 pq add --after T         repeatable, at add time: don't dispatch until T's PR has merged
+pq add --repo PATH       repeatable, only with --split/--split-dir: name the repos a split may use
 pq add --split           split a plan into a stack of standalone parts, wired with --after
 pq add --split-dir D     queue an already-split directory, skipping the split step
 pq after <task>          list a task's blockers and what each is waiting on
@@ -184,11 +185,21 @@ The load-bearing constraint is that parts wait for merges, never for branches - 
 Each part starts from the default branch with its declared dependencies already merged, and every part is written for an agent that sees only that one file: it never mentions another part, its filename, or its branch.
 `pq` validates this before anything is queued - full coverage of the original plan, no missing or forgotten parts, no cycles, and no part referencing a sibling by name - and refuses to queue anything if a check fails.
 
-The split artifacts land in `$PQ_HOME/splits/<plan>-<stamp>/`: the source plan, one `NN-short-slug.md` per part, and `graph.tsv` recording which parts must merge before which others.
+The split artifacts land in `$PQ_HOME/splits/<plan>-<stamp>-<pid>/`: the source plan, one `NN-short-slug.md` per part, and `graph.tsv` recording which parts must merge before which others.
 Before queueing anything, `pq` shows a table of the parts, their wave (how many merges deep they are), their branch, and what each waits on, then asks to confirm - `-y` skips the prompt, but `--json` does not, so a caller after machine-readable output never gets tasks queued unlooked-at.
 Declining leaves the split directory on disk and costs nothing: `pq add --split-dir <dir>` resumes from it later, without paying for the Opus session again, which is what makes hand-editing a part before it ships a first-class path.
 
 `--after` on the split itself only applies to the root parts - the ones with no dependency inside the split - since `pq after`'s own reporting already surfaces the rest of the chain to anyone asking why a downstream part hasn't started.
+
+A plan that names more than one checkout - a mobile feature spanning the Rails monolith and the iOS app, say - gets its parts assigned across repositories instead of forced into one.
+The splitter is shown every git checkout sitting alongside the primary, or under `PQ_REPOS_DIR` if you'd rather point it somewhere else, and told to use the primary unless the plan clearly places some of the work elsewhere - it never assigns a part to a repository the plan doesn't talk about.
+A part belongs to exactly one repository, because a part is one pull request; work that genuinely spans two repositories is two parts, wired with an ordinary `--after` the same way an intra-repo dependency is - a client part waiting on the server part it needs is just that edge crossing a repo boundary.
+`--repo PATH` is repeatable and is the escape hatch for the discovery, not the normal path: passing it once still lets the scan contribute, which is how you fix a wrong cwd without silently turning multi-repo splitting off, and only passing it two or more times narrows the set to exactly those repos.
+`-y` accepts the splitter's repo assignment sight unseen - the confirmation table, which grows a `REPO` column once a split actually spans more than one repository, always prints to stderr before that early return, so it is the audit trail even when nothing pauses to ask.
+
+Running `pq add --split` from `~/projects` itself - a directory that holds several checkouts but is not a checkout of anything - works the same way in reverse: instead of scanning the primary's siblings, `pq` discovers `~/projects`' own immediate children that are git repositories and offers those as the candidate set.
+There is no primary in that case, deliberately: nothing among a container's children is privileged as a default the splitter can fall back into, so every part's repository assignment becomes required rather than optional, and a part left unassigned fails validation instead of silently landing wherever the primary would have been.
+The same `--repo PATH` naming a directory instead of a checkout triggers this from anywhere, not only from inside the container itself.
 
 #### Hitting the session limit
 
