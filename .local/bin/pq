@@ -22,12 +22,14 @@
 #   pq after <task> T... add blockers to a task already in the queue or held
 #   pq after <task> --clear   drop them all
 #   pq ls                every task, its state, and what it is waiting on
+#   pq ls --all           also show archive/ - settled history pq no longer walks
 #   pq show <task>       one task's header and plan
 #   pq urgent <task>     move it to the very front of the queue
 #   pq later <task>      move it to the very back of the queue
 #   pq hold <task>       park a task so nothing picks it up
 #   pq unhold <task>     put it back in the queue
 #   pq rm <task>         drop a task (never touches a worktree or a branch)
+#   pq archive <task>    file a done task away by hand (done only)
 #   pq tick              free finished slots, then fill them from the queue
 #   pq run               tick on an interval until you stop it
 #   pq cap [N]           how many may run at once; 0 pauses. Read every tick.
@@ -52,6 +54,12 @@
 # thing that holds a teardown off is the agent still going, or `pq` itself
 # sitting in the workspace about to be closed - see `reap_task` below.
 #
+# Once a done task's verdict is terminal - merged and torn down, or every PR
+# closed without one - `pq tick` files it away to `archive/`, keeping only the
+# newest few behind (`PQ_DONE_KEEP`) so `pq ls` stays a list of what still
+# needs a look rather than a growing pile of finished history. See
+# `archive_pass` below, and `pq archive` for the manual escape hatch.
+#
 # LAYOUT ─────────────────────────────────────────────────────────────────────
 # A task is a DIRECTORY, and the directory it sits in is its state:
 #
@@ -59,6 +67,7 @@
 #            hold/20260729150431-risky-refactor/         parked by you
 #            running/20260729121005-spotify-scope-fix/   dispatched
 #            done/20260728091500-live-chat-links/        a PR exists, slot freed
+#            archive/20260727080000-live-chat-onboarding/  settled history - `pq ls` hides it, tick never walks it
 #            splits/live-chat-mentions-20260728-141230-83421/   a plan mid-split, or one left over
 #
 #   <task>/plan.md     the settings header + Claude's plan, immutable once added
@@ -97,7 +106,7 @@ set -uo pipefail
 PQ_HOME="${PQ_HOME:-${XDG_STATE_HOME:-$HOME/.local/state}/pq}"
 PLANS_DIR="${PQ_PLANS_DIR:-$HOME/.claude/plans}"
 WT="${PQ_WT:-$HOME/.local/bin/wt}"
-STATES="queue hold running done"
+STATES="queue hold running done archive"
 
 # Any stamp below this has a year under 1000, so it cannot be a date pq ever
 # produced - which is what makes the low range safe to reserve for --urgent.
@@ -122,6 +131,10 @@ PQ_REPOS_MAX="${PQ_REPOS_MAX:-12}"         # cap on repo_candidates'/repo_candid
 # which BSD and GNU head disagree on.
 [[ "$PQ_REPOS_MAX" =~ ^[0-9]+$ ]] && [ "$PQ_REPOS_MAX" -ge 1 ] || PQ_REPOS_MAX=12
 PQ_REPOS_DIR="${PQ_REPOS_DIR:-}"           # scan root override; default is the primary's dirname, or a container split's own path
+PQ_LABEL_MAX="${PQ_LABEL_MAX:-16}"         # max chars of a blocker label in AGENT's cell, before the +N count
+[[ "$PQ_LABEL_MAX" =~ ^[0-9]+$ ]] && [ "$PQ_LABEL_MAX" -ge 1 ] || PQ_LABEL_MAX=16
+PQ_DONE_KEEP="${PQ_DONE_KEEP:-3}"           # newest archivable done/ tasks archive_pass leaves behind; 0 is legal
+[[ "$PQ_DONE_KEEP" =~ ^[0-9]+$ ]] || PQ_DONE_KEEP=3
 
 # What the session wall looks like on screen, and how hard to knock. These are
 # Claude Code UI strings, so they will change - hence up here and overridable
@@ -299,13 +312,15 @@ task_name() {                           # stamp slug
 next_stamp() {                          # [urgent] -> bare integer
   local urgent=${1:-0} want max=0 s d
   if [ "$urgent" = 1 ]; then want=1; else want=$(date -u +%Y%m%d%H%M%S); fi
+  # Spans archive: a stamp must never be reissued, and an archived task is
+  # still a task that once claimed this number. See all_tasks.
   while IFS= read -r d; do
     [ -n "$d" ] || continue
     s=$(stamp_of "$d")
     if [ "$urgent" = 1 ]; then [ "$s" -lt "$PQ_STAMP_REAL" ] || continue
     else                       [ "$s" -ge "$PQ_STAMP_REAL" ] || continue; fi
     [ "$s" -gt "$max" ] && max=$s
-  done <<<"$(all_tasks)"
+  done <<<"$(all_tasks all)"
   [ "$want" -gt "$max" ] || want=$(( max + 1 ))
   printf '%s' "$want"
 }
@@ -316,9 +331,25 @@ next_stamp() {                          # [urgent] -> bare integer
 # fixed width is what makes bash's own glob ordering agree with numeric order. A
 # lingering legacy or foreign directory of a different width can still disagree
 # with it, which is exactly what the one-time migration exists to clear out.
-all_tasks() {
-  local s d
-  for s in running queue hold done; do
+#
+# `scope` narrows what "every task directory" means. `live` (the default) is
+# what every display and dispatch walker wants - archive/ is settled history,
+# not something to show or to search. `all` adds it, always last: even more
+# history than `done`, and the one thing a stamp-uniqueness check
+# (`slug_taken_in`) or a stamp allocation (`next_stamp`) cannot afford to miss.
+all_tasks() {                           # [scope: live|all]
+  # An array, not a space-joined string split with `for s in $states`: this
+  # function is routinely reached from inside an ancestor's
+  # `IFS=$'\t' read ... <<<"$(...)"` (after_check's read of after_state is
+  # exactly that shape), and that prefix assignment is in effect for the
+  # WHOLE command it prefixes - including the command substitution that
+  # builds its herestring, which is a subshell this function then runs in. An
+  # unquoted `$states` word-splits on that inherited IFS, and a tab-only IFS
+  # has no space in it - `for s in $states` collapses to one bogus iteration
+  # and every task vanishes. `"${states[@]}"` never depends on IFS at all.
+  local scope=${1:-live} s d states=(running queue hold done)
+  [ "$scope" = all ] && states+=(archive)
+  for s in "${states[@]}"; do
     for d in "$PQ_HOME/$s"/*/; do
       [ -d "$d" ] || continue
       printf '%s\n' "${d%/}"
@@ -343,16 +374,26 @@ queue_ordered() {
 # outright, so a slug that happens to prefix a longer one is still reachable;
 # otherwise a unique prefix is enough, and an ambiguous one is an error rather than
 # a guess - picking the wrong task here would queue or delete the wrong work.
+#
+# Live tasks first, archive/ only on a miss - so a prefix that already resolves
+# (uniquely or ambiguously) among live tasks reads exactly as it did before
+# archive/ existed, and history sharing a prefix never changes that answer.
+# Archive is consulted only when live has nothing at all, which is what keeps
+# `pq show`/`pq rm` working on an archived slug.
 find_task() {                           # needle
-  local needle=${1:-} d s exact="" hits=()
+  local needle=${1:-} d s scope exact="" hits=()
   [ -n "$needle" ] || die "which task? (pq ls)"
-  while IFS= read -r d; do
-    [ -n "$d" ] || continue
-    s=$(slug_of "$d")
-    [ "$s" = "$needle" ] && { exact=$d; break; }
-    case "$s" in "$needle"*) hits+=("$d") ;; esac
-  done <<<"$(all_tasks)"
-  [ -n "$exact" ] && { printf '%s' "$exact"; return 0; }
+  for scope in live all; do
+    exact=""; hits=()
+    while IFS= read -r d; do
+      [ -n "$d" ] || continue
+      s=$(slug_of "$d")
+      [ "$s" = "$needle" ] && { exact=$d; break; }
+      case "$s" in "$needle"*) hits+=("$d") ;; esac
+    done <<<"$(all_tasks "$scope")"
+    [ -n "$exact" ] && { printf '%s' "$exact"; return 0; }
+    [ "${#hits[@]}" -gt 0 ] && break
+  done
   case "${#hits[@]}" in
     0) die "no task matching '$needle' (pq ls)" ;;
     1) printf '%s' "${hits[0]}" ;;
@@ -411,13 +452,20 @@ after_add() {                           # task_dir label repo branch
 # branch) - or nothing. Used for cycle detection and for telling "orphan" (no
 # task anywhere owns this branch, so nothing will ever open a PR for it) apart
 # from the ordinary "waiting, not started yet" case.
+#
+# Live first, archive only on a miss - blocker_state reaches this only after
+# pr_merged_into has already said no, so the archive scan happens only on that
+# rarer path. Without it, a blocker whose owner has since archived would read
+# as "no task owns its branch" and fire a false orphan warning.
 task_by_branch() {                      # repo branch
-  local d
-  while IFS= read -r d; do
-    [ -n "$d" ] || continue
-    [ "$(hdr "$d/plan.md" repo)" = "$1" ] && [ "$(hdr "$d/plan.md" branch)" = "$2" ] \
-      && { printf '%s' "$d"; return 0; }
-  done <<<"$(all_tasks)"
+  local d scope
+  for scope in live all; do
+    while IFS= read -r d; do
+      [ -n "$d" ] || continue
+      [ "$(hdr "$d/plan.md" repo)" = "$1" ] && [ "$(hdr "$d/plan.md" branch)" = "$2" ] \
+        && { printf '%s' "$d"; return 0; }
+    done <<<"$(all_tasks "$scope")"
+  done
   return 1
 }
 
@@ -2450,22 +2498,70 @@ after_json() {                          # task_dir
   rm -f "$tmp"
 }
 
+# The width every caller here renders against, unless told otherwise. `PQ_WIDTH`
+# is the escape hatch - what the tests pin to exercise this deterministically
+# without a tty, and what a caller in a Herdr pane or a detached `pq tick` can
+# set if the probe below ever resolves to the wrong terminal.
+#
+# `stty size </dev/tty`, not `tput cols`: every caller here reaches term_width
+# through a command substitution, so tput's stdout is a pipe, its ioctl fails,
+# and it falls back to terminfo's 80 rather than the real width.
+term_width() {
+  local c=${PQ_WIDTH:-}
+  [ -n "$c" ] || c=$(stty size </dev/tty 2>/dev/null | cut -d' ' -f2)
+  [ -n "$c" ] || c=$(tput cols 2>/dev/null)
+  [[ "$c" =~ ^[0-9]+$ ]] && [ "$c" -ge 40 ] || c=100
+  printf '%s' "$c"
+}
+
 # Same table renderer as wt: every column but the last padded to its own widest
-# cell, so one long branch name does not force a fixed width on everything else.
+# cell, so one long branch name does not force a fixed width on everything else -
+# THEN shrunk to fit `width` (default term_width), so no row can ever roll over
+# to a second line. A table that already fits renders byte-identical to before:
+# the shrink loop and the truncation below only ever engage once natural widths
+# exceed the target.
 #
 # Cells must be ASCII. macOS awk's length() counts BYTES, not characters, and no
 # locale changes that (verified on awk 20200816) - so a single multi-byte character
 # anywhere in a cell silently over-pads that column by the number of extra bytes and
 # skews the whole table. Cheap to avoid, fiddly to detect, so: plain ASCII in tables.
-render_table() {                        # tsv_file
-  awk -F'\t' '
+render_table() {                        # tsv_file [width]
+  local width=${2:-$(term_width)}
+  awk -F'\t' -v width="$width" '
     { rows = NR; if (NF > n) n = NF
       for (i = 1; i <= NF; i++) { cell[NR, i] = $i; if (length($i) > w[i]) w[i] = length($i) } }
     END {
+      # Row 1 is the floor: no column shrinks below the width of its own
+      # header cell, so a header is never truncated.
+      for (i = 1; i <= n; i++) floor[i] = length(cell[1, i])
+
+      total = 0
+      for (i = 1; i <= n; i++) total += w[i] + (i < n ? 2 : 0)
+      # Shrink the widest shrinkable column by one, repeatedly, until the row
+      # fits or nothing can give - bounded by the sum of the widths, and it
+      # naturally targets whichever column (TASK, AGENT, ...) is widest.
+      while (total > width) {
+        wi = 0; widest = 0
+        for (i = 1; i <= n; i++) if (w[i] > floor[i] && w[i] > widest) { widest = w[i]; wi = i }
+        if (wi == 0) break
+        w[wi]--; total--
+      }
+
       for (r = 1; r <= rows; r++) {
         line = ""
-        for (i = 1; i <= n; i++) line = line (i == n ? cell[r, i] : sprintf("%-*s  ", w[i], cell[r, i]))
-        sub(/[ \t]+$/, "", line); print line
+        for (i = 1; i <= n; i++) {
+          v = cell[r, i]
+          # Truncate an over-long cell with ".." - matching cells own
+          # convention - including the last column, which is unpadded and so
+          # can otherwise overflow on its own.
+          if (length(v) > w[i]) v = substr(v, 1, w[i] - 2) ".."
+          line = line (i == n ? v : sprintf("%-*s  ", w[i], v))
+        }
+        sub(/[ \t]+$/, "", line)
+        # Final backstop, for a terminal narrower than the headers themselves
+        # can fit - the shrink loop above cannot go below a header floor.
+        if (length(line) > width) line = substr(line, 1, width)
+        print line
       }
     }
   ' "$1"
@@ -2514,11 +2610,12 @@ agent_cell() {                          # task_dir state
         met)  printf -- '-' ;;
         waiting\ *)
           lbl=${verdict#waiting }; cnt=${lbl##* }; lbl=${lbl% *}
+          lbl=$(cell "$lbl" "$PQ_LABEL_MAX")
           if [ "$cnt" -gt 1 ] 2>/dev/null; then printf 'after %s +%d' "$lbl" "$((cnt - 1))"
           else printf 'after %s' "$lbl"; fi
           ;;
-        stalled\ *) printf 'stalled %s' "${verdict#stalled }" ;;
-        dead\ *)    printf 'dead %s' "${verdict#dead }" ;;
+        stalled\ *) printf 'stalled %s' "$(cell "${verdict#stalled }" "$PQ_LABEL_MAX")" ;;
+        dead\ *)    printf 'dead %s' "$(cell "${verdict#dead }" "$PQ_LABEL_MAX")" ;;
       esac
       return
       ;;
@@ -2566,34 +2663,61 @@ agent_cell() {                          # task_dir state
 }
 
 cmd_ls() {
-  local as_json=0
-  [ "${1:-}" = "--json" ] && as_json=1
+  local as_json=0 all=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --json) as_json=1; shift ;;
+      --all)  all=1; shift ;;
+      -h|--help) die "usage: pq ls [--all] [--json]" ;;
+      *)      die "unknown option '$1' (usage: pq ls [--all] [--json])" ;;
+    esac
+  done
 
-  local tasks; tasks=$(all_tasks)
-  [ -n "$tasks" ] || { [ "$as_json" = 1 ] && echo '[]'; msg "queue is empty - add one with: pq add"; return 0; }
+  local tasks; tasks=$(all_tasks "$([ "$all" = 1 ] && printf all || printf live)")
+  if [ -z "$tasks" ]; then
+    [ "$as_json" = 1 ] && echo '[]'
+    local narch0; narch0=$(ls -d "$PQ_HOME/archive"/*/ 2>/dev/null | wc -l | tr -d ' ')
+    if [ "$narch0" -gt 0 ] && [ "$all" != 1 ]; then
+      msg "queue is empty - add one with: pq add ($narch0 archived, --all to see)"
+    else
+      msg "queue is empty - add one with: pq add"
+    fi
+    return 0
+  fi
 
   # PR state for every dispatched branch, PLUS every blocker of a task that has
   # not started - a blocker's branch can belong to a repo nothing else in the
   # queue touches, so pq ls would otherwise lie about it being unmet forever.
+  # pr_targets itself only ever walks live tasks, regardless of --all: archive
+  # is settled history, so a listed archived row never costs a fresh `gh` call.
   local d st repo
   pidx_load
   pr_load_all "$(pr_targets)"
 
-  # A PROJECT column, but only once the queue actually spans more than one. It is
-  # the first thing you need when it does, and a column of the same word when it
-  # doesn't. `repos` above covers only running and done tasks, so count separately.
-  local multi
+  # PROJECT, MODEL, and EFFORT each show only once the listed tasks actually
+  # span more than one value - the first thing you need when they do, and a
+  # column of the same word repeated on every row when they don't.
+  local multi multi_model multi_effort
   multi=$(while IFS= read -r d; do [ -n "$d" ] && hdr "$d/plan.md" repo; done <<<"$tasks" \
+            | sed '/^$/d' | sort -u | awk 'END { print (NR > 1) }')
+  multi_model=$(while IFS= read -r d; do [ -n "$d" ] && hdr "$d/plan.md" model; done <<<"$tasks" \
+            | sed '/^$/d' | sort -u | awk 'END { print (NR > 1) }')
+  multi_effort=$(while IFS= read -r d; do [ -n "$d" ] && hdr "$d/plan.md" effort; done <<<"$tasks" \
             | sed '/^$/d' | sort -u | awk 'END { print (NR > 1) }')
 
   local tbl="$PQ_HOME/.ls.$$.tsv"
   local slug branch model effort dev intent added pr num prstate draft agent needs=0 blocked dispst
+  local TAB=$'\t'
   if [ "$as_json" = 1 ]; then
     : > "$tbl"
-  elif [ "$multi" = 1 ]; then
-    printf 'TASK\tPROJECT\tSTATE\tBRANCH\tMODEL\tEFFORT\tAGENT\tPR\tAGE\n' > "$tbl"
   else
-    printf 'TASK\tSTATE\tBRANCH\tMODEL\tEFFORT\tAGENT\tPR\tAGE\n' > "$tbl"
+    local hdrline="TASK"
+    [ "$multi" = 1 ] && hdrline="${hdrline}${TAB}PROJECT"
+    hdrline="${hdrline}${TAB}STATE"
+    [ "$multi_model" = 1 ]  && hdrline="${hdrline}${TAB}MODEL"
+    [ "$multi_effort" = 1 ] && hdrline="${hdrline}${TAB}EFFORT"
+    hdrline="${hdrline}${TAB}AGENT${TAB}PR${TAB}AGE"
+    printf '%s\n' "$hdrline" > "$tbl"
   fi
   while IFS= read -r d; do
     [ -n "$d" ] || continue
@@ -2642,10 +2766,13 @@ cmd_ls() {
           after: $after, blocked: $blocked,
           merged: ($merged|str), reaped: ($reaped|str), held: ($held|str) }' >> "$tbl"
     else
-      printf '%s\t%s%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
-        "$slug" "$([ "$multi" = 1 ] && printf '%s\t' "$(basename "${repo:--}")")" \
-        "$dispst" "${branch:--}" "${model:--}" "${effort:--}" \
-        "$agent" "$pr" "$(age_of "$added")" >> "$tbl"
+      local row="$slug"
+      [ "$multi" = 1 ] && row="${row}${TAB}$(cell "$(basename "${repo:--}")" 20)"
+      row="${row}${TAB}${dispst}"
+      [ "$multi_model" = 1 ]  && row="${row}${TAB}${model:--}"
+      [ "$multi_effort" = 1 ] && row="${row}${TAB}${effort:--}"
+      row="${row}${TAB}${agent}${TAB}${pr}${TAB}$(age_of "$added")"
+      printf '%s\n' "$row" >> "$tbl"
     fi
   done <<<"$tasks"
 
@@ -2653,11 +2780,14 @@ cmd_ls() {
     jq -s '.' "$tbl"
   else
     render_table "$tbl"
-    local nq nr
+    local nq nr narch
     nq=$(ls -d "$PQ_HOME/queue"/*/ 2>/dev/null | wc -l | tr -d ' ')
     nr=$(ls -d "$PQ_HOME/running"/*/ 2>/dev/null | wc -l | tr -d ' ')
+    narch=$(ls -d "$PQ_HOME/archive"/*/ 2>/dev/null | wc -l | tr -d ' ')
     printf '\n' >&2
-    msg "$nr running, $nq queued$([ "$needs" -gt 0 ] && printf ' (%s needs you)' "$needs")"
+    msg "$nr running, $nq queued\
+$([ "$needs" -gt 0 ] && printf ' (%s needs you)' "$needs")\
+$([ "$narch" -gt 0 ] && printf ', %s archived%s' "$narch" "$([ "$all" = 1 ] || printf ' (--all to see)')")"
   fi
   rm -f "$tbl" "$PR_CACHE" "$PR_ANS"
   repo_base_reset
@@ -2861,9 +2991,27 @@ cmd_rm() {
   # a branch pq no longer knows about, so that is the moment to say so.
   [ -z "$deps" ] || warn "$slug was a blocker for: ${deps% } - they now wait on a branch nothing owns"
   case "$st" in
-    running|done)
+    running|done|archive)
       [ -n "$reaped" ] || warn "its worktree and branch are untouched - remove those with: wt rm $branch" ;;
   esac
+}
+
+# The manual escape hatch alongside archive_pass' automatic one - for the two
+# legacy reaped-without-verdict stragglers, or anything else pq cannot prove
+# either way itself. Restricted to `done`: a queued or running task still
+# holds a slot or a worktree, so archiving it would strand one - `pq hold` and
+# `pq rm` are the right tools there instead.
+cmd_archive() {
+  local d; d=$(find_task "${1:-}") || exit 1
+  local st; st=$(state_of "$d")
+  [ "$st" = done ] || die "$(slug_of "$d") is $st, not done - hold or remove it instead (pq hold / pq rm)"
+  local slug name dst moved
+  slug=$(slug_of "$d"); name=$(basename "$d")
+  dst="$PQ_HOME/archive/$name"
+  [ -e "$dst" ] && die "a task already exists at archive/$name"
+  moved=$(retitle "$d" archive)
+  st_set "$moved" PQ_ARCHIVED "$(now)"
+  msg "archived $slug"
 }
 
 # ── dispatch ────────────────────────────────────────────────────────────────
@@ -3018,12 +3166,29 @@ reap_task() {                           # task_dir dry -> 0 torn down, 2 would (
   { [ -n "$(st "$d" PQ_REAPED)" ] || [ -n "$(st "$d" PQ_CLOSED)" ]; } && return 1
 
   # 2. The worktree is already gone - a hand-run `wt rm`, or `wt gc`, got there
-  #    first. Stamp and stop watching without invoking `wt` at all.
+  #    first. Nothing left to invoke `wt` for, but the tick already paid for a
+  #    verdict - reap_watching kept this task's branch in pr_targets running,
+  #    so the row is already sitting in the cache pr_load_all loaded above.
+  #    Resolve it before stamping PQ_REAPED, or a merged/closed task would be
+  #    reaped with no verdict at all and never become archivable - exactly the
+  #    state the two legacy `010-`/`020-` rows are stuck in today.
   wt=$(st "$d" PQ_WORKTREE)
   if [ -z "$wt" ] || [ ! -d "$wt" ]; then
+    repo=$(hdr "$d/plan.md" repo); branch=$(hdr "$d/plan.md" branch)
+    local verdict=""
+    if [ -n "$repo" ] && [ -n "$branch" ]; then
+      base=$(repo_base "$repo")
+      if [ -n "$base" ] && pr_merged_into "$repo" "$branch" "$base"; then verdict=merged
+      elif pr_all_closed "$repo" "$branch"; then verdict=closed
+      fi
+    fi
     if [ "$dry" = 1 ]; then
-      msg "would stop watching $slug - its worktree is already gone"
+      msg "would stop watching $slug - its worktree is already gone$([ -n "$verdict" ] && printf ' (%s)' "$verdict")"
     else
+      case "$verdict" in
+        merged) st_set "$d" PQ_MERGED "$(now)" ;;
+        closed) st_set "$d" PQ_CLOSED "$(now)" ;;
+      esac
       st_set "$d" PQ_REAPED "$(now)"
       msg "$slug: worktree already gone - no longer watching"
     fi
@@ -3112,6 +3277,86 @@ reap_task() {                           # task_dir dry -> 0 torn down, 2 would (
   fi
   warn "$slug: wt rm failed - run by hand: wt rm -y $branch"
   return 1
+}
+
+# ── archive ─────────────────────────────────────────────────────────────────
+# `done/` never gets pruned on its own, so every task pq has ever finished
+# still shows in it - and, once reap_task has torn a merged task's worktree
+# down, still shows in `pq ls` too, for nothing pq or you can still decide.
+# `archive_pass` (called from `tick_body`) files that settled history away to
+# `archive/`, a fifth state nothing walks on the hot path.
+
+# Terminal history - nothing pq or you can still decide, so it can leave done/.
+# Two ways in, both stamped by reap_task:
+#   PQ_CLOSED           every PR closed without merging - it will never ship
+#   PQ_MERGED+PQ_REAPED it shipped and the worktree is gone
+# PQ_REAP_HELD needs no check: reap_task clears it before it can ever stamp
+# PQ_REAPED, so a held task cannot satisfy the second rule.
+archivable() {                          # task_dir -> 0 when it can leave done/
+  [ -n "$(st "$1" PQ_CLOSED)" ] && return 0
+  [ -n "$(st "$1" PQ_MERGED)" ] && [ -n "$(st "$1" PQ_REAPED)" ] && return 0
+  return 1
+}
+
+# Files every archivable done/ task away, except the newest PQ_DONE_KEEP -
+# kept behind so `pq ls` still answers "did last night's batch ship?" at a
+# glance. Ordered by `stamp_of`, exactly as `queue_ordered` is, NOT by glob
+# order - done/ still holds legacy directories whose width disagrees with the
+# %014d prefix (see all_tasks' own caveat).
+#
+# Never reaches retitle's `die`: this runs inside tick_body's lock, so a
+# destination collision - a hand-corrupted archive/ sharing this task's name -
+# is worth one skipped row, not an aborted tick. next_stamp spanning archive
+# (see all_tasks) is what keeps a FRESH task's destination from ever
+# colliding; this guard is only for archive/ itself having been tampered with.
+#
+# Prints the count archived (or that would be, under --dry-run) so tick_body
+# can fold it into its one-line summary.
+archive_pass() {                        # dry -> count, via stdout; msg/warn as it goes
+  local dry=$1 d cands total keep=$PQ_DONE_KEEP n_arch=0
+  # Piped straight from the loop, same as queue_ordered - NOT built up in a
+  # variable and fed to sort through <<<, which appends its own trailing
+  # newline on top of the loop's and sorts that spurious blank line (numeric
+  # key 0) to the very front, stealing a slot from head -n below.
+  cands=$(
+    for d in "$PQ_HOME/done"/*/; do
+      [ -d "$d" ] || continue
+      d=${d%/}
+      archivable "$d" || continue
+      printf '%s\t%s\n' "$(stamp_of "$d")" "$d"
+    done | sort -s -n -k1,1 | cut -f2-
+  )
+  [ -n "$cands" ] || { printf 0; return; }
+
+  total=$(grep -c . <<<"$cands")
+  local to_archive=$(( total - keep ))
+  if [ "$to_archive" -le 0 ]; then printf 0; return; fi
+
+  local slug branch dst why moved
+  while IFS= read -r d; do
+    [ -n "$d" ] || continue
+    slug=$(slug_of "$d")
+    dst="$PQ_HOME/archive/$(basename "$d")"
+    if [ -e "$dst" ]; then
+      warn "$slug: could not archive - archive/$(basename "$d") already exists"
+      continue
+    fi
+    branch=$(hdr "$d/plan.md" branch)
+    if [ -n "$(st "$d" PQ_CLOSED)" ]; then
+      why="its PR closed without merging; worktree untouched (wt rm ${branch:-?})"
+    else
+      why="it shipped; worktree already torn down"
+    fi
+    if [ "$dry" = 1 ]; then
+      msg "would archive $slug - $why"
+    else
+      moved=$(retitle "$d" archive)
+      st_set "$moved" PQ_ARCHIVED "$(now)"
+      msg "archived $slug - $why"
+    fi
+    n_arch=$((n_arch + 1))
+  done <<<"$(head -n "$to_archive" <<<"$cands")"
+  printf '%s' "$n_arch"
 }
 
 # ── tick ────────────────────────────────────────────────────────────────────
@@ -3265,6 +3510,11 @@ tick_body() {                           # cap dry
     done
   fi
 
+  # 1.3 Archive - file settled done/ history away to archive/, right after reap
+  # (which stamps the verdict this reads) and before the blocker pass. Needs
+  # no herdr gate: archiving never touches a worktree, only a directory mv.
+  local n_arch; n_arch=$(archive_pass "$dry")
+
   # 1.5 Blockers - runs for every task that has not started, queue AND hold,
   # so a chain stalled on a stuck agent's draft is flagged even while parked.
   # This runs AFTER reconcile and BEFORE fill, so a dependency that merged
@@ -3344,7 +3594,8 @@ $([ "$started" -gt 0 ] && printf ', %s started' "$started")\
 $([ "$would" -gt 0 ] && printf ', %s would start' "$would")\
 $([ "$waiting" -gt 0 ] && printf ', %s waiting on a merge' "$waiting")\
 $([ "$n_torn" -gt 0 ] && printf ', %s torn down' "$n_torn")\
-$([ "$would_torn" -gt 0 ] && printf ', %s would tear down' "$would_torn")$reap_note"
+$([ "$would_torn" -gt 0 ] && printf ', %s would tear down' "$would_torn")$reap_note\
+$([ "$n_arch" -gt 0 ] && printf ', %s %s' "$n_arch" "$([ "$dry" = 1 ] && printf 'would archive' || printf 'archived')")"
 }
 
 # ── run ─────────────────────────────────────────────────────────────────────
@@ -3448,7 +3699,8 @@ main() {
     hold)       shift; cmd_hold "$@" ;;
     unhold)     shift; cmd_unhold "$@" ;;
     rm|remove)  shift; cmd_rm "$@" ;;
-    *) die "usage: pq {add [plan] [--urgent] [--after task|branch]... [--split | --split-dir DIR] [-y] [--json] | after <task> [<task|branch>... | --clear] | ls [--json] | show <task> | tick [--cap N] [--dry-run] | run [--interval S] [--cap N] | cap [N] | urgent <task> | later <task> | hold <task> | unhold <task> | rm <task>}" ;;
+    archive)    shift; cmd_archive "$@" ;;
+    *) die "usage: pq {add [plan] [--urgent] [--after task|branch]... [--split | --split-dir DIR] [-y] [--json] | after <task> [<task|branch>... | --clear] | ls [--all] [--json] | show <task> | tick [--cap N] [--dry-run] | run [--interval S] [--cap N] | cap [N] | urgent <task> | later <task> | hold <task> | unhold <task> | rm <task> | archive <task>}" ;;
   esac
 }
 if [ "${BASH_SOURCE[0]}" = "$0" ]; then main "$@"; fi

@@ -311,15 +311,45 @@ for marker in PQ_MERGED PQ_CLOSED PQ_REAPED; do
   rm -rf "$wtN" "$dN"
 done
 
-echo "== PQ_WORKTREE gone from disk: stop watching, wt never invoked ==" >&2
+echo "== PQ_WORKTREE gone from disk, gh silent: only PQ_REAPED stamped ==" >&2
 reset_caches; reset_wt_log
 d10=$(mk_done 10 case10 "$REPO" tom/case10 "$PQ_HOME/no-such-worktree-anywhere")
-cache_row "$REPO" tom/case10 10 MERGED "" master   # would matter if step 2 were skipped - it must not be reached
+# No cache_row at all - gh never answered, so no verdict is there to record.
 reap_task "$d10" 0
 rc=$?
 [ "$rc" -ne 0 ] && ok || bad "a gone worktree must not itself report a teardown"
 [ ! -s "$WT_LOG" ] && ok || bad "wt must never be invoked when the worktree is already gone"
 [ -n "$(st "$d10" PQ_REAPED)" ] && ok || bad "PQ_REAPED should be stamped so it stops being watched"
+[ -z "$(st "$d10" PQ_MERGED)" ] && [ -z "$(st "$d10" PQ_CLOSED)" ] \
+  && ok || bad "no verdict should be stamped when gh never answered"
+archivable "$d10" && bad "reaped with no verdict must not be archivable" || ok
+
+echo "== PQ_WORKTREE gone from disk, cache says MERGED: the verdict is recorded, not thrown away ==" >&2
+reset_caches; reset_wt_log
+d10m=$(mk_done 11 case10m "$REPO" tom/case10m "$PQ_HOME/no-such-worktree-anywhere")
+# The row is already sitting in the cache the tick paid for (reap_watching
+# kept it in pr_targets running) - this is exactly what section 3 of the plan
+# fixes: the old code stamped PQ_REAPED and returned before ever looking.
+cache_row "$REPO" tom/case10m 10 MERGED "" master
+reap_task "$d10m" 0
+rc=$?
+[ "$rc" -ne 0 ] && ok || bad "a gone worktree must not itself report a teardown"
+[ ! -s "$WT_LOG" ] && ok || bad "wt must never be invoked when the worktree is already gone"
+[ -n "$(st "$d10m" PQ_REAPED)" ] && ok || bad "PQ_REAPED should be stamped"
+[ -n "$(st "$d10m" PQ_MERGED)" ] && ok || bad "PQ_MERGED should be stamped from the already-loaded cache"
+archivable "$d10m" && ok || bad "merged+reaped should now be archivable"
+
+echo "== PQ_WORKTREE gone from disk, cache says every PR CLOSED: PQ_CLOSED recorded too ==" >&2
+reset_caches; reset_wt_log
+d10c=$(mk_done 12 case10c "$REPO" tom/case10c "$PQ_HOME/no-such-worktree-anywhere")
+cache_row "$REPO" tom/case10c 11 CLOSED "" master
+reap_task "$d10c" 0
+rc=$?
+[ "$rc" -ne 0 ] && ok || bad "a gone worktree must not itself report a teardown"
+[ ! -s "$WT_LOG" ] && ok || bad "wt must never be invoked when the worktree is already gone"
+[ -n "$(st "$d10c" PQ_REAPED)" ] && ok || bad "PQ_REAPED should be stamped"
+[ -n "$(st "$d10c" PQ_CLOSED)" ] && ok || bad "PQ_CLOSED should be stamped from the already-loaded cache"
+archivable "$d10c" && ok || bad "closed should now be archivable"
 
 echo "== gh down (no rows, no PR_ANS): nothing stamped, retries next pass ==" >&2
 reset_caches; reset_wt_log
