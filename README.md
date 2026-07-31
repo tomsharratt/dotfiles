@@ -90,7 +90,7 @@ Human-facing output always goes to stderr, so `--json` leaves stdout clean for a
 `pq` is a queue of Claude Code plans waiting to be run as implementer sessions, built on top of `wt` but separable from it.
 The split it exists to make: one long-lived session, in plan mode, does the thinking and produces a plan that has already answered every question; `pq` then runs those plans later, unattended, several at a time, as cheap implementer sessions that only have to execute.
 
-A task is a directory, and the directory it sits in is its state - `queue/`, `hold/`, `running/`, `done/` under `~/.local/state/pq`.
+A task is a directory, and the directory it sits in is its state - `queue/`, `hold/`, `running/`, `done/`, `archive/` under `~/.local/state/pq`.
 Every transition is a `mv`, which is atomic within a filesystem, so two dispatchers cannot claim the same task.
 Each task holds an immutable `plan.md` (a settings header prepended to whatever Claude Code wrote) and a `state.env` of runtime facts, so an agent can re-read its plan at any point and never see it change underneath it.
 
@@ -112,7 +112,7 @@ pq add --split-dir D     queue an already-split directory, skipping the split st
 pq after <task>          list a task's blockers and what each is waiting on
 pq after <task> T...     add blockers to a task still in queue/ or hold/
 pq after <task> --clear  drop them all
-pq ls [--json]           every task, its state, and what it is waiting on
+pq ls [--all] [--json]   every task, its state, and what it is waiting on
 pq show <task>           one task's header and plan
 pq tick [--cap N]        free finished slots, then fill them from the queue
 pq run [--interval S]    tick on an interval until you stop it
@@ -121,6 +121,7 @@ pq urgent <task>         move it to the very front of the queue
 pq later <task>          move it to the very back of the queue
 pq hold / unhold         park a task, or put it back
 pq rm <task>             drop a task (never touches a worktree or a branch)
+pq archive <task>        file a done task away by hand (done only)
 ```
 
 The fourteen-digit prefix on a task directory is a UTC timestamp and nothing else - promoting a task (`pq urgent`, `pq later`) renames its directory, so commands take the task's slug, or any unique prefix of it.
@@ -269,6 +270,24 @@ Two things hold a teardown off, both checked only once the merge is confirmed:
 `pq ls` shows a held task as `held agent`, `held here`, or `held nobase` (its repo's default branch could not be resolved), and a closed-without-merging one as `closed`.
 A task with nothing left to reclaim shows `-`, the same as any other task that needs nothing from you.
 There is no off switch, for the same reason `pq` has none for dispatch-hours or the usage gate: one mechanism, not two.
+
+Once its verdict is in - merged and torn down, or closed without merging - a done task is exactly what the next tick's archive pass files away; see below.
+
+#### Archiving history
+
+`done/` is never pruned on its own, so every task `pq` has ever finished stays there, crowding out what is still live or still needs a decision.
+Once a done task is **terminal** - its PR merged and the worktree is gone, or every PR for it closed without merging - `pq tick` moves it to `archive/`, the same `mv` every other transition uses.
+A task with no verdict yet, one held on `PQ_REAP_HELD`, or one reaped with no verdict at all stays in `done/` - each of those still wants something.
+
+A blocker survives this by construction: it is a resolved `(label, repo, branch)` triple, not a task reference, so a dependent still resolves it correctly once its blocker has archived - see "Blockers" above.
+
+The newest `PQ_DONE_KEEP` (default 3) archivable tasks are kept behind in `done/`, so `pq ls` still answers "did last night's batch ship?" at a glance.
+`pq ls` hides `archive/` by default and reports how many rows it is hiding; `pq ls --all` shows everything, and `--json` composes with either.
+
+`pq archive <task>` files a done task away by hand - the escape hatch for anything `pq` cannot prove either way itself.
+It is restricted to `done`: a queued or running task still holds a slot or a worktree, so `pq hold` and `pq rm` are the right tools there instead.
+
+Nothing in `archive/` is ever deleted or swept up again by a later tick - it is where settled history lives, not a queue for cleanup.
 
 ### Reclaiming resources
 
