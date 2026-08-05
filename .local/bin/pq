@@ -2563,9 +2563,14 @@ after_json() {                          # task_dir
 # `stty size </dev/tty`, not `tput cols`: every caller here reaches term_width
 # through a command substitution, so tput's stdout is a pipe, its ioctl fails,
 # and it falls back to terminfo's 80 rather than the real width.
+#
+# The redirection is wrapped in a group so /dev/tty's own absence is silenced
+# too: `stty ... 2>/dev/null` only covers what stty says, and a missing
+# controlling terminal is the SHELL complaining about the redirect - "Device not
+# configured", once per rendered table, in every detached `pq tick` log.
 term_width() {
   local c=${PQ_WIDTH:-}
-  [ -n "$c" ] || c=$(stty size </dev/tty 2>/dev/null | cut -d' ' -f2)
+  [ -n "$c" ] || c=$( { stty size </dev/tty; } 2>/dev/null | cut -d' ' -f2 )
   [ -n "$c" ] || c=$(tput cols 2>/dev/null)
   [[ "$c" =~ ^[0-9]+$ ]] && [ "$c" -ge 40 ] || c=100
   printf '%s' "$c"
