@@ -94,7 +94,8 @@ A task is a directory, and the directory it sits in is its state - `queue/`, `ho
 Every transition is a `mv`, which is atomic within a filesystem, so two dispatchers cannot claim the same task.
 Each task holds an immutable `plan.md` (a settings header prepended to whatever Claude Code wrote) and a `state.env` of runtime facts, so an agent can re-read its plan at any point and never see it change underneath it.
 
-`pq add` with no plan, at a terminal, shows the ten most recently touched plans in `~/.claude/plans` and lets you pick one rather than silently guessing - see "Picking a plan" below.
+`pq add` with no plan, at a terminal, shows the ten most recently touched plans in `~/.claude/plans` - `n` and `p` page back through the older ones - and lets you pick one rather than silently guessing.
+See "Picking a plan" below.
 Either way, it then asks Haiku for a branch name and a one-line statement of intent (Claude Code auto-names plan files, so the filename is never a usable branch), and refuses a branch that is already spoken for - `wt new` checks out an existing branch rather than failing, so two tasks sharing a name would quietly land in the same worktree.
 
 Each task records its own project, so one queue serves all of them.
@@ -131,7 +132,14 @@ The fourteen-digit prefix on a task directory is a UTC timestamp and nothing els
 A bare `pq add` at a terminal shows the ten most recently touched plans in `~/.claude/plans`, each with its age and its title - the first `# H1` in the file, since Claude Code names the file itself from your opening prompt and that name is rarely what the plan is actually about.
 "Most recently touched" means whichever is newer, mtime or birth time, so a plan edited this morning outranks one merely created today, and a plan restored by `cp -p`, `rsync -a`, or a git checkout doesn't fall to the bottom on a stale mtime.
 
-Pick a number - Enter takes the most recent - and it previews the plan before asking `use this plan? [y/N]`; answering `n` returns to the number prompt rather than aborting the whole command.
+Ten is a page, not a limit.
+`n` pages back to older plans and `p` pages forward again, and the header says where you are - `11-20 of 47 (page 2/5)`.
+The keys are offered only when there is more than one page, and paging past either end says so rather than doing nothing.
+`PQ_PICK_LIMIT` sets the page size.
+
+Row numbers are absolute: row 11 is the eleventh-newest plan whichever page you are looking at, so a number always means the same plan and any listed row can be picked from any page.
+Pick a number - Enter takes the top row of the page you are on, which is the most recent plan on page one - and it previews the plan before asking `use this plan? [y/N]`; answering `n` returns to the number prompt, on the page you were reading, rather than aborting the whole command.
+That `n` is "no", not "next page" - the two prompts read the key differently, and each one's hint says which is in force.
 Once you confirm, it asks the two things that actually shape how a task runs: whether to split it into a stack of small PRs, and which of the tasks already queued, held, or running it should wait on.
 
 Passing a flag the wizard would otherwise ask about skips just that one question - `pq add --split` picks a plan and skips straight past the split question (it still asks about blockers), `pq add --after some-task` picks a plan and skips straight past the blocker question (it still asks about splitting).
@@ -178,7 +186,8 @@ Three situations short-circuit the ordinary wait and warn once, because they rea
 None of the three auto-holds anything; fill already costs no slot on a blocked task, and `pq` does not re-order your work on its own judgement.
 
 `pq tick` is one idempotent pass: reconcile, then fill.
-Reconcile runs first so a task that shipped hands its slot straight to the next one - any pull request, in any state, means the work has left the queue.
+Reconcile runs first so a task that shipped leaves the queue promptly - any pull request, in any state, means the work is out of `queue`'s hands.
+Leaving the queue and giving up the slot are separate things, though: see the cap below, which keeps counting a task whose agent is still working on its PR.
 Fill claims a task by moving it to `running/` *before* calling `wt new`, because that call takes the better part of a minute and an unclaimed task is one a second tick would happily pick up too.
 Each dispatch step records itself as it succeeds, so an interrupted tick is resumed rather than restarted - and resuming deliberately skips `wt new` when the pane is still there, since re-provisioning would drop the worktree's database.
 A `mkdir` lock keeps two ticks from both filling to cap.
@@ -192,6 +201,20 @@ The cap is **state, not an argument**: it lives in a file that is re-read at the
 `pq cap 0` is the pause, which is why pausing needs no separate concept.
 Caps are soft - lowering one never kills anything, it just starts nothing new until enough slots free up.
 The default is 1, deliberately: a fresh machine should not start dispatching several unattended agents because nobody had said otherwise yet.
+
+What the cap counts is **live agents, not directories**.
+Those are the same number only while "has a pull request" means "has stopped working", and it does not: a Claude Code agent that opens a PR keeps going - answering review, fixing CI, pushing again - and never exits on its own.
+So a task that reconcile has already moved to `done/` goes on spending its slot until its agent is actually finished, and `pq ls` marks it **wrapping up** while it does.
+Counting only `running/` is what once ran six agents at a cap of 3, three fresh ones alongside three still wrapping up, and reported it as "3 running".
+
+The release has to be a timer rather than an exit, because an agent that has genuinely finished sits idle indefinitely instead of exiting - so waiting for one to disappear would stall the queue outright rather than merely overshoot it.
+`PQ_WRAPUP_GRACE` (default 300s) is that timer: once an agent has not been working for that long, its slot goes.
+It governs the tasks whose PR is still open or in draft; a task whose PR has *merged* gets torn down by the reap pass as soon as its agent stops, and a torn-down task releases its slot at once with no grace at all.
+The grace applies to `idle` and to herdr's `done` alike, because both are per-turn rather than per-task: an agent that opens a PR and then goes back in to fix CI passes through them between every turn, and releasing on the first sighting would be the same bug in a subtler form.
+A `blocked` agent - a permission prompt, a quota wall - holds its slot too, the same trade `running/` already makes, since it will resume rather than having finished.
+Nothing knocks on a `done/` pane the way it does on a running one, though, so that row reads as **blocked** rather than "wrapping up" and counts into "needs you": it is holding a slot until you answer it.
+An exited agent or a vanished workspace releases immediately, with no grace at all, and while herdr is unreachable the slot is held rather than guessed at.
+Setting `PQ_WRAPUP_GRACE=0` restores the old release-on-PR behaviour.
 
 Ctrl-C is a graceful shutdown: during the sleep it stops immediately, and during a tick it lets the work in flight finish first.
 That needs a little care, because a terminal signals the whole foreground process group - so by default a `wt new` halfway through copying a database would die alongside the tick.

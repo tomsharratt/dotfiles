@@ -37,6 +37,11 @@
 # `pq tick` is one idempotent pass, safe to run by hand at any time - including
 # alongside a running `pq run`.
 #
+# The cap counts live AGENTS, not directories in `running/`. An agent does not
+# exit when it opens its pull request, so a task reconcile has moved to `done/`
+# keeps spending its slot until that agent has actually stopped - see the
+# `slots` section below for why the release is a timer rather than an exit.
+#
 # A task may name blockers: other work that must have merged before it is
 # eligible for dispatch. Blocked is derived, not stored - a blocked task sits in
 # `queue/` like any other, and fill just skips it, the same way the cap is soft
@@ -66,7 +71,7 @@
 #   $PQ_HOME/queue/20260729143022-live-chat-mentions/    waiting to be picked up
 #            hold/20260729150431-risky-refactor/         parked by you
 #            running/20260729121005-spotify-scope-fix/   dispatched
-#            done/20260728091500-live-chat-links/        a PR exists, slot freed
+#            done/20260728091500-live-chat-links/        a PR exists; still spending a slot until its agent stops
 #            archive/20260727080000-live-chat-onboarding/  settled history - `pq ls` hides it, tick never walks it
 #            splits/live-chat-mentions-20260728-141230-83421/   a plan mid-split, or one left over
 #
@@ -117,10 +122,12 @@ PQ_DEFAULT_EFFORT="${PQ_DEFAULT_EFFORT:-xhigh}"
 PQ_NAMER_MODEL="${PQ_NAMER_MODEL:-haiku}"
 PQ_SPLITTER_MODEL="${PQ_SPLITTER_MODEL:-opus}"
 PQ_SPLITTER_EFFORT="${PQ_SPLITTER_EFFORT:-xhigh}"
-PQ_PICK_LIMIT="${PQ_PICK_LIMIT:-10}"       # how many recent plans pick_plan lists
+PQ_PICK_LIMIT="${PQ_PICK_LIMIT:-10}"       # plans per page in pick_plan; `n`/`p` walk the rest
 # A non-positive limit would break "Enter takes 1" - the table would have
 # zero rows, yet Enter still defaults to a row 1 that can't exist - so this
-# one, unlike its neighbours, is worth guarding against a bad override.
+# one, unlike its neighbours, is worth guarding against a bad override. It is
+# also the page STRIDE, so a zero would divide by zero working out how many
+# pages there are.
 [[ "$PQ_PICK_LIMIT" =~ ^[0-9]+$ ]] && [ "$PQ_PICK_LIMIT" -ge 1 ] || PQ_PICK_LIMIT=10
 PQ_PICK_PREVIEW="${PQ_PICK_PREVIEW:-12}"   # lines of a plan pick_plan previews
 PQ_REPOS_MAX="${PQ_REPOS_MAX:-12}"         # cap on repo_candidates'/repo_candidates_container's scanned inventory
@@ -135,6 +142,12 @@ PQ_LABEL_MAX="${PQ_LABEL_MAX:-16}"         # max chars of a blocker label in AGE
 [[ "$PQ_LABEL_MAX" =~ ^[0-9]+$ ]] && [ "$PQ_LABEL_MAX" -ge 1 ] || PQ_LABEL_MAX=16
 PQ_DONE_KEEP="${PQ_DONE_KEEP:-3}"           # newest archivable done/ tasks archive_pass leaves behind; 0 is legal
 [[ "$PQ_DONE_KEEP" =~ ^[0-9]+$ ]] || PQ_DONE_KEEP=3
+# How long a done/ task's agent must have stopped working before its slot is
+# released - see the `slots` section. 0 is legal and restores the old
+# release-on-PR behaviour; a non-numeric override is a typo, not a request to
+# disable the cap, so it falls back to the default rather than to 0.
+PQ_WRAPUP_GRACE="${PQ_WRAPUP_GRACE:-300}"
+[[ "$PQ_WRAPUP_GRACE" =~ ^[0-9]+$ ]] || PQ_WRAPUP_GRACE=300
 
 # What the session wall looks like on screen, and how hard to knock. These are
 # Claude Code UI strings, so they will change - hence up here and overridable
@@ -200,6 +213,15 @@ st_set() {                              # task_dir key value
 }
 now() { date -u '+%Y-%m-%dT%H:%M:%SZ'; }
 epoch() { date -u '+%s'; }
+# One of pq's own ISO stamps back to epoch seconds, or nothing when it cannot be
+# parsed. BSD `date` only, like every other date call in this file: `-j` (do not
+# set the clock) and `-f` (input format) are not GNU flags, and pq is a darwin
+# tool. Prints nothing rather than 0 on a bad stamp, so a caller can tell "no
+# stamp" from "the epoch".
+epoch_of() {                            # iso8601 -> epoch seconds, or empty
+  [ -n "${1:-}" ] || return 0
+  date -j -u -f '%Y-%m-%dT%H:%M:%SZ' "$1" '+%s' 2>/dev/null || return 0
+}
 
 # ── shielded children ───────────────────────────────────────────────────────
 # Run a command in a process group of its own, so a Ctrl-C aimed at pq does not
@@ -262,13 +284,27 @@ cmd_cap() {
   [ $# -eq 0 ] && { printf '%s\n' "$(cap_get)"; return 0; }
   [[ "$1" =~ ^[0-9]+$ ]] || die "usage: pq cap [N]   (0 pauses; nothing running is touched)"
   cap_set "$1"
-  local active; active=$(ls -d "$PQ_HOME/running"/*/ 2>/dev/null | wc -l | tr -d ' ')
+  # The same arithmetic fill uses, so what this promises and what the next tick
+  # does cannot drift - a done task still wrapping up its PR is spending a slot,
+  # and saying "room for 1 more" while it does would be the old lie in a new
+  # place. slot_state, not slot_held: reporting the cap must not start anybody's
+  # wrap-up clock. pidx_load first, or every pane reads as unknowable and every
+  # unsettled done task is counted out of caution.
+  local active nwrap=0 d
+  pidx_load
+  for d in "$PQ_HOME/done"/*/; do
+    [ -d "$d" ] || continue
+    [ -n "$(slot_state "${d%/}")" ] && nwrap=$((nwrap + 1))
+  done
+  active=$(( $(ls -d "$PQ_HOME/running"/*/ 2>/dev/null | wc -l | tr -d ' ') + nwrap ))
+  local also=""
+  [ "$nwrap" -gt 0 ] && also=" ($nwrap of them wrapping up a PR)"
   if [ "$1" = 0 ]; then
-    msg "cap 0 - paused. $active still running; nothing new will start."
+    msg "cap 0 - paused. $active still running$also; nothing new will start."
   elif [ "$active" -gt "$1" ]; then
-    msg "cap $1 - $active already running, so nothing new starts until $(( active - $1 + 1 )) of them finish."
+    msg "cap $1 - $active already running$also, so nothing new starts until $(( active - $1 + 1 )) of them finish."
   else
-    msg "cap $1 - room for $(( $1 - active )) more."
+    msg "cap $1 - room for $(( $1 - active )) more$also."
   fi
 }
 
@@ -640,48 +676,103 @@ cell() {                                # text width -> ASCII-safe, truncated
   printf '%s' "$out"
 }
 
+# One page of `recent_plans`, as a table numbered ABSOLUTELY: row 11 is the
+# eleventh-newest plan whichever page it happens to be shown on. That is what
+# keeps `sed -n "${ans}p"` below a direct index into the full list, with no
+# per-page arithmetic to get wrong, and what makes a number mean one fixed plan
+# rather than "the third one I can currently see".
+pick_page() {                           # rows lo hi out_tsv
+  local lo=$2 hi=$3 out=$4 n=0 epoch path title
+  printf '#\tAGE\tPLAN\tSUMMARY\n' > "$out"
+  while IFS=$'\t' read -r epoch path; do
+    [ -n "$path" ] || continue
+    n=$((n + 1))
+    [ "$n" -lt "$lo" ] && continue
+    [ "$n" -gt "$hi" ] && break
+    title=$(plan_title "$path")
+    printf '%s\t%s\t%s\t%s\n' "$n" "$(age_since "$epoch")" \
+      "$(cell "$(basename "$path" .md)" 30)" "$(cell "$title" 60)" >> "$out"
+  done <<<"$1"
+  # A `while read` loop returns whatever its body last ran, and this body can
+  # end on a short-circuited test - so a perfectly good page would otherwise
+  # report failure. Exit codes carry meaning in this file (see pick_plan's own
+  # contract below); say the happy path out loud.
+  return 0
+}
+
 # Exit codes carry meaning, the way reap_task's already do: 0 chose one (its
 # path on stdout), 1 declined/`q`/EOF, 2 nothing in $PLANS_DIR to pick from -
 # the caller falls through to the existing "none found" error on that one.
 # Everything a human reads goes to stderr: pick_plan is consumed by a command
 # substitution, and any leakage on stdout would silently corrupt $plan, the
 # `source:` header, and the staged plan.md.
+#
+# $PLANS_DIR is every plan ever written, so this shows PQ_PICK_LIMIT of them at
+# a time - the newest page answers it most days - and `n`/`p` walk back through
+# the rest. Paging beats simply raising the limit because the plans you want
+# are named by the prompt that started their session
+# ("floofy-hugging-dragonfly.md"), so digging back is reading titles, not
+# recalling a filename, and a hundred-row table is not a thing you read.
 pick_plan() {
-  local rows total n=0 tbl epoch path title
+  local rows total
   rows=$(recent_plans)
   [ -n "$rows" ] || return 2
   total=$(wc -l <<<"$rows" | tr -d ' ')
 
-  tbl="$PQ_HOME/.pick.$$.tsv"
-  printf '#\tAGE\tPLAN\tSUMMARY\n' > "$tbl"
-  while IFS=$'\t' read -r epoch path; do
-    [ -n "$path" ] || continue
-    n=$((n + 1))
-    [ "$n" -gt "$PQ_PICK_LIMIT" ] && { n=$((n - 1)); break; }
-    title=$(plan_title "$path")
-    printf '%s\t%s\t%s\t%s\n' "$n" "$(age_since "$epoch")" \
-      "$(cell "$(basename "$path" .md)" 30)" "$(cell "$title" 60)" >> "$tbl"
-  done <<<"$rows"
+  # `lo`, the 1-based index of the page's first row, is the whole of the paging
+  # state - the stride cannot change mid-picker, so every other bound is
+  # arithmetic on it. It survives a declined preview, which is what returns you
+  # to the page you were reading rather than to the top.
+  local per=$PQ_PICK_LIMIT lo=1 hi pages
+  pages=$(( (total + per - 1) / per ))
 
+  local tbl="$PQ_HOME/.pick.$$.tsv"
   local ans row sel_path total_lines ans2 rule
   rule=$(printf -- '─%.0s' $(seq 1 60))
   while :; do
-    msg "$n most recent of $total"
+    hi=$(( lo + per - 1 )); [ "$hi" -gt "$total" ] && hi=$total
+    pick_page "$rows" "$lo" "$hi" "$tbl"
+
+    if [ "$pages" -gt 1 ]; then
+      msg "$lo-$hi of $total (page $(( (lo - 1) / per + 1 ))/$pages)"
+    else
+      msg "$total most recent of $total"
+    fi
     printf '\n' >&2
     render_table "$tbl" >&2
     printf '\n' >&2
-    printf 'pq: pick a plan [1-%s, Enter for 1, q to quit] ' "$n" >&2
+    # One page is the whole list, so there is nowhere to page to - don't offer
+    # keys that can only answer "already at the oldest".
+    if [ "$pages" -gt 1 ]; then
+      printf 'pq: pick a plan [%s-%s, n older, p newer, Enter for %s, q to quit] ' "$lo" "$hi" "$lo" >&2
+    else
+      printf 'pq: pick a plan [1-%s, Enter for 1, q to quit] ' "$total" >&2
+    fi
     read -r ans || { rm -f "$tbl"; return 1; }
-    [ -z "$ans" ] && ans=1
+    # The top of what you are looking at, which is row 1 on the first page -
+    # so a plain `pq add`, Enter, still takes the newest plan.
+    [ -z "$ans" ] && ans=$lo
+    # `n` here is "next page, older"; `n` at the `use this plan? [y/N]` prompt
+    # a few lines down is "no". Two prompts, two vocabularies - each one's own
+    # hint says which is in force, and neither key is ever ambiguous within the
+    # prompt that reads it.
     case "$ans" in
       q|Q) rm -f "$tbl"; return 1 ;;
+      n|N) if [ "$hi" -lt "$total" ]; then lo=$(( lo + per )); else warn "already at the oldest"; fi
+           continue ;;
+      p|P) if [ "$lo" -gt 1 ]; then lo=$(( lo - per )); else warn "already at the newest"; fi
+           continue ;;
     esac
+    # Any listed plan, on this page or not: the numbering is absolute, so
+    # rejecting a number that names a real plan just because it scrolled off
+    # would be a lie about what that number means.
+    #
     # Capped at 9 digits so a huge number never reaches the arithmetic tests
     # below: bash's [ -lt ]/[ -gt ] error out (a false "false") on an integer
     # past its native range, which would flip this whole OR-chain to skip the
     # reject instead of triggering it.
-    if ! [[ "$ans" =~ ^[0-9]{1,9}$ ]] || [ "$ans" -lt 1 ] || [ "$ans" -gt "$n" ]; then
-      warn "not a number from 1 to $n"
+    if ! [[ "$ans" =~ ^[0-9]{1,9}$ ]] || [ "$ans" -lt 1 ] || [ "$ans" -gt "$total" ]; then
+      warn "not a number from 1 to $total"
       continue
     fi
 
@@ -1979,6 +2070,162 @@ pane_state() {                          # pane_id
     END { if (!found) print "missing" }' <<<"$PIDX"
 }
 
+# ── slots ───────────────────────────────────────────────────────────────────
+# What the cap counts. The cap is a promise about how many AGENTS run at once,
+# and for a long time it counted directories in `running/` instead - which is
+# the same number only while "has a pull request" means "has stopped working".
+# It does not. A Claude Code agent that opens a PR keeps going: it answers
+# review, fixes CI, pushes again, and it never exits on its own. So reconcile
+# would move a task to `done/` the moment its PR appeared, free the slot, and
+# start a fourth agent while the third was still typing. Three tasks wrapping
+# up in `done/` alongside three fresh ones in `running/` is six live agents at
+# a cap of 3 - measured, not hypothetical.
+#
+# Reconcile is right and stays as it is: a PR in any state does mean the work
+# left the queue, and a draft PR is what the stalled-chain verdict is built on
+# (`blocker_state`). What was wrong is only the arithmetic, so only the
+# arithmetic changes - `done/` tasks keep counting while their agent is still
+# there.
+#
+# The release has to be a TIMER, not an exit. An agent that has genuinely
+# finished sits `idle` forever rather than exiting, so counting `idle` with no
+# deadline would not overshoot the cap - it would stall the queue permanently,
+# which is worse. PQ_WRAPUP_GRACE is that deadline: once the agent has not been
+# working for that long, the slot goes. `idle` is the state a finished agent
+# actually rests in, so putting a deadline on that one is what rules out the
+# stall.
+#
+# herdr's agent_status is one of exactly five words - idle, working, blocked,
+# done, unknown - on top of the two pq derives from the snapshot itself:
+#
+#   working           holds it, and clears the clock - this is real work
+#   blocked           holds it, and clears the clock. Same trade `running/`
+#                     already makes: a permission prompt or a quota wall is an
+#                     agent that will resume, not one that has finished. It is
+#                     the one state besides `working` with no deadline, and
+#                     unlike a running task nothing here knocks on the pane - so
+#                     `pq ls` reports a blocked done row as `blocked` rather
+#                     than `wrapping up`, and counts it into "needs you"
+#   idle | done       holds it until the clock passes the grace, then releases.
+#                     Both are per-TURN, not per-task: `done` means the agent
+#                     finished the turn it was on, and one that opened a PR and
+#                     then went back in to fix CI passes through it every time.
+#                     Releasing on either the moment it appeared would be the
+#                     original bug in a subtler form - a slot handed away in the
+#                     pause between two turns of the same task.
+#   unknown | other   same treatment, which is also the safe default for a word
+#                     herdr adds later: bounded, so nothing can hold a slot for
+#                     ever on a status pq has never heard of
+#   noagent | missing releases at once - Claude exited, or the workspace is gone
+#   "" (herdr silent) holds it, clock untouched. There is no way to tell a live
+#                     agent from a finished one, and guessing "finished" is
+#                     exactly the over-dispatch this exists to stop. Dispatch
+#                     needs herdr too, so nothing is lost by waiting.
+#
+# `running/` is deliberately NOT put through this: it counts unconditionally.
+# That preserves the documented trade that a blocked task still holds its slot,
+# and it avoids a leak this would otherwise open - a `running/` task whose agent
+# went idle without ever opening a PR would stop counting while still sitting in
+# `running/`, holding a worktree, with nothing to move it on.
+
+# Does this done/ task still hold a slot? 0 yes, 1 no. Writes PQ_WRAPUP_SINCE,
+# so it must not be called from a listing - see slot_state for the read-only
+# view `pq ls` uses.
+slot_held() {                           # task_dir -> 0 holds, 1 released
+  local d=$1 pane status since nowe
+  # Terminal - there is no agent left to hold anything. PQ_REAPED means the
+  # workspace itself has been closed, so the pane id on file now points at
+  # nothing (or, if herdr ever recycles ids, at somebody else's agent).
+  [ -n "$(st "$d" PQ_REAPED)" ] && return 1
+  [ -n "$(st "$d" PQ_CLOSED)" ] && return 1
+  pane=$(st "$d" PQ_PANE)
+  [ -n "$pane" ] || return 1
+  status=$(pane_state "$pane")
+  case "$status" in
+    working|blocked)
+      [ -z "$(st "$d" PQ_WRAPUP_SINCE)" ] || st_set "$d" PQ_WRAPUP_SINCE ""
+      return 0 ;;
+    noagent|missing) return 1 ;;
+    "")              return 0 ;;
+  esac
+  # idle | done | unknown, and anything herdr adds later - start the clock on the
+  # transition, then compare against it.
+  since=$(st "$d" PQ_WRAPUP_SINCE)
+  if [ -z "$since" ]; then
+    st_set "$d" PQ_WRAPUP_SINCE "$(now)"
+    return 0
+  fi
+  since=$(epoch_of "$since")
+  # An unparseable stamp is corruption, not a verdict: rewrite it and hold the
+  # slot for one more grace period rather than releasing on a bad read.
+  [ -n "$since" ] || { st_set "$d" PQ_WRAPUP_SINCE "$(now)"; return 0; }
+  nowe=$(epoch)
+  [ $(( nowe - since )) -ge "$PQ_WRAPUP_GRACE" ] && return 1
+  return 0
+}
+
+# The slot count the cap is compared against, as `running<TAB>wrapping-up`:
+# every running/ task, plus every done/ task whose agent has not finished. The
+# two halves come back separately because the summary has to name them
+# separately - "3 running (cap 3)" while six agents are live is the report that
+# hid this bug for as long as it lasted.
+#
+# One pass, one set of PQ_WRAPUP_SINCE writes: slot_held is idempotent, but the
+# clock it starts should be read by everything in a tick, not restarted partway
+# through it. Reads state that reconcile and reap have already stamped, so it
+# must run after them.
+#
+# Under `dry` it counts through slot_state instead, so `--dry-run` starts nobody's
+# clock - the same promise reap_task keeps by gating each of its write sites
+# individually. The two agree on every branch (an unstamped idle agent holds its
+# slot either way; it is only the stamping that differs), so the number a
+# dry-run reports is the number a real tick would have acted on.
+active_slots() {                        # [dry] -> run<TAB>wrap
+  local dry=${1:-0} d run=0 wrap=0
+  for d in "$PQ_HOME/running"/*/; do
+    [ -d "$d" ] && run=$((run + 1))
+  done
+  for d in "$PQ_HOME/done"/*/; do
+    [ -d "$d" ] || continue
+    d=${d%/}
+    if [ "$dry" = 1 ]; then
+      [ -n "$(slot_state "$d")" ] && wrap=$((wrap + 1))
+    else
+      slot_held "$d" && wrap=$((wrap + 1))
+    fi
+  done
+  printf '%s\t%s' "$run" "$wrap"
+}
+
+# The read-only half of slot_held, for `pq ls` and `pq cap`: the same verdict
+# with no state written and no clock started. Prints `wrapping up` when the task
+# is holding a slot it will eventually give back, and nothing when it is not
+# holding one at all - so a caller can tell the two apart by emptiness alone.
+#
+# It deliberately does NOT start the clock. A listing that stamped
+# PQ_WRAPUP_SINCE would reset the grace period every time you ran `pq ls`, and
+# an agent could then hold its slot for as long as you kept looking at it.
+slot_state() {                          # task_dir -> "wrapping up" | ""
+  local d=$1 pane status since
+  [ -n "$(st "$d" PQ_REAPED)" ] && return 0
+  [ -n "$(st "$d" PQ_CLOSED)" ] && return 0
+  pane=$(st "$d" PQ_PANE)
+  [ -n "$pane" ] || return 0
+  status=$(pane_state "$pane")
+  case "$status" in
+    working|blocked|"") printf 'wrapping up'; return 0 ;;
+    noagent|missing)    return 0 ;;
+  esac
+  since=$(st "$d" PQ_WRAPUP_SINCE)
+  # Not yet stamped: the next tick is what starts the clock, and until then the
+  # slot is still held.
+  [ -n "$since" ] || { printf 'wrapping up'; return 0; }
+  since=$(epoch_of "$since")
+  [ -n "$since" ] || { printf 'wrapping up'; return 0; }
+  [ $(( $(epoch) - since )) -ge "$PQ_WRAPUP_GRACE" ] || printf 'wrapping up'
+  return 0
+}
+
 # ── the session wall ────────────────────────────────────────────────────────
 # Claude Code turns a 429 into a dialog - "Wait for limit to reset · Resets 3pm" -
 # and every option on it only dismisses the dialog. Nothing resumes by itself. So
@@ -2506,9 +2753,14 @@ after_json() {                          # task_dir
 # `stty size </dev/tty`, not `tput cols`: every caller here reaches term_width
 # through a command substitution, so tput's stdout is a pipe, its ioctl fails,
 # and it falls back to terminfo's 80 rather than the real width.
+#
+# The redirection is wrapped in a group so /dev/tty's own absence is silenced
+# too: `stty ... 2>/dev/null` only covers what stty says, and a missing
+# controlling terminal is the SHELL complaining about the redirect - "Device not
+# configured", once per rendered table, in every detached `pq tick` log.
 term_width() {
   local c=${PQ_WIDTH:-}
-  [ -n "$c" ] || c=$(stty size </dev/tty 2>/dev/null | cut -d' ' -f2)
+  [ -n "$c" ] || c=$( { stty size </dev/tty; } 2>/dev/null | cut -d' ' -f2 )
   [ -n "$c" ] || c=$(tput cols 2>/dev/null)
   [[ "$c" =~ ^[0-9]+$ ]] && [ "$c" -ge 40 ] || c=100
   printf '%s' "$c"
@@ -2584,8 +2836,8 @@ age_since() {                           # epoch_seconds -> 12m / 3h / 5d
 
 age_of() {                              # iso8601
   local then
-  [ -n "${1:-}" ] || { printf -- '-'; return; }
-  then=$(date -j -u -f '%Y-%m-%dT%H:%M:%SZ' "$1" '+%s' 2>/dev/null) || { printf -- '-'; return; }
+  then=$(epoch_of "${1:-}")
+  [ -n "$then" ] || { printf -- '-'; return; }
   age_since "$then"
 }
 
@@ -2628,6 +2880,26 @@ agent_cell() {                          # task_dir state
       local reason
       if [ -n "$(st "$d" PQ_CLOSED)" ]; then printf 'closed'; return; fi
       reason=$(st "$d" PQ_REAP_HELD)
+      # These two want a decision from you and say nothing about the agent, so
+      # they outrank the slot report below. `held agent` does not: it means the
+      # very thing `wrapping up` says, and says it without mentioning the slot.
+      case "$reason" in
+        nobase|here) printf 'held %s' "$reason"; return ;;
+      esac
+      # A done task whose agent is still going still holds one of the cap's
+      # slots (see the `slots` section). Without this the queue not advancing
+      # has no visible cause at all - the running/ rows add up to less than the
+      # cap and nothing on screen accounts for the difference.
+      #
+      # `blocked` is called out rather than folded into `wrapping up`, because
+      # the two want opposite things from you. A wrapping-up agent wants
+      # nothing; a blocked one is sitting on a prompt, holds its slot for as
+      # long as it sits there, and nothing knocks on a done/ pane the way
+      # check_stall knocks on a running one. It reads as `blocked` for the same
+      # reason a running row does, and counts into "needs you" through the case
+      # cmd_ls already has for that word.
+      if [ "$(pane_state "$(st "$d" PQ_PANE)")" = blocked ]; then printf 'blocked'; return; fi
+      if [ -n "$(slot_state "$d")" ]; then printf 'wrapping up'; return; fi
       if [ -n "$reason" ]; then printf 'held %s' "$reason"; else printf -- '-'; fi
       return
       ;;
@@ -2707,6 +2979,7 @@ cmd_ls() {
 
   local tbl="$PQ_HOME/.ls.$$.tsv"
   local slug branch model effort dev intent added pr num prstate draft agent needs=0 blocked dispst
+  local holding nwrap=0
   local TAB=$'\t'
   if [ "$as_json" = 1 ]; then
     : > "$tbl"
@@ -2736,6 +3009,15 @@ cmd_ls() {
       permission|gone|exited|blocked|unknown|closed) needs=$((needs + 1)) ;;
       dead\ *|stalled\ *|held\ *)                     needs=$((needs + 1)) ;;
     esac
+    # Which rows are spending the cap. `running` unconditionally, the same way
+    # active_slots counts it; a done row only while its agent is still there.
+    # Deliberately NOT folded into `needs` - a task wrapping up is healthy, it
+    # just is not free.
+    holding=false
+    case "$st" in
+      running) holding=true ;;
+      done)    [ -n "$(slot_state "$d")" ] && { holding=true; nwrap=$((nwrap + 1)); } ;;
+    esac
     num=""; prstate=""; draft=""
     IFS=$'\t' read -r num prstate draft <<<"$(pr_get "$repo" "$branch")"
     case "${prstate:-}" in
@@ -2755,6 +3037,7 @@ cmd_ls() {
         --arg draft "$draft" --arg stamp "$(stamp_of "$d")" \
         --argjson urgent "$(is_urgent "$d" && printf true || printf false)" \
         --arg merged "$merged" --arg reaped "$reaped" --arg held "$held" \
+        --argjson holding_slot "$holding" \
         --argjson after "$(after_json "$d")" --argjson blocked "$blocked" '
         def str: if . == "" then null else . end;
         { task: $task, stamp: ($stamp|tonumber), urgent: $urgent, state: $state, dir: $dir,
@@ -2763,7 +3046,7 @@ cmd_ls() {
           agent: ($agent | if . == "-" then null else . end),
           pr: ($pr|str|if . then tonumber else null end),
           pr_state: ($prstate|str), pr_draft: ($draft == "draft"),
-          after: $after, blocked: $blocked,
+          after: $after, blocked: $blocked, holding_slot: $holding_slot,
           merged: ($merged|str), reaped: ($reaped|str), held: ($held|str) }' >> "$tbl"
     else
       local row="$slug"
@@ -2785,7 +3068,11 @@ cmd_ls() {
     nr=$(ls -d "$PQ_HOME/running"/*/ 2>/dev/null | wc -l | tr -d ' ')
     narch=$(ls -d "$PQ_HOME/archive"/*/ 2>/dev/null | wc -l | tr -d ' ')
     printf '\n' >&2
-    msg "$nr running, $nq queued\
+    # The wrap-up count only earns its words when there is one, but when there
+    # is, it is the line that explains a queue sitting still at a cap that looks
+    # unreached - so it names the cap alongside it rather than leaving you to
+    # add the two numbers up yourself.
+    msg "$nr running$([ "$nwrap" -gt 0 ] && printf ' + %s wrapping up (cap %s)' "$nwrap" "$(cap_get)"), $nq queued\
 $([ "$needs" -gt 0 ] && printf ' (%s needs you)' "$needs")\
 $([ "$narch" -gt 0 ] && printf ', %s archived%s' "$narch" "$([ "$all" = 1 ] || printf ' (--all to see)')")"
   fi
@@ -3530,10 +3817,14 @@ tick_body() {                           # cap dry
   done
   local waiting; waiting=$(awk -F'\t' '$2 !~ /^met/ { n++ } END { print n + 0 }' "$afterpass")
 
-  # 2. Fill. `running` is the slot count: a task blocked on a permission prompt still
-  #    holds one, which is the deliberate trade for running everything in auto mode.
-  local active
-  active=$(ls -d "$PQ_HOME/running"/*/ 2>/dev/null | wc -l | tr -d ' ')
+  # 2. Fill. A live agent is a slot, wherever its task now sits - every running/
+  #    task (a task blocked on a permission prompt still holds one, the
+  #    deliberate trade for running everything in auto mode) plus every done/
+  #    task still wrapping up its pull request. See the `slots` section for why
+  #    the second half is not optional.
+  local n_run n_wrap active
+  IFS=$'\t' read -r n_run n_wrap <<<"$(active_slots "$dry")"
+  active=$(( n_run + n_wrap ))
   local free=$(( cap - active ))
 
   # Build the queue ONCE, in stamp order, then walk it - skipping whatever
@@ -3587,9 +3878,15 @@ tick_body() {                           # cap dry
   rm -f "$afterpass" "$PR_CACHE" "$PR_ANS"
   repo_base_reset
 
-  active=$(ls -d "$PQ_HOME/running"/*/ 2>/dev/null | wc -l | tr -d ' ')
+  # Only running/ is recounted - fill just moved tasks into it. The wrap-up half
+  # is reused rather than recomputed: nothing after fill can change it, and a
+  # second active_slots pass would re-walk done/ for the same answer.
+  n_run=$(ls -d "$PQ_HOME/running"/*/ 2>/dev/null | wc -l | tr -d ' ')
   local queued; queued=$(ls -d "$PQ_HOME/queue"/*/ 2>/dev/null | wc -l | tr -d ' ')
-  summary "$active running (cap $cap), $queued queued\
+  # Name the two halves separately. A cap of 3 reading "3 running" while three
+  # more agents were still wrapping up in done/ is precisely what made six live
+  # agents look like a healthy tick for as long as this bug lasted.
+  summary "$n_run running$([ "$n_wrap" -gt 0 ] && printf ' + %s wrapping up' "$n_wrap") (cap $cap), $queued queued\
 $([ "$started" -gt 0 ] && printf ', %s started' "$started")\
 $([ "$would" -gt 0 ] && printf ', %s would start' "$would")\
 $([ "$waiting" -gt 0 ] && printf ', %s waiting on a merge' "$waiting")\
@@ -3678,7 +3975,19 @@ cmd_run() {
     [ "$PQ_STOP" = 1 ] && break
   done
   release_lock
-  msg "stopped - $(ls -d "$PQ_HOME/running"/*/ 2>/dev/null | wc -l | tr -d ' ') still running, queue untouched"
+  # The same arithmetic the tick itself used, for the same reason cmd_cap uses
+  # it: this is the line you read as you Ctrl-C, and "2 still running" while six
+  # agents are live is how the cap came to be trusted when it should not have
+  # been. slot_state, not slot_held - the loop is over, and nobody's clock should
+  # start on the way out.
+  local n_run n_wrap d
+  n_run=$(ls -d "$PQ_HOME/running"/*/ 2>/dev/null | wc -l | tr -d ' ')
+  n_wrap=0
+  for d in "$PQ_HOME/done"/*/; do
+    [ -d "$d" ] || continue
+    [ -n "$(slot_state "${d%/}")" ] && n_wrap=$((n_wrap + 1))
+  done
+  msg "stopped - $n_run still running$([ "$n_wrap" -gt 0 ] && printf ' + %s wrapping up' "$n_wrap"), queue untouched"
 }
 
 # Wrapped so the script can be sourced without dispatching - `test/pq-after.sh`
