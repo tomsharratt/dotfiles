@@ -3311,13 +3311,19 @@ cmd_archive() {
 # plan to remember would mean one forgetful plan costs a whole night, so it lives
 # here where it cannot be forgotten.
 #
+# It names no review step, and asking for one here is the wrong place to try. This
+# prompt may only name capabilities the model can invoke ITSELF, and Claude Code's
+# `/code-review` and `/security-review` are reserved for a human typing them
+# (`disable-model-invocation`), so every dispatched agent answered the review clause
+# that used to be here with a complaint that it could not run it. A review gate is
+# still wanted; it needs a mechanism pq drives rather than a sentence in a prompt.
+#
 # Deliberately free of single quotes - it is wrapped in them below so it survives
 # being re-parsed by the pane's shell, and the inline check in dispatch_task
 # enforces that before anything is sent.
 dispatch_prompt() {                     # plan_path
   printf '%s' "Read $1 and carry it out. \
-Before opening a pull request, run /code-review on your diff and act on what it finds. \
-Then commit, push, and open a pull request whose description opens with the intent line \
+Commit, push, and open a pull request whose description opens with the intent line \
 from the plan header, followed by what you actually did. \
 If you get stuck, or the plan turns out not to fit, commit what you have, push, and open \
 a DRAFT pull request whose description explains what blocked you, then stop. \
