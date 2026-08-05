@@ -207,6 +207,13 @@ st() {                                  # task_dir key
 # Upsert KEY=VALUE, preserving the other keys. Each dispatch step records itself the
 # moment it succeeds, which is what lets reconcile tell a half-finished dispatch from
 # a finished one after an interrupted tick.
+#
+# Values must be shell-safe WORDS, because `st` reads this file by sourcing it and
+# nothing here quotes anything. That is not a style note: a value containing a
+# bracket - `PQ_RESETS=3pm (PDT)`, as the session wall used to store its hint - is a
+# syntax error, and bash abandons the whole file at that line, so every key written
+# after it silently reads empty. Store the machine form of a fact (an epoch, an id, a
+# stamp) and format it on the way out; never store prose.
 st_set() {                              # task_dir key value
   local f="$1/state.env"
   { grep -v "^$2=" "$f" 2>/dev/null || true; printf '%s=%s\n' "$2" "$3"; } > "$f.tmp" && mv "$f.tmp" "$f"
@@ -299,8 +306,14 @@ cmd_cap() {
   active=$(( $(ls -d "$PQ_HOME/running"/*/ 2>/dev/null | wc -l | tr -d ' ') + nwrap ))
   local also=""
   [ "$nwrap" -gt 0 ] && also=" ($nwrap of them wrapping up a PR)"
+  # A wall outranks the arithmetic here as much as it does in fill: room the next
+  # tick will not use is not room, and the reason is the whole answer.
+  local walled_by walled_at
+  IFS=$'\t' read -r walled_by walled_at <<<"$(walled_slot)"
   if [ "$1" = 0 ]; then
     msg "cap 0 - paused. $active still running$also; nothing new will start."
+  elif [ -n "$walled_by" ]; then
+    msg "cap $1 - $active running$also, but $walled_by is $(walled_note "$walled_at"), so nothing new starts until it is moving again."
   elif [ "$active" -gt "$1" ]; then
     msg "cap $1 - $active already running$also, so nothing new starts until $(( active - $1 + 1 )) of them finish."
   else
@@ -2103,9 +2116,8 @@ pane_state() {                          # pane_id
 #                     already makes: a permission prompt or a quota wall is an
 #                     agent that will resume, not one that has finished. It is
 #                     the one state besides `working` with no deadline, and
-#                     unlike a running task nothing here knocks on the pane - so
 #                     `pq ls` reports a blocked done row as `blocked` rather
-#                     than `wrapping up`, and counts it into "needs you"
+#                     than `wrapping up`, counting it into "needs you"
 #   idle | done       holds it until the clock passes the grace, then releases.
 #                     Both are per-TURN, not per-task: `done` means the agent
 #                     finished the turn it was on, and one that opened a PR and
@@ -2121,6 +2133,21 @@ pane_state() {                          # pane_id
 #                     agent from a finished one, and guessing "finished" is
 #                     exactly the over-dispatch this exists to stop. Dispatch
 #                     needs herdr too, so nothing is lost by waiting.
+#
+# On top of herdr's word, pq's own PQ_BLOCKED=quota holds the slot with no
+# deadline, exactly as `blocked` does, and for a reason herdr cannot see: the
+# first thing check_stall does about a wall is DISMISS it, which stops the
+# spinner, so from that moment a walled agent reads `idle` and the grace would
+# hand its slot away while it waits for its window. It is then handed back on the
+# very tick the block clears - the tick its agent starts working again - which is
+# the "six agents at a cap of 3" bug arriving one tick late.
+#
+# One asymmetry that is deliberate, since two functions otherwise look like they
+# disagree: reap_task decides "the agent is still going" from herdr's
+# `working`/`blocked` alone, so it will tear down a walled task that this one is
+# still holding a slot for. Reap wins, and should - it only ever fires once the
+# pull request has MERGED, and a merged PR means there is nothing left for the
+# agent to come back to. The slot goes with the teardown.
 #
 # `running/` is deliberately NOT put through this: it counts unconditionally.
 # That preserves the documented trade that a blocked task still holds its slot,
@@ -2142,10 +2169,15 @@ slot_held() {                           # task_dir -> 0 holds, 1 released
   [ -n "$pane" ] || return 1
   status=$(pane_state "$pane")
   case "$status" in
+    noagent|missing) return 1 ;;
+  esac
+  # A dismissed wall reads `idle`, so pq's own verdict has to be consulted before
+  # the grace is applied to one - see the note above.
+  [ "$(st "$d" PQ_BLOCKED)" = quota ] && status=blocked
+  case "$status" in
     working|blocked)
       [ -z "$(st "$d" PQ_WRAPUP_SINCE)" ] || st_set "$d" PQ_WRAPUP_SINCE ""
       return 0 ;;
-    noagent|missing) return 1 ;;
     "")              return 0 ;;
   esac
   # idle | done | unknown, and anything herdr adds later - start the clock on the
@@ -2213,8 +2245,12 @@ slot_state() {                          # task_dir -> "wrapping up" | ""
   [ -n "$pane" ] || return 0
   status=$(pane_state "$pane")
   case "$status" in
+    noagent|missing) return 0 ;;
+  esac
+  # Same override as slot_held, for the same reason: a dismissed wall reads `idle`.
+  [ "$(st "$d" PQ_BLOCKED)" = quota ] && status=blocked
+  case "$status" in
     working|blocked|"") printf 'wrapping up'; return 0 ;;
-    noagent|missing)    return 0 ;;
   esac
   since=$(st "$d" PQ_WRAPUP_SINCE)
   # Not yet stamped: the next tick is what starts the clock, and until then the
@@ -2262,15 +2298,33 @@ slot_state() {                          # task_dir -> "wrapping up" | ""
 # and it also takes over after a knock at the named time turns out to be too early.
 # Waiting on an unparsed guess is the only outcome worth ruling out, since that
 # strands a task silently, where a knock sent early costs one instantly-failing call.
+# `pane read`, not `agent read`, and `--format text` is already text - it is not a
+# JSON envelope with the terminal inside it. Piping it through jq is how this
+# returned the empty string on every tick of every task for as long as the section
+# existed, which check_stall reads as "could not see the pane" and returns on. The
+# wall was never once detected.
+#
+# `pane read` is also the only one of the two that answers for a pane whose agent
+# binding has lapsed - `agent read` returns an `agent_not_found` error object - and
+# answering for exactly that pane is the point of the `noagent` case reconcile goes
+# out of its way to include. An error object is still possible (a dead socket, a
+# pane id that is gone), so drop one: it is not terminal text, and letting it
+# through would have `classify_tail` reading somebody's error message.
 pane_tail() {                           # pane_id -> the last lines on screen
   [ -n "${1:-}" ] || return 0
-  herdr agent read "$1" --source visible --format text 2>/dev/null \
-    | jq -r '.result.read.text // ""' 2>/dev/null | tail -n "$PQ_TAIL_LINES"
+  herdr pane read "$1" --source visible --format text 2>/dev/null \
+    | grep -v '^{"error":' | tail -n "$PQ_TAIL_LINES"
 }
 
 # "Resets 8:30pm" / "Resets Jul 28, 8pm" -> epoch. Local time throughout, because
 # that is what Claude Code printed. Silence means "could not read it" and the caller
 # falls back to polling, so every branch here fails closed rather than guessing.
+#
+# Every format below carries an explicit `%S` against a literal `00`, because BSD
+# `date -j -f` fills a field the format does not mention from the CURRENT time - so a
+# hint with no seconds in it silently picked up however many seconds past the minute
+# it happened to be parsed at. Harmless in the arithmetic, but it made a stored reset
+# disagree with the one on screen, and `clock_of` its own inverse only by luck.
 parse_reset() {                         # hint text -> epoch seconds
   local s=$1 dpart tpart e nowe
   s=${s%%(*}                                          # drop a trailing " (PDT)"
@@ -2288,14 +2342,14 @@ parse_reset() {                         # hint text -> epoch seconds
   if [ -n "$dpart" ]; then
     dpart=$(sed 's/^[[:space:]]*//; s/[[:space:]]*$//' <<<"$dpart")
     case "$dpart" in
-      *[0-9][0-9][0-9][0-9]*) e=$(date -j -f '%b %d %Y %I:%M%p' "$dpart $tpart" '+%s' 2>/dev/null) ;;
-      *) e=$(date -j -f '%b %d %Y %I:%M%p' "$dpart $(date '+%Y') $tpart" '+%s' 2>/dev/null)
+      *[0-9][0-9][0-9][0-9]*) e=$(date -j -f '%b %d %Y %I:%M%p %S' "$dpart $tpart 00" '+%s' 2>/dev/null) ;;
+      *) e=$(date -j -f '%b %d %Y %I:%M%p %S' "$dpart $(date '+%Y') $tpart 00" '+%s' 2>/dev/null)
          # No year printed means this year - unless we are reading it across new year.
          [ -n "$e" ] && [ "$e" -lt $(( nowe - 86400 )) ] &&
-           e=$(date -j -f '%b %d %Y %I:%M%p' "$dpart $(( $(date '+%Y') + 1 )) $tpart" '+%s' 2>/dev/null) ;;
+           e=$(date -j -f '%b %d %Y %I:%M%p %S' "$dpart $(( $(date '+%Y') + 1 )) $tpart 00" '+%s' 2>/dev/null) ;;
     esac
   else
-    e=$(date -j -f '%Y-%m-%d %I:%M%p' "$(date '+%Y-%m-%d') $tpart" '+%s' 2>/dev/null)
+    e=$(date -j -f '%Y-%m-%d %I:%M%p %S' "$(date '+%Y-%m-%d') $tpart 00" '+%s' 2>/dev/null)
     # A bare clock time is the next time the clock reads it, so 1am seen at 11pm
     # is tomorrow. The small grace keeps a reset we have just passed from jumping.
     [ -n "$e" ] && [ "$e" -lt $(( nowe - 300 )) ] && e=$(( e + 86400 ))
@@ -2306,8 +2360,51 @@ parse_reset() {                         # hint text -> epoch seconds
 
 # The hint sits at the end of a line that may well be inside a bordered box, so
 # anything trailing that cannot be part of a date is dropped.
+#
+# Which line it comes off matters, because there are usually two. The wall's own
+# line carries one ("You've hit your session limit - resets 3pm (PDT)"), and a
+# statusline that reports rate limits carries another ("session 70% (resets
+# 10:40pm)") - so a plain `tail -1` takes the statusline's, purely because the
+# statusline is drawn below the transcript. That is the wrong one twice over: it
+# names the five-hour window even when what walled us was the weekly one, and its
+# trailing bracket makes parse_reset fail, silently demoting a reset we could have
+# read to blind polling.
+#
+# So prefer a hint on a line that also looks like the wall, and only fall back to
+# any other. The fallback is worth keeping - a statusline hint beats no hint, and
+# it is right in the common case - which is why the two shapes it comes in are
+# tolerated below: a trailing bracket, and a weekday for a reset that crosses
+# midnight. Dropping the weekday loses nothing, since parse_reset already reads a
+# bare clock time as the next time the clock reads it.
 reset_hint() {                          # pane text -> the time the wall names
-  sed -n 's/.*[Rr]esets \(.*\)$/\1/p' <<<"$1" | tail -1 | sed 's/[^0-9A-Za-z:,() ]*$//'
+  local line
+  line=$(grep -iE "$PQ_QUOTA_RE" <<<"$1" | grep -i 'resets ' | tail -1)
+  [ -n "$line" ] || line=$(grep -i 'resets ' <<<"$1" | tail -1)
+  # The weekday strip is anchored to a whole bare clock time on purpose: a leading
+  # three-letter word is a weekday in "Sat 1:00am" and a MONTH in "Jul 28, 8pm",
+  # and dropping the month would move the reset by up to a year.
+  sed -n 's/.*[Rr]esets \(.*\)$/\1/p' <<<"$line" | tail -1 \
+    | sed 's/[^0-9A-Za-z:,() ]*$//
+           s/)$//
+           s/^[A-Za-z][a-z][a-z] \([0-9]\{1,2\}\(:[0-9][0-9]\)*[APap][Mm]\)$/\1/'
+}
+
+# parse_reset's inverse, for the one place a stored reset is shown to a human. What
+# is KEPT is the epoch - a hint is prose, and prose does not survive a round trip
+# through state.env (see st_set) - so the display form is rebuilt on the way out
+# rather than stored alongside it.
+#
+# Formatted the way Claude Code formats the same fact, since that is what you saw on
+# the pane: minutes dropped when they are zero, and a weekday only once the reset is
+# not today. ASCII throughout, as every `pq ls` cell must be.
+clock_of() {                            # epoch seconds -> "8:30pm" | "Sat 1am"
+  [ -n "${1:-}" ] || return 0
+  local fmt='+%-I:%M%p'
+  [ "$(date -r "$1" '+%M' 2>/dev/null)" = 00 ] && fmt='+%-I%p'
+  [ "$(date -r "$1" '+%j' 2>/dev/null)" = "$(date '+%j')" ] || fmt="+%a ${fmt#+}"
+  # Only the meridiem is lowercased, and by substitution rather than `tr`, which
+  # would take the weekday with it. Same two expressions the statusline uses.
+  date -r "$1" "$fmt" 2>/dev/null | sed 's/AM$/am/; s/PM$/pm/'
 }
 
 classify_tail() {                       # text -> quota | permission | none
@@ -2331,14 +2428,38 @@ unstick() {                             # pane_id [text to send after]
 
 clear_block() {                         # task_dir
   local d=$1 k
-  for k in PQ_BLOCKED PQ_QUOTA_SINCE PQ_TRIES PQ_RETRY_AT PQ_GAVEUP PQ_RESETS; do st_set "$d" "$k" ""; done
+  for k in PQ_BLOCKED PQ_QUOTA_SINCE PQ_TRIES PQ_RETRY_AT PQ_GAVEUP PQ_RESETS_AT; do st_set "$d" "$k" ""; done
 }
 
-# One running task, one tick: record what its pane is waiting on, and knock if it
-# is the wall. Everything else is classified and left alone - answering a dialog
-# nobody has identified is how an unattended system approves something it shouldn't.
+# One task, one tick: record what its pane is waiting on, and knock if it is the
+# wall. Everything else is classified and left alone - answering a dialog nobody has
+# identified is how an unattended system approves something it shouldn't.
+#
+# **Once the wall has been seen, the schedule is pq's own.** The banner is not
+# transcript text: it is live UI that Claude Code derives from the reset time it is
+# waiting for, so it clears ITSELF at the reset - which is the exact moment the knock
+# comes due. Cancelling the plan whenever the wall is no longer on screen therefore
+# threw it away at the one moment it mattered, and an agent walled at 2am sat there
+# until morning with nothing left on file to say it ever had been.
+#
+# So the text is treated as a signal, not as state. It puts the block on; from then
+# on PQ_RETRY_AT decides, and what is on screen decides nothing until the knock is
+# due.
+#
+# What takes the block off is evidence the agent is MOVING again, and "moving" needs
+# two things, not one. The tail hash alone is not enough, because a statusline that
+# reports rate limits is inside the tail and turns over at the reset - a one-tick
+# hash change landing at precisely `due + 60`, indistinguishable from the agent
+# picking its work back up, and it would clear the block on an idle agent that never
+# resumed. So movement has to be corroborated by herdr calling the pane `working`.
+#
+# That is not a retreat from "detection is the pane's TEXT, never herdr's status".
+# That rule is about DETECTION, where herdr's top rule reads the spinner still in the
+# title as `working` while the request that hit the wall is in flight. By the time a
+# knock is due the dialog has long been dismissed and nothing is in flight, so
+# `working` there means what it says. PIDX is loaded once per tick, so it is free.
 check_stall() {                         # task_dir
-  local d=$1 slug pane text hash prev kind was tries at nowsec
+  local d=$1 slug pane text hash prev kind was tries at nowsec still moved
   pane=$(st "$d" PQ_PANE); [ -n "$pane" ] || return 0
   text=$(pane_tail "$pane"); [ -n "$text" ] || return 0
   slug=$(slug_of "$d"); nowsec=$(epoch)
@@ -2346,34 +2467,51 @@ check_stall() {                         # task_dir
   prev=$(st "$d" PQ_TAIL); st_set "$d" PQ_TAIL "$hash"
   kind=$(classify_tail "$text")
   was=$(st "$d" PQ_BLOCKED)
+  # "Has this screen stopped" and "has this screen moved" are not each other's
+  # negation: with no hash on file yet, the honest answer to both is no. Folding them
+  # into one flag has to pick a side, and each side is wrong somewhere - a first read
+  # counted as still detects a wall off a single glimpse, and a first read counted as
+  # moved lets one glimpse of a `working` title clear a block that is real.
+  still=0; moved=0
+  if [ -n "$prev" ]; then
+    if [ "$prev" = "$hash" ]; then still=1; else moved=1; fi
+  fi
 
-  if [ "$kind" != quota ]; then
+  # A permission prompt is recorded and deliberately never answered. That is the
+  # trade for running everything in auto mode, and it is the distinction `pq ls`
+  # draws in the morning between waiting on the clock and waiting on you.
+  #
+  # It also ends a wall, wherever we had got to with one: a session that is asking
+  # for something is a session that is running again. Ending it here matters, because
+  # the alternative is a knock sending Escape at a prompt - refusing it - and then
+  # doing that again every ten minutes.
+  if [ "$kind" = permission ]; then
     [ "$was" = quota ] && msg "$slug: moving again after the session limit"
-    # Only when there is something to clear: this is the overwhelmingly common
-    # branch, and each clear is five rewrites of state.env for no change at all.
-    [ -n "$was" ] && clear_block "$d"
-    # A permission prompt is recorded and deliberately never answered. That is the
-    # trade for running everything in auto mode, and it is the distinction `pq ls`
-    # draws in the morning between waiting on the clock and waiting on you.
-    [ "$kind" = permission ] && st_set "$d" PQ_BLOCKED permission
+    [ -n "$was" ] && [ "$was" != permission ] && clear_block "$d"
+    st_set "$d" PQ_BLOCKED permission
     return 0
   fi
 
-  # The wall is on screen, but only a screen that has stopped moving is stuck.
-  [ -n "$prev" ] && [ "$prev" = "$hash" ] || return 0
-
   if [ "$was" != quota ]; then
+    if [ "$kind" != quota ]; then
+      # Only when there is something to clear: this is the overwhelmingly common
+      # branch, and each clear is six rewrites of state.env for no change at all.
+      [ -n "$was" ] && clear_block "$d"
+      return 0
+    fi
+    # The wall is on screen, but only a screen that has stopped moving is stuck.
+    [ "$still" = 1 ] || return 0
     local hint due plan
     hint=$(reset_hint "$text")
     due=$(parse_reset "$hint") || due=""
     if [ -n "$due" ] && [ "$due" -gt "$nowsec" ]; then
+      plan="waiting until $(clock_of "$due")"
+      st_set "$d" PQ_RESETS_AT "$due"
       due=$(( due + 60 ))               # a minute past it, so clock skew cannot land early
-      plan="waiting until $hint"
-      st_set "$d" PQ_RESETS "$hint"
     else
       due=$(( nowsec + PQ_QUOTA_RETRY ))
       plan="no reset time on screen, so knocking every $(( PQ_QUOTA_RETRY / 60 ))m"
-      st_set "$d" PQ_RESETS ""
+      st_set "$d" PQ_RESETS_AT ""
     fi
     st_set "$d" PQ_BLOCKED quota;  st_set "$d" PQ_QUOTA_SINCE "$(now)"
     st_set "$d" PQ_TRIES 0;        st_set "$d" PQ_RETRY_AT "$due"
@@ -2382,6 +2520,24 @@ check_stall() {                         # task_dir
     return 0
   fi
 
+  # Already walled. The pane is moving under its own steam, so it is back - let it
+  # be, whatever the clock says. Waiting for the reset before believing this would
+  # strand the block for hours whenever you rescue an agent yourself in the morning,
+  # and a block still on file is a block that freezes the queue (see the freeze in
+  # tick_body). A wall that is over is over.
+  #
+  # Both halves are needed. `moved` alone is the statusline turning over at the
+  # reset; `working` alone risks a spinner herdr has not caught up with yet, one tick
+  # after the Escape. Together they are only ever true of an agent doing work: while
+  # walled and dismissed the pane is both still and idle.
+  if [ "$moved" = 1 ] && [ "$(pane_state "$pane")" = working ]; then
+    msg "$slug: moving again after the session limit"
+    clear_block "$d"
+    return 0
+  fi
+
+  # Until the knock is due, nothing on screen changes anything - the banner going
+  # away is what the reset looks like, not what recovery looks like.
   tries=$(st "$d" PQ_TRIES); tries=${tries:-0}
   at=$(st "$d" PQ_RETRY_AT); at=${at:-0}
   [ "$nowsec" -ge "$at" ] || return 0
@@ -2394,14 +2550,69 @@ check_stall() {                         # task_dir
     return 0
   fi
 
-  # Past the named reset and still walled means the hint was optimistic, so from
-  # here it is the poll interval. PQ_RESETS goes with it - a time already gone is
-  # worse than no time at all in `pq ls`.
+  # Past the named reset and still there means the hint was optimistic, so from here
+  # it is the poll interval. PQ_RESETS_AT goes with it - a time already gone is worse
+  # than no time at all in `pq ls`.
   tries=$(( tries + 1 ))
   st_set "$d" PQ_TRIES "$tries"; st_set "$d" PQ_RETRY_AT "$(( nowsec + PQ_QUOTA_RETRY ))"
-  st_set "$d" PQ_RESETS ""
+  st_set "$d" PQ_RESETS_AT ""
   unstick "$pane" "Continue with what you were doing."
   msg "$slug: knocking after the session limit (attempt $tries)"
+}
+
+# Is anybody behind the wall right now, and when does their window reopen? The first
+# one found, as `slug<TAB>epoch` with an empty epoch when no reset could be read;
+# nothing at all when nobody is walled. Writes nothing, so a listing may call it.
+#
+# Fill consults this and starts NOTHING while it answers, because the usage window is
+# one account-wide budget rather than a per-agent one. A second agent dispatched
+# behind the wall does not get its own allowance: it walls on its first request,
+# having spent a minute of `wt new`, a database, a port and a puma-dev entry to get
+# there, and it arrives with its own knock cycle to run. Waiting costs nothing by
+# comparison - the queue is a queue, and the tick that clears the block is the tick
+# that fills again.
+#
+# It takes a LIVE agent to freeze anything, which is why `noagent` is excluded
+# alongside `missing`, and this is the one place where reading the pane properly (see
+# pane_tail) makes something newly possible rather than only fixing it. Claude Code
+# renders inline rather than on the alternate screen, so a session that exited while
+# walled leaves its banner sitting in the visible viewport above a shell prompt -
+# and `pane read`, unlike the `agent read` it replaced, returns that quite happily.
+# classify_tail would go on reading `quota` off dead scrollback for ever, the knocks
+# would land on bash, and a freeze that only asked whether the PANE existed would
+# hold the entire queue until somebody looked. check_stall still runs on `noagent`
+# panes - a binding that lapsed for a moment is worth knocking through - it just
+# does not get to stop everybody else.
+# A task pq has GIVEN UP on stops freezing anything, which is the only bound on how
+# long a freeze can last, and it is worth one. Detection is a regex over a terminal,
+# so it can be wrong: any pane showing the words - a diff of this very file, a plan
+# that quotes the wall, `pq ls` output about somebody else - is a candidate, and one
+# that goes idle rather than resuming can never satisfy `moved && working`. Before the
+# freeze existed that cost one task's status cell. With it, and without this, it costs
+# every night after it: forty knocks is under seven hours, and nothing past that ever
+# clears the block on its own.
+#
+# Releasing it costs one worktree in the case where the wall was real all along - the
+# agent dispatched behind it walls on its first request, is detected, and the freeze
+# comes back. That is the right way round: a misread pane should cost a worktree, not
+# a night.
+walled_slot() {                         # -> slug<TAB>resets_at | ""
+  local d
+  for d in "$PQ_HOME/running"/*/ "$PQ_HOME/done"/*/; do
+    [ -d "$d" ] || continue
+    d=${d%/}
+    [ "$(st "$d" PQ_BLOCKED)" = quota ] || continue
+    [ "$(st "$d" PQ_GAVEUP)" = 1 ] && continue
+    case "$(pane_state "$(st "$d" PQ_PANE)")" in noagent|missing) continue ;; esac
+    printf '%s\t%s' "$(slug_of "$d")" "$(st "$d" PQ_RESETS_AT)"
+    return 0
+  done
+}
+
+# "walled until 3pm", or just "walled" when the reset could not be read.
+walled_note() {                         # resets_at -> text
+  local at; at=$(clock_of "${1:-}")
+  [ -n "$at" ] && printf 'walled until %s' "$at" || printf 'walled'
 }
 
 # One `gh` lookup per dispatched branch, concurrently. Only tasks that have been
@@ -2841,6 +3052,22 @@ age_of() {                              # iso8601
   age_since "$then"
 }
 
+# What check_stall recorded about a pane, as a cell: `quota 8:30pm`, `walled 2h`,
+# `permission`, or nothing at all when the task is not blocked. Shared by the running
+# and the done branches below, because check_stall now knocks on both and a wrapping-up
+# agent behind the wall has exactly as much to say about it as a running one.
+block_cell() {                          # task_dir
+  local d=$1 at
+  case "$(st "$d" PQ_BLOCKED)" in
+    quota)      [ "$(st "$d" PQ_GAVEUP)" = 1 ] && printf 'walled ' || printf 'quota '
+                # The time it comes back beats how long it has been gone, when the
+                # wall told us one. Both are ASCII, as every cell here must be.
+                at=$(clock_of "$(st "$d" PQ_RESETS_AT)")
+                printf '%s' "${at:-$(age_of "$(st "$d" PQ_QUOTA_SINCE)")}" ;;
+    permission) printf 'permission' ;;
+  esac
+}
+
 # What an agent is waiting on, in the words that decide what you do about it.
 # `pq` records why it classified a blocked agent the way it did, so the morning
 # read separates "waiting on the clock" from "waiting on you".
@@ -2893,11 +3120,17 @@ agent_cell() {                          # task_dir state
       #
       # `blocked` is called out rather than folded into `wrapping up`, because
       # the two want opposite things from you. A wrapping-up agent wants
-      # nothing; a blocked one is sitting on a prompt, holds its slot for as
-      # long as it sits there, and nothing knocks on a done/ pane the way
-      # check_stall knocks on a running one. It reads as `blocked` for the same
-      # reason a running row does, and counts into "needs you" through the case
-      # cmd_ls already has for that word.
+      # nothing; a blocked one is sitting on a prompt and holds its slot for as
+      # long as it sits there. It reads as `blocked` for the same reason a
+      # running row does, and counts into "needs you" through the case cmd_ls
+      # already has for that word.
+      #
+      # What pq read off the pane comes first, exactly as it does for a running
+      # row: `quota 8:30pm` says which of the two it is and when it comes back,
+      # where herdr's bare `blocked` cannot. A wall here is knocked on now, so
+      # this is the row that tells you it is being handled rather than waiting.
+      blocked=$(block_cell "$d")
+      if [ -n "$blocked" ]; then printf '%s' "$blocked"; return; fi
       if [ "$(pane_state "$(st "$d" PQ_PANE)")" = blocked ]; then printf 'blocked'; return; fi
       if [ -n "$(slot_state "$d")" ]; then printf 'wrapping up'; return; fi
       if [ -n "$reason" ]; then printf 'held %s' "$reason"; else printf -- '-'; fi
@@ -2918,15 +3151,8 @@ agent_cell() {                          # task_dir state
   # can call a walled agent `working` off the spinner still in its title, or
   # `noagent` if the binding lapsed, and the wall is the whole reason this column
   # exists at 8am. Same ordering as reconcile, for the same reason.
-  blocked=$(st "$d" PQ_BLOCKED)
-  case "$blocked" in
-    quota)      [ "$(st "$d" PQ_GAVEUP)" = 1 ] && printf 'walled ' || printf 'quota '
-                # The time it comes back beats how long it has been gone, when the
-                # wall told us one. Both are ASCII, as every cell here must be.
-                blocked=$(st "$d" PQ_RESETS)
-                printf '%s' "${blocked:-$(age_of "$(st "$d" PQ_QUOTA_SINCE)")}"; return ;;
-    permission) printf 'permission'; return ;;
-  esac
+  blocked=$(block_cell "$d")
+  [ -n "$blocked" ] && { printf '%s' "$blocked"; return; }
   case "$status" in
     noagent) printf 'exited';  return ;;      # a shell is sitting where Claude was
     unknown) printf 'unknown'; return ;;
@@ -3774,6 +4000,31 @@ tick_body() {                           # cap dry
     done
   fi
 
+  # 1.2 The wall, for tasks that have already opened their pull request. An agent
+  # does not stop when it opens one - it answers review, fixes CI, pushes again -
+  # so `done/` is where an unattended agent spends most of the night, and it can
+  # hit the wall there exactly as easily as in `running/`. For a long time nothing
+  # knocked on those panes at all, which made the whole section useless for the
+  # case it was written for: three agents wrapping up at midnight, all three
+  # walled, none of them touched by morning.
+  #
+  # No new authority comes with this. check_stall only ever answers the wall; a
+  # permission prompt in `done/` is recorded and left for you, the same as
+  # anywhere else. Reaped and closed tasks are skipped because their pane is gone
+  # or their work never shipped, and it runs BEFORE reap and before active_slots
+  # so the block it sets is visible to the teardown gate, to the slot arithmetic
+  # and to the freeze below, all on the tick that set it.
+  if [ "$dry" != 1 ]; then
+    for d in "$PQ_HOME/done"/*/; do
+      [ -d "$d" ] || continue
+      d=${d%/}
+      [ -n "$(st "$d" PQ_REAPED)" ] && continue
+      [ -n "$(st "$d" PQ_CLOSED)" ] && continue
+      [ "$(pane_state "$(st "$d" PQ_PANE)")" = missing ] && continue
+      check_stall "$d"
+    done
+  fi
+
   # 1.25 Reap - tear down what merged, once the agent has stopped and pq is not
   # itself sitting in the workspace about to be closed. Runs after reconcile, so
   # a task that just moved from running/ to done/ this same tick is torn down on
@@ -3833,6 +4084,12 @@ tick_body() {                           # cap dry
   active=$(( n_run + n_wrap ))
   local free=$(( cap - active ))
 
+  # ...and a wall stops fill outright, whatever the arithmetic says, because every
+  # agent pq runs draws on the same window. See walled_slot.
+  local walled_by walled_at
+  IFS=$'\t' read -r walled_by walled_at <<<"$(walled_slot)"
+  [ -n "$walled_by" ] && free=0
+
   # Build the queue ONCE, in stamp order, then walk it - skipping whatever
   # is not eligible - rather than re-globbing and taking the first entry every
   # pass, which only worked because a claimed task leaves queue/. --dry-run
@@ -3845,7 +4102,13 @@ tick_body() {                           # cap dry
       [ -n "$d" ] || continue
       slug=$(slug_of "$d")
       if [ "$free" -le 0 ]; then
-        [ "$dry" = 1 ] && msg "would skip $slug - cap reached"
+        # Name the wall rather than the cap when the wall is what closed it: the two
+        # want completely different things from you, and "cap reached" reads as
+        # healthy.
+        if [ "$dry" = 1 ]; then
+          if [ -n "$walled_by" ]; then msg "would skip $slug - $(walled_note "$walled_at")"
+          else msg "would skip $slug - cap reached"; fi
+        fi
         continue
       fi
       verdict=$(awk -F'\t' -v d="$d" '$1 == d { print $2; exit }' "$afterpass")
@@ -3892,7 +4155,12 @@ tick_body() {                           # cap dry
   # Name the two halves separately. A cap of 3 reading "3 running" while three
   # more agents were still wrapping up in done/ is precisely what made six live
   # agents look like a healthy tick for as long as this bug lasted.
+  #
+  # The wall gets said out loud for the same reason: `pq run` suppresses a summary
+  # identical to the last one, so a frozen queue would otherwise leave a log that
+  # goes quiet at 2am and says nothing about why.
   summary "$n_run running$([ "$n_wrap" -gt 0 ] && printf ' + %s wrapping up' "$n_wrap") (cap $cap), $queued queued\
+$([ -n "$walled_by" ] && printf ', %s - starting nothing' "$(walled_note "$walled_at")")\
 $([ "$started" -gt 0 ] && printf ', %s started' "$started")\
 $([ "$would" -gt 0 ] && printf ', %s would start' "$would")\
 $([ "$waiting" -gt 0 ] && printf ', %s waiting on a merge' "$waiting")\
