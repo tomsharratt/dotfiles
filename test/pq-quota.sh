@@ -552,6 +552,37 @@ eq "$(pane_state w3:p1)" missing "the workspace itself has gone"
 tick 3 1
 has "$OUT" "would dispatch next" "a task nothing can resume must not hold the queue"
 
+echo "== tick_body: a task pq has given up on stops freezing the queue ==" >&2
+# The only bound on how long a freeze can last, and the reason it needs one:
+# detection is a regex over a terminal, so any pane showing the words is a candidate -
+# a diff of pq itself, a plan quoting the wall, this test file. One that goes idle
+# rather than resuming can never satisfy `moved && working`, so without this the cost
+# of a single misread pane is every night after it rather than one status cell.
+set_panes "$(printf 'w3:p1\tclaude\tidle')"
+tick 3 1
+hasnt "$OUT" "would dispatch next" "while pq is still knocking, the freeze holds"
+st_set "$R" PQ_GAVEUP 1
+tick 3 1
+has "$OUT" "would dispatch next" "once it has given up and left the task for you, the queue moves"
+hasnt "$PQ_SUMMARY" "walled" "and it stops being reported as a wall anybody is waiting on"
+eq "$(block_cell "$R")" "walled $(clock_of "$DUE")" "the row still says walled, because it still wants you"
+st_set "$R" PQ_GAVEUP ""
+
+echo "== pq ls: a done row reports its wall ahead of 'wrapping up' ==" >&2
+# Through the real caller, not block_cell directly: this is the branch the done/ knock
+# made necessary, and a walled wrap-up that reads as "wrapping up" says the one thing
+# it is not - quietly waiting, with nothing wanted from anyone.
+reset_tasks; reset_caches
+DN=$(mk_task 'done' 040 dwall tom/dwall w5:p1)
+st_set "$DN" PQ_LAUNCHED "$(now)"; st_set "$DN" PQ_PR 700; st_set "$DN" PQ_FINISHED "$(now)"
+st_set "$DN" PQ_BLOCKED quota; st_set "$DN" PQ_QUOTA_SINCE "$(ago 60)"; st_set "$DN" PQ_RESETS_AT "$DUE"
+set_panes "$(printf 'w5:p1\tclaude\tidle')"
+eq "$(agent_cell "$DN" done)" "quota $(clock_of "$DUE")" "the done row names the wall and when it lifts"
+st_set "$DN" PQ_BLOCKED permission
+eq "$(agent_cell "$DN" done)" permission "and a permission prompt there still reads as one"
+st_set "$DN" PQ_BLOCKED ""
+eq "$(agent_cell "$DN" done)" "wrapping up" "with nothing blocking it, it is just wrapping up"
+
 echo "== a walled agent still counts against the cap while it waits ==" >&2
 # The freeze is not the only thing keeping the arithmetic honest: it lifts on the
 # tick the block clears, which is the tick the agent starts working again, and the

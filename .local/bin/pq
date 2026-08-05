@@ -2583,12 +2583,26 @@ check_stall() {                         # task_dir
 # hold the entire queue until somebody looked. check_stall still runs on `noagent`
 # panes - a binding that lapsed for a moment is worth knocking through - it just
 # does not get to stop everybody else.
+# A task pq has GIVEN UP on stops freezing anything, which is the only bound on how
+# long a freeze can last, and it is worth one. Detection is a regex over a terminal,
+# so it can be wrong: any pane showing the words - a diff of this very file, a plan
+# that quotes the wall, `pq ls` output about somebody else - is a candidate, and one
+# that goes idle rather than resuming can never satisfy `moved && working`. Before the
+# freeze existed that cost one task's status cell. With it, and without this, it costs
+# every night after it: forty knocks is under seven hours, and nothing past that ever
+# clears the block on its own.
+#
+# Releasing it costs one worktree in the case where the wall was real all along - the
+# agent dispatched behind it walls on its first request, is detected, and the freeze
+# comes back. That is the right way round: a misread pane should cost a worktree, not
+# a night.
 walled_slot() {                         # -> slug<TAB>resets_at | ""
   local d
   for d in "$PQ_HOME/running"/*/ "$PQ_HOME/done"/*/; do
     [ -d "$d" ] || continue
     d=${d%/}
     [ "$(st "$d" PQ_BLOCKED)" = quota ] || continue
+    [ "$(st "$d" PQ_GAVEUP)" = 1 ] && continue
     case "$(pane_state "$(st "$d" PQ_PANE)")" in noagent|missing) continue ;; esac
     printf '%s\t%s' "$(slug_of "$d")" "$(st "$d" PQ_RESETS_AT)"
     return 0

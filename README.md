@@ -222,6 +222,7 @@ The other reason the queue can sit still with slots apparently free is that **a 
 Every agent `pq` runs draws on one account-wide usage window, so a second agent started behind the wall does not get an allowance of its own: it walls on its first request, having spent a minute of `wt new`, a database, a port and a puma-dev entry to get there, and it arrives with its own knock cycle to run.
 So fill starts nothing at all until whoever is walled is moving again, and both the tick summary and `pq cap` say so rather than reporting room that will not be used.
 It takes a *live* agent to freeze anything: a task whose Claude has exited, or whose workspace is gone, holds nothing up, however much of the wall is still legible on its pane.
+Nor does one `pq` has given up knocking on - see the session limit section for why that bound matters.
 
 Ctrl-C is a graceful shutdown: during the sleep it stops immediately, and during a tick it lets the work in flight finish first.
 That needs a little care, because a terminal signals the whole foreground process group - so by default a `wt new` halfway through copying a database would die alongside the tick.
@@ -297,7 +298,9 @@ The one outcome ruled out is waiting on a guess, because that strands a task sil
 The wall is the only thing `pq` ever answers.
 A permission prompt is recorded as `permission` and deliberately left alone - that is the trade for running everything in auto mode - so `pq ls` separates the agents waiting on the clock from the ones waiting on you.
 One appearing where a wall was is taken as recovery, because a session asking for something is a session running again, and the alternative is a knock sending Escape at the prompt - refusing it - every ten minutes.
-After forty unanswered knocks a task is marked `walled` and left, rather than knocking all night.
+After forty unanswered knocks a task is marked `walled` and left, rather than knocking all night - and at that point it stops freezing dispatch, which is the only bound on how long a freeze can last.
+It wants one, because detection is a regex over a terminal and so can be wrong: any pane showing the words is a candidate, including one showing a diff of `pq` itself, and one that goes idle rather than resuming can never prove it recovered.
+Releasing the freeze there costs a single worktree if the wall was real - the next agent walls, is detected, and the freeze comes back - which is the right way round, since a misread pane should cost a worktree rather than a night.
 
 #### Tearing a task down
 
