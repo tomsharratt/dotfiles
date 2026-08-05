@@ -288,12 +288,22 @@ An agent you rescue yourself is believed straight away, clock or no clock, since
 **It waits for the time the message names, and polls only when it cannot read one.**
 The wall's own line carries "resets 3pm", and that hint beats any other source of the same fact, because it comes from the error that walled us and so already refers to the right window - the account has both a five-hour and a weekly limit, and nothing else on hand would say which one you are behind.
 A statusline that reports rate limits carries a "resets" of its own, and it is only ever the fallback, since it always names the five-hour window even when the weekly one is what walled you.
+Either can arrive wrapped, because the pane is only so wide and the wall line that turns up most nights is a background agent's failure with the whole API error quoted inside it.
+Claude Code breaks on word boundaries, and almost every break point is harmless, but one is not: a break straight after `resets` puts the time on a row that no longer looks like the wall and leaves a wall row trimmed back to end at `resets` with nothing after it, so a pane showing the reset in plain sight reads as having none.
+Those two rows are rejoined before anything looks at them, and the lines are then tried in order - the wall's own, newest first, then everyone else's - until one yields a hint that actually parses, rather than a single unreadable line hiding a good one below it.
 Two habits of Claude Code's formatter are worth knowing, since both will catch out anything that assumes otherwise: minutes are dropped when they are zero, so it reads `8pm` rather than `8:00pm`, and no date is printed for a reset less than 24 hours out, so a bare `1am` seen at 11pm means tomorrow.
 Beyond 24 hours it becomes `Jul 28, 8:30pm`, gaining a year only when the year differs.
 What is *stored* is the epoch, and `pq ls` formats it back on the way out - state files are read by sourcing them, so a value like `3pm (PDT)` is a syntax error that silently truncates everything written after it.
 
 A hint that cannot be read is not a failure: ten-minute polling is the fallback, and it also takes over if the knock at the named time turns out to be too early.
 The one outcome ruled out is waiting on a guess, because that strands a task silently, where an early knock costs a single instantly-failing call.
+
+Nor is it final, which matters more than it sounds.
+What walls a task is usually a background agent, and its failure reaches the transcript seconds before the session's own next request fails and puts the same time in the statusline - so the tick that catches the wall can honestly have nothing to read, on a pane that names the time plainly a moment later.
+`pq` keeps looking, and takes the first reset the screen offers.
+Only until the first knock, though, because a knock is precisely what demoted it to polling - the named time came and went with the wall still up - while the line that named it stays in the scrollback for ever.
+Re-reading that line afterwards would not even give back a stale time: a bare clock time is read as the next time the clock comes round to it, so `resets 4:20pm` read at 4:30 is tomorrow, and a ten-minute cycle would quietly become a day-long one.
+The same rollover is why a second look never accepts a reset further out than `pq` would keep knocking for anyway - a hint that has rolled sits a clear day away, well past a bound that a five-hour window's reset is nowhere near.
 
 The wall is the only thing `pq` ever answers.
 A permission prompt is recorded as `permission` and deliberately left alone - that is the trade for running everything in auto mode - so `pq ls` separates the agents waiting on the clock from the ones waiting on you.

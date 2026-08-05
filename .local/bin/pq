@@ -2358,6 +2358,33 @@ parse_reset() {                         # hint text -> epoch seconds
   printf '%s' "$e"
 }
 
+# The pane WRAPS, and the wall line that turns up most nights is long enough to
+# need it: what walls a task is usually a background agent, and its failure is
+# reported into the transcript with the whole API error inside it, under a bullet
+# that indents the lot ("Agent "..." failed: Agent terminated early due to an API
+# error: You've hit your session limit - resets 4:20pm (America/Toronto)").
+#
+# Claude Code breaks on word boundaries, and almost every break point is harmless:
+# the hint lands whole on one row or the other, and parse_reset stops at the first
+# bracket, so a break inside "(America/Toronto)" costs nothing. Exactly one hurts,
+# and it is the one that happens - a break straight after "resets", which leaves
+# the time on a row that no longer looks like the wall and a wall row with nothing
+# after "resets" at all. Herdr trims the row, so not even the trailing space
+# survives to mark it as a hint that was cut off. Both greps below then come up
+# empty on a pane that is showing the reset time in plain sight.
+#
+# Rejoining those two rows before looking at anything is the whole fix, and the
+# continuation's indent goes with the join so the hint comes out clean.
+unwrap_resets() {                       # pane text -> the same, wrapped hints whole
+  awk '
+    held != "" { cont = $0; sub(/^[[:space:]]+/, "", cont)
+                 print held " " cont; held = ""; next }
+    /[Rr]esets[[:space:]]*$/ { held = $0; next }
+                             { print }
+    END { if (held != "") print held }
+  ' <<<"$1"
+}
+
 # The hint sits at the end of a line that may well be inside a bordered box, so
 # anything trailing that cannot be part of a date is dropped.
 #
@@ -2376,17 +2403,29 @@ parse_reset() {                         # hint text -> epoch seconds
 # tolerated below: a trailing bracket, and a weekday for a reset that crosses
 # midnight. Dropping the weekday loses nothing, since parse_reset already reads a
 # bare clock time as the next time the clock reads it.
+#
+# Preference, though, is not the same as one shot at it. Picking the last line of
+# the better group and giving up if nothing came of it lets a single unreadable
+# line hide a perfectly good one lower down - a dangling "...resets" at the very
+# bottom of the visible area, with no next row to be joined to, is enough to do it.
+# So the groups are a queue in priority order, newest line of each first, and the
+# answer is the first hint that parse_reset will actually take.
 reset_hint() {                          # pane text -> the time the wall names
-  local line
-  line=$(grep -iE "$PQ_QUOTA_RE" <<<"$1" | grep -i 'resets ' | tail -1)
-  [ -n "$line" ] || line=$(grep -i 'resets ' <<<"$1" | tail -1)
-  # The weekday strip is anchored to a whole bare clock time on purpose: a leading
-  # three-letter word is a weekday in "Sat 1:00am" and a MONTH in "Jul 28, 8pm",
-  # and dropping the month would move the reset by up to a year.
-  sed -n 's/.*[Rr]esets \(.*\)$/\1/p' <<<"$line" | tail -1 \
-    | sed 's/[^0-9A-Za-z:,() ]*$//
-           s/)$//
-           s/^[A-Za-z][a-z][a-z] \([0-9]\{1,2\}\(:[0-9][0-9]\)*[APap][Mm]\)$/\1/'
+  local text cand hint
+  text=$(unwrap_resets "$1")
+  while IFS= read -r cand; do
+    # The weekday strip is anchored to a whole bare clock time on purpose: a
+    # leading three-letter word is a weekday in "Sat 1:00am" and a MONTH in
+    # "Jul 28, 8pm", and dropping the month would move the reset by up to a year.
+    hint=$(sed -n 's/.*[Rr]esets \(.*\)$/\1/p' <<<"$cand" \
+      | sed 's/[^0-9A-Za-z:,() ]*$//
+             s/)$//
+             s/^[A-Za-z][a-z][a-z] \([0-9]\{1,2\}\(:[0-9][0-9]\)*[APap][Mm]\)$/\1/')
+    [ -n "$hint" ] || continue
+    parse_reset "$hint" >/dev/null 2>&1 || continue
+    printf '%s' "$hint"; return 0
+  done <<<"$( { grep -iE "$PQ_QUOTA_RE" <<<"$text" | grep -i 'resets ' | tail -r
+                grep -i 'resets ' <<<"$text" | tail -r; } )"
 }
 
 # parse_reset's inverse, for the one place a stored reset is shown to a human. What
@@ -2536,11 +2575,50 @@ check_stall() {                         # task_dir
     return 0
   fi
 
-  # Until the knock is due, nothing on screen changes anything - the banner going
-  # away is what the reset looks like, not what recovery looks like.
   tries=$(st "$d" PQ_TRIES); tries=${tries:-0}
   at=$(st "$d" PQ_RETRY_AT); at=${at:-0}
-  [ "$nowsec" -ge "$at" ] || return 0
+
+  # Until the knock is due, nothing on screen changes anything - the banner going
+  # away is what the reset looks like, not what recovery looks like - with one
+  # exception, which is a reset time that was not there to be read at detection.
+  #
+  # It often is not. What walls a task is usually a BACKGROUND agent's request, and
+  # its failure reaches the transcript seconds before the session's own next
+  # request fails and puts the same time in the statusline - so the tick that
+  # catches the wall can be one that honestly has nothing to read, on a pane that
+  # is showing the time plainly by the time you look at it. Reading once and
+  # settling for polling all night is the worst of both, because the reset was
+  # there.
+  #
+  # Two guards, and both are load-bearing. The knock must not be due yet, so this
+  # only ever refines a plan still in force rather than overruling one that has run
+  # its course. And nothing may have been knocked on yet, because a knock DEMOTES
+  # us to polling on purpose - it means the named time came and went with the wall
+  # still up - while the line that named it stays in the scrollback for ever.
+  # Re-reading that line afterwards would not even give back a stale time:
+  # parse_reset reads a bare clock time as the next time the clock comes round to
+  # it, so `resets 4:20pm` read at 4:30 is TOMORROW, and a ten-minute cycle would
+  # become a day-long one. Before any knock neither applies - nothing has been
+  # demoted, and what is on screen is minutes old.
+  if [ "$nowsec" -lt "$at" ]; then
+    [ "$tries" = 0 ] && [ -z "$(st "$d" PQ_RESETS_AT)" ] || return 0
+    local late
+    late=$(parse_reset "$(reset_hint "$text")") || return 0
+    [ "$late" -gt "$nowsec" ] || return 0
+    # Later than now is not enough on its own, because there is a second way into
+    # this branch: detection DID read a hint, and rejected it for being already
+    # past. That line then stays on screen, and parse_reset reads a bare clock time
+    # as the next time the clock comes round to it - so `resets 4:20pm`, rejected
+    # at 4:21, reads as TOMORROW's 4:20pm by 4:26 and walks straight through a
+    # "later than now" test. The bound is what pq is prepared to keep knocking for
+    # anyway: past PQ_QUOTA_MAX_TRIES it gives up, so a longer wait buys nothing,
+    # and a hint that has rolled over sits a clear day out - far outside it.
+    [ $(( late - nowsec )) -le $(( PQ_QUOTA_MAX_TRIES * PQ_QUOTA_RETRY )) ] || return 0
+    st_set "$d" PQ_RESETS_AT "$late"
+    st_set "$d" PQ_RETRY_AT "$(( late + 60 ))"   # a minute past, so skew cannot land early
+    msg "$slug: the pane named its reset after all - waiting until $(clock_of "$late")"
+    return 0
+  fi
 
   if [ "$tries" -ge "$PQ_QUOTA_MAX_TRIES" ]; then
     [ "$(st "$d" PQ_GAVEUP)" = 1 ] || {

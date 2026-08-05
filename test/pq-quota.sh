@@ -246,6 +246,38 @@ echo "== reset_hint must not mistake a MONTH for a weekday ==" >&2
 eq "$(reset_hint 'resets Jul 28, 8pm')" "Jul 28, 8pm" "the month survives"
 eq "$(reset_hint 'resets Jan 3, 2027, 9am')" "Jan 3, 2027, 9am" "so does a year"
 
+echo "== reset_hint reads a hint the pane WRAPPED ==" >&2
+# The wall line that turns up most nights is a background agent's failure reported
+# into the transcript with the whole API error inside it, under a bullet that indents
+# the lot - long enough to wrap. Claude Code breaks on word boundaries, and the break
+# that lands straight after "resets" puts the time on a row that no longer looks like
+# the wall and leaves a wall row that herdr has trimmed back to end at "resets", with
+# not even a trailing space to mark it as cut off. Both greps then come up empty on a
+# pane showing the time in plain sight, and pq says "no reset time on screen".
+WRAPPED=$(printf '%s\n%s\n' \
+  "⏺ Agent \"Fix the bugs\" failed: Agent terminated early due to an API error: You've hit your session limit · resets" \
+  "4:20pm (America/Toronto)")
+eq "$(reset_hint "$WRAPPED")" "4:20pm (America/Toronto" "the two rows are rejoined and the hint read off them"
+eq "$(reset_hint "$(printf "You've hit your session limit · resets\n     3pm (PDT)\n")")" "3pm (PDT" \
+   "and a continuation indented under a bullet does not bring its indent along"
+# Every other break point was always harmless. They have to stay that way, because
+# the rejoin above is the only one that knows which row a hint started on.
+eq "$(reset_hint "$(printf "⏺ You've hit your session limit ·\nresets Jul 28, 8pm\n")")" "Jul 28, 8pm" \
+   "a break BEFORE 'resets' leaves the hint whole on one row"
+eq "$(reset_hint "$(printf "⏺ You've hit your session limit · resets 3pm\n(PDT)\n")")" "3pm" \
+   "and a break inside the timezone costs nothing - parse_reset stops at the bracket"
+
+echo "== reset_hint keeps looking until a hint actually parses ==" >&2
+# Preferring the wall's line is not the same as one shot at it. Taking the last line
+# of the better group and giving up if nothing came of it lets a single unreadable
+# line hide a perfectly good one lower down, and demotes a reset we could have read
+# to blind polling.
+UNREADABLE=$(printf '%s\n%s\n' \
+  "  235.7K / 1M · session 100% (resets 10:40pm)" \
+  "⏺ You've hit your session limit · resets shortly")
+eq "$(reset_hint "$UNREADABLE")" "10:40pm" "a wall hint that will not parse falls through to the statusline's"
+eq "$(reset_hint "$(printf 'resets\nresets soon\n')")" "" "and nothing readable anywhere is still empty"
+
 echo "== parse_reset: every form Claude Code prints, and nothing else ==" >&2
 NOWE=$(now_e)
 for h in "3pm" "8:30pm" "3pm (PDT)" "10:40pm" "Jul 28, 8pm" "Jan 3, 2027, 9am"; do
@@ -270,7 +302,23 @@ has "$(clock_of $(( MID + 86400 )))" "$(date -r $(( MID + 86400 )) '+%a')" \
     "a reset that is not today carries its weekday"
 eq "$(clock_of '')" "" "nothing in, nothing out"
 # The round trip is what pq ls depends on: an epoch is stored, a clock time is shown.
-eq "$(parse_reset "$(clock_of "$MID")")" "$MID" "clock_of and parse_reset agree"
+#
+# It has to go back through reset_hint, and the whole trip has to be anchored to a
+# reset that is genuinely AHEAD, because neither function is a plain inverse of the
+# other on its own. clock_of stamps a weekday on anything that is not today and
+# parse_reset refuses one, so the pair only meet in the middle by way of the strip
+# reset_hint does; and parse_reset resolves a bare clock time to the next time the
+# clock comes round to it, so an epoch already past never comes back as itself. Both
+# are deliberate, and neither is a shape pq ever stores - every reset on file was
+# read off a wall that had not reset yet.
+#
+# Pinning the trip to a fixed hour instead is what made this fail every afternoon:
+# 3pm is in the past from 3pm onwards, so parse_reset correctly returned tomorrow's
+# and the assertion correctly disagreed. An hour out from now is always ahead, and it
+# crosses midnight - the case that exercises the weekday - free of charge.
+RT=$(( ($(now_e) + 3600) / 60 * 60 ))
+eq "$(parse_reset "$(reset_hint "resets $(clock_of "$RT")")")" "$RT" \
+   "a reset stored, shown, and read back names the same moment"
 
 # ── check_stall ──────────────────────────────────────────────────────────────
 
@@ -413,6 +461,109 @@ sent_reset
 check_stall "$D"                          # same text: still
 eq "$(st "$D" PQ_BLOCKED)" quota "a spinner in the title does not release a still pane"
 eq "$(st "$D" PQ_TRIES)" 1 "it gets knocked on"
+
+echo "== check_stall: a reset that only turns up AFTER detection is still used ==" >&2
+# What walls a task is usually a background agent, and its failure reaches the
+# transcript seconds before the session's own next request fails and puts the same
+# time in the statusline. So the tick that catches the wall can honestly have nothing
+# to read, on a pane that names the time plainly a moment later - and settling for
+# ten-minute polling all night when the reset was right there is the worst of both.
+D=$(new_case)
+set_panes "$(printf 'w1:p1\tclaude\tidle')"
+set_text w1:p1 <<'EOF'
+⏺ Agent "Fix the bugs" failed: You've hit your session limit
+
+  235.7K / 1M · session 100%
+EOF
+check_stall "$D"; check_stall "$D"        # a still wall, so it is detected
+eq "$(st "$D" PQ_BLOCKED)" quota "the wall is caught with no time on screen to read"
+eq "$(st "$D" PQ_RESETS_AT)" "" "so nothing is stored, and it is on the poll"
+POLL=$(st "$D" PQ_RETRY_AT)
+LATE=$(( $(now_e) + 3600 ))
+set_text w1:p1 <<EOF
+⏺ Agent "Fix the bugs" failed: You've hit your session limit
+  ⎿  You've hit your session limit · resets $(clock_of "$LATE") (America/Toronto)
+
+  235.7K / 1M · session 100%
+EOF
+check_stall "$D"
+RA=$(st "$D" PQ_RESETS_AT)
+[ -n "$RA" ] && [ "$RA" -ge $(( LATE - 90 )) ] && [ "$RA" -le $(( LATE + 90 )) ] \
+  && ok || bad "the reset must be picked up on a later tick (got '$RA', want ~$LATE)"
+eq "$(st "$D" PQ_RETRY_AT)" "$(( RA + 60 ))" "and the knock re-armed for it instead of for the poll"
+[ "$(st "$D" PQ_RETRY_AT)" != "$POLL" ] && ok || bad "the ten-minute poll must have been replaced"
+eq "$(st "$D" PQ_TRIES)" 0 "with no knock sent on the way past"
+
+echo "== check_stall: a knock that is DUE is never deferred by a hint on screen ==" >&2
+# Reading a late reset refines a plan still in force; it must never overrule one that
+# has run its course. The statusline here names a five-hour window the agent is
+# nowhere near spending - 4% of it - and pushing a due knock out to that window's
+# reset would be the wrong window and the wrong time both.
+D=$(new_case)
+set_panes "$(printf 'w1:p1\tclaude\tidle')"
+st_set "$D" PQ_BLOCKED quota
+st_set "$D" PQ_QUOTA_SINCE "$(ago 600)"
+st_set "$D" PQ_TRIES 0
+st_set "$D" PQ_RETRY_AT "$(( $(now_e) - 5 ))"
+settled_text w1:p1 4 "$(clock_of $(( $(now_e) + 7200 )))"
+check_stall "$D"; sent_reset; check_stall "$D"
+eq "$(st "$D" PQ_TRIES)" 1 "the knock lands on time"
+eq "$(st "$D" PQ_RESETS_AT)" "" "and nothing on screen re-dates it"
+
+echo "== check_stall: a reset that has just GONE does not become tomorrow's ==" >&2
+# The other way into "walled, nothing stored, nothing knocked on yet" is a detection
+# that did read a hint and rejected it for being already past. The line stays on
+# screen, and parse_reset reads a bare clock time as the NEXT time the clock comes
+# round to it - so six minutes later the very same line reads as tomorrow, clears any
+# "later than now" test, and turns a ten-minute cycle into a day-long one. Nothing
+# about PQ_TRIES catches this: no knock has been sent.
+D=$(new_case)
+set_panes "$(printf 'w1:p1\tclaude\tidle')"
+st_set "$D" PQ_BLOCKED quota
+st_set "$D" PQ_QUOTA_SINCE "$(ago 360)"
+st_set "$D" PQ_TRIES 0
+st_set "$D" PQ_RESETS_AT ""               # detection found only a time already gone
+NEXT=$(( $(now_e) + 240 ))
+st_set "$D" PQ_RETRY_AT "$NEXT"
+# Named six minutes ago, so it is past the grace parse_reset allows and will roll.
+walled_text w1:p1 "$(clock_of $(( $(now_e) - 360 )))" 100 "10:40pm"
+check_stall "$D"; sent_reset; check_stall "$D"
+eq "$(st "$D" PQ_RESETS_AT)" "" "a reset a day out is not a reset this wall named"
+eq "$(st "$D" PQ_RETRY_AT)" "$NEXT" "and the poll is left where it was"
+# The bound is what pq will keep knocking for, so everything it would knock through
+# still gets waited for - a five-hour window's reset included.
+D=$(new_case)
+set_panes "$(printf 'w1:p1\tclaude\tidle')"
+st_set "$D" PQ_BLOCKED quota
+st_set "$D" PQ_QUOTA_SINCE "$(ago 60)"
+st_set "$D" PQ_TRIES 0
+st_set "$D" PQ_RETRY_AT "$(( $(now_e) + 540 ))"
+FIVEH=$(( $(now_e) + 18000 ))
+walled_text w1:p1 "$(clock_of "$FIVEH")" 100 "10:40pm"
+check_stall "$D"; check_stall "$D"
+RA=$(st "$D" PQ_RESETS_AT)
+[ -n "$RA" ] && [ "$RA" -ge $(( FIVEH - 90 )) ] && [ "$RA" -le $(( FIVEH + 90 )) ] \
+  && ok || bad "a five-hour window's reset is well inside the bound (got '$RA', want ~$FIVEH)"
+
+echo "== check_stall: a knocked task does not re-date itself off the scrollback ==" >&2
+# The knock at the named time is exactly what demotes pq to polling: it means the
+# time came and went with the wall still up. The line that named it stays in the
+# scrollback for ever, though, and parse_reset reads a bare clock time as the NEXT
+# time the clock comes round to it - so re-reading it afterwards does not return a
+# stale time, it returns TOMORROW, and the ten-minute cycle becomes a day-long one.
+D=$(new_case)
+set_panes "$(printf 'w1:p1\tclaude\tidle')"
+st_set "$D" PQ_BLOCKED quota
+st_set "$D" PQ_QUOTA_SINCE "$(ago 3600)"
+st_set "$D" PQ_TRIES 1                    # one knock sent at the named time, rebuffed
+st_set "$D" PQ_RESETS_AT ""               # which is what cleared this
+NEXT=$(( $(now_e) + 300 ))
+st_set "$D" PQ_RETRY_AT "$NEXT"
+walled_text w1:p1 "$(clock_of $(( $(now_e) - 3600 )))" 100 "10:40pm"
+check_stall "$D"; sent_reset; check_stall "$D"
+eq "$(st "$D" PQ_RESETS_AT)" "" "a demoted task stays demoted"
+eq "$(st "$D" PQ_RETRY_AT)" "$NEXT" "the poll it is on is left exactly where it was"
+eq "$(sent)" "" "and nothing is typed before that poll comes round"
 
 echo "== check_stall: a permission prompt ends a wall and is never answered ==" >&2
 # A session asking for something is a session running again. Ending the wall here
