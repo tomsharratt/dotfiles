@@ -94,7 +94,8 @@ A task is a directory, and the directory it sits in is its state - `queue/`, `ho
 Every transition is a `mv`, which is atomic within a filesystem, so two dispatchers cannot claim the same task.
 Each task holds an immutable `plan.md` (a settings header prepended to whatever Claude Code wrote) and a `state.env` of runtime facts, so an agent can re-read its plan at any point and never see it change underneath it.
 
-`pq add` with no plan, at a terminal, shows the ten most recently touched plans in `~/.claude/plans` and lets you pick one rather than silently guessing - see "Picking a plan" below.
+`pq add` with no plan, at a terminal, shows the ten most recently touched plans in `~/.claude/plans` - `n` and `p` page back through the older ones - and lets you pick one rather than silently guessing.
+See "Picking a plan" below.
 Either way, it then asks Haiku for a branch name and a one-line statement of intent (Claude Code auto-names plan files, so the filename is never a usable branch), and refuses a branch that is already spoken for - `wt new` checks out an existing branch rather than failing, so two tasks sharing a name would quietly land in the same worktree.
 
 Each task records its own project, so one queue serves all of them.
@@ -131,7 +132,14 @@ The fourteen-digit prefix on a task directory is a UTC timestamp and nothing els
 A bare `pq add` at a terminal shows the ten most recently touched plans in `~/.claude/plans`, each with its age and its title - the first `# H1` in the file, since Claude Code names the file itself from your opening prompt and that name is rarely what the plan is actually about.
 "Most recently touched" means whichever is newer, mtime or birth time, so a plan edited this morning outranks one merely created today, and a plan restored by `cp -p`, `rsync -a`, or a git checkout doesn't fall to the bottom on a stale mtime.
 
-Pick a number - Enter takes the most recent - and it previews the plan before asking `use this plan? [y/N]`; answering `n` returns to the number prompt rather than aborting the whole command.
+Ten is a page, not a limit.
+`n` pages back to older plans and `p` pages forward again, and the header says where you are - `11-20 of 47 (page 2/5)`.
+The keys are offered only when there is more than one page, and paging past either end says so rather than doing nothing.
+`PQ_PICK_LIMIT` sets the page size.
+
+Row numbers are absolute: row 11 is the eleventh-newest plan whichever page you are looking at, so a number always means the same plan and any listed row can be picked from any page.
+Pick a number - Enter takes the top row of the page you are on, which is the most recent plan on page one - and it previews the plan before asking `use this plan? [y/N]`; answering `n` returns to the number prompt, on the page you were reading, rather than aborting the whole command.
+That `n` is "no", not "next page" - the two prompts read the key differently, and each one's hint says which is in force.
 Once you confirm, it asks the two things that actually shape how a task runs: whether to split it into a stack of small PRs, and which of the tasks already queued, held, or running it should wait on.
 
 Passing a flag the wizard would otherwise ask about skips just that one question - `pq add --split` picks a plan and skips straight past the split question (it still asks about blockers), `pq add --after some-task` picks a plan and skips straight past the blocker question (it still asks about splitting).

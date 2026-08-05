@@ -117,10 +117,12 @@ PQ_DEFAULT_EFFORT="${PQ_DEFAULT_EFFORT:-xhigh}"
 PQ_NAMER_MODEL="${PQ_NAMER_MODEL:-haiku}"
 PQ_SPLITTER_MODEL="${PQ_SPLITTER_MODEL:-opus}"
 PQ_SPLITTER_EFFORT="${PQ_SPLITTER_EFFORT:-xhigh}"
-PQ_PICK_LIMIT="${PQ_PICK_LIMIT:-10}"       # how many recent plans pick_plan lists
+PQ_PICK_LIMIT="${PQ_PICK_LIMIT:-10}"       # plans per page in pick_plan; `n`/`p` walk the rest
 # A non-positive limit would break "Enter takes 1" - the table would have
 # zero rows, yet Enter still defaults to a row 1 that can't exist - so this
-# one, unlike its neighbours, is worth guarding against a bad override.
+# one, unlike its neighbours, is worth guarding against a bad override. It is
+# also the page STRIDE, so a zero would divide by zero working out how many
+# pages there are.
 [[ "$PQ_PICK_LIMIT" =~ ^[0-9]+$ ]] && [ "$PQ_PICK_LIMIT" -ge 1 ] || PQ_PICK_LIMIT=10
 PQ_PICK_PREVIEW="${PQ_PICK_PREVIEW:-12}"   # lines of a plan pick_plan previews
 PQ_REPOS_MAX="${PQ_REPOS_MAX:-12}"         # cap on repo_candidates'/repo_candidates_container's scanned inventory
@@ -640,48 +642,103 @@ cell() {                                # text width -> ASCII-safe, truncated
   printf '%s' "$out"
 }
 
+# One page of `recent_plans`, as a table numbered ABSOLUTELY: row 11 is the
+# eleventh-newest plan whichever page it happens to be shown on. That is what
+# keeps `sed -n "${ans}p"` below a direct index into the full list, with no
+# per-page arithmetic to get wrong, and what makes a number mean one fixed plan
+# rather than "the third one I can currently see".
+pick_page() {                           # rows lo hi out_tsv
+  local lo=$2 hi=$3 out=$4 n=0 epoch path title
+  printf '#\tAGE\tPLAN\tSUMMARY\n' > "$out"
+  while IFS=$'\t' read -r epoch path; do
+    [ -n "$path" ] || continue
+    n=$((n + 1))
+    [ "$n" -lt "$lo" ] && continue
+    [ "$n" -gt "$hi" ] && break
+    title=$(plan_title "$path")
+    printf '%s\t%s\t%s\t%s\n' "$n" "$(age_since "$epoch")" \
+      "$(cell "$(basename "$path" .md)" 30)" "$(cell "$title" 60)" >> "$out"
+  done <<<"$1"
+  # A `while read` loop returns whatever its body last ran, and this body can
+  # end on a short-circuited test - so a perfectly good page would otherwise
+  # report failure. Exit codes carry meaning in this file (see pick_plan's own
+  # contract below); say the happy path out loud.
+  return 0
+}
+
 # Exit codes carry meaning, the way reap_task's already do: 0 chose one (its
 # path on stdout), 1 declined/`q`/EOF, 2 nothing in $PLANS_DIR to pick from -
 # the caller falls through to the existing "none found" error on that one.
 # Everything a human reads goes to stderr: pick_plan is consumed by a command
 # substitution, and any leakage on stdout would silently corrupt $plan, the
 # `source:` header, and the staged plan.md.
+#
+# $PLANS_DIR is every plan ever written, so this shows PQ_PICK_LIMIT of them at
+# a time - the newest page answers it most days - and `n`/`p` walk back through
+# the rest. Paging beats simply raising the limit because the plans you want
+# are named by the prompt that started their session
+# ("floofy-hugging-dragonfly.md"), so digging back is reading titles, not
+# recalling a filename, and a hundred-row table is not a thing you read.
 pick_plan() {
-  local rows total n=0 tbl epoch path title
+  local rows total
   rows=$(recent_plans)
   [ -n "$rows" ] || return 2
   total=$(wc -l <<<"$rows" | tr -d ' ')
 
-  tbl="$PQ_HOME/.pick.$$.tsv"
-  printf '#\tAGE\tPLAN\tSUMMARY\n' > "$tbl"
-  while IFS=$'\t' read -r epoch path; do
-    [ -n "$path" ] || continue
-    n=$((n + 1))
-    [ "$n" -gt "$PQ_PICK_LIMIT" ] && { n=$((n - 1)); break; }
-    title=$(plan_title "$path")
-    printf '%s\t%s\t%s\t%s\n' "$n" "$(age_since "$epoch")" \
-      "$(cell "$(basename "$path" .md)" 30)" "$(cell "$title" 60)" >> "$tbl"
-  done <<<"$rows"
+  # `lo`, the 1-based index of the page's first row, is the whole of the paging
+  # state - the stride cannot change mid-picker, so every other bound is
+  # arithmetic on it. It survives a declined preview, which is what returns you
+  # to the page you were reading rather than to the top.
+  local per=$PQ_PICK_LIMIT lo=1 hi pages
+  pages=$(( (total + per - 1) / per ))
 
+  local tbl="$PQ_HOME/.pick.$$.tsv"
   local ans row sel_path total_lines ans2 rule
   rule=$(printf -- '─%.0s' $(seq 1 60))
   while :; do
-    msg "$n most recent of $total"
+    hi=$(( lo + per - 1 )); [ "$hi" -gt "$total" ] && hi=$total
+    pick_page "$rows" "$lo" "$hi" "$tbl"
+
+    if [ "$pages" -gt 1 ]; then
+      msg "$lo-$hi of $total (page $(( (lo - 1) / per + 1 ))/$pages)"
+    else
+      msg "$total most recent of $total"
+    fi
     printf '\n' >&2
     render_table "$tbl" >&2
     printf '\n' >&2
-    printf 'pq: pick a plan [1-%s, Enter for 1, q to quit] ' "$n" >&2
+    # One page is the whole list, so there is nowhere to page to - don't offer
+    # keys that can only answer "already at the oldest".
+    if [ "$pages" -gt 1 ]; then
+      printf 'pq: pick a plan [%s-%s, n older, p newer, Enter for %s, q to quit] ' "$lo" "$hi" "$lo" >&2
+    else
+      printf 'pq: pick a plan [1-%s, Enter for 1, q to quit] ' "$total" >&2
+    fi
     read -r ans || { rm -f "$tbl"; return 1; }
-    [ -z "$ans" ] && ans=1
+    # The top of what you are looking at, which is row 1 on the first page -
+    # so a plain `pq add`, Enter, still takes the newest plan.
+    [ -z "$ans" ] && ans=$lo
+    # `n` here is "next page, older"; `n` at the `use this plan? [y/N]` prompt
+    # a few lines down is "no". Two prompts, two vocabularies - each one's own
+    # hint says which is in force, and neither key is ever ambiguous within the
+    # prompt that reads it.
     case "$ans" in
       q|Q) rm -f "$tbl"; return 1 ;;
+      n|N) if [ "$hi" -lt "$total" ]; then lo=$(( lo + per )); else warn "already at the oldest"; fi
+           continue ;;
+      p|P) if [ "$lo" -gt 1 ]; then lo=$(( lo - per )); else warn "already at the newest"; fi
+           continue ;;
     esac
+    # Any listed plan, on this page or not: the numbering is absolute, so
+    # rejecting a number that names a real plan just because it scrolled off
+    # would be a lie about what that number means.
+    #
     # Capped at 9 digits so a huge number never reaches the arithmetic tests
     # below: bash's [ -lt ]/[ -gt ] error out (a false "false") on an integer
     # past its native range, which would flip this whole OR-chain to skip the
     # reject instead of triggering it.
-    if ! [[ "$ans" =~ ^[0-9]{1,9}$ ]] || [ "$ans" -lt 1 ] || [ "$ans" -gt "$n" ]; then
-      warn "not a number from 1 to $n"
+    if ! [[ "$ans" =~ ^[0-9]{1,9}$ ]] || [ "$ans" -lt 1 ] || [ "$ans" -gt "$total" ]; then
+      warn "not a number from 1 to $total"
       continue
     fi
 

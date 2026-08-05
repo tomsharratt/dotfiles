@@ -192,16 +192,94 @@ reset_plans
 pick_plan >/dev/null 2>&1; rc=$?
 eq "$rc" "2" "nothing in PLANS_DIR should return 2, not 1"
 
-echo "== pick_plan: PQ_PICK_LIMIT truncates the table ==" >&2
+echo "== pick_plan: PQ_PICK_LIMIT is a page, and n/p walk the pages ==" >&2
+# Five plans at a limit of 2 is three pages, the last of them short - which is
+# the only fixture shape that exercises a middle page and a partial one at once.
+# Spaced with real sleeps, like the ordering fixtures at the top of this file:
+# recent_plans breaks an epoch tie on the path, so five plans written inside one
+# second would order by name, and a second boundary landing mid-loop would
+# reorder them halfway. That is a flaky test, not a fast one.
 reset_plans
-mkplan aaa-plan.md "Alpha"; sleep 1.1
-mkplan bbb-plan.md "Bravo"; sleep 1.1
-mkplan ccc-plan.md "Charlie"
+mkplan p1-oldest.md "Plan One"; sleep 1.1
+mkplan p2.md "Plan Two"; sleep 1.1
+mkplan p3-middle.md "Plan Three"; sleep 1.1
+mkplan p4.md "Plan Four"; sleep 1.1
+mkplan p5-newest.md "Plan Five"
+p1="$PQ_PLANS_DIR/p1-oldest.md"
+p3="$PQ_PLANS_DIR/p3-middle.md"
+# Rows, newest first: 1 p5-newest, 2 p4, 3 p3-middle, 4 p2, 5 p1-oldest.
+# Which page a header reports is the one thing every case below asserts on, so
+# it is read off stderr rather than inferred from what got picked: accepting any
+# number in 1-$total means a paging key that did nothing at all would leave most
+# stdout assertions passing anyway.
+last_page() { grep -o 'page [0-9]/3' <<<"$1" | tail -1; }
+
 err=$(PQ_PICK_LIMIT=2 pick_plan <<<'q' 2>&1 >/dev/null)
-case "$err" in *"2 most recent of 3"*) ok ;; *) bad "header should read '2 most recent of 3' (got: $err)" ;; esac
-case "$err" in *"ccc-plan"*) ok ;; *) bad "the newest plan should render in the truncated table" ;; esac
-case "$err" in *"bbb-plan"*) ok ;; *) bad "the second-newest plan should render too" ;; esac
-case "$err" in *"aaa-plan"*) bad "the oldest plan should NOT render when the limit is 2" ;; *) ok ;; esac
+case "$err" in *"1-2 of 5 (page 1/3)"*) ok ;; *) bad "header should read '1-2 of 5 (page 1/3)' (got: $err)" ;; esac
+case "$err" in *"p5-newest"*) ok ;; *) bad "the newest plan should render on page 1" ;; esac
+case "$err" in *"p4"*) ok ;; *) bad "the second-newest plan should render on page 1 too" ;; esac
+case "$err" in *"p3-middle"*) bad "page 1 must not render page 2's rows" ;; *) ok ;; esac
+case "$err" in *"n older, p newer"*) ok ;; *) bad "more than one page should offer the paging keys" ;; esac
+
+echo "== pick_plan: n pages back to older plans ==" >&2
+err=$(PQ_PICK_LIMIT=2 pick_plan <<<$'n\nq' 2>&1 >/dev/null)
+case "$err" in *"3-4 of 5 (page 2/3)"*) ok ;; *) bad "n should render page 2 as '3-4 of 5' (got: $err)" ;; esac
+case "$err" in *"p3-middle"*) ok ;; *) bad "n should bring the third-newest plan into view" ;; esac
+
+echo "== pick_plan: Enter takes the top of the CURRENT page ==" >&2
+# The one case that cannot pass with paging broken: if n had been ignored, Enter
+# would take row 1 (p5-newest) instead of row 3.
+out=$(PQ_PICK_LIMIT=2 pick_plan <<<$'n\n\ny' 2>/dev/null)
+eq "$out" "$p3" "Enter on page 2 should take that page's first row, not the newest plan"
+
+echo "== pick_plan: p pages back towards newer plans ==" >&2
+err=$(PQ_PICK_LIMIT=2 pick_plan <<<$'n\np\nq' 2>&1 >/dev/null)
+eq "$(last_page "$err")" "page 1/3" "p from page 2 should land back on page 1"
+case "$err" in *"page 2/3"*) ok ;; *) bad "page 2 should have been rendered on the way out" ;; esac
+
+echo "== pick_plan: the last page is short, and n cannot go past it ==" >&2
+err=$(PQ_PICK_LIMIT=2 pick_plan <<<$'n\nn\nn\nq' 2>&1 >/dev/null)
+eq "$(last_page "$err")" "page 3/3" "n past the last page should stay on it"
+case "$err" in *"5-5 of 5 (page 3/3)"*) ok ;; *) bad "a short final page should report its real range (got: $err)" ;; esac
+case "$err" in *"p1-oldest"*) ok ;; *) bad "the last page should render the oldest plan" ;; esac
+case "$err" in *"already at the oldest"*) ok ;; *) bad "n past the end should say so rather than no-op silently" ;; esac
+
+echo "== pick_plan: p cannot go past the first page ==" >&2
+err=$(PQ_PICK_LIMIT=2 pick_plan <<<$'p\nq' 2>&1 >/dev/null)
+eq "$(last_page "$err")" "page 1/3" "p on page 1 should stay on page 1"
+case "$err" in *"already at the newest"*) ok ;; *) bad "p at the front should say so rather than no-op silently" ;; esac
+
+echo "== pick_plan: the numbering is absolute, so an off-page row is still selectable ==" >&2
+out=$(PQ_PICK_LIMIT=2 pick_plan <<<$'5\ny' 2>/dev/null)
+eq "$out" "$p1" "row 5 should be selectable from page 1"
+err=$(PQ_PICK_LIMIT=2 pick_plan <<<$'6\nq' 2>&1 >/dev/null)
+case "$err" in *"not a number from 1 to 5"*) ok ;; *) bad "past the last row is still out of range (got: $err)" ;; esac
+
+echo "== pick_plan: declining a preview returns to the page you were reading ==" >&2
+err=$(PQ_PICK_LIMIT=2 pick_plan <<<$'n\n3\nn\nq' 2>&1 >/dev/null)
+eq "$(last_page "$err")" "page 2/3" "declining should re-render page 2, not the first page"
+
+echo "== pick_plan: one page renders exactly as it did before paging existed ==" >&2
+err=$(PQ_PICK_LIMIT=10 pick_plan <<<'q' 2>&1 >/dev/null)
+case "$err" in *"5 most recent of 5"*) ok ;; *) bad "a single page keeps the old header (got: $err)" ;; esac
+case "$err" in *"[1-5, Enter for 1, q to quit]"*) ok ;; *) bad "a single page keeps the old prompt (got: $err)" ;; esac
+case "$err" in *"n older"*) bad "a single page should not offer keys that can only refuse" ;; *) ok ;; esac
+
+echo "== pick_page: a rendered page reports success, and numbers rows absolutely ==" >&2
+pp_rows=$(recent_plans)
+pp="$PQ_HOME/.pp.tsv"
+pick_page "$pp_rows" 1 2 "$pp"; rc=$?
+eq "$rc" "0" "pick_page should report success on the first page"
+eq "$(wc -l < "$pp" | tr -d ' ')" "3" "a two-row page is a header plus two rows"
+eq "$(awk -F'\t' 'NR == 2 { print $1 }' "$pp")" "1" "page 1's first row is numbered 1"
+pick_page "$pp_rows" 3 4 "$pp"; rc=$?
+eq "$rc" "0" "pick_page should report success on a later page too"
+eq "$(awk -F'\t' 'NR == 2 { print $1 }' "$pp")" "3" "page 2's first row keeps its absolute number 3"
+eq "$(awk -F'\t' 'NR == 2 { print $3 }' "$pp")" "p3-middle" "page 2's first row is the third-newest plan"
+pick_page "$pp_rows" 5 6 "$pp"; rc=$?
+eq "$rc" "0" "a page whose upper bound runs past the last row is still a success"
+eq "$(wc -l < "$pp" | tr -d ' ')" "2" "that page holds the one row that exists"
+rm -f "$pp"
 
 echo "== pick_after: 1,3 selects the right slugs; space/comma forms agree; duplicates collapse ==" >&2
 reset_tasks
