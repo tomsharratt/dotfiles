@@ -212,9 +212,16 @@ The release has to be a timer rather than an exit, because an agent that has gen
 It governs the tasks whose PR is still open or in draft; a task whose PR has *merged* gets torn down by the reap pass as soon as its agent stops, and a torn-down task releases its slot at once with no grace at all.
 The grace applies to `idle` and to herdr's `done` alike, because both are per-turn rather than per-task: an agent that opens a PR and then goes back in to fix CI passes through them between every turn, and releasing on the first sighting would be the same bug in a subtler form.
 A `blocked` agent - a permission prompt, a quota wall - holds its slot too, the same trade `running/` already makes, since it will resume rather than having finished.
-Nothing knocks on a `done/` pane the way it does on a running one, though, so that row reads as **blocked** rather than "wrapping up" and counts into "needs you": it is holding a slot until you answer it.
+That row reads as **permission** or **quota 8:30pm** rather than "wrapping up", and a permission prompt counts into "needs you": it is holding a slot until you answer it.
+A quota wall does not, because `pq` answers that one itself, on a `done/` pane as readily as on a running one.
+Note that a dismissed wall reads as `idle` to herdr - dismissing the dialog is what stops the spinner - so `pq`'s own verdict is what holds that slot, or the grace below would hand it away while the agent waits for its window and then take it back on the tick the agent resumes.
 An exited agent or a vanished workspace releases immediately, with no grace at all, and while herdr is unreachable the slot is held rather than guessed at.
 Setting `PQ_WRAPUP_GRACE=0` restores the old release-on-PR behaviour.
+
+The other reason the queue can sit still with slots apparently free is that **a wall anywhere stops dispatch entirely**.
+Every agent `pq` runs draws on one account-wide usage window, so a second agent started behind the wall does not get an allowance of its own: it walls on its first request, having spent a minute of `wt new`, a database, a port and a puma-dev entry to get there, and it arrives with its own knock cycle to run.
+So fill starts nothing at all until whoever is walled is moving again, and both the tick summary and `pq cap` say so rather than reporting room that will not be used.
+It takes a *live* agent to freeze anything: a task whose Claude has exited, or whose workspace is gone, holds nothing up, however much of the wall is still legible on its pane.
 
 Ctrl-C is a graceful shutdown: during the sleep it stops immediately, and during a tick it lets the work in flight finish first.
 That needs a little care, because a terminal signals the whole foreground process group - so by default a `wt new` halfway through copying a database would die alongside the tick.
@@ -251,30 +258,45 @@ The same `--repo PATH` naming a directory instead of a checkout triggers this fr
 
 #### Hitting the session limit
 
-When a Claude session runs out of its usage window it puts up a dialog - "Wait for limit to reset · Resets 8:00pm" - and every option on that dialog only dismisses it.
+When a Claude session runs out of its usage window it says so on the pane - "You've hit your session limit · resets 3pm (PDT)" - and puts up a dialog whose every option only dismisses it.
 Nothing resumes by itself, so an agent that hits the wall at 2am would otherwise sit there until morning holding a slot.
-Each tick reads the last lines of every running agent's pane, and when it finds the wall it dismisses the dialog, waits for the time the dialog names, and then knocks with "Continue with what you were doing" until the agent picks its work back up.
+Each tick reads the last lines of every dispatched agent's pane, and when it finds the wall it dismisses the dialog, waits for the time the message names, and then knocks with "Continue with what you were doing" until the agent picks its work back up.
+Agents wrapping up in `done/` are read the same way as running ones: that is where an unattended agent spends most of the night, answering review and fixing CI, and it can hit the wall there just as easily.
 
-Three details make that safe to leave running unattended.
+Four details make that safe to leave running unattended.
 
 **Detection is the pane's text, not Herdr's status.**
 Herdr derives agent status from its own regexes over the terminal, and its highest-priority rule reads a spinner in the window title as `working` - which is exactly what is on screen while the request that hit the wall is still in flight.
 Waiting for Herdr to say `blocked` would risk never firing at all.
+The read is `herdr pane read` rather than `herdr agent read`, because the wall has to stay detectable on a pane whose agent binding has lapsed, and only the first of those answers for one.
 
 **Only a screen that has stopped moving counts as stuck.**
 `pq` hashes the tail each tick and acts only when the wall is showing *and* the hash is unchanged since last time.
-A working agent's tail moves every few seconds, so this cannot interrupt one - which matters, because the wall's message stays in the scrollback for a while after the session recovers.
+A working agent's tail moves every few seconds, so this cannot interrupt one.
 
-**It waits for the time the dialog names, and polls only when it cannot read one.**
-The dialog carries "Resets 8:30pm", and that hint beats any other source of the same fact, because it comes from the error that walled us and so already refers to the right window - the account has both a five-hour and a weekly limit, and nothing else on hand would say which one you are behind.
+**Once the wall has been seen, the schedule is `pq`'s own.**
+That message is live UI, not transcript text: Claude Code derives it from the reset time it is waiting for, so it clears *itself* at the reset - which is the exact moment the knock comes due.
+Treating "the wall is no longer on screen" as recovery therefore threw the plan away at the one moment it mattered.
+So the text only ever puts the block *on*; from there the stored reset time decides, and what is on screen decides nothing until the knock is due.
+
+What takes the block off is evidence the agent is moving again, and that needs two things rather than one: a tail that has changed **and** Herdr calling the pane `working`.
+A changed tail alone is not enough, because a statusline reporting rate limits sits inside the tail and turns over at the reset all by itself - a one-tick change landing at precisely the moment the knock is due, indistinguishable from the agent resuming, and believing it would clear the block on an idle agent and strand it.
+That is not a retreat from the first rule above: that one governs detection, where the spinner makes `working` unreliable; by the time a knock is due the dialog is long dismissed and nothing is in flight.
+An agent you rescue yourself is believed straight away, clock or no clock, since a block still on file is a block that freezes the queue.
+
+**It waits for the time the message names, and polls only when it cannot read one.**
+The wall's own line carries "resets 3pm", and that hint beats any other source of the same fact, because it comes from the error that walled us and so already refers to the right window - the account has both a five-hour and a weekly limit, and nothing else on hand would say which one you are behind.
+A statusline that reports rate limits carries a "resets" of its own, and it is only ever the fallback, since it always names the five-hour window even when the weekly one is what walled you.
 Two habits of Claude Code's formatter are worth knowing, since both will catch out anything that assumes otherwise: minutes are dropped when they are zero, so it reads `8pm` rather than `8:00pm`, and no date is printed for a reset less than 24 hours out, so a bare `1am` seen at 11pm means tomorrow.
 Beyond 24 hours it becomes `Jul 28, 8:30pm`, gaining a year only when the year differs.
+What is *stored* is the epoch, and `pq ls` formats it back on the way out - state files are read by sourcing them, so a value like `3pm (PDT)` is a syntax error that silently truncates everything written after it.
 
 A hint that cannot be read is not a failure: ten-minute polling is the fallback, and it also takes over if the knock at the named time turns out to be too early.
 The one outcome ruled out is waiting on a guess, because that strands a task silently, where an early knock costs a single instantly-failing call.
 
 The wall is the only thing `pq` ever answers.
 A permission prompt is recorded as `permission` and deliberately left alone - that is the trade for running everything in auto mode - so `pq ls` separates the agents waiting on the clock from the ones waiting on you.
+One appearing where a wall was is taken as recovery, because a session asking for something is a session running again, and the alternative is a knock sending Escape at the prompt - refusing it - every ten minutes.
 After forty unanswered knocks a task is marked `walled` and left, rather than knocking all night.
 
 #### Tearing a task down
