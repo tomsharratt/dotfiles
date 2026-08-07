@@ -47,6 +47,7 @@ For `supercast` (`~/.config/wt/profiles/supercast.sh`) each worktree gets:
 So `wt new premier-video` and `wt new spotify-reconcile` can run side by side, each serving its own url against its own database, with no handoff between them.
 The app needs no changes for this: its `database.yml`, `sidekiq.rb`, and `development.rb`/`session_store.rb` already honor `DATABASE_URL` / `REDIS_URL` / `LOCAL_DOMAIN`, and `config.hosts.clear` allows any `*.test` host.
 The profile injects the port by generating a per-worktree Procfile (the tracked `Procfile.dev` pins the web port to 3000), written outside the repo so the checkout stays clean.
+Provisioning also restarts puma-dev whenever a slug's port actually moves, because puma-dev reads `~/.puma-dev/<slug>` only once per hostname and then caches that proxy for the life of the daemon - nothing short of a restart evicts it, so a moved port otherwise leaves the url 502ing against a dead port while the dev server runs happily on the new one.
 
 For the two mobile repos (`~/.config/wt/profiles/supercast-ios.sh`, `supercast-android.sh`) there is nothing to isolate per worktree, because both apps build a fixed bundle id/applicationId - a second install on the same device just replaces the first.
 So instead of per-worktree isolation, each profile targets the one shared simulator or emulator, and the last `wt open` wins: it builds that worktree's branch, installs it, and launches it, so "look at this branch on a device" is a single command, and rerunning it is the reload.

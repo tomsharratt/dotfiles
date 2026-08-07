@@ -32,6 +32,50 @@ _wt_dropdb() {
   dropdb "$db"
 }
 
+# Point puma-dev's <slug>.test at this worktree's port, restarting the daemon when that
+# is not the port it already has on file.
+#
+# puma-dev reads ~/.puma-dev/<slug> exactly ONCE - the first time it builds a proxy for
+# that hostname - and then holds that proxy for the life of the process. It does not
+# watch the directory, SIGUSR1 and `puma-dev -stop` both leave proxy apps untouched, and
+# even deleting the entry keeps the cached proxy serving. So a port that MOVES under a
+# running daemon strands it: puma-dev keeps dialing the port it read the first time and
+# every request to the worktree 502s, while the dev server sits perfectly healthy on the
+# new one. That is invisible from the browser - the url is right, the app is up, and the
+# only evidence is a "dial tcp 127.0.0.1:<old>: connection refused" line in
+# ~/Library/Logs/puma-dev.log.
+#
+# Two ordinary things move a port. supercast's own bin/preview-setup registers the same
+# slug at :3100, its default, which is outside wt's range and so is never what wt then
+# writes. And a torn-down slug that comes back - `wt rm` then `wt new` on the same branch
+# - gets whatever port is free next, while puma-dev still holds the proxy from its first
+# life.
+#
+# Restarting is the only thing that clears the pool. Cheap, but not free: every entry in
+# ~/.puma-dev is a port file, so no app is actually stopped, and launchd holds the :80/:443
+# sockets so a connection opened after the kill just queues - but a connection puma-dev had
+# already accepted dies with it. So anything in flight on ANY .test host - a page mid-load,
+# an open ActionCable socket - is dropped and has to retry. Hence only on a real change:
+# a re-provision that keeps its port stays silent, and the cost is paid on `wt new` and on
+# a genuine move, which is where a stale pool would otherwise break the worktree outright.
+_wt_puma_dev_route() {
+  local entry="$HOME/.puma-dev/$WT_SLUG" had label
+  [ -f "$entry" ] && had=$(tr -dc '0-9' < "$entry" 2>/dev/null)
+  printf '%s' "$WT_PORT" > "$entry"
+  msg "puma-dev: https://$WT_DOMAIN -> :$WT_PORT"
+  [ "${had:-}" = "$WT_PORT" ] && return 0
+  for label in io.puma.dev homebrew.mxcl.puma-dev; do
+    launchctl list "$label" >/dev/null 2>&1 || continue
+    launchctl kickstart -k "gui/$(id -u)/$label" >/dev/null 2>&1 \
+      && { msg "restarted puma-dev so $WT_DOMAIN re-reads :$WT_PORT"; return 0; }
+  done
+  # Not fatal: the dev server still serves the port directly, it is only the .test url
+  # that is stale. Say exactly what to run, since nothing else will reveal the cause.
+  warn "puma-dev is not under launchd - it may still route $WT_DOMAIN at ${had:-an old port};"
+  warn "  restart it to pick up :$WT_PORT"
+  return 0
+}
+
 wt_provision() {
   local canonical=$WT_REPO db key rel
   db=$(_wt_db)
@@ -94,8 +138,7 @@ wt_provision() {
   fi
 
   # 5. Route puma-dev's <slug>.test at this worktree's port.
-  printf '%s' "$WT_PORT" > "$HOME/.puma-dev/$WT_SLUG"
-  msg "puma-dev: https://$WT_DOMAIN -> :$WT_PORT"
+  _wt_puma_dev_route
 
   # Record human-facing facts for `wt ls`.
   wt_state_set WT_URL "https://$WT_DOMAIN"
