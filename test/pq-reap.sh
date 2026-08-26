@@ -291,8 +291,13 @@ case "$(pr_targets running)" in
 esac
 rm -rf "$wt8"
 
-echo "== any terminal marker: pr_targets running stops listing it (regression) ==" >&2
-for marker in PQ_MERGED PQ_CLOSED PQ_REAPED; do
+echo "== a VERDICT marker: pr_targets running stops listing it (regression) ==" >&2
+# PQ_REAPED is deliberately not in this list any more. It says the worktree is
+# gone, which is silent about whether the pull request merged - and treating it
+# as terminal is what stopped a task being watched through the window where its
+# merge actually landed. Only a verdict ends the watch; the PQ_REAPED case is
+# asserted on its own below.
+for marker in PQ_MERGED PQ_CLOSED; do
   reset_caches
   wtN=$(mktemp -d)
   dN=$(mk_done 20 "term-$marker" "$REPO" "tom/term-$marker" "$wtN")
@@ -311,7 +316,20 @@ for marker in PQ_MERGED PQ_CLOSED PQ_REAPED; do
   rm -rf "$wtN" "$dN"
 done
 
-echo "== PQ_WORKTREE gone from disk, gh silent: only PQ_REAPED stamped ==" >&2
+# The other half of the same rule: reaped, with no verdict, must STAY listed.
+reset_caches
+wtR=$(mktemp -d)
+dR=$(mk_done 20 term-reaped-only "$REPO" tom/term-reaped-only "$wtR")
+cache_row "$REPO" tom/term-reaped-only 9 OPEN "" master
+st_set "$dR" PQ_REAPED "$(now)"
+reap_watching "$dR" && ok || bad "PQ_REAPED alone must not end the watch - there is no verdict yet"
+case "$(pr_targets running)" in
+  *"$(printf '%s\t%s' "$REPO" tom/term-reaped-only)"*) ok ;;
+  *) bad "a reaped row with no verdict must stay in pr_targets, or its merge is never seen" ;;
+esac
+rm -rf "$wtR" "$dR"
+
+echo "== PQ_WORKTREE gone from disk, gh silent: nothing stamped, still watching ==" >&2
 reset_caches; reset_wt_log
 d10=$(mk_done 10 case10 "$REPO" tom/case10 "$PQ_HOME/no-such-worktree-anywhere")
 # No cache_row at all - gh never answered, so no verdict is there to record.
@@ -319,10 +337,15 @@ reap_task "$d10" 0
 rc=$?
 [ "$rc" -ne 0 ] && ok || bad "a gone worktree must not itself report a teardown"
 [ ! -s "$WT_LOG" ] && ok || bad "wt must never be invoked when the worktree is already gone"
-[ -n "$(st "$d10" PQ_REAPED)" ] && ok || bad "PQ_REAPED should be stamped so it stops being watched"
+# Inverted deliberately. This used to stamp PQ_REAPED here, which read "stop
+# asking" - so a task whose worktree vanished while gh was unreachable, or while
+# its pull request was simply still open, was written off before any verdict
+# existed. With nothing to record, the right move is to record nothing.
+[ -z "$(st "$d10" PQ_REAPED)" ] && ok || bad "nothing is settled yet, so PQ_REAPED must not be stamped"
 [ -z "$(st "$d10" PQ_MERGED)" ] && [ -z "$(st "$d10" PQ_CLOSED)" ] \
   && ok || bad "no verdict should be stamped when gh never answered"
-archivable "$d10" && bad "reaped with no verdict must not be archivable" || ok
+reap_watching "$d10" && ok || bad "it must stay watched until gh does answer"
+archivable "$d10" && bad "with no verdict it must not be archivable" || ok
 
 echo "== PQ_WORKTREE gone from disk, cache says MERGED: the verdict is recorded, not thrown away ==" >&2
 reset_caches; reset_wt_log
@@ -477,6 +500,58 @@ rc=$?
 [ ! -s "$WT_LOG" ] && ok || bad "wt must never be invoked when the repo itself is gone"
 case "$out" in *"repo"*"is gone"*) ok ;; *) bad "should name the repo as gone, not a generic wt-rm failure (got '$out')" ;; esac
 rm -rf "$wt15"
+
+echo "== a worktree gone while the PR is still open keeps its verdict alive ==" >&2
+# The nine-minute window, as a test. sup-7-centralize-video-output was reaped at
+# 16:22:17 with its pull request still open, and merged at 16:31:26 - by which
+# time PQ_REAPED had already taken it out of pr_targets, so PQ_MERGED was never
+# stamped and archivable() could never be true. It sat in done/ for eight days.
+reset_tasks; reset_caches; reset_wt_log
+d16=$(mk_done 16 wt-gone-pr-open "$REPO" tom/case16 "$PQ_HOME/no-such-worktree")
+cache_row "$REPO" tom/case16 16 OPEN "" master        # still in review
+reap_task "$d16" 0 >/dev/null 2>&1
+eq "$(st "$d16" PQ_REAPED)" "" "an open PR must NOT be stamped reaped just because the worktree went"
+eq "$(st "$d16" PQ_MERGED)" "" "and no verdict is invented"
+reap_watching "$d16" && ok || bad "it must stay watched, or its merge lands with nobody listening"
+
+# ...and the message is once-only, since this can last for days.
+first=$(reap_task "$d16" 0 2>&1 >/dev/null | grep -c "still watching")
+second=$(reap_task "$d16" 0 2>&1 >/dev/null | grep -c "still watching")
+eq "$first"  "0" "the worktree-gone notice does not repeat once stamped"
+eq "$second" "0" "...and stays quiet"
+
+# Now the merge lands, exactly as it did nine minutes later.
+reset_caches
+cache_row "$REPO" tom/case16 16 MERGED "" master
+reap_task "$d16" 0 >/dev/null 2>&1
+[ -n "$(st "$d16" PQ_MERGED)" ] && ok || bad "the merge that arrives later must still be recorded"
+[ -n "$(st "$d16" PQ_REAPED)" ] && ok || bad "and reaped stamped alongside it"
+archivable "$d16" && ok || bad "which is what finally lets it leave done/"
+eq "$([ -s "$WT_LOG" ] && printf called || printf quiet)" "quiet" \
+  "wt is never invoked for a worktree that is already gone"
+
+echo "== a row stranded by the old rule heals itself ==" >&2
+# PQ_REAPED with no verdict is exactly the state the four stuck rows were in.
+# Nothing hand-repairs them: they simply become watchable again and the next
+# tick that reaches a verdict records it.
+reset_tasks; reset_caches; reset_wt_log
+d17=$(mk_done 17 stranded "$REPO" tom/case17 "$PQ_HOME/gone-too")
+st_set "$d17" PQ_REAPED "2026-08-18T16:22:17Z"        # stamped, no verdict
+reap_watching "$d17" && ok || bad "a reaped row with no verdict must be watched again"
+cache_row "$REPO" tom/case17 17 MERGED "" master
+reap_task "$d17" 0 >/dev/null 2>&1
+[ -n "$(st "$d17" PQ_MERGED)" ] && ok || bad "the stranded row must pick up its verdict"
+archivable "$d17" && ok || bad "and become archivable without being touched by hand"
+
+# A settled row is still left alone, and still costs no gh call.
+reset_tasks; reset_caches
+d18=$(mk_done 18 settled "$REPO" tom/case18 "$PQ_HOME/gone3")
+st_set "$d18" PQ_MERGED "2026-08-01T00:00:00Z"; st_set "$d18" PQ_REAPED "2026-08-01T00:00:01Z"
+reap_watching "$d18" && bad "a merged+reaped row must stop being watched" || ok
+reap_task "$d18" 0; eq "$?" "1" "...and reap_task leaves it alone"
+d19=$(mk_done 19 closed-row "$REPO" tom/case19 "$PQ_HOME/gone4")
+st_set "$d19" PQ_CLOSED "2026-08-01T00:00:00Z"
+reap_watching "$d19" && bad "a closed row must stop being watched" || ok
 
 printf '\n%d passed, %d failed\n' "$pass" "$fail" >&2
 [ "$fail" -eq 0 ]

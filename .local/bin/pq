@@ -4149,13 +4149,26 @@ reap_ok() {
   return 0
 }
 
-# True while a done task still needs a `gh` answer - none of `PQ_MERGED`,
-# `PQ_CLOSED`, `PQ_REAPED` is set. This is what keeps `pr_targets running` from
-# repeating a `gh` call forever once the verdict is in: a merged-but-held task
-# stops watching (the verdict is already known; only local checks remain), a
-# closed one stops for good, and a reaped one has nothing left to ask about.
+# True while a done task still needs a `gh` answer - which is exactly "no verdict
+# yet". This is what keeps `pr_targets running` from repeating a `gh` call forever
+# once the answer is in: a merged-but-held task stops watching (the verdict is
+# known; only local checks remain) and a closed one stops for good.
+#
+# `PQ_REAPED` deliberately does NOT appear here, though it used to. Reaping is a
+# statement about the WORKTREE - there is nothing left to tear down - and it was
+# being read as a statement about the VERDICT, which is a different fact. A task
+# whose worktree vanished while its pull request was still open got stamped
+# reaped, stopped being watched, and then its merge landed with nobody listening:
+# no `PQ_MERGED` ever, so `archivable` never true, so it sat in `done/` forever.
+# Measured: sup-7-centralize-video-output was reaped at 16:22:17 and its pull
+# request merged at 16:31:26, nine minutes later.
+#
+# Dropping the clause costs nothing now that `reap_task` only ever stamps
+# `PQ_REAPED` alongside a verdict: a settled task is already excluded by the two
+# checks above, and the only rows this newly watches are precisely the ones the
+# old rule stranded - which is what lets them heal on their own.
 reap_watching() {                       # task_dir
-  [ -z "$(st "$1" PQ_MERGED)" ] && [ -z "$(st "$1" PQ_CLOSED)" ] && [ -z "$(st "$1" PQ_REAPED)" ]
+  [ -z "$(st "$1" PQ_MERGED)" ] && [ -z "$(st "$1" PQ_CLOSED)" ]
 }
 
 # Tear one task down, once its PR has genuinely merged - 0 only when a teardown
@@ -4172,16 +4185,24 @@ reap_task() {                           # task_dir dry -> 0 torn down, 2 would (
 
   slug=$(slug_of "$d")
 
-  # 1. Already reaped or closed - nothing left to do.
-  { [ -n "$(st "$d" PQ_REAPED)" ] || [ -n "$(st "$d" PQ_CLOSED)" ]; } && return 1
+  # 1. Settled - a verdict is already on file and nothing can change it.
+  #    `PQ_REAPED` alone is NOT settled: it says the worktree is gone, which is
+  #    silent about whether the pull request ever merged. Treating it as settled
+  #    is what stranded the rows this now lets back in, so a reaped task with no
+  #    verdict falls through to step 2 and gets one.
+  [ -n "$(st "$d" PQ_CLOSED)" ] && return 1
+  { [ -n "$(st "$d" PQ_REAPED)" ] && [ -n "$(st "$d" PQ_MERGED)" ]; } && return 1
 
   # 2. The worktree is already gone - a hand-run `wt rm`, or `wt gc`, got there
   #    first. Nothing left to invoke `wt` for, but the tick already paid for a
   #    verdict - reap_watching kept this task's branch in pr_targets running,
   #    so the row is already sitting in the cache pr_load_all loaded above.
-  #    Resolve it before stamping PQ_REAPED, or a merged/closed task would be
-  #    reaped with no verdict at all and never become archivable - exactly the
-  #    state the two legacy `010-`/`020-` rows are stuck in today.
+  #    `PQ_REAPED` is stamped ONLY alongside a verdict. Stamping it regardless
+  #    was the bug: an open pull request has no verdict yet, and marking the task
+  #    reaped stopped it being watched, so a merge arriving minutes later was
+  #    never recorded and the row could never archive. With no verdict we say so
+  #    once and come back next tick, exactly as a task with a live worktree and
+  #    an open pull request already does.
   wt=$(st "$d" PQ_WORKTREE)
   if [ -z "$wt" ] || [ ! -d "$wt" ]; then
     repo=$(hdr "$d/plan.md" repo); branch=$(hdr "$d/plan.md" branch)
@@ -4193,15 +4214,26 @@ reap_task() {                           # task_dir dry -> 0 torn down, 2 would (
       fi
     fi
     if [ "$dry" = 1 ]; then
-      msg "would stop watching $slug - its worktree is already gone$([ -n "$verdict" ] && printf ' (%s)' "$verdict")"
-    else
-      case "$verdict" in
-        merged) st_set "$d" PQ_MERGED "$(now)" ;;
-        closed) st_set "$d" PQ_CLOSED "$(now)" ;;
-      esac
-      st_set "$d" PQ_REAPED "$(now)"
-      msg "$slug: worktree already gone - no longer watching"
+      if [ -n "$verdict" ]; then
+        msg "would stop watching $slug - its worktree is already gone ($verdict)"
+      else
+        msg "would keep watching $slug - its worktree is gone, but its pull request has not settled"
+      fi
+      return 1
     fi
+    if [ -z "$verdict" ]; then
+      # Once-only, on its own key: a task can legitimately sit in this state for
+      # days, and saying it every tick would bury everything else in the log.
+      [ -n "$(st "$d" PQ_WT_GONE)" ] || { st_set "$d" PQ_WT_GONE "$(now)"
+        msg "$slug: worktree already gone - still watching for its verdict"; }
+      return 1
+    fi
+    case "$verdict" in
+      merged) st_set "$d" PQ_MERGED "$(now)" ;;
+      closed) st_set "$d" PQ_CLOSED "$(now)" ;;
+    esac
+    st_set "$d" PQ_REAPED "$(now)"
+    msg "$slug: worktree already gone - recorded as $verdict"
     return 1
   fi
 
