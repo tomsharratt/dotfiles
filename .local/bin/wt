@@ -14,6 +14,8 @@
 #        --no-agent      don't start Claude in the root pane
 #        --no-dev        provision, but don't boot the dev server
 #        --no-focus      leave focus where it is
+#        --base REF      fork a NEW branch off REF instead of the default branch
+#                        (ignored when the branch already exists locally or on origin)
 #        --json          print the worktree's facts (path, panes, port, url) to stdout
 #   wt dev  <path>       run the worktree's dev server (the dev pane's command)
 #   wt run  [cmd...]     run a command with the worktree's isolated env loaded
@@ -744,15 +746,16 @@ cmd_gc() {
 # output already goes to stderr, so stdout stays clean for the JSON.
 cmd_new() {
   need_herdr
-  local no_agent=0 no_focus=0 no_dev=0 as_json=0
+  local no_agent=0 no_focus=0 no_dev=0 as_json=0 want_base=""
   while [ $# -gt 0 ]; do
     case "$1" in
       --no-agent) no_agent=1; shift ;;
       --no-focus) no_focus=1; shift ;;
       --no-dev)   no_dev=1;   shift ;;
+      --base)     want_base=${2:-}; shift 2 ;;
       --json)     as_json=1;  shift ;;
       --)         shift; break ;;
-      -*)         die "unknown option '$1' (usage: wt new [--no-agent] [--no-dev] [--no-focus] [--json] [name])" ;;
+      -*)         die "unknown option '$1' (usage: wt new [--no-agent] [--no-dev] [--no-focus] [--base REF] [--json] [name])" ;;
       *)          break ;;
     esac
   done
@@ -776,15 +779,29 @@ cmd_new() {
   # matching the tmux-era wt: reuse an existing local branch, adopt an existing
   # remote branch (fork a tracking copy at its tip), or fork a brand-new branch
   # off the up-to-date default base. The --base we pass decides which.
+  # `--base` only ever answers the THIRD case. The first two are not forks at all -
+  # they adopt a branch that already exists, and its history is already whatever it
+  # is - so a --base passed alongside one of them would be silently meaningless.
+  # Saying so is better than appearing to honour it.
   local base resp
   if git -C "$repo" show-ref --verify --quiet "refs/heads/$name"; then
     base=""                                    # existing local branch: check it out as-is
     msg "using existing local branch '$name'"
+    [ -n "$want_base" ] && msg "ignoring --base $want_base - '$name' already exists locally"
   elif git -C "$repo" ls-remote --exit-code --heads origin "$name" >/dev/null 2>&1; then
     msg "checking out existing remote branch '$name'"
     git -C "$repo" fetch --quiet origin "+refs/heads/$name:refs/remotes/origin/$name" 2>/dev/null \
       || msg "fetch failed (offline?) - using last-known origin/$name"
     base="origin/$name"                        # remote branch: fork a local copy at its tip
+    [ -n "$want_base" ] && msg "ignoring --base $want_base - '$name' already exists on origin"
+  elif [ -n "$want_base" ]; then
+    # Verified, never assumed: an unresolvable --base must not quietly degrade to
+    # origin/HEAD, because the whole reason to pass one is that the default branch
+    # is the wrong place to fork from.
+    git -C "$repo" rev-parse --verify --quiet "$want_base^{commit}" >/dev/null \
+      || die "cannot fork '$name': no such base ref '$want_base'"
+    base=$want_base
+    msg "creating worktree '$name' off $base"
   else
     base=$(base_ref "$repo")                   # brand-new task: fork off the default branch
     case "${base:-}" in */*)
