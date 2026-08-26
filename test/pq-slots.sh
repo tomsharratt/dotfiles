@@ -83,7 +83,25 @@ reset_tasks
 
 # An ISO stamp N seconds in the past. BSD `date -v`, like every date call in pq
 # itself - this is a darwin tool.
-ago() { date -u -v-"$1"S '+%Y-%m-%dT%H:%M:%SZ'; }
+# The clock is PINNED for this file rather than read off the wall, because the
+# boundary cases below sit one second either side of PQ_WRAPUP_GRACE.
+#
+# `st_set ... "$(ago 299)"` followed by a `slot_held` that reads the real clock is
+# a one-second race: any pause between those two lines - a loaded machine, another
+# test's `git`, a real `pq run` ticking alongside - makes the difference 300, the
+# `>=` fires, and "an agent idle for less than the grace still holds its slot"
+# fails for a reason that has nothing to do with the code under test. Observed
+# once in ~13 full-suite runs, and reproducible on demand by putting a `sleep 1`
+# between the two lines.
+#
+# Pinning does not weaken the assertion - it sharpens it. 299 and 300 now differ
+# by exactly one second no matter how long the shell takes to get there, which is
+# what makes testing a `>=` boundary meaningful at all. `now` is pinned alongside
+# `epoch` so the stamp slot_held WRITES and the clock it later reads agree.
+FAKE_NOW=$(date -u '+%s')
+epoch() { printf '%s' "$FAKE_NOW"; }
+now()   { date -u -r "$FAKE_NOW" '+%Y-%m-%dT%H:%M:%SZ'; }
+ago()   { date -u -r "$(( FAKE_NOW - $1 ))" '+%Y-%m-%dT%H:%M:%SZ'; }
 
 # tick_body writes its verdict to the PQ_SUMMARY global, which a command
 # substitution would strip along with the subshell it ran in - so its output
