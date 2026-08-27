@@ -300,7 +300,13 @@ load_profile() {
 # free to follow the rename - it is display text, and reap_one takes the branch from git.
 prepare_state() {                       # name path repo repo_name [workspace_id]
   local name=$1 path=$2 repo=$3 repo_name=$4 ws=${5:-} slug res sf
-  WT_PORT="" WT_REDIS="" WT_SLUG=""     # so a stale caller value cannot pose as saved state
+  # Every WT_* a state file can supply, cleared before we read one, so a value
+  # left in the process cannot pose as this worktree's saved state. The port and
+  # redis index matter because the loop below KEEPS whatever it finds rather than
+  # reallocating; the url and db matter because they are a profile's to write, in
+  # the separate shell that runs wt_provision, so nothing legitimately sets them
+  # here and whatever survives would be emitted by --json as if it were ours.
+  WT_PORT="" WT_REDIS="" WT_SLUG="" WT_URL="" WT_DB=""
   sidx_load
   sf=$(sf_for_path "$path")
   if [ -n "$sf" ]; then
@@ -514,7 +520,7 @@ gc_run() {
   GC_RECLAIMED=0
   local f
   for f in "$STATE_DIR"/*.env; do
-    [ -e "$f" ] || return 0
+    [ -e "$f" ] || break
     wt_reset
     load_state "$f" || continue
     # Live worktree? leave it entirely alone.
@@ -531,6 +537,15 @@ gc_run() {
     rm_leftover "${WT_PATH:-}"
     rm -f "$f"
   done
+  # Leave the process as we found it. The per-iteration wt_reset above is not
+  # enough on its own: the load happens BEFORE the "live worktree? leave it
+  # alone" continue, so this loop sources every reservation it walks past,
+  # reclaiming or not, and the last one would otherwise stay behind in our
+  # caller. That is how `wt new` came to report another worktree's WT_URL - it
+  # calls gc_run first, and nothing between here and its --json block sets a
+  # url of its own, because only a profile's wt_provision writes one and that
+  # runs in a different shell. See test/wt-new-url.sh.
+  wt_reset
 }
 
 # Remove a worktree directory git has already let go of. `git worktree remove` leaves
