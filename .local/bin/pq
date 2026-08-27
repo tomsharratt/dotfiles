@@ -83,7 +83,6 @@
 # A task is a DIRECTORY, and the directory it sits in is its state:
 #
 #   $PQ_HOME/queue/20260729143022-live-chat-mentions/    waiting to be picked up
-#            hold/                                       vestigial - still made, never moved into
 #            running/20260729121005-spotify-scope-fix/   dispatched
 #            done/20260728091500-live-chat-links/        a PR exists; still spending a slot until its agent stops
 #            archive/20260727080000-live-chat-onboarding/  settled history - `pq ls` hides it, tick never walks it
@@ -126,7 +125,7 @@ set -uo pipefail
 PQ_HOME="${PQ_HOME:-${XDG_STATE_HOME:-$HOME/.local/state}/pq}"
 PLANS_DIR="${PQ_PLANS_DIR:-$HOME/.claude/plans}"
 WT="${PQ_WT:-$HOME/.local/bin/wt}"
-STATES="queue hold running done archive"
+STATES="queue running done archive"
 
 # Any stamp below this has a year under 1000, so it cannot be a date pq ever
 # produced - which is what makes the low range safe to reserve for --urgent.
@@ -411,7 +410,7 @@ all_tasks() {                           # [scope: live|all]
   # unquoted `$states` word-splits on that inherited IFS, and a tab-only IFS
   # has no space in it - `for s in $states` collapses to one bogus iteration
   # and every task vanishes. `"${states[@]}"` never depends on IFS at all.
-  local scope=${1:-live} s d states=(running queue hold done)
+  local scope=${1:-live} s d states=(running queue done)
   [ "$scope" = all ] && states+=(archive)
   for s in "${states[@]}"; do
     for d in "$PQ_HOME/$s"/*/; do
@@ -465,7 +464,7 @@ find_task() {                           # needle
   esac
 }
 
-state_of() {                            # task_dir  -> queue|hold|running|done
+state_of() {                            # task_dir  -> queue|running|done
   local p=${1%/*}; basename "$p"
 }
 
@@ -838,7 +837,7 @@ pick_after() {
   while IFS= read -r d; do
     [ -n "$d" ] || continue
     st=$(state_of "$d")
-    case "$st" in queue|hold|running) ;; *) continue ;; esac
+    case "$st" in queue|running) ;; *) continue ;; esac
     n=$((n + 1))
     slug=$(slug_of "$d"); branch=$(hdr "$d/plan.md" branch); repo=$(hdr "$d/plan.md" repo)
     printf '%s\t%s\t%s\t%s\t%s\n' "$n" "$st" "$slug" "${repo:--}" "${branch:--}" >> "$full"
@@ -2876,9 +2875,9 @@ pr_get() {                              # repo branch
 }
 
 # Every (repo, branch) pair pq needs PR/answered state for THIS pass, plus the
-# blockers of every task that has not started (queue + hold) - those branches
-# can belong to a repo nothing else in the queue touches, so they would
-# otherwise never get looked up at all.
+# blockers of every task that has not started - those branches can belong to a
+# repo nothing else in the queue touches, so they would otherwise never get
+# looked up at all.
 #
 # `scope` picks which dispatched branches count: `all` (the default) is
 # running + done, which `cmd_ls` needs for its PR column; `tick_body` passes
@@ -2909,7 +2908,7 @@ pr_targets() {                          # [scope: all|running]
         repo=$(hdr "$d/plan.md" repo); branch=$(hdr "$d/plan.md" branch)
         [ -n "$repo" ] && [ -n "$branch" ] && printf '%s\t%s\n' "$repo" "$branch"
         ;;
-      queue|hold)
+      queue)
         while IFS=$'\t' read -r _ repo branch; do
           [ -n "$repo" ] && [ -n "$branch" ] && printf '%s\t%s\n' "$repo" "$branch"
         done <<<"$(after_list "$d")"
@@ -3437,7 +3436,7 @@ block_cell() {                          # task_dir
 agent_cell() {                          # task_dir state
   local d=$1 st=$2 pane status blocked
   case "$st" in
-    queue|hold)
+    queue)
       # A base that has gone missing outranks any blocker verdict: the task cannot
       # start either way, and this is the one that needs YOU rather than time.
       # Read from the stamp, never probed here - `base_check` in the tick is the
@@ -3587,11 +3586,11 @@ cmd_ls() {
   while IFS= read -r d; do
     [ -n "$d" ] || continue
     st=$(state_of "$d"); slug=$(slug_of "$d")
-    # Urgency is only meaningful for what has not started - "queue!" / "hold!"
-    # in the human table, restricted to those two states, since render_table
-    # widens the STATE column on its own once one of them shows up.
+    # Urgency is only meaningful for what has not started - "queue!" in the
+    # human table, since render_table widens the STATE column on its own the
+    # moment one shows up.
     dispst=$st
-    case "$st" in queue|hold) is_urgent "$d" && dispst="$st!" ;; esac
+    case "$st" in queue) is_urgent "$d" && dispst="$st!" ;; esac
     branch=$(hdr "$d/plan.md" branch); model=$(hdr "$d/plan.md" model)
     effort=$(hdr "$d/plan.md" effort)
     intent=$(hdr "$d/plan.md" intent);  added=$(hdr "$d/plan.md" added)
@@ -3716,7 +3715,6 @@ cmd_after() {
         waiting)
           case "$ownerst" in
             done|-) desc="waiting on your merge" ;;
-            hold)   desc="parked - nothing will pick it up" ;;
             *)
               IFS=$'\t' read -r overdict _ <<<"$(after_state "$owner")"
               case "$overdict" in
@@ -3742,7 +3740,7 @@ cmd_after() {
   # started: blockers only gate a task that has not been dispatched yet. Same
   # message shape as cmd_base's own guard below.
   case "$(state_of "$d")" in
-    queue|hold) ;;
+    queue) ;;
     *) die "$(slug_of "$d") is $(state_of "$d") - blockers only gate what has not started" ;;
   esac
 
@@ -3794,7 +3792,7 @@ cmd_base() {
   fi
 
   case "$(state_of "$d")" in
-    queue|hold) ;;
+    queue) ;;
     *) die "$(slug_of "$d") is $(state_of "$d") - the base only gates what has not started" ;;
   esac
 
@@ -4436,7 +4434,7 @@ tick_body() {                           # cap dry
   # a task that just moved from running/ to done/ this same tick is torn down on
   # the same pass, using the PR row `pr_targets running` already loaded for it
   # above - and before the blocker pass, though the two are independent (done
-  # tasks vs. queue/hold tasks, neither reads the other's cache).
+  # tasks vs. queued tasks, neither reads the other's cache).
   local n_torn=0 would_torn=0 reap_note= rc
   if reap_ok; then
     for d in "$PQ_HOME/done"/*/; do
@@ -4465,15 +4463,15 @@ tick_body() {                           # cap dry
   # no herdr gate: archiving never touches a worktree, only a directory mv.
   local n_arch; n_arch=$(archive_pass "$dry")
 
-  # 1.5 Blockers - runs for every task that has not started, queue AND hold,
-  # so a chain stalled on a stuck agent's draft is flagged even while parked.
+  # 1.5 Blockers - runs for every task that has not started, so a chain
+  # stalled on a stuck agent's draft is flagged before anything waits on it.
   # This runs AFTER reconcile and BEFORE fill, so a dependency that merged
   # during the interval that just ended unblocks its dependent on the same
   # tick that noticed, and it warms the per-task verdict fill reuses below
   # rather than recomputing it.
   local afterpass="$PQ_HOME/.after.$$"; : > "$afterpass"
   local v bgone
-  for d in "$PQ_HOME/queue"/*/ "$PQ_HOME/hold"/*/; do
+  for d in "$PQ_HOME/queue"/*/; do
     [ -d "$d" ] || continue
     d=${d%/}
     v=""

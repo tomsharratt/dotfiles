@@ -46,8 +46,8 @@ git init -q -b master "$REPO"
 git -C "$REPO" -c user.email=test@test -c user.name=test commit -q --allow-empty -m init
 
 reset_tasks() {
-  rm -rf "$PQ_HOME/queue" "$PQ_HOME/hold" "$PQ_HOME/running" "$PQ_HOME/done"
-  mkdir -p "$PQ_HOME/queue" "$PQ_HOME/hold" "$PQ_HOME/running" "$PQ_HOME/done"
+  rm -rf "$PQ_HOME/queue" "$PQ_HOME/running" "$PQ_HOME/done"
+  mkdir -p "$PQ_HOME/queue" "$PQ_HOME/running" "$PQ_HOME/done"
 }
 
 PLAN="$PQ_HOME/.test-plan.md"

@@ -97,8 +97,8 @@ cache_row_v1() { printf '%s\t%s\t%s\t%s\t%s\t%s\n'     "$@" >> "$PR_CACHE"; }  #
 ans_row()      { printf '%s\t%s\n' "$@" >> "$PR_ANS"; }
 
 reset_tasks() {
-  rm -rf "$PQ_HOME/queue" "$PQ_HOME/hold" "$PQ_HOME/running" "$PQ_HOME/done"
-  mkdir -p "$PQ_HOME/queue" "$PQ_HOME/hold" "$PQ_HOME/running" "$PQ_HOME/done"
+  rm -rf "$PQ_HOME/queue" "$PQ_HOME/running" "$PQ_HOME/done"
+  mkdir -p "$PQ_HOME/queue" "$PQ_HOME/running" "$PQ_HOME/done"
 }
 reset_tasks
 
@@ -391,14 +391,15 @@ eq "$(hdr "$fresh/plan.md" model)" "sonnet" "...or anything after it"
 grep -q "plan body" "$fresh/plan.md" && ok || bad "insert must not damage the plan body"
 eq "$(grep -c '^base:' "$fresh/plan.md")" "1" "exactly one base: line, never a duplicate"
 
-# A held task is where a task with a stale base actually accumulates, so it must
-# follow the same path as a queued one - gated, and warned about only once.
-held=$(mk_task hold 73 held-base-gone "$REPO" tom/hbg no-such-integration-branch)
-eq "$(base_check "$held")" "basegone no-such-integration-branch" "a held task is gated too"
-eq "$(st "$held" PQ_BASE_GONE)" "1" "...and stamped on the transition"
-eq "$(base_check "$held")" "basegone no-such-integration-branch" "still gated on the next pass"
-second_warn=$(base_check "$held" 2>&1 >/dev/null)
-eq "$second_warn" "" "a held task must not re-warn every tick while it sits there"
+# A long-queued task is where a stale base accumulates - the branch it names can
+# be merged and deleted while it waits - so it must be gated, and warned about
+# only once however many ticks it then sits through.
+stale=$(mk_task queue 73 queued-base-gone "$REPO" tom/qbg no-such-integration-branch)
+eq "$(base_check "$stale")" "basegone no-such-integration-branch" "a task whose base is gone is gated"
+eq "$(st "$stale" PQ_BASE_GONE)" "1" "...and stamped on the transition"
+eq "$(base_check "$stale")" "basegone no-such-integration-branch" "still gated on the next pass"
+second_warn=$(base_check "$stale" 2>&1 >/dev/null)
+eq "$second_warn" "" "it must not re-warn every tick while it sits there"
 
 # Only what has not started, same rule as pq after's mutating forms.
 r=$(mk_task running 71 already-going "$REPO" tom/ag)

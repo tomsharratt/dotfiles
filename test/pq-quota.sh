@@ -101,8 +101,8 @@ PQ_QUOTA_RETRY=600
 PQ_QUOTA_MAX_TRIES=40
 
 reset_tasks() {
-  rm -rf "$PQ_HOME/queue" "$PQ_HOME/hold" "$PQ_HOME/running" "$PQ_HOME/done" "$PQ_HOME/archive"
-  mkdir -p "$PQ_HOME/queue" "$PQ_HOME/hold" "$PQ_HOME/running" "$PQ_HOME/done" "$PQ_HOME/archive"
+  rm -rf "$PQ_HOME/queue" "$PQ_HOME/running" "$PQ_HOME/done" "$PQ_HOME/archive"
+  mkdir -p "$PQ_HOME/queue" "$PQ_HOME/running" "$PQ_HOME/done" "$PQ_HOME/archive"
 }
 reset_tasks
 

@@ -90,8 +90,8 @@ cache_row() { printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$@" >> "$PR_CACHE"; }   # repo 
 ans_row()   { printf '%s\t%s\n' "$@" >> "$PR_ANS"; }                    # repo branch
 
 reset_tasks() {
-  rm -rf "$PQ_HOME/queue" "$PQ_HOME/hold" "$PQ_HOME/running" "$PQ_HOME/done"
-  mkdir -p "$PQ_HOME/queue" "$PQ_HOME/hold" "$PQ_HOME/running" "$PQ_HOME/done"
+  rm -rf "$PQ_HOME/queue" "$PQ_HOME/running" "$PQ_HOME/done"
+  mkdir -p "$PQ_HOME/queue" "$PQ_HOME/running" "$PQ_HOME/done"
 }
 
 # A task directory built by hand, bypassing cmd_add (and the Haiku round trip
@@ -161,12 +161,6 @@ reset_caches
 ans_row "$REPO" tom/queued-owner
 mk_task queue 10 owner-queued "$REPO" tom/queued-owner >/dev/null
 eq "$(blocker_state "$REPO" tom/queued-owner master)" "waiting" "no PR yet, queued owner"
-
-# answered, no rows, a held task owns the branch -> waiting
-reset_caches
-ans_row "$REPO" tom/held-owner
-mk_task hold 10 owner-held "$REPO" tom/held-owner >/dev/null
-eq "$(blocker_state "$REPO" tom/held-owner master)" "waiting" "no PR yet, held owner"
 
 # answered, no rows, no live task owns the branch -> orphan
 reset_caches

@@ -77,8 +77,8 @@ reset_plans() { rm -rf "$PQ_PLANS_DIR"; mkdir -p "$PQ_PLANS_DIR"; }
 mkplan() { printf '# %s\n\nBody.\n' "$2" > "$PQ_PLANS_DIR/$1"; }        # filename title
 
 reset_tasks() {
-  rm -rf "$PQ_HOME/queue" "$PQ_HOME/hold" "$PQ_HOME/running" "$PQ_HOME/done"
-  mkdir -p "$PQ_HOME/queue" "$PQ_HOME/hold" "$PQ_HOME/running" "$PQ_HOME/done"
+  rm -rf "$PQ_HOME/queue" "$PQ_HOME/running" "$PQ_HOME/done"
+  mkdir -p "$PQ_HOME/queue" "$PQ_HOME/running" "$PQ_HOME/done"
 }
 reset_tasks
 
@@ -284,7 +284,7 @@ echo "== pick_after: 1,3 selects the right slugs; space/comma forms agree; dupli
 reset_tasks
 mk_task queue 010 task-a "$REPO" tom/task-a >/dev/null
 mk_task queue 020 task-b "$REPO" tom/task-b >/dev/null
-mk_task hold  030 task-c "$REPO" tom/task-c >/dev/null
+mk_task queue 030 task-c "$REPO" tom/task-c >/dev/null
 
 # `after_vals` and friends are cmd_add's own locals, reached through bash's
 # dynamic scope - this wrapper stands in for cmd_add so pick_after can mutate
@@ -323,6 +323,14 @@ err=$(run_pick_after "$REPO" <<<$'\n' 2>&1 >/dev/null)
 case "$err" in *"3 tasks"*) ok ;; *) bad "a done task must not count as a candidate (got: $err)" ;; esac
 case "$err" in *"task-d"*) bad "a done task must never be listed" ;; *) ok ;; esac
 
+echo "== pick_after: a running task IS offered - work in flight is a real blocker ==" >&2
+reset_tasks
+mk_task queue   010 task-a "$REPO" tom/task-a >/dev/null
+mk_task running 020 task-r "$REPO" tom/task-r >/dev/null
+err=$(run_pick_after "$REPO" <<<$'\n' 2>&1 >/dev/null)
+case "$err" in *"2 tasks"*) ok ;; *) bad "a running task should count as a candidate (got: $err)" ;; esac
+case "$err" in *task-r*) ok ;; *) bad "a running task should be listed (got: $err)" ;; esac
+
 echo "== pick_after: no candidates at all - the prompt is skipped silently ==" >&2
 reset_tasks
 out=$(run_pick_after "$REPO" 2>"$PQ_HOME/.noneerr" </dev/null)
@@ -359,7 +367,10 @@ eq "$out" "split=1 after_vals=[]" "y at the split prompt should set split=1; aft
 
 echo "== add_wizard: split already 1 skips that question; the blocker prompt still runs ==" >&2
 mk_task queue 010 task-a "$REPO" tom/task-a >/dev/null
-out=$(run_wizard 1 0 <<<$'1\n')
+# 2>/dev/null like every run_pick_after call above: the command substitution
+# captures stdout, but pick_after's prompt goes to stderr, so without this the
+# "block on which?" line leaks into the suite's own output.
+out=$(run_wizard 1 0 <<<$'1\n' 2>/dev/null)
 eq "$out" "split=1 after_vals=[task-a"$'\n'"]" \
   "split=1 skips its question outright; picking 1 at the blocker prompt selects task-a"
 

@@ -92,7 +92,6 @@ Human-facing output always goes to stderr, so `--json` leaves stdout clean for a
 The split it exists to make: one long-lived session, in plan mode, does the thinking and produces a plan that has already answered every question; `pq` then runs those plans later, unattended, several at a time, as cheap implementer sessions that only have to execute.
 
 A task is a directory, and the directory it sits in is its state - `queue/`, `running/`, `done/`, `archive/` under `~/.local/state/pq`.
-(A `hold/` sits alongside them, left from when a task could be parked by hand - it is still created on every run, but nothing is ever moved into it.)
 Every transition is a `mv`, which is atomic within a filesystem, so two dispatchers cannot claim the same task.
 Each task holds an immutable `plan.md` (a settings header prepended to whatever Claude Code wrote) and a `state.env` of runtime facts, so an agent can re-read its plan at any point and never see it change underneath it.
 

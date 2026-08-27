@@ -212,8 +212,8 @@ git -C "$CONTAINERB" -c user.email=test@test -c user.name=test commit -q --allow
 export CONTAINERA CONTAINERB
 
 reset_tasks() {
-  rm -rf "$PQ_HOME/queue" "$PQ_HOME/hold" "$PQ_HOME/running" "$PQ_HOME/done"
-  mkdir -p "$PQ_HOME/queue" "$PQ_HOME/hold" "$PQ_HOME/running" "$PQ_HOME/done"
+  rm -rf "$PQ_HOME/queue" "$PQ_HOME/running" "$PQ_HOME/done"
+  mkdir -p "$PQ_HOME/queue" "$PQ_HOME/running" "$PQ_HOME/done"
 }
 
 # A split directory built by hand: source.md + repo file, so the validation-
