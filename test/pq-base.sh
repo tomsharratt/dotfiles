@@ -116,7 +116,6 @@ mk_task() {                             # state prio slug repo branch base -> ta
     [ -n "$base" ] && printf 'base:     %s\n' "$base"
     printf 'model:    sonnet\n'
     printf 'effort:   xhigh\n'
-    printf 'dev:      false\n'
     printf 'intent:   test fixture\n'
     printf 'added:    2026-01-01T00:00:00Z\n'
     printf -- '---\n\nplan body\n'

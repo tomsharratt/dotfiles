@@ -129,7 +129,6 @@ mk_task() {                             # state prio slug branch pane -> task_di
     printf 'branch:   %s\n' "$branch"
     printf 'model:    sonnet\n'
     printf 'effort:   xhigh\n'
-    printf 'dev:      false\n'
     printf 'intent:   test fixture\n'
     printf 'added:    2026-01-01T00:00:00Z\n'
     printf -- '---\n\nplan body\n'

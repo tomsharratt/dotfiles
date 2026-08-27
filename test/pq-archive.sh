@@ -73,7 +73,6 @@ mk_task() {                             # state prefix slug repo branch [KEY=VAL
     printf 'branch:   %s\n' "$branch"
     printf 'model:    sonnet\n'
     printf 'effort:   xhigh\n'
-    printf 'dev:      false\n'
     printf 'intent:   test fixture\n'
     printf 'added:    2026-01-01T00:00:00Z\n'
     printf -- '---\n\nplan body\n'
@@ -213,7 +212,7 @@ err=$(find_task poke 2>&1 1>/dev/null); rc=$?
 case "$err" in *"poke-beta"*"poke-gamma"*) ok ;; *) bad "should list the two live matches (got: $err)" ;; esac
 case "$err" in *"poke-alpha"*) bad "must not pull the archived match into the ambiguity - live already decided it" ;; *) ok ;; esac
 
-echo "== find_task: an archived slug with no live match at all still resolves (pq show / pq rm) ==" >&2
+echo "== find_task: an archived slug with no live match at all still resolves (pq rm) ==" >&2
 reset_tasks
 mk_task archive 20260101000001 lone-archived "$REPO" tom/lone-archived PQ_CLOSED=2026-01-01T00:00:00Z >/dev/null
 resolved=$(find_task lone-archived)

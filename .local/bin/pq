@@ -20,20 +20,14 @@
 #   pq add --split       split a plan into a stack of standalone parts, wired with --after
 #   pq add --split-dir D queue an already-split directory, skipping the split step
 #   pq after <task>      list a task's blockers and what each is waiting on
-#   pq after <task> T... add blockers to a task already in the queue or held
+#   pq after <task> T... add blockers to a task already in the queue
 #   pq after <task> --clear   drop them all
 #   pq base <task>       what branch it forks from and aims its PR at
-#   pq base <task> B     retarget it (queue/hold only - a base can be merged and deleted)
+#   pq base <task> B     retarget it (queued only - a base can be merged and deleted)
 #   pq base <task> --clear   back to the repo's default branch
 #   pq ls                every task, its state, and what it is waiting on
 #   pq ls --all           also show archive/ - settled history pq no longer walks
-#   pq show <task>       one task's header and plan
-#   pq urgent <task>     move it to the very front of the queue
-#   pq later <task>      move it to the very back of the queue
-#   pq hold <task>       park a task so nothing picks it up
-#   pq unhold <task>     put it back in the queue
 #   pq rm <task>         drop a task (never touches a worktree or a branch)
-#   pq archive <task>    file a done task away by hand (done only)
 #   pq tick              free finished slots, then fill them from the queue
 #   pq run               tick on an interval until you stop it
 #   pq cap [N]           how many may run at once; 0 pauses. Read every tick.
@@ -83,13 +77,13 @@
 # closed without one - `pq tick` files it away to `archive/`, keeping only the
 # newest few behind (`PQ_DONE_KEEP`) so `pq ls` stays a list of what still
 # needs a look rather than a growing pile of finished history. See
-# `archive_pass` below, and `pq archive` for the manual escape hatch.
+# `archive_pass` below.
 #
 # LAYOUT ─────────────────────────────────────────────────────────────────────
 # A task is a DIRECTORY, and the directory it sits in is its state:
 #
 #   $PQ_HOME/queue/20260729143022-live-chat-mentions/    waiting to be picked up
-#            hold/20260729150431-risky-refactor/         parked by you
+#            hold/                                       vestigial - still made, never moved into
 #            running/20260729121005-spotify-scope-fix/   dispatched
 #            done/20260728091500-live-chat-links/        a PR exists; still spending a slot until its agent stops
 #            archive/20260727080000-live-chat-onboarding/  settled history - `pq ls` hides it, tick never walks it
@@ -123,9 +117,9 @@
 # change underneath it.
 #
 # The fourteen-digit prefix is a UTC timestamp and nothing else - the queue is
-# add-order, oldest first. It is not an identity: promoting a task (`pq urgent`,
-# `pq later`) renames its directory, so every command here takes the SLUG (or
-# any unique prefix of it) instead.
+# add-order, oldest first. It is not an identity: a task's directory is renamed
+# as it changes state, so every command here takes the SLUG (or any unique
+# prefix of it) instead.
 
 set -uo pipefail
 
@@ -204,8 +198,8 @@ for d in $STATES; do mkdir -p "$PQ_HOME/$d"; done
 # The header is deliberately flat `key: value`, one per line, no nesting and no
 # folded blocks. It is written by this script and read by this script (in bash,
 # in a loop, on every tick), so being trivially parseable beats being expressive
-# YAML. `intent` is therefore one long line - it is read by `pq show` and pasted
-# into a PR body, never wrapped by hand.
+# YAML. `intent` is therefore one long line - it is pasted into a PR body,
+# never wrapped by hand.
 hdr() {                                 # plan.md key
   [ -f "$1" ] || return 0
   awk -v k="$2" '
@@ -449,7 +443,7 @@ queue_ordered() {
 # (uniquely or ambiguously) among live tasks reads exactly as it did before
 # archive/ existed, and history sharing a prefix never changes that answer.
 # Archive is consulted only when live has nothing at all, which is what keeps
-# `pq show`/`pq rm` working on an archived slug.
+# `pq rm` working on an archived slug.
 find_task() {                           # needle
   local needle=${1:-} d s scope exact="" hits=()
   [ -n "$needle" ] || die "which task? (pq ls)"
@@ -575,7 +569,7 @@ after_cycle() {                         # owner_repo owner_branch repo branch [v
 
 # The slugs of every task, in any state, that lists (repo, branch) as a
 # blocker. Holding or removing a task silently stalls everything after it, and
-# this is what lets `cmd_hold` and `cmd_rm` say so before they do it.
+# this is what lets `cmd_rm` say so before it does it.
 dependents_of() {                       # repo branch
   local d r b
   while IFS= read -r d; do
@@ -927,10 +921,10 @@ add_wizard() {
 
 cmd_add() {
   local plan="" branch="" model=$PQ_DEFAULT_MODEL effort=$PQ_DEFAULT_EFFORT
-  local urgent=0 dev=false hold=0 repo="" repo_explicit=0 as_json=0
+  local urgent=0 repo="" repo_explicit=0 as_json=0
   # `basebr` rather than `base`: the blocker-hint loop at the end of this
   # function already declares a `local base`, and `split_queue` reads THIS one
-  # through bash's dynamic scope (as it already does for $dev/$hold/$urgent), so
+  # through bash's dynamic scope (as it already does for $urgent), so
   # the two must not share a name.
   local basebr=""
   # A string, not an array: an empty bash array expanded under `set -u` is a
@@ -965,10 +959,8 @@ cmd_add() {
       --split)     split=1; shift ;;
       --split-dir) split_dir=${2:-}; shift 2 ;;
       -y|--yes)    yes=1; shift ;;
-      --dev)       dev=true; shift ;;
-      --hold)      hold=1; shift ;;
       --json)      as_json=1; shift ;;
-      -h|--help)   die "usage: pq add [plan.md] [--branch B] [--base BRANCH] [--model M] [--effort E] [--urgent] [--repo PATH]... [--after task|branch]... [--intent TEXT] [--split | --split-dir DIR] [-y] [--dev] [--hold] [--json]" ;;
+      -h|--help)   die "usage: pq add [plan.md] [--branch B] [--base BRANCH] [--model M] [--effort E] [--urgent] [--repo PATH]... [--after task|branch]... [--intent TEXT] [--split | --split-dir DIR] [-y] [--json]" ;;
       -*)          die "unknown option '$1'" ;;
       *)           plan=$1; shift ;;
     esac
@@ -1057,9 +1049,8 @@ cmd_add() {
         # so `--split` inherits it, but that is several lines before `plan:` is
         # announced - and a bare `base:` arriving ahead of the plan it belongs to
         # reads like a different command's output. Emitted next to `branch:`
-        # instead, which is the line it pairs with (and the pairing `pq show`
-        # already uses). The split path prints it on its way past, since it
-        # returns long before that block.
+        # instead, which is the line it pairs with. The split path prints it on
+        # its way past, since it returns long before that block.
         base_note="base:   $cur (the branch $(basename "$repo") is on - pass --base $def for the default)"
       else
         warn "$(basename "$repo") is on $cur, which is not on origin - queuing against $def instead; push it, or pass --base"
@@ -1185,7 +1176,7 @@ cmd_add() {
     after_lines="${after_lines}$(printf '%s\t%s\t%s' "$label" "$arepo" "$abranch")"$'\n'
   done <<<"$after_vals"
 
-  local state=queue; [ "$hold" = 1 ] && state=hold
+  local state=queue
   # Allocated here, immediately before the directory is built - not earlier,
   # alongside the rest of the parse - so a `--split` that pays for a Haiku
   # naming round trip between the two points records a stamp for when the
@@ -1216,7 +1207,6 @@ cmd_add() {
     [ -n "$basebr" ] && printf 'base:     %s\n' "$basebr"
     printf 'model:    %s\n'   "$model"
     printf 'effort:   %s\n'   "$effort"
-    printf 'dev:      %s\n'   "$dev"
     printf 'intent:   %s\n'   "${intent:-}"
     printf 'source:   %s\n'   "$plan"
     printf 'added:    %s\n'   "$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
@@ -1234,7 +1224,7 @@ cmd_add() {
   msg "branch: $branch"
   [ -n "$base_note" ] && msg "$base_note"
   [ -n "$intent" ] && msg "intent: $intent"
-  msg "added:  $state/$(basename "$dir")  ($model, effort $effort, dev $dev)"
+  msg "added:  $state/$(basename "$dir")  ($model, effort $effort)"
 
   if [ -n "$after_lines" ]; then
     pr_load_all "$(awk -F'\t' '{print $2"\t"$3}' <<<"$after_lines")"
@@ -1261,13 +1251,13 @@ cmd_add() {
   if [ "$as_json" = 1 ]; then
     jq -nc --arg task "$slug" --arg state "$state" --arg branch "$branch" \
       --arg repo "$repo" --arg base "$(task_base "$dir")" \
-      --arg model "$model" --arg effort "$effort" --arg dev "$dev" \
+      --arg model "$model" --arg effort "$effort" \
       --arg intent "$intent" --arg dir "$dir" --argjson after "$(after_json "$dir")" \
       --arg stamp "$stamp" --argjson urgent "$([ "$urgent" = 1 ] && printf true || printf false)" '
       def str: if . == "" then null else . end;
       { task: $task, stamp: ($stamp|tonumber), urgent: $urgent, state: $state, dir: $dir,
         repo: $repo, branch: $branch, base: ($base|str), model: $model, effort: $effort,
-        dev: ($dev == "true"), intent: ($intent|str), after: $after }'
+        intent: ($intent|str), after: $after }'
   else
     printf '%s\n' "$slug"
   fi
@@ -1380,9 +1370,9 @@ repo_candidates_container() {           # dir -> label<TAB>path, sorted by label
 # the other half, since it is what keeps the part text honest about it.
 #
 # `do_split` reads `cmd_add`'s locals through bash's dynamic scope (`plan`,
-# `repo`, `repo_explicit`, `repo_vals`, `model`, `effort`, `dev`, `hold`, `urgent`,
-# `after_vals`, `as_json`, `yes`, `split_dir`) and is only ever called from
-# there - hence no arguments of its own.
+# `repo`, `repo_explicit`, `repo_vals`, `model`, `effort`, `urgent`, `after_vals`,
+# `as_json`, `yes`, `split_dir`) and is only ever called from there - hence no
+# arguments of its own.
 
 # The prompt the splitter session is given, passed as an argv element (unlike
 # `dispatch_prompt`, never typed into a pane's shell) so it has no quote
@@ -1450,14 +1440,12 @@ EOF
 # of queueing everything - declined, or a validation failure, or a part that
 # failed to queue mid-pass. Carries every one of cmd_add's own locals that
 # isn't already the tool's default, so following this line verbatim does not
-# silently drop --model/--effort/--dev/--hold/--urgent/--after the way a
-# bare `--split-dir DIR --repo REPO` would.
+# silently drop --model/--effort/--urgent/--after the way a bare
+# `--split-dir DIR --repo REPO` would.
 split_resume_hint() {                   # sd
   local hint="pq add --split-dir $1 --repo $repo" av
   [ "$model" = "$PQ_DEFAULT_MODEL" ]   || hint="$hint --model $model"
   [ "$effort" = "$PQ_DEFAULT_EFFORT" ] || hint="$hint --effort $effort"
-  [ "$dev" = true ]      && hint="$hint --dev"
-  [ "$hold" = 1 ]        && hint="$hint --hold"
   [ "$urgent" = 1 ]      && hint="$hint --urgent"
   while IFS= read -r av; do
     [ -n "$av" ] || continue
@@ -1834,8 +1822,6 @@ split_queue() {                         # sd leveled_tsv named_file
   local sd=$1 leveled=$2 named_file=$3
   local slugmap="$PQ_HOME/.splitslugs.$$"; : > "$slugmap"
   local objects="$PQ_HOME/.splitjson.$$"; : > "$objects"
-  local devflag=""; [ "$dev" = true ] && devflag=--dev
-  local holdflag=""; [ "$hold" = 1 ] && holdflag=--hold
   local urgentflag=""; [ "$urgent" = 1 ] && urgentflag=--urgent
   # A stack is the case `--base` exists for, so a `--base` that reached `--split`
   # and then applied to none of the parts it queued would be the one shape
@@ -1909,13 +1895,13 @@ $basebr
       fi
     fi
 
-    # shellcheck disable=SC2086  # devflag/holdflag/urgentflag/afterflags are
-    # deliberately unquoted - see the identical idiom at pq:1573 for $devflag.
+    # shellcheck disable=SC2086  # urgentflag/afterflags are deliberately
+    # unquoted - an empty one has to vanish rather than become an empty arg.
     # Each part's OWN repo, resolved by split_levels - never the shared
     # `$repo`, which is only ever the primary (or, in a no-primary container
     # split, not a repo at all).
     out=$(cmd_add "$sd/$part" --repo "$repopath" --branch "$branch" --intent "$intent" \
-            --model "$model" --effort "$effort" $devflag $holdflag \
+            --model "$model" --effort "$effort" \
             $urgentflag $baseflag $afterflags --json)
     rc=$?
     if [ "$rc" != 0 ]; then
@@ -3584,7 +3570,7 @@ cmd_ls() {
             | sed '/^$/d' | sort -u | awk 'END { print (NR > 1) }')
 
   local tbl="$PQ_HOME/.ls.$$.tsv"
-  local slug branch model effort dev intent added pr num prstate draft agent needs=0 blocked dispst
+  local slug branch model effort intent added pr num prstate draft agent needs=0 blocked dispst
   local holding nwrap=0
   local TAB=$'\t'
   if [ "$as_json" = 1 ]; then
@@ -3607,7 +3593,7 @@ cmd_ls() {
     dispst=$st
     case "$st" in queue|hold) is_urgent "$d" && dispst="$st!" ;; esac
     branch=$(hdr "$d/plan.md" branch); model=$(hdr "$d/plan.md" model)
-    effort=$(hdr "$d/plan.md" effort); dev=$(hdr "$d/plan.md" dev)
+    effort=$(hdr "$d/plan.md" effort)
     intent=$(hdr "$d/plan.md" intent);  added=$(hdr "$d/plan.md" added)
     repo=$(hdr "$d/plan.md" repo)
     agent=$(agent_cell "$d" "$st")
@@ -3644,7 +3630,7 @@ cmd_ls() {
       local merged reaped held
       merged=$(st "$d" PQ_MERGED); reaped=$(st "$d" PQ_REAPED); held=$(st "$d" PQ_REAP_HELD)
       jq -nc --arg task "$slug" --arg state "$st" --arg branch "$branch" \
-        --arg repo "$repo" --arg model "$model" --arg effort "$effort" --arg dev "$dev" \
+        --arg repo "$repo" --arg model "$model" --arg effort "$effort" \
         --arg intent "$intent" --arg added "$added" --arg dir "$d" \
         --arg base "$tbase" \
         --arg agent "$agent" --arg pr "${num:-}" --arg prstate "${prstate:-}" \
@@ -3656,7 +3642,7 @@ cmd_ls() {
         def str: if . == "" then null else . end;
         { task: $task, stamp: ($stamp|tonumber), urgent: $urgent, state: $state, dir: $dir,
           repo: $repo, branch: $branch, base: ($base|str), model: $model, effort: $effort,
-          dev: ($dev == "true"), intent: ($intent|str), added: ($added|str),
+          intent: ($intent|str), added: ($added|str),
           agent: ($agent | if . == "-" then null else . end),
           pr: ($pr|str|if . then tonumber else null end),
           pr_state: ($prstate|str), pr_draft: ($draft == "draft"),
@@ -3694,106 +3680,14 @@ $([ "$narch" -gt 0 ] && printf ', %s archived%s' "$narch" "$([ "$all" = 1 ] || p
   repo_base_reset
 }
 
-# ── the small movers ────────────────────────────────────────────────────────
-cmd_show() {
-  local d st; d=$(find_task "${1:-}") || exit 1
-  st=$(state_of "$d")
-  case "$st" in queue|hold) is_urgent "$d" && st="$st, urgent" ;; esac
-  printf '%s  [%s]\n\n' "$(slug_of "$d")" "$st"
-  local k
-  for k in repo branch model effort dev intent source added; do
-    printf '  %-8s %s\n' "$k" "$(hdr "$d/plan.md" "$k")"
-    # The EFFECTIVE base, printed right under the branch it pairs with rather
-    # than as one more raw header read - a task with no `base:` still has a base,
-    # and "the default branch, whatever that resolves to" is the answer worth
-    # showing when you are asking why something did or did not count as merged.
-    [ "$k" = branch ] && printf '  %-8s %s\n' base "$(task_base "$d")"
-  done
-  if [ -f "$d/state.env" ]; then
-    printf '\n  runtime\n'
-    sed 's/^/    /' "$d/state.env"
-  fi
-  if [ -f "$d/after" ]; then
-    printf '\n  after\n'
-    pr_load_all "$(after_list "$d" | awk -F'\t' '{ print $2 "\t" $3 }')"
-    local label repo branch base bst
-    while IFS=$'\t' read -r label repo branch; do
-      [ -n "$label" ] || continue
-      base=$(blocker_base "$d" "$repo")
-      bst=$(blocker_state "$repo" "$branch" "${base:-}")
-      printf '    %-20s %-8s %s\n' "$label" "$bst" "$branch"
-    done <<<"$(after_list "$d")"
-    rm -f "$PR_CACHE" "$PR_ANS"
-  fi
-  # Unconditional now: the base line above calls task_base for EVERY task, so the
-  # memo exists whether or not this one had blockers to list.
-  repo_base_reset
-  printf '\n%s\n\n' "$(printf '─%.0s' $(seq 1 60))"
-  # The plan itself, with our header stripped back off. Leading blank lines go too -
-  # the header is followed by one, and it would otherwise stack with the gap above.
-  # A file with no header at all just prints whole, which is the right fallback.
-  awk 'NR == 1 && $0 == "---" { inh = 1; next }
-       inh && $0 == "---" { inh = 0; next }
-       inh { next }
-       !started && $0 ~ /^[[:space:]]*$/ { next }
-       { started = 1; print }' "$d/plan.md"
-}
-
-# The shared `queue|hold` guard for ordering: `pq urgent` and `pq later` (and
-# `pq after`'s mutating forms, which cite this same message shape) only ever
-# move what has not started.
-order_movable() {                       # task_dir -> dies unless queue|hold
-  case "$(state_of "$1")" in
-    queue|hold) ;;
-    *) die "$(slug_of "$1") is $(state_of "$1") - ordering only moves what has not started" ;;
-  esac
-}
-
-# `pq urgent` and `pq later` are the whole of re-ordering. The queue is add-order,
-# so the only two moves that matter are "do this next" and "not yet" - there is no
-# number to slot between two tasks, because there is no number. Both are a
-# re-stamp, restricted to what has not started, the same rule blockers follow.
-cmd_urgent() {
-  local d; d=$(find_task "${1:-}") || exit 1
-  order_movable "$d"
-  is_urgent "$d" && { msg "$(slug_of "$d") is already urgent"; return 0; }
-  # "-> urgent" only, not "next off the queue": next_stamp(1) lands behind
-  # whatever else is already urgent, so this promotion can land anywhere
-  # within the urgent group, not necessarily at its very front.
-  retitle "$d" "$(state_of "$d")" "$(next_stamp 1)" >/dev/null
-  msg "$(slug_of "$d") -> urgent"
-}
-
-cmd_later() {
-  local d; d=$(find_task "${1:-}") || exit 1
-  order_movable "$d"
-  retitle "$d" "$(state_of "$d")" "$(next_stamp 0)" >/dev/null
-  msg "$(slug_of "$d") -> back of the queue"
-}
-
-cmd_hold() {
-  local d; d=$(find_task "${1:-}") || exit 1
-  [ "$(state_of "$d")" = queue ] || die "$(slug_of "$d") is $(state_of "$d"), not queued"
-  # Read before the move: holding A silently stalls everything after it, and
-  # this is the moment to say so - same reasoning as the cmd_rm warning below.
-  local deps; deps=$(dependents_of "$(hdr "$d/plan.md" repo)" "$(hdr "$d/plan.md" branch)" | tr '\n' ' ')
-  retitle "$d" hold >/dev/null; msg "held $(slug_of "$d") - nothing will pick it up"
-  [ -z "$deps" ] || warn "$(slug_of "$d") is a blocker for: ${deps% } - holding it stalls them too"
-}
-
-cmd_unhold() {
-  local d; d=$(find_task "${1:-}") || exit 1
-  [ "$(state_of "$d")" = hold ] || die "$(slug_of "$d") is $(state_of "$d"), not held"
-  retitle "$d" queue >/dev/null; msg "queued $(slug_of "$d")"
-}
-
+# ── the small commands ──────────────────────────────────────────────────────
 # `pq after <task>` alone answers "why has this not started": per blocker, both
 # the state of the TASK that owns the branch and the state of its PR, since
 # either one can be the reason and the fix differs.
 #
 # `pq after <task> <task|branch>...` adds blockers; `--clear` drops them all.
-# Restricted to queue and hold, with order_movable's message shape - blockers
-# only gate what has not started.
+# Restricted to what has not been dispatched - blockers only gate what has not
+# started. `cmd_base` carries the same restriction, worded the same way.
 cmd_after() {
   local d; d=$(find_task "${1:-}") || exit 1; shift
 
@@ -3845,8 +3739,8 @@ cmd_after() {
   fi
 
   # Both mutating forms - clearing and adding - are restricted to what has not
-  # started, same message shape as order_movable: blockers only gate a task
-  # that has not been dispatched yet.
+  # started: blockers only gate a task that has not been dispatched yet. Same
+  # message shape as cmd_base's own guard below.
   case "$(state_of "$d")" in
     queue|hold) ;;
     *) die "$(slug_of "$d") is $(state_of "$d") - blockers only gate what has not started" ;;
@@ -3881,14 +3775,14 @@ cmd_after() {
 }
 
 # Read or change a queued task's base. `base:` lives in plan.md alongside
-# model/effort/dev because it is a SETTING, not runtime state - but that makes it
+# model/effort because it is a SETTING, not runtime state - but that makes it
 # the one setting with a reason to change after the fact, since the branch it
 # names can be merged and deleted while the task is still waiting.
 #
-# Restricted to queue|hold, with order_movable's message shape and for the same
-# reason cmd_after's mutating forms are: plan.md's immutability contract is about
-# an agent never seeing its own plan change underneath it, and a task that has not
-# been dispatched has no agent to protect.
+# Restricted to what has not been dispatched, for the same reason cmd_after's
+# mutating forms are: plan.md's immutability contract is about an agent never
+# seeing its own plan change underneath it, and a task that has not been
+# dispatched has no agent to protect.
 cmd_base() {
   local d; d=$(find_task "${1:-}") || exit 1; shift
 
@@ -3969,24 +3863,6 @@ cmd_rm() {
   esac
 }
 
-# The manual escape hatch alongside archive_pass' automatic one - for the two
-# legacy reaped-without-verdict stragglers, or anything else pq cannot prove
-# either way itself. Restricted to `done`: a queued or running task still
-# holds a slot or a worktree, so archiving it would strand one - `pq hold` and
-# `pq rm` are the right tools there instead.
-cmd_archive() {
-  local d; d=$(find_task "${1:-}") || exit 1
-  local st; st=$(state_of "$d")
-  [ "$st" = done ] || die "$(slug_of "$d") is $st, not done - hold or remove it instead (pq hold / pq rm)"
-  local slug name dst moved
-  slug=$(slug_of "$d"); name=$(basename "$d")
-  dst="$PQ_HOME/archive/$name"
-  [ -e "$dst" ] && die "a task already exists at archive/$name"
-  moved=$(retitle "$d" archive)
-  st_set "$moved" PQ_ARCHIVED "$(now)"
-  msg "archived $slug"
-}
-
 # ── dispatch ────────────────────────────────────────────────────────────────
 # What every implementer is told. Short and fixed: the plan carries the work, this
 # carries only the contract - how to finish, and how to fail without stalling.
@@ -4048,10 +3924,9 @@ wt_in() {                               # repo wt-subcommand args...
 }
 
 dispatch_task() {                       # task_dir  -> 0 launched, 1 failed
-  local d=$1 repo branch model effort dev pane wtjson cmdline prompt
+  local d=$1 repo branch model effort pane wtjson cmdline prompt
   repo=$(hdr "$d/plan.md" repo);     branch=$(hdr "$d/plan.md" branch)
   model=$(hdr "$d/plan.md" model);   effort=$(hdr "$d/plan.md" effort)
-  dev=$(hdr "$d/plan.md" dev)
   # The DECLARED base only. `task_base` would fall back to the repo default,
   # which is precisely what `wt new` already does on its own - so passing that
   # back to it would be a no-op dressed up as a decision, and it is what keeps
@@ -4062,7 +3937,11 @@ dispatch_task() {                       # task_dir  -> 0 launched, 1 failed
 
   pane=$(st "$d" PQ_PANE)
   if [ -z "$pane" ] || [ "$(pane_state "$pane")" = missing ]; then
-    local devflag=--no-dev; [ "$dev" = true ] && devflag=""
+    # Always --no-dev. A profile's dev server is a whole foreman stack, and at
+    # cap 3 an overnight batch would leave three of them running behind agents
+    # that never look at a browser. The worktree is still provisioned and its
+    # url still routed, so `wt dev` in the worktree brings it up when you come
+    # to look at the PR - which is when the server is actually wanted.
     # `wt new` on a brand-new branch forks from the local origin/HEAD with no
     # fetch first, so a stale checkout can hand a task whose blocker just
     # merged a base that predates the very commit it waited for - `pq` says "A
@@ -4092,7 +3971,7 @@ dispatch_task() {                       # task_dir  -> 0 launched, 1 failed
     # letting finish when you Ctrl-C. wt's own progress still goes to stderr and
     # straight to the user; only its stdout (the JSON) is captured.
     # shellcheck disable=SC2086
-    shielded wt_in "$repo" new --no-agent --no-focus $devflag $baseflag --json "$branch" \
+    shielded wt_in "$repo" new --no-agent --no-focus --no-dev $baseflag --json "$branch" \
       || { warn "$(slug_of "$d"): wt new failed"; return 1; }
     wtjson=$SHIELDED_OUT
     pane=$(jq -r '.root_pane_id // empty' <<<"$wtjson" 2>/dev/null)
@@ -4815,14 +4694,8 @@ main() {
     run)        shift; cmd_run "$@" ;;
     cap)        shift; cmd_cap "$@" ;;
     ls|list)    shift; cmd_ls "$@" ;;
-    show)       shift; cmd_show "$@" ;;
-    urgent)     shift; cmd_urgent "$@" ;;
-    later)      shift; cmd_later "$@" ;;
-    hold)       shift; cmd_hold "$@" ;;
-    unhold)     shift; cmd_unhold "$@" ;;
     rm|remove)  shift; cmd_rm "$@" ;;
-    archive)    shift; cmd_archive "$@" ;;
-    *) die "usage: pq {add [plan] [--base B] [--urgent] [--after task|branch]... [--split | --split-dir DIR] [-y] [--json] | after <task> [<task|branch>... | --clear] | base <task> [<branch> | --clear] | ls [--all] [--json] | show <task> | tick [--cap N] [--dry-run] | run [--interval S] [--cap N] | cap [N] | urgent <task> | later <task> | hold <task> | unhold <task> | rm <task> | archive <task>}" ;;
+    *) die "usage: pq {add [plan] [--base B] [--urgent] [--after task|branch]... [--split | --split-dir DIR] [-y] [--json] | after <task> [<task|branch>... | --clear] | base <task> [<branch> | --clear] | ls [--all] [--json] | tick [--cap N] [--dry-run] | run [--interval S] [--cap N] | cap [N] | rm <task>}" ;;
   esac
 }
 if [ "${BASH_SOURCE[0]}" = "$0" ]; then main "$@"; fi

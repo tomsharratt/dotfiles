@@ -91,7 +91,8 @@ Human-facing output always goes to stderr, so `--json` leaves stdout clean for a
 `pq` is a queue of Claude Code plans waiting to be run as implementer sessions, built on top of `wt` but separable from it.
 The split it exists to make: one long-lived session, in plan mode, does the thinking and produces a plan that has already answered every question; `pq` then runs those plans later, unattended, several at a time, as cheap implementer sessions that only have to execute.
 
-A task is a directory, and the directory it sits in is its state - `queue/`, `hold/`, `running/`, `done/`, `archive/` under `~/.local/state/pq`.
+A task is a directory, and the directory it sits in is its state - `queue/`, `running/`, `done/`, `archive/` under `~/.local/state/pq`.
+(A `hold/` sits alongside them, left from when a task could be parked by hand - it is still created on every run, but nothing is ever moved into it.)
 Every transition is a `mv`, which is atomic within a filesystem, so two dispatchers cannot claim the same task.
 Each task holds an immutable `plan.md` (a settings header prepended to whatever Claude Code wrote) and a `state.env` of runtime facts, so an agent can re-read its plan at any point and never see it change underneath it.
 
@@ -112,21 +113,17 @@ pq add --repo PATH       repeatable, only with --split/--split-dir: name the rep
 pq add --split           split a plan into a stack of standalone parts, wired with --after
 pq add --split-dir D     queue an already-split directory, skipping the split step
 pq after <task>          list a task's blockers and what each is waiting on
-pq after <task> T...     add blockers to a task still in queue/ or hold/
+pq after <task> T...     add blockers to a task still in queue/
 pq after <task> --clear  drop them all
+pq base <task> [B]       what branch it forks from and aims its PR at; B retargets it
 pq ls [--all] [--json]   every task, its state, and what it is waiting on
-pq show <task>           one task's header and plan
 pq tick [--cap N]        free finished slots, then fill them from the queue
 pq run [--interval S]    tick on an interval until you stop it
 pq cap [N]               how many may run at once; 0 pauses
-pq urgent <task>         move it to the very front of the queue
-pq later <task>          move it to the very back of the queue
-pq hold / unhold         park a task, or put it back
 pq rm <task>             drop a task (never touches a worktree or a branch)
-pq archive <task>        file a done task away by hand (done only)
 ```
 
-The fourteen-digit prefix on a task directory is a UTC timestamp and nothing else - promoting a task (`pq urgent`, `pq later`) renames its directory, so commands take the task's slug, or any unique prefix of it.
+The fourteen-digit prefix on a task directory is a UTC timestamp and nothing else, and a task's directory is renamed as it moves between states, so commands take the task's slug, or any unique prefix of it.
 
 #### Picking a plan
 
@@ -141,7 +138,7 @@ The keys are offered only when there is more than one page, and paging past eith
 Row numbers are absolute: row 11 is the eleventh-newest plan whichever page you are looking at, so a number always means the same plan and any listed row can be picked from any page.
 Pick a number - Enter takes the top row of the page you are on, which is the most recent plan on page one - and it previews the plan before asking `use this plan? [y/N]`; answering `n` returns to the number prompt, on the page you were reading, rather than aborting the whole command.
 That `n` is "no", not "next page" - the two prompts read the key differently, and each one's hint says which is in force.
-Once you confirm, it asks the two things that actually shape how a task runs: whether to split it into a stack of small PRs, and which of the tasks already queued, held, or running it should wait on.
+Once you confirm, it asks the two things that actually shape how a task runs: whether to split it into a stack of small PRs, and which of the tasks already queued or running it should wait on.
 
 Passing a flag the wizard would otherwise ask about skips just that one question - `pq add --split` picks a plan and skips straight past the split question (it still asks about blockers), `pq add --after some-task` picks a plan and skips straight past the blocker question (it still asks about splitting).
 
@@ -152,9 +149,9 @@ A plan path given explicitly skips the picker too, but uses exactly that plan ra
 
 The queue is add-order, oldest first - a task's position is exactly when it was added, nothing more.
 `--urgent` allocates from a reserved range below any real date, so an urgent task always sorts ahead of every ordinary one.
-Two urgent tasks are still ordered oldest first between themselves, by the order they were made urgent.
-`pq urgent <task>` and `pq later <task>` are the only two moves - "do this next" and "not yet".
-There is no number to slot between two tasks, because plans are added in the order they should run, so there was never anything to insert between them.
+Two urgent tasks are still ordered oldest first between themselves, by the order they were added.
+`--urgent` is the only move there is, and it is declared when the task is queued rather than applied afterwards.
+There is no number to slot between two tasks, and nothing to promote or demote one later, because plans are added in the order they should run - so there was never anything to insert between them, or any position to correct.
 The fourteen-digit prefix is a fixed-width UTC timestamp, which is what makes bash's own glob order agree with numeric order - `pq ls` and the queue's actual dispatch order are the same order, as long as every task directory carries that prefix.
 A lingering directory from before this scheme won't - that is what the one-time migration is for.
 
@@ -343,8 +340,8 @@ A blocker survives this by construction: it is a resolved `(label, repo, branch)
 The newest `PQ_DONE_KEEP` (default 3) archivable tasks are kept behind in `done/`, so `pq ls` still answers "did last night's batch ship?" at a glance.
 `pq ls` hides `archive/` by default and reports how many rows it is hiding; `pq ls --all` shows everything, and `--json` composes with either.
 
-`pq archive <task>` files a done task away by hand - the escape hatch for anything `pq` cannot prove either way itself.
-It is restricted to `done`: a queued or running task still holds a slot or a worktree, so `pq hold` and `pq rm` are the right tools there instead.
+Archiving is entirely automatic - there is no manual form.
+A `done` task that `pq` cannot settle either way simply stays in `done/`, where `pq ls` keeps showing it, which is the right outcome for the one case that needs a human to look.
 
 Nothing in `archive/` is ever deleted or swept up again by a later tick - it is where settled history lives, not a queue for cleanup.
 

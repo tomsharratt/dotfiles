@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# test/pq-order.sh - the timestamp queue: next_stamp, --urgent, pq urgent/later.
+# test/pq-order.sh - the timestamp queue: next_stamp, --urgent, queue order.
 #
 # Plain bash, no framework, matching the repo's zero-dependency habit and
 # test/pq-after.sh's preamble: a temp PQ_HOME exported before sourcing pq (so
@@ -69,44 +69,40 @@ queue_slugs() {
   done
 }
 
-echo "== pq urgent moves a queued task ahead of everything; pq later moves it behind everything ==" >&2
+# `--urgent` at add time is the whole of re-ordering now: the queue is
+# add-order, and the one exception is "do this next", declared when the task is
+# queued rather than moved afterwards. So what has to hold is that the reserved
+# range really does outrank every real date, in both directions - ahead of what
+# is already queued, and still ahead of what is queued after it.
+echo "== the queue is add-order, and --urgent outranks every real date in it ==" >&2
 reset_tasks
-a=$(add_task tom/order-a); add_task tom/order-b >/dev/null; c=$(add_task tom/order-c)
-eq "$(queue_slugs | tr '\n' ' ')" "order-a order-b order-c " "fresh adds should queue in add-order"
-main urgent "$c" >/dev/null 2>&1
-eq "$(queue_slugs | tr '\n' ' ')" "order-c order-a order-b " "pq urgent should move c to the very front"
-main later "$a" >/dev/null 2>&1
-eq "$(queue_slugs | tr '\n' ' ')" "order-c order-b order-a " "pq later should move a to the very back"
+add_task tom/order-a >/dev/null; add_task tom/order-b >/dev/null
+eq "$(queue_slugs | tr '\n' ' ')" "order-a order-b " "fresh adds should queue in add-order"
+add_task tom/order-c --urgent >/dev/null
+eq "$(queue_slugs | tr '\n' ' ')" "order-c order-a order-b " \
+  "an urgent add should lead tasks that were already queued"
+add_task tom/order-d >/dev/null
+eq "$(queue_slugs | tr '\n' ' ')" "order-c order-a order-b order-d " \
+  "and should still lead a normal task queued after it"
 
-echo "== pq urgent on an already-urgent task is a no-op and does not reshuffle the urgent group ==" >&2
+echo "== two --urgent adds keep add-order within the urgent group ==" >&2
 reset_tasks
-u1=$(add_task tom/urgent-one --urgent); u2=$(add_task tom/urgent-two --urgent)
+add_task tom/urgent-one --urgent >/dev/null; add_task tom/urgent-two --urgent >/dev/null
 eq "$(queue_slugs | tr '\n' ' ')" "urgent-one urgent-two " "two urgent adds should queue in urgent add-order"
-out=$(main urgent "$u1" 2>&1 1>/dev/null)
-case "$out" in *"already urgent"*) ok ;; *) bad "urgent on the frontmost urgent task should say so (got: $out)" ;; esac
-eq "$(queue_slugs | tr '\n' ' ')" "urgent-one urgent-two " "a no-op urgent call must not reshuffle the urgent group"
-out=$(main urgent "$u2" 2>&1 1>/dev/null)
-case "$out" in *"already urgent"*) ok ;; *) bad "urgent on a non-frontmost urgent task should also say so (got: $out)" ;; esac
-eq "$(queue_slugs | tr '\n' ' ')" "urgent-one urgent-two " "still no reshuffle after the second no-op call"
 
-echo "== pq urgent and pq later both refuse a running or done task ==" >&2
+# This file owned `pq urgent` and `pq later`; the guard covers all six commands
+# removed in the same pass, so there is one place to look. Each is checked
+# through `main`, which is where the dispatch decision actually lives - and in a
+# command substitution, so `die`'s exit kills the subshell rather than this
+# script.
+echo "== the six removed commands are gone from the dispatch table ==" >&2
 reset_tasks
-r=$(add_task tom/order-running)
-retitle "$(find_task "$r")" running >/dev/null
-out=$(main urgent "$r" 2>&1 1>/dev/null); rc=$?
-[ "$rc" -ne 0 ] && ok || bad "pq urgent on a running task should fail"
-case "$out" in *"ordering only moves what has not started"*) ok ;; *) bad "should carry order_movable's message (got: $out)" ;; esac
-out=$(main later "$r" 2>&1 1>/dev/null); rc=$?
-[ "$rc" -ne 0 ] && ok || bad "pq later on a running task should fail"
-case "$out" in *"ordering only moves what has not started"*) ok ;; *) bad "should carry order_movable's message (got: $out)" ;; esac
-
-reset_tasks
-dn=$(add_task tom/order-done)
-retitle "$(find_task "$dn")" done >/dev/null
-out=$(main urgent "$dn" 2>&1 1>/dev/null); rc=$?
-[ "$rc" -ne 0 ] && ok || bad "pq urgent on a done task should fail"
-out=$(main later "$dn" 2>&1 1>/dev/null); rc=$?
-[ "$rc" -ne 0 ] && ok || bad "pq later on a done task should fail"
+gone=$(add_task tom/order-gone)
+for removed in show urgent later hold unhold archive; do
+  out=$(main "$removed" "$gone" 2>&1 1>/dev/null); rc=$?
+  if [ "$rc" -ne 0 ] && [ "${out#*usage: pq}" != "$out" ]; then ok
+  else bad "pq $removed should be an unknown subcommand now (rc=$rc, got: $out)"; fi
+done
 
 echo "== two adds inside the same second get strictly ascending stamps ==" >&2
 reset_tasks
@@ -153,7 +149,6 @@ mkdir -p "$legacy"
   printf 'branch:   %s\n' "tom/legacy-task"
   printf 'model:    sonnet\n'
   printf 'effort:   xhigh\n'
-  printf 'dev:      false\n'
   printf 'intent:   legacy fixture\n'
   printf 'added:    2026-01-01T00:00:00Z\n'
   printf -- '---\n\nplan body\n'
@@ -171,8 +166,8 @@ reset_tasks
 # with a directory of a different width mixed in; all_tasks' glob order
 # (what pq ls displays) can legitimately disagree with it in that case - see
 # the caveat on all_tasks' own comment - which is exactly why the migration
-# step exists, and why pq later is the escape hatch for a directory that
-# landed at the front because of it.
+# step exists. There is no escape hatch for a directory that lands at the front
+# because of it: `pq later` was that, and it is gone.
 mkdir -p "$PQ_HOME/queue/900-legacy-in-queue"
 add_task tom/order-fresh >/dev/null
 eq "$(queue_slugs | tr '\n' ' ')" "legacy-in-queue order-fresh " \
