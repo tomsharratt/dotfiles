@@ -62,7 +62,8 @@ Commands:
 wt new [name]        create/open an isolated worktree, provision, start dev + Claude
 wt dev  <path>       run a worktree's dev server (this is the dev pane's command)
 wt run  [cmd...]     run a command with the worktree's isolated env loaded
-wt open [name]       open the worktree's dev url in the browser, or hand the
+wt open [name]       open the worktree's dev url in the browser, starting the
+                     dev server first if nothing is serving it yet, or hand the
                      command to the profile's own open action (build, install
                      and launch on a device) when it defines one instead of a url
                      (the mobile profiles' own open action accepts --launch-only/
@@ -85,6 +86,17 @@ wt gc                reclaim resources from worktrees removed outside wt rm
 
 Human-facing output always goes to stderr, so `--json` leaves stdout clean for a caller to parse.
 `--no-dev` deliberately still provisions: the dev server is four long-running foreman processes, while provisioning is the one-off that creates the isolated database - skip that too and `wt run bin/rails test` inside the worktree fails confusingly.
+
+`pq` always dispatches with `--no-dev`, for that same reason: a batch running overnight would otherwise hold a foreman stack per task, behind agents that never open a browser.
+The cost used to land in the morning, because provisioning routes `<slug>.test` at the worktree's port but nothing answers there until the server runs, so `wt open` on last night's work reached a dead url that read exactly like broken puma routing.
+So `wt open` now starts the server itself when nothing is serving that port, waits for it to bind, and then opens the browser.
+
+It declines in every case where starting one would be wrong: outside Herdr there is no pane to start it in, a profile with no `wt_dev` has no server, and a profile that allocates no port gives nothing to probe (which is what leaves the two mobile profiles alone).
+The gate that matters most is an existing `dev` tab, because "nothing is listening" stays true for the whole time a foreman stack is binding.
+Without it a second `wt open` inside the boot window would start a second stack: two `yarn build --watch` writing one output directory, and two sidekiq on one redis index.
+That window is easy to land in, since `wt new` makes the tab and opens no browser of its own, so `wt open` is the natural next keystroke.
+So an existing tab is waited for rather than warned about, on the same bounded budget: a tab still binding and a tab whose server died look identical from outside, and waiting is the only way to tell them apart.
+Either way the browser opens at the end, and a server that never came up is named against the tab holding the error rather than allowed to fail the command.
 
 ### Plan queue (`pq`)
 

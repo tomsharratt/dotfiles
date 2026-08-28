@@ -995,6 +995,105 @@ cmd_run() {
 # resolution has to keep working for, so a leading `-` is treated as a
 # pass-through arg rather than a branch name. Git refs cannot begin with `-`, so
 # nothing legitimate is shadowed.
+# Is something actually SERVING on this port? -sTCP:LISTEN, unlike alloc_port's
+# bare `lsof -ti tcp:$p`: allocation asks "is this port involved in anything at
+# all", and answering that question here would let a stray outbound connection
+# read as a running dev server.
+port_listening() {                      # port
+  [ -n "${1:-}" ] || return 1
+  lsof -nP -iTCP:"$1" -sTCP:LISTEN >/dev/null 2>&1
+}
+
+# The tab `wt` labelled `dev` in this workspace, or nothing. True from the instant
+# `wt new` creates the tab, which is exactly what port_listening cannot be: a
+# foreman stack takes many seconds to bind, and every second of that is a window
+# where "nothing is listening" is true and starting a SECOND stack would put two
+# `yarn build --watch` on one output directory and two sidekiq on one redis index.
+#
+# Read off herdr rather than out of the profile's Procfile: wt created this tab and
+# chose its label, so this is wt's own fact. A worktree pq dispatched has a `setup`
+# tab instead (cmd_new's label when --no-dev drops the server), which is why those
+# are the ones this finds nothing for.
+dev_tab_for() {                         # workspace_id -> tab_id, or empty
+  [ -n "${1:-}" ] || return 0
+  "$HERDR" api snapshot 2>/dev/null \
+    | jq -r --arg ws "$1" '.result.snapshot.tabs[]?
+        | select(.workspace_id == $ws and .label == "dev") | .tab_id' 2>/dev/null \
+    | head -1
+}
+
+# Start the dev server if nothing is serving this worktree's url yet, so `wt open`
+# alone does what `wt open && wt dev` did by hand.
+#
+# The gap this closes: provisioning routes <slug>.test at the worktree's port, but
+# nothing answers there until the profile's dev server runs - and pq dispatches with
+# --no-dev, deliberately, so an overnight batch does not leave a foreman stack per
+# task. So `wt open` on last night's work landed on a dead url, which reads exactly
+# like broken puma routing, and the repair was always the same two commands.
+#
+# Every gate here is a reason NOT to touch anything:
+#   no herdr        - there is no pane to start a server in
+#   no wt_dev       - this project has no dev server to start
+#   no WT_PORT      - nothing to probe, so nothing can be concluded. This is what
+#                     excludes the mobile profiles, which allocate no port at all
+#   already LISTEN  - the server is up; this is the common case
+#   a `dev` tab     - it is booting, or it died and left the pane open (wt_dev drops
+#                     to a shell on purpose). Either way a second stack would only
+#                     fight the first - but we still WAIT, because `wt new` making
+#                     that tab seconds ago is the commonest way to get here
+dev_autostart() {
+  in_herdr || return 0
+  declare -F wt_dev >/dev/null || return 0
+  [ -n "${WT_PORT:-}" ] || return 0
+  port_listening "$WT_PORT" && return 0
+
+  local ws=${WT_WORKSPACE:-}
+  [ -n "$ws" ] && [ "$ws" != null ] || ws=$(herdr_ws_for "$WT_REPO" "$WT_PATH" "$WT_NAME")
+  [ -n "$ws" ] || { warn "no herdr workspace for this worktree - start the server with: wt dev $WT_PATH"; return 0; }
+
+  if [ -n "$(dev_tab_for "$ws")" ]; then
+    # Somebody else's stack is coming up in there - almost always `wt new`'s, from
+    # seconds ago, since `wt new` does not open a browser itself and `wt open` is
+    # the natural next keystroke. Waiting is the same answer as below: the tab we
+    # would have made already exists, so the waiting is all that is left to do.
+    msg "waiting for the 'dev' tab's server on :$WT_PORT"
+  else
+    # The new pane's shell inherits nothing from this process, so anything that
+    # decides WHERE wt keeps its state has to be carried across by hand - the same
+    # reasoning, and the same two variables, as cmd_new's dev tab.
+    local envp="" v cmd dtab dpane
+    for v in XDG_STATE_HOME XDG_CONFIG_HOME; do
+      [ -n "${!v:-}" ] && envp="$envp$(printf '%s=%q ' "$v" "${!v}")"
+    done
+    cmd=$envp$(printf '%q dev %q' "$SELF" "$WT_PATH")
+
+    dtab=$("$HERDR" tab create --workspace "$ws" --cwd "$WT_PATH" --label dev --no-focus 2>/dev/null)
+    dpane=$(hj "$dtab" '.result.root_pane.pane_id')
+    [ -n "$dpane" ] && [ "$dpane" != null ] \
+      || { warn "could not open a dev tab - start the server with: wt dev $WT_PATH"; return 0; }
+    "$HERDR" pane send-text "$dpane" "$cmd" >/dev/null 2>&1
+    "$HERDR" pane send-keys "$dpane" enter >/dev/null 2>&1
+    msg "starting the dev server in a 'dev' tab - waiting for :$WT_PORT"
+  fi
+
+  # Wait for the port either way, because opening a browser at a Rails boot just
+  # shows the user an error they then have to refresh past - the waiting is the
+  # whole point of doing this here rather than telling them to run `wt dev`. The
+  # budget is deliberately identical in both branches: a tab that is booting and a
+  # tab whose server died are indistinguishable from out here, and waiting is the
+  # only way to tell them apart. NEVER dies - the url is what was asked for, so a
+  # server that does not come up is a warning on the way past.
+  local waited=0 limit=${WT_DEV_WAIT:-60}
+  while [ "$waited" -lt "$limit" ]; do
+    sleep 1; waited=$((waited + 1))
+    if port_listening "$WT_PORT"; then
+      msg "dev server up after ${waited}s"
+      return 0
+    fi
+  done
+  warn "nothing on :$WT_PORT after ${limit}s - opening anyway; the 'dev' tab has the detail"
+}
+
 cmd_open() {
   local name=${1:-} repo repo_name url path
   repo=$(main_worktree "$PWD"); [ -n "$repo" ] || die "not inside a git worktree"
@@ -1007,6 +1106,10 @@ cmd_open() {
   path=$(repo_worktrees "$repo" | awk -F'\t' -v b="$name" '$2 == b { print $1; exit }')
   load_state_for_path "${path:-$PWD}" "$repo_name" "$name" \
     || die "no saved state for '$name' - run 'wt provision' first"
+  # Above the wt_open branch below, so ONE place decides whether a dev server is
+  # wanted. Which profiles are affected is then a property of what they declare -
+  # a port - rather than of where this line happens to sit.
+  dev_autostart
   # A profile whose "open" is an action rather than a url (build, install and launch an
   # app on a device) defines wt_open and owns the command outright. NOT captured in
   # $(...) like wt_open_url: a build is long and noisy and has to stream to the terminal,
