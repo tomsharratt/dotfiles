@@ -259,9 +259,17 @@ set_panes "$(printf 'w1:p1\tclaude\tworking')"
 R=$(mk_task 'done' 002 reaped tom/reaped w1:p1)
 st_set "$R" PQ_REAPED "$(now)"
 slot_held "$R" && bad "a reaped task holds no slot - its workspace is closed" || ok
+# A closed pull request is no longer the end of the line: it earns the same
+# teardown a merge does, and that teardown waits for the agent to stop. So the
+# slot stays spent while the agent is still going - releasing it on the verdict
+# would start a second agent beside one still running, which is the whole bug
+# this section exists to prevent. Only PQ_REAPED is terminal now.
 C=$(mk_task 'done' 003 closed tom/closed w1:p1)
 st_set "$C" PQ_CLOSED "$(now)"
-slot_held "$C" && bad "a closed task holds no slot - it is over" || ok
+slot_held "$C" && ok || bad "a closed task whose agent is still working holds its slot"
+st_set "$C" PQ_REAPED "$(now)"
+slot_held "$C" && bad "once torn down, a closed task holds nothing" || ok
+st_set "$C" PQ_REAPED ""
 N=$(mk_task 'done' 004 nopane tom/nopane "")
 slot_held "$N" && bad "a task with no pane recorded holds no slot" || ok
 
@@ -295,7 +303,7 @@ eq "$(st "$D" PQ_WRAPUP_SINCE)" "$(st "$D" PQ_WRAPUP_SINCE)" "slot_state left th
 set_panes "$(printf 'w1:p1\t\t')"
 eq "$(slot_state "$D")" "" "noagent reads as no slot held"
 eq "$(slot_state "$R")" "" "a reaped task reads as no slot held"
-eq "$(slot_state "$C")" "" "a closed task reads as no slot held"
+eq "$(slot_state "$C")" "" "a closed task whose agent has gone reads as no slot held"
 
 echo "== active_slots: running/ counts unconditionally, done/ only while live ==" >&2
 reset_tasks
@@ -439,8 +447,15 @@ eq "$(agent_cell "$d" 'done')" "held nobase" "held nobase outranks the slot repo
 st_set "$d" PQ_REAP_HELD agent
 eq "$(agent_cell "$d" 'done')" "wrapping up" "held agent is reported as wrapping up instead"
 st_set "$d" PQ_REAP_HELD ""
+# `closed` used to be its own word here, because pq left the worktree alone and
+# only you could decide what became of it. It is torn down automatically now, so
+# it reads exactly as a merged task does - the slot while its agent runs, then
+# nothing. The PR column is where `#N closed` is said.
 st_set "$d" PQ_CLOSED "$(now)"
-eq "$(agent_cell "$d" 'done')" "closed" "a closed task still reads as closed"
+eq "$(agent_cell "$d" 'done')" "wrapping up" \
+  "a closed task whose agent is still going reads as wrapping up, not as a decision for you"
+st_set "$d" PQ_REAPED "$(now)"
+eq "$(agent_cell "$d" 'done')" "-" "and once torn down it wants nothing"
 
 echo "== epoch_of: pq's own stamps, and everything that is not one ==" >&2
 eq "$(epoch_of 1970-01-01T00:00:01Z)" "1" "a real stamp parses to epoch seconds"

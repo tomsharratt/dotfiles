@@ -255,21 +255,46 @@ eq "$(st "$d6" PQ_REAP_HELD)" "" "PQ_REAP_HELD should be cleared once resolved"
 [ -n "$(st "$d6" PQ_REAPED)" ] && ok || bad "PQ_REAPED should be stamped"
 rm -rf "$wt6"
 
-echo "== every PR CLOSED: left alone, warns once ==" >&2
+echo "== every PR CLOSED: torn down, exactly as a merge is ==" >&2
+# Closing a pull request is a decision that the work is finished, so it earns the
+# same teardown - the worktree, the agent and the dev environment all go.
 reset_caches; reset_wt_log
 wt7=$(mktemp -d)
 d7=$(mk_done 10 case7 "$REPO" tom/case7 "$wt7")
 cache_row "$REPO" tom/case7 7 CLOSED "" master
 PIDX_OK=1; PIDX=""
-first=$(reap_task "$d7" 0 2>&1 1>/dev/null); rc1=$?
-[ "$rc1" -ne 0 ] && ok || bad "an every-PR-closed task must not report a teardown"
-[ ! -s "$WT_LOG" ] && ok || bad "wt must never be invoked for a closed-without-merging task"
+out7=$(reap_task "$d7" 0 2>&1 1>/dev/null); rc1=$?
+eq "$rc1" 0 "an every-PR-closed task should report a teardown"
+eq "$(cut -f2,3,4 < "$WT_LOG")" "$(printf 'rm\t--yes\ttom/case7')" \
+  "wt rm should be invoked for the closed task's branch"
+eq "$(head -1 "$WT_LOG" | cut -f1)" "$REPO" "and invoked from inside the repo"
 [ -n "$(st "$d7" PQ_CLOSED)" ] && ok || bad "PQ_CLOSED should be stamped"
-case "$first" in *"closed"*) ok ;; *) bad "should warn once about the closed PR (got '$first')" ;; esac
-second=$(reap_task "$d7" 0 2>&1 1>/dev/null)
-[ -z "$second" ] && ok || bad "a second pass on an already-closed task must stay silent (got '$second')"
-eq "$(agent_cell "$d7" done)" "closed" "agent_cell should surface a closed-without-merging task rather than reading as settled"
+[ -n "$(st "$d7" PQ_REAPED)" ] && ok || bad "PQ_REAPED should be stamped"
+case "$out7" in *closed*) ok ;; *) bad "should say which verdict it acted on (got '$out7')" ;; esac
+reset_wt_log
+second=$(reap_task "$d7" 0 2>&1 1>/dev/null); rc2=$?
+[ "$rc2" -ne 0 ] && ok || bad "a settled task must not report a second teardown"
+[ ! -s "$WT_LOG" ] && ok || bad "and must not invoke wt again"
+[ -z "$second" ] && ok || bad "a second pass on an already-settled task must stay silent (got '$second')"
+eq "$(agent_cell "$d7" done)" "-" \
+  "a closed-and-torn-down task wants nothing from you, so it reads as settled"
+archivable "$d7" && ok || bad "closed + reaped should be archivable"
 rm -rf "$wt7"
+
+echo "== every PR CLOSED, but the agent is still going: held, not torn down ==" >&2
+reset_caches; reset_wt_log
+wt7b=$(mktemp -d)
+d7b=$(mk_done 10 case7b "$REPO" tom/case7b "$wt7b")
+cache_row "$REPO" tom/case7b 71 CLOSED "" master
+st_set "$d7b" PQ_PANE pane-7b
+PIDX_OK=1; PIDX=$'pane-7b\tclaude\tworking'
+held=$(reap_task "$d7b" 0 2>&1 1>/dev/null); rc3=$?
+[ "$rc3" -ne 0 ] && ok || bad "a closed task whose agent is still going must not be torn down"
+[ ! -s "$WT_LOG" ] && ok || bad "wt must not be invoked while the agent is working"
+eq "$(st "$d7b" PQ_REAP_HELD)" agent "the hold reason should be recorded"
+case "$held" in *closed*) ok ;; *) bad "the hold warning should name the verdict (got '$held')" ;; esac
+archivable "$d7b" && bad "a held closed task must not be archivable yet" || ok
+rm -rf "$wt7b"
 
 echo "== PR still OPEN: not yet, still watched ==" >&2
 reset_caches; reset_wt_log

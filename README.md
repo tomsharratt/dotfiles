@@ -218,7 +218,8 @@ Counting only `running/` is what once ran six agents at a cap of 3, three fresh 
 
 The release has to be a timer rather than an exit, because an agent that has genuinely finished sits idle indefinitely instead of exiting - so waiting for one to disappear would stall the queue outright rather than merely overshoot it.
 `PQ_WRAPUP_GRACE` (default 300s) is that timer: once an agent has not been working for that long, its slot goes.
-It governs the tasks whose PR is still open or in draft; a task whose PR has *merged* gets torn down by the reap pass as soon as its agent stops, and a torn-down task releases its slot at once with no grace at all.
+It governs the tasks whose PR is still open or in draft; a task whose PR has *settled* - merged or closed - gets torn down by the reap pass as soon as its agent stops, and a torn-down task releases its slot at once with no grace at all.
+A settled task still holds its slot until then, exactly as an open one does: the teardown is waiting on that agent, so handing the slot away on the verdict alone would start a second agent beside one still running.
 The grace applies to `idle` and to herdr's `done` alike, because both are per-turn rather than per-task: an agent that opens a PR and then goes back in to fix CI passes through them between every turn, and releasing on the first sighting would be the same bug in a subtler form.
 A `blocked` agent - a permission prompt, a quota wall - holds its slot too, the same trade `running/` already makes, since it will resume rather than having finished.
 That row reads as **permission** or **quota 8:30pm** rather than "wrapping up", and a permission prompt counts into "needs you": it is holding a slot until you answer it.
@@ -323,28 +324,41 @@ Releasing the freeze there costs a single worktree if the wall was real - the ne
 
 #### Tearing a task down
 
-Once a `done` task's pull request has genuinely merged into its repo's default branch - checked against the forge, the same predicate blockers use, not `wt gc --merged`'s looser "state == MERGED" - `pq` tears it down: the worktree, its database, its port, its redis index, its puma-dev entry, and the Herdr workspace holding its agent's pane.
+Once a `done` task's pull request has **settled**, `pq` tears it down: the worktree, its database, its port, its redis index, its puma-dev entry, and the Herdr workspace holding its agent's pane.
 That is the same `wt rm` you would have run by hand, driven unattended.
 
-`pq` never touches a worktree it did not create.
-A task whose PR closed without merging is left exactly as `wt rm` would have found it - the work never shipped, so what to do with it stays your call.
+Settled means either of two things:
 
-Two things hold a teardown off, both checked only once the merge is confirmed:
+- **merged** into the base it was aimed at - checked against the forge, the same predicate blockers use, not `wt gc --settled`'s looser "state == MERGED"
+- **closed** without merging, every pull request for the branch - closing one is a decision that the work is finished, so it settles the task exactly as a merge does
+
+Closing a pull request is how you say you are done with a piece of work, and there is nothing left for its agent to come back to either way.
+So a closed PR reclaims exactly as much as a merged one: the same teardown, the same holds, the same archive.
+The asymmetry that used to live here - a merged task torn down, a closed one left sitting on a database and a port until you remembered it - only ever cost you the reclaim.
+
+`pq` never touches a worktree it did not create, and never merges or closes a pull request itself.
+What it leaves alone is a task with no verdict at all: no pull request, or one still open, because nobody has decided anything yet.
+
+A pull request you reopen before its teardown runs stops being settled, and `pr_all_closed` needs *every* row closed - so closing one alongside a fresh one is not a verdict either.
+But once the teardown has happened it is not undone; that is the point of saying you are done with it.
+
+Two things hold a teardown off, both checked only once the verdict is in:
 
 - the agent is still going - Herdr reports `working` or `blocked` for its pane
 - `pq` is itself running inside that task's own Herdr workspace, where closing it would kill the pane mid-teardown
 
-`pq ls` shows a held task as `held agent`, `held here`, or `held nobase` (its repo's default branch could not be resolved), and a closed-without-merging one as `closed`.
-A task with nothing left to reclaim shows `-`, the same as any other task that needs nothing from you.
+`pq ls` shows a held task as `held agent`, `held here`, or `held nobase` (its repo's default branch could not be resolved).
+A task with nothing left to reclaim shows `-`, the same as any other task that needs nothing from you - a closed one included, since its teardown is automatic now and the `PR` column already reads `#N closed`.
 There is no off switch, for the same reason `pq` has none for dispatch-hours or the usage gate: one mechanism, not two.
 
-Once its verdict is in - merged and torn down, or closed without merging - a done task is exactly what the next tick's archive pass files away; see below.
+Once its verdict is in *and* the teardown has run, a done task is exactly what the next tick's archive pass files away; see below.
 
 #### Archiving history
 
 `done/` is never pruned on its own, so every task `pq` has ever finished stays there, crowding out what is still live or still needs a decision.
-Once a done task is **terminal** - its PR merged and the worktree is gone, or every PR for it closed without merging - `pq tick` moves it to `archive/`, the same `mv` every other transition uses.
-A task with no verdict yet, one held on `PQ_REAP_HELD`, or one reaped with no verdict at all stays in `done/` - each of those still wants something.
+Once a done task is **terminal** - its PR settled, merged or closed, *and* its worktree gone - `pq tick` moves it to `archive/`, the same `mv` every other transition uses.
+Both halves are required: `archive/` is not walked on the hot path, so filing a task away on the verdict alone would strand its worktree, database and port where nothing would ever reclaim them.
+A task with no verdict yet, one held on `PQ_REAP_HELD`, and one reaped with no verdict at all all stay in `done/` - each of those still wants something.
 
 A blocker survives this by construction: it is a resolved `(label, repo, branch)` triple, not a task reference, so a dependent still resolves it correctly once its blocker has archived - see "Blockers" above.
 
@@ -362,8 +376,9 @@ Herdr has no worktree-removal hook, so removing a worktree through Herdr's own U
 `wt gc` reconciles this: it checks each recorded worktree and, for any whose directory no longer exists, runs the profile's teardown and frees the reservation.
 `wt new` runs it automatically, so orphans are always reclaimed on the next task - run `wt gc` yourself any time to clean up immediately.
 
-`wt gc --merged` goes further and reclaims worktrees whose PR has merged, the case the orphan pass structurally cannot see since a shipped worktree is still a perfectly valid git worktree.
-It lists what it intends to take before taking it, and skips a repo whose PR state it could not read.
+`wt gc --settled` goes further and reclaims worktrees whose pull request has stopped moving - merged or closed - the case the orphan pass structurally cannot see, since a finished worktree is still a perfectly valid git worktree.
+Only `open` is still live: one branch shipped and the other was abandoned, and neither has anything left to come back to.
+It lists what it intends to take, and which verdict each row is, before taking any of it, and skips a repo whose PR state it could not read.
 
 `wt gc --sweep` reclaims project-owned resources (databases, puma-dev entries) whose worktree is gone entirely, so no state file points at them any more.
 It previews what it would reclaim first, since - unlike the other two passes - it deletes on a naming pattern rather than on a recorded fact.

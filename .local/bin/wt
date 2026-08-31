@@ -26,7 +26,7 @@
 #        -y, --yes       answer both prompts yes (needed to run unattended)
 #   wt ls                every worktree: port, age, agent state, PR/CI state, url
 #   wt gc                reclaim resources from worktrees that no longer exist
-#   wt gc --merged       also reclaim worktrees whose PR has merged (needs gh)
+#   wt gc --settled      also reclaim worktrees whose PR has merged or closed (needs gh)
 #   wt gc --sweep        also sweep orphan project resources (profile's wt_sweep)
 #
 # Bind `wt new` to a key in ~/.config/herdr/config.toml (see README).
@@ -440,8 +440,8 @@ pr_get() { awk -F'\t' -v b="$1" '$1 == b { print $2 "\t" $3; exit }' "${PR_CACHE
 # flight at once, so the wait is one round trip and the cost scales with how many
 # worktrees you have rather than with how many PRs the repo has ever had.
 #
-# This is deliberately separate from pr_load: `wt gc --merged` only needs to know what
-# merged, and must not pay for detail it will never print.
+# This is deliberately separate from pr_load: `wt gc --settled` only needs to know what
+# has stopped moving, and must not pay for detail it will never print.
 PR_DETAIL_CACHE=""
 PR_DETAIL_FIELDS='headRefName,state,isDraft,reviewDecision,mergeStateStatus,statusCheckRollup'
 # Reduce a PR to a single word: the most blocking thing first, so the label always names
@@ -503,8 +503,8 @@ pr_detail_get() { awk -F'\t' -v b="$1" '$1 == b { print $2; exit }' "${PR_DETAIL
 # you. `wt ls` joins that in because the two questions you actually have about a worktree -
 # "is anything still happening here?" and "has the work shipped?" - are answered in two
 # different places, and neither answer alone tells you what to do: an idle agent with no PR
-# is finished work that nobody opened a PR for, while an idle agent on a merged PR is just
-# resources to reclaim.
+# is finished work that nobody opened a PR for, while an idle agent on a settled PR is
+# just resources to reclaim.
 #
 # Matched by path like everything else here, and deliberately NOT gated on running inside
 # Herdr - the CLI reaches the server over its socket, so this works from a plain terminal
@@ -545,10 +545,10 @@ agent_for_path() {                      # path
 # automatically at the start of every `wt new`, or on demand via `wt gc`.
 #
 # That invariant is deliberately conservative, and it has a blind spot by design: a
-# worktree whose work has already SHIPPED is still a perfectly valid git worktree, so
+# worktree whose work has already SETTLED is still a perfectly valid git worktree, so
 # this pass leaves it alone forever while it goes on holding a database, a port and a
-# few hundred MB. Detecting that needs the forge, not the filesystem - see gc_merged,
-# which `wt gc --merged` opts into.
+# few hundred MB. Detecting that needs the forge, not the filesystem - see gc_settled,
+# which `wt gc --settled` opts into.
 GC_RECLAIMED=0
 gc_run() {
   GC_RECLAIMED=0
@@ -683,16 +683,22 @@ reap_one() {                            # repo repo_name branch path del_branch(
   fi
 }
 
-# Reclaim worktrees whose PR has merged - the case plain `wt gc` structurally cannot
-# see, and the one that actually accumulates: the work shipped, so nobody thinks about
-# the branch again, while the worktree keeps its database, port, redis index and disk
-# for as long as the checkout survives.
+# Reclaim worktrees whose pull request has stopped moving - the case plain `wt gc`
+# structurally cannot see, and the one that actually accumulates: the work is over, so
+# nobody thinks about the branch again, while the worktree keeps its database, port,
+# redis index and disk for as long as the checkout survives.
+#
+# MERGED and CLOSED both count, because both are decisions that the branch is finished:
+# one shipped it, the other abandoned it, and neither leaves anything to come back to.
+# Only OPEN is still live. There is no base question here as there is in `pq` - a closed
+# pull request is closed whatever it was aimed at - so this stays the plain state match
+# it has always been.
 #
 # Destructive and network-driven, so it is opt-in, lists what it intends to take before
 # taking it, and reclaims nothing when the PR state could not be read.
-gc_merged() {                           # yes(1|0)
-  local yes=$1 repo rn wts branches path branch cur here="" n=0 ans
-  local plan="$STATE_DIR/.gc-merged.tsv"
+gc_settled() {                          # yes(1|0)
+  local yes=$1 repo rn wts branches path branch st cur here="" n=0 ans
+  local plan="$STATE_DIR/.gc-settled.tsv"
   cur=$(realpath_p "$(git -C "$PWD" rev-parse --show-toplevel 2>/dev/null)")
   : > "$plan"
   while IFS= read -r repo; do
@@ -707,28 +713,30 @@ gc_merged() {                           # yes(1|0)
     fi
     while IFS=$'\t' read -r path branch; do
       [ -n "$path" ] && [ "$branch" != "-" ] || continue
-      [ "$(pr_get "$branch" | cut -f2)" = MERGED ] || continue
+      st=$(pr_get "$branch" | cut -f2)
+      case "$st" in MERGED|CLOSED) ;; *) continue ;; esac
       # Never reclaim the worktree we are standing in: closing its Herdr workspace
       # would kill this pane partway through the batch.
-      if [ "$path" = "$cur" ]; then here="$rn/$branch"; continue; fi
-      printf '%s\t%s\t%s\t%s\n' "$repo" "$rn" "$path" "$branch" >> "$plan"
+      if [ "$path" = "$cur" ]; then here="$rn/$branch ($(tr '[:upper:]' '[:lower:]' <<<"$st"))"; continue; fi
+      printf '%s\t%s\t%s\t%s\t%s\n' "$repo" "$rn" "$path" "$branch" "$st" >> "$plan"
       n=$((n + 1))
     done <<<"$wts"
   done <<<"$(known_repos)"
 
-  [ -n "$here" ] && msg "$here has merged too, but you are inside it - remove that one with: wt rm"
-  [ "$n" -gt 0 ] || { rm -f "$plan"; msg "nothing merged to reclaim"; return 0; }
+  [ -n "$here" ] && msg "$here has settled too, but you are inside it - remove that one with: wt rm"
+  [ "$n" -gt 0 ] || { rm -f "$plan"; msg "nothing settled to reclaim"; return 0; }
 
-  msg "$n merged worktree(s) to reclaim:"
-  while IFS=$'\t' read -r repo rn path branch; do
-    [ -n "${branch:-}" ] && printf '  %-12s %-42s %s\n' "$rn" "$branch" "$path" >&2
+  msg "$n settled worktree(s) to reclaim:"
+  while IFS=$'\t' read -r repo rn path branch st; do
+    [ -n "${branch:-}" ] && printf '  %-12s %-42s %-8s %s\n' \
+      "$rn" "$branch" "$(tr '[:upper:]' '[:lower:]' <<<"${st:-?}")" "$path" >&2
   done < "$plan"
   if [ "$yes" != 1 ]; then
     printf 'wt: reclaim all %s (worktree, branch, db, port all go)? [y/N] ' "$n" >&2
     read -r ans || ans=n
     [[ "${ans:-}" =~ ^[Yy]$ ]] || { rm -f "$plan"; msg "cancelled"; return 0; }
   fi
-  while IFS=$'\t' read -r repo rn path branch; do
+  while IFS=$'\t' read -r repo rn path branch st; do
     [ -n "${branch:-}" ] && reap_one "$repo" "$rn" "$branch" "$path" y
   done < "$plan"
   rm -f "$plan"
@@ -783,20 +791,20 @@ gc_sweep() {                            # yes(1|0)
 }
 
 cmd_gc() {
-  local merged=0 sweep=0 yes=0
+  local settled=0 sweep=0 yes=0
   while [ $# -gt 0 ]; do
     case "$1" in
-      --merged) merged=1 ;;
-      --sweep)  sweep=1 ;;
-      -y|--yes) yes=1 ;;
-      *) die "usage: wt gc [--merged] [--sweep] [-y]" ;;
+      --settled) settled=1 ;;
+      --sweep)   sweep=1 ;;
+      -y|--yes)  yes=1 ;;
+      *) die "usage: wt gc [--settled] [--sweep] [-y]" ;;
     esac
     shift
   done
   sidx_load
   gc_run
   [ "${GC_RECLAIMED:-0}" -gt 0 ] && msg "reclaimed ${GC_RECLAIMED} orphan(s)" || msg "no orphans - all worktrees accounted for"
-  [ "$merged" = 1 ] && gc_merged "$yes"
+  [ "$settled" = 1 ] && gc_settled "$yes"
   [ "$sweep" = 1 ] && gc_sweep "$yes"
   return 0
 }
@@ -1280,7 +1288,7 @@ render_table() {                        # tsv_file
 # the tool.
 cmd_ls() {
   local repo rn wts branches path branch sf port url age dirty prinfo num st det pr agent
-  local rows=0 merged=0 nopr=0 ready=0 waiting=0
+  local rows=0 settled=0 nopr=0 ready=0 waiting=0
   local tbl="$STATE_DIR/.ls.$$.tsv"
   sidx_load
   aidx_load
@@ -1314,9 +1322,9 @@ cmd_ls() {
       IFS=$'\t' read -r num st <<<"$prinfo"
       det=$(pr_detail_get "$branch")
       case "${st:-}" in
-        MERGED) pr="#$num merged"; merged=$((merged + 1)) ;;
+        MERGED) pr="#$num merged"; settled=$((settled + 1)) ;;
         OPEN)   pr="#$num ${det:-open}"; [ "$det" = ready ] && ready=$((ready + 1)) ;;
-        CLOSED) pr="#$num closed" ;;
+        CLOSED) pr="#$num closed"; settled=$((settled + 1)) ;;
         *)      if [ "${PR_OK:-0}" = 1 ]; then pr="no pr"; nopr=$((nopr + 1)); else pr="?"; fi ;;
       esac
       printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
@@ -1328,9 +1336,13 @@ cmd_ls() {
   rm -f "$tbl"
   # Most urgent first: something is waiting on you, then something is finished and
   # waiting to be merged, then resources to reclaim, then work that never shipped.
+  #
+  # Merged and closed share one line because they want the same thing from you: the
+  # branch has stopped moving and its worktree is still holding a database, a port and
+  # a redis index. Which of the two it was is on the row itself.
   [ "$waiting" -gt 0 ] && msg "$waiting waiting on you (agent blocked) - jump with: herdr agent focus <name>"
   [ "$ready" -gt 0 ] && msg "$ready green and mergeable - nothing left but the merge"
-  [ "$merged" -gt 0 ] && msg "$merged shipped (PR merged) and still holding resources - reclaim with: wt gc --merged"
+  [ "$settled" -gt 0 ] && msg "$settled settled (PR merged or closed) and still holding resources - reclaim with: wt gc --settled"
   [ "$nopr" -gt 0 ] && msg "$nopr with no PR - unshipped work or abandoned; check each before removing"
   return 0
 }
@@ -1349,7 +1361,7 @@ main() {
     rm|remove)  shift; cmd_rm "$@" ;;
     ls|list)    shift; cmd_ls "$@" ;;
     gc)         shift; cmd_gc "$@" ;;
-    *) die "usage: wt {new [--no-agent] [--no-dev] [--no-focus] [--json] [name] | dev <path> | run [cmd...] | open [name] | provision <path> | rm [-y] [name] | ls | gc [--merged] [--sweep] [-y]}" ;;
+    *) die "usage: wt {new [--no-agent] [--no-dev] [--no-focus] [--json] [name] | dev <path> | run [cmd...] | open [name] | provision <path> | rm [-y] [name] | ls | gc [--settled] [--sweep] [-y]}" ;;
   esac
 }
 if [ "${BASH_SOURCE[0]}" = "$0" ]; then main "$@"; fi
