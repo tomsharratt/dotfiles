@@ -178,9 +178,19 @@ wt_reset() {
   WT_PORT="" WT_REDIS="" WT_WORKSPACE="" WT_URL="" WT_DB="" WT_STATE_FILE=""
 }
 # Read one key out of a state file without disturbing the caller's own WT_* variables.
+#
+# The `unset` is what makes this a read of the FILE rather than of the process. Sourcing
+# only sets the keys the file happens to carry, and the subshell inherits everything
+# else - so without it a key the file does not define falls through to whatever the
+# caller had under that name, and the answer reads like a recorded fact. That is not
+# hypothetical: `cmd_rm` resolves a worktree it can no longer see in git through
+# `state_get "$sf" WT_PATH`, and a `wt` invoked from a dev server or a profile function
+# has WT_PATH exported (see run_profile_fn) - so a state file missing the key would hand
+# back the CALLER's own worktree as the thing to reap. Unset just the one key rather than
+# calling wt_reset: profiles record their own keys here through wt_state_set.
 state_get() {                           # state_file key
   [ -f "$1" ] || return 0
-  ( set -a; . "$1" 2>/dev/null; set +a; eval "printf '%s' \"\${$2:-}\"" ) 2>/dev/null
+  ( unset "$2"; set -a; . "$1" 2>/dev/null; set +a; eval "printf '%s' \"\${$2:-}\"" ) 2>/dev/null
 }
 
 # Index every state file by the worktree PATH it describes ("path<TAB>file"), so a
@@ -191,11 +201,21 @@ state_get() {                           # state_file key
 # entry all keep the ORIGINAL slug. Deriving the slug from today's branch would fail to
 # find those resources - so `wt rm` would silently leak them, and worse, `wt gc
 # --sweep` would mistake a live worktree's database for an orphan.
+#
+# `unset WT_PATH` first, for the reason spelled out on state_get: the subshell inherits
+# the caller's WT_PATH, so a state file that does not record one of its own would be
+# indexed under the CALLER's path instead of being skipped. Since sf_for_path takes the
+# first match in glob order, that file then outranks the correct one for the caller's own
+# worktree, and reap_one goes on to release another worktree's database, delete its state
+# file and close the Herdr workspace its agent is sitting in - while git removes the
+# worktree it was actually asked to. A state file legitimately lacks WT_PATH for the few
+# milliseconds prepare_state takes to write its first keys, and permanently if that is
+# interrupted. See test/wt-rm.sh.
 state_index() {
   local f
   for f in "$STATE_DIR"/*.env; do
     [ -e "$f" ] || return 0
-    ( set -a; . "$f" 2>/dev/null; set +a
+    ( unset WT_PATH; set -a; . "$f" 2>/dev/null; set +a
       [ -n "${WT_PATH:-}" ] && printf '%s\t%s\n' "$(realpath_p "$WT_PATH")" "$f" ) || true
   done
 }
@@ -220,12 +240,21 @@ sf_for_path() {                         # path
 # its branch implies. Every command that needs a worktree's resources goes through this,
 # so `wt dev`, `wt run` and `wt open` all agree on which state file is the worktree's -
 # including on a worktree whose branch has since been renamed, where the slug no longer
-# matches. Non-zero when the worktree has no saved state at all.
+# matches.
+#
+# wt_reset before the load, not after: `load_state` sources a file, so it only ever SETS
+# the keys that file carries and leaves every other WT_* exactly as the process had it.
+# `wt dev` and `wt run` are routinely started from inside a worktree's own dev server,
+# which run_profile_fn exported WT_PORT, WT_SLUG, WT_DB and WT_URL into - so without this
+# a state file that is missing a key silently answers with the SURROUNDING worktree's
+# value, and the console reads one worktree's database while the server serves another's.
+# gc_run and reap_one already reset for the same reason.
 load_state_for_path() {                 # path repo_name branch
   local sf
   sidx_load
   sf=$(sf_for_path "$1")
   [ -n "$sf" ] || sf=$(state_file "$2" "$(slugify "$3")")
+  wt_reset
   load_state "$sf"
 }
 
@@ -325,9 +354,14 @@ prepare_state() {                       # name path repo repo_name [workspace_id
       redis) [ -n "${WT_REDIS:-}" ] || WT_REDIS=$(alloc_redis) || die "no free redis db (1-${WT_REDIS_MAX:-15}) available" ;;
     esac
   done
+  # WT_PATH first, because it is the key every other lookup finds this file BY. Written
+  # third (as it was) a brand-new state file sits on disk WITHOUT it for as long as two
+  # state_set calls take, and forever if the command is interrupted in between - and
+  # state_index has to skip a file it cannot place, so those are the moments this
+  # worktree's own resources go missing from the index.
+  state_set "$WT_STATE_FILE" WT_PATH      "$WT_PATH"
   state_set "$WT_STATE_FILE" WT_NAME      "$WT_NAME"
   state_set "$WT_STATE_FILE" WT_SLUG      "$WT_SLUG"
-  state_set "$WT_STATE_FILE" WT_PATH      "$WT_PATH"
   state_set "$WT_STATE_FILE" WT_REPO      "$WT_REPO"
   state_set "$WT_STATE_FILE" WT_REPO_NAME "$WT_REPO_NAME"
   state_set "$WT_STATE_FILE" WT_DOMAIN    "$WT_DOMAIN"
@@ -593,6 +627,20 @@ reap_one() {                            # repo repo_name branch path del_branch(
   load_profile "$repo" "$rn"
   wt_reset
   load_state "$sf" || warn "$rn/$name: no saved state - its db/redis/dns entry may not be fully freed"
+  # Everything below this line acts on the loaded state: it drops the database WT_SLUG
+  # names, deletes $sf, and closes the Herdr workspace WT_WORKSPACE names - none of which
+  # git would stop, because git is only ever asked about $path. So the one thing worth
+  # checking is the one thing that makes those the RIGHT resources: that the file we
+  # loaded actually describes the worktree we were asked to reap. A mismatch is somebody
+  # else's worktree, and its agent is very likely still working in it; the safe direction
+  # is to proceed on $path alone and leak, since a leak is what `wt gc` exists to
+  # reclaim. Placed here deliberately - the WT_PATH assignment below overwrites the
+  # evidence, so a check sequenced after it could never fire. See test/wt-rm.sh.
+  if [ -n "${WT_PATH:-}" ] && [ "$(realpath_p "$WT_PATH")" != "$(realpath_p "$path")" ]; then
+    warn "$rn/$name: $(basename "$sf") describes $WT_PATH, not $path - ignoring it"
+    warn "  its db/redis/dns entry may not be fully freed; 'wt gc --sweep' reclaims them"
+    sf=""; wt_reset
+  fi
   # Resolve the workspace NOW, while the worktree still exists for Herdr to name it by.
   # Asking after step 3 (as this used to) can only ever fail: git has let the worktree go
   # by then, so it is in nobody's worktree list to be matched.
@@ -620,8 +668,11 @@ reap_one() {                            # repo repo_name branch path del_branch(
   rm_leftover "$path"
   [ "$del" = y ] && git -C "$repo" branch -D "$name" >/dev/null 2>&1 && msg "deleted branch $name"
 
-  # 4. Drop our bookkeeping so it cannot outlive the worktree.
-  rm -f "$sf"
+  # 4. Drop our bookkeeping so it cannot outlive the worktree. Empty when the state file
+  #    we found turned out to describe a different worktree (see above) - there is then
+  #    nothing of ours to drop, and `rm -f ""` would be a silent no-op rather than a
+  #    stated one.
+  [ -n "$sf" ] && rm -f "$sf"
   msg "removed $rn/$name"
 
   # 5. Close the Herdr workspace LAST (see the ordering note above). A worktree we
