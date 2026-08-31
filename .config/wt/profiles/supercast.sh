@@ -17,7 +17,19 @@ WT_AGENT="claude"
 
 # The dev db has a hyphen; a bareword pg db name can't, so the slug's dashes
 # become underscores for the worktree's db.
-_wt_db() { printf 'supercast-web_development_%s' "${WT_SLUG//-/_}"; }
+#
+# Truncated to 63 bytes because postgres does it anyway: an identifier is
+# NAMEDATALEN-1, so `createdb` silently accepts a longer name and creates a
+# shorter one. Everything that looked the name up afterwards then missed it -
+# `_wt_dropdb` searched for the name it asked for, found nothing and reported
+# "no such database", so `wt rm` and `wt gc --sweep` both left the database
+# behind forever. Worse, wt_sweep reads a slug back OUT of the db name, and a
+# truncated name yields a slug that matches no live worktree - so a live
+# worktree's database looked exactly like an orphan. Seven of supercast's
+# thirteen worktree databases were over the limit when this was found.
+# Truncating here is what makes create, drop and sweep all name the same thing.
+# Slugs are ASCII by construction (slugify), so bytes and characters agree.
+_wt_db() { local s=${1:-$WT_SLUG}; s="supercast-web_development_${s//-/_}"; printf '%s' "${s:0:63}"; }
 
 # Drop a db, first terminating any connections to it (a still-running dev server)
 # so dropdb can't fail on "database is being accessed by other users". Silent -
@@ -214,9 +226,24 @@ wt_dev() {
 #     bin/preview-setup entries (:3100) alone - they are not wt's to reclaim.
 #   - a database must carry the supercast-web_development_ prefix WITH something after
 #     it, so the canonical supercast-web_development can never match.
+#
+# The databases are matched by NAME, not by a slug read back out of the name. That
+# reverse mapping cannot be done safely: _wt_db truncates to postgres's 63-byte
+# identifier limit, so a long slug's db name has no slug to recover - and the
+# truncated one it produced matched nothing on the live list, which made a live
+# worktree's database look like an orphan to a pass that drops what it does not
+# recognise. Going forwards instead - build each live slug's db name and compare
+# those - is exact for every slug length.
 wt_sweep() {
-  local live f slug port db dry=${WT_SWEEP_DRY:-}
+  local live f slug port db livedbs dry=${WT_SWEEP_DRY:-}
   live=$(printf '%s\n' "${WT_LIVE_SLUGS:-}" | sed '/^$/d')
+  # printf, because _wt_db deliberately emits no trailing newline - it is written to
+  # be read through command substitution. Without one every name here lands on a
+  # single line and matches nothing, which is the same live-database-looks-orphaned
+  # failure this rewrite exists to remove.
+  livedbs=$(while IFS= read -r slug; do
+    [ -n "$slug" ] && printf '%s\n' "$(_wt_db "$slug")"
+  done <<<"$live")
 
   for f in "$HOME"/.puma-dev/*; do
     [ -f "$f" ] || continue
@@ -230,8 +257,7 @@ wt_sweep() {
 
   while IFS= read -r db; do
     [ -n "$db" ] || continue
-    slug=${db#supercast-web_development_}; slug=${slug//_/-}
-    grep -qxF "$slug" <<<"$live" && continue
+    grep -qxF "$db" <<<"$livedbs" && continue
     [ -n "$dry" ] && { printf 'database %s\n' "$db"; continue; }
     _wt_dropdb "$db" && msg "swept database $db"
   done < <(psql -lqtA 2>/dev/null | cut -d'|' -f1 | grep '^supercast-web_development_.')
