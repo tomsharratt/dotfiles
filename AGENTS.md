@@ -17,6 +17,8 @@ This makes sure you find the real problem so your fix will actually solve it. Yo
 If something clearly looks off, even if it is not directly related to what you are doing, try to get it fixed along the way.
 - Apply that same high standard to engineering execellence: lint, test failures, and test flakiness.
 If you see one, even if it is not caused by what you are working on right now, still get it fixed.
+- When a plan is built from a Claude Design file, save that file to disk (`~/.claude/plans/designs/<file>.dc.html`) and cite the absolute path in the plan on its own line (`Design file: /Users/...`).
+A plan that only describes a design in prose leaves the implementer with nothing to compare against.
 
 ## Tom's opinions
 

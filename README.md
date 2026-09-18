@@ -87,9 +87,10 @@ wt gc                reclaim resources from worktrees removed outside wt rm
 Human-facing output always goes to stderr, so `--json` leaves stdout clean for a caller to parse.
 `--no-dev` deliberately still provisions: the dev server is four long-running foreman processes, while provisioning is the one-off that creates the isolated database - skip that too and `wt run bin/rails test` inside the worktree fails confusingly.
 
-`pq` always dispatches with `--no-dev`, for that same reason: a batch running overnight would otherwise hold a foreman stack per task, behind agents that never open a browser.
-The cost used to land in the morning, because provisioning routes `<slug>.test` at the worktree's port but nothing answers there until the server runs, so `wt open` on last night's work reached a dead url that read exactly like broken puma routing.
-So `wt open` now starts the server itself when nothing is serving that port, waits for it to bind, and then opens the browser.
+`pq` dispatches with the dev server on.
+It used to pass `--no-dev`, because a batch running overnight would otherwise hold a foreman stack per task behind agents that never opened a browser - but batches no longer run overnight, most of the work is visual, and the delivery contract (see "Delivering a reviewable pull request" below) has every implementer verify each screen it touches in the browser and screenshot it.
+An agent with no running app cannot do that, so the server is part of what dispatch provides.
+`wt open`'s own autostart stays, for a server that has died by the time you come to look: it starts the server itself when nothing is serving that port, waits for it to bind, and then opens the browser.
 
 It declines in every case where starting one would be wrong: outside Herdr there is no pane to start it in, a profile with no `wt_dev` has no server, and a profile that allocates no port gives nothing to probe (which is what leaves the two mobile profiles alone).
 The gate that matters most is an existing `dev` tab, because "nothing is listening" stays true for the whole time a foreman stack is binding.
@@ -120,6 +121,7 @@ Branch *lookups* are keyed on the repo as well as the name, but a task's slug is
 pq add [plan]            add a plan to the queue (no plan, at a terminal: pick one)
 pq add --urgent          allocate from a reserved range, ahead of every real date
 pq add --after T         repeatable, at add time: don't dispatch until T's PR has merged
+pq add --design PATH     repeatable: a design file the implementer builds to (auto-detected from the plan too)
 pq add --repo PATH       repeatable, only with --split/--split-dir: name the repos a split may use
 pq add --split           split a plan into a stack of standalone parts, wired with --after
 pq add --split-dir D     queue an already-split directory, skipping the split step
@@ -132,6 +134,7 @@ pq tick [--cap N]        free finished slots, then fill them from the queue
 pq run [--interval S]    tick on an interval until you stop it
 pq cap [N]               how many may run at once; 0 pauses
 pq rm <task>             drop a task (never touches a worktree or a branch)
+pq evidence [task]       publish a task's screenshots to the pq-evidence branch; prints the markdown to paste
 ```
 
 The fourteen-digit prefix on a task directory is a UTC timestamp and nothing else, and a task's directory is renamed as it moves between states, so commands take the task's slug, or any unique prefix of it.
@@ -155,6 +158,51 @@ Passing a flag the wizard would otherwise ask about skips just that one question
 
 `-y` and no tty (a script, a cron run, an agent) skip the picker altogether and take the newest plan without asking anything - exactly what `pq add` has always done.
 A plan path given explicitly skips the picker too, but uses exactly that plan rather than the newest one - also unchanged from before.
+
+#### Delivering a reviewable pull request
+
+Two things about a `pq` pull request used to cost the most time to review.
+It arrived as one blob - a thousand changed lines in a single commit, with a description that summarised rather than guided - so GitHub's commit-by-commit view was useless against it.
+And visual work drifted from the design it had been planned against, because the implementer had only ever seen the plan's prose about that design.
+
+So every task now carries a *delivery contract*, `<task>/contract.md`, and the dispatch prompt is reduced to a pointer: read the plan, read the contract, follow it to the letter, and never wait for input.
+The contract is `pq`'s own template, written per task at dispatch rather than at add - so an improvement to it reaches every task still queued, while a running agent never sees its own contract change - and parameterised with the task's paths, its dev url and its design files.
+Every path it hands out is the task's *stable* one, `$PQ_HOME/tasks/<name>`: a task's real directory moves from `running/` to `done/` the moment its pull request is reconciled, while the agent is still saving screenshots into it, and the first task run this way recreated the old path as a phantom task that `pq` then tried to resume.
+The link follows the task through every transition, and it is the only path anything outside `pq` is ever told.
+The repository's own conventions still apply on top; the contract says so.
+
+It asks for four things.
+**Commits are the unit of review**: one coherent, self-contained step per commit, in the order a reader should meet them, each message saying what and why; a mechanical change is its own commit and says so; a non-mechanical commit over about 300 lines is split; never one squashed commit at the end.
+History may be rewritten only while the pull request is a draft.
+**Verification in the browser**: the app is served at the worktree's own url from its `dev` tab, and the implementer walks every path the change touches, captures each screen before and after with `chrome-devtools-axi`, and is told to fix anything that looks off even when the plan did not name it.
+**Design fidelity**, when the task carries design files: open each in the browser, screenshot the target artboard at its native width, build to it, then screenshot the implementation at the same width and state and compare side by side - layout, spacing, sizes, colour, type, radius, icons, copy, and every state the artboard shows - until nothing differs or a difference is deliberate and recorded.
+**A draft pull request with a guide**: `pq evidence` publishes the screenshots, the pull request opens as a draft with the intent line first, a `## Review guide` (the commits in reading order, where the risk is, what is mechanical) and a `## Visual evidence` section - plus, for a design task, a `## Design fidelity` table and the deliberate deviations.
+
+The pull request stays a draft until the review gate below has run and the implementer has answered it.
+An agent that gets stuck, or finds the plan does not fit, commits what it has and opens a draft whose title begins with `STUCK:` - the gate leaves those alone, and `pq ls` reads the chain behind one as stalled.
+
+#### Designs travel with the task
+
+A plan written from a Claude Design file describes the design in prose, and an implementer that only ever sees the prose builds to its memory of a picture it never saw - one pull request's own description admitted as much.
+So the file travels with the task.
+`pq add --design PATH` attaches one (repeatable), and every absolute or `~`-prefixed path to a `.dc.html`, `.html`, `.png`, `.jpg`, `.jpeg` or `.pdf` that the plan's text mentions is picked up on its own; a mention that does not exist on disk is warned about by name, and a `.html.erb` or a `claude.ai` url is never mistaken for one.
+The rule in `AGENTS.md` closes the loop from the planning side: a plan built from a Claude Design file saves that file to `~/.claude/plans/designs/` and cites the absolute path on its own line, so `pq add` finds it.
+
+The files are copied into `<task>/design/` inside the same staging step that writes `plan.md`, so a task lands with its design or not at all, and the `design:` header lists them - absent, like `base:`, when there are none.
+A plan that reads as built from a design (it cites `claude.ai/design` or a `.dc.html`) with no file found gets one question at the wizard - the path, or Enter to go without, loudly - and a warning under `-y`.
+On a split, each part carries the design files it names by filename (the splitter is told to cite them), and a file no part names goes to every part with a warning rather than to none.
+The contract then tells the implementer exactly what to do with them.
+
+#### Evidence
+
+Screenshots are what let a pull request be judged without checking it out, and a description can only show an image that has a url.
+`pq evidence <task>` (or bare, from inside the task's worktree) publishes `<task>/evidence/*.{png,jpg,jpeg,gif,webp}` to one shared branch, `pq-evidence`, in the task's own repository under `<slug>/`, and prints one `![file](https://github.com/<owner>/<repo>/raw/pq-evidence/<slug>/<file>)` line per file on stdout - everything human goes to stderr, so the output pastes straight into the description.
+
+It is all git plumbing against a temporary index in the worktree: nothing is checked out, the worktree's own index and tree are never touched, and the implementer's uncommitted work is not in the way.
+Re-running replaces the slug's files rather than appending, so a second pass after a fix is idempotent, and a push rejected because another task published first is rebuilt on top of theirs, three times at most.
+
+One branch for every task rather than one per task, so nothing accumulates in the branch list, and it is never deleted: a merged pull request's description keeps pointing at it, and a per-task branch reaped with its worktree would break the images in every merged pull request.
+Neither the reap pass nor `wt rm` touches it.
 
 #### Order
 
@@ -191,7 +239,8 @@ c=$(pq add planC.md --after "$b")
 A blocker that has already merged is fine to add - `pq` says so rather than refusing.
 Self-reference and cycles are rejected at the moment you try to create them.
 
-Three situations short-circuit the ordinary wait and warn once, because they read as healthy waiting until you look closer: a **dead** blocker (every pull request for it is closed), an **orphan** (nothing owns that branch, so nothing will ever open one), and a **stalled** chain (the owning task already reached `done` with only a draft PR open - a stuck agent, not a chain in review).
+Three situations short-circuit the ordinary wait and warn once, because they read as healthy waiting until you look closer: a **dead** blocker (every pull request for it is closed), an **orphan** (nothing owns that branch, so nothing will ever open one), and a **stalled** chain (the owning task already reached `done` with only a draft PR open *and* its review gate settled - a stuck agent, not a chain in review).
+That last qualification matters now that every pull request opens as a draft: a draft during the review gate is the gate working, and only a draft still open once the gate is over is a stalled chain.
 None of the three auto-holds anything; fill already costs no slot on a blocked task, and `pq` does not re-order your work on its own judgement.
 
 `pq tick` is one idempotent pass: reconcile, then fill.
@@ -226,7 +275,9 @@ That row reads as **permission** or **quota 8:30pm** rather than "wrapping up", 
 A quota wall does not, because `pq` answers that one itself, on a `done/` pane as readily as on a running one.
 Note that a dismissed wall reads as `idle` to herdr - dismissing the dialog is what stops the spinner - so `pq`'s own verdict is what holds that slot, or the grace below would hand it away while the agent waits for its window and then take it back on the tick the agent resumes.
 An exited agent or a vanished workspace releases immediately, with no grace at all, and while herdr is unreachable the slot is held rather than guessed at.
-Setting `PQ_WRAPUP_GRACE=0` restores the old release-on-PR behaviour.
+A task whose review gate is in flight - waiting for the reviewer, or for the follow-up to be delivered - holds its slot with no clock at all, for the same reason a blocked one does: the implementer is idle because it is waiting, and it is about to be handed more work.
+That hold is bounded by the gate's own bounds (see "The review gate" below), and ends the moment the follow-up is delivered, after which the ordinary grace applies.
+Setting `PQ_WRAPUP_GRACE=0` restores the old release-on-PR behaviour for a task the gate does not apply to; for a gated task it means release once the gate is through, not on the pull request.
 
 The other reason the queue can sit still with slots apparently free is that **a wall anywhere stops dispatch entirely**.
 Every agent `pq` runs draws on one account-wide usage window, so a second agent started behind the wall does not get an allowance of its own: it walls on its first request, having spent a minute of `wt new`, a database, a port and a puma-dev entry to get there, and it arrives with its own knock cycle to run.
@@ -245,6 +296,12 @@ Either way nothing is lost - a task caught mid-dispatch keeps its claim without 
 
 A plan-mode session naturally produces a plan for a whole feature, but a whole feature is almost never one pull request worth reviewing.
 `pq add plan.md --split` runs one Opus session that reads the plan, decides where the real seams are, and writes one standalone plan per part plus a dependency graph - then queues every part through the ordinary `pq add` path, with `--after` already wired from the graph.
+
+You do not have to decide that by yourself.
+The Haiku call that names every task also returns an outline: the pull requests the plan would naturally be delivered as, in build order, one title each - a single entry when the plan is one coherent change.
+When the outline has more than one entry the wizard's split question shows it first, so you can see how the plan is read before answering, and once it reaches `PQ_SPLIT_SUGGEST` entries (default 3) Enter means yes.
+The outline is advisory: it is shown to you, not fed to the splitter, which finds its own seams and still shows its table for confirmation before anything is queued, so a split that comes out differently from the outline is visible before it costs anything.
+A non-interactive add (`-y`, no tty, an explicit plan path) never auto-splits; it prints the same outline as a warning, followed by `consider --split`.
 The result is a stack of small, individually reviewable PRs where nothing downstream starts until you have merged what it depends on, and a plan that turns out to be wrong is wrong for one PR rather than for a whole night.
 
 The load-bearing constraint is that parts wait for merges, never for branches - no part is ever built on top of a sibling's branch.
@@ -321,6 +378,32 @@ One appearing where a wall was is taken as recovery, because a session asking fo
 After forty unanswered knocks a task is marked `walled` and left, rather than knocking all night - and at that point it stops freezing dispatch, which is the only bound on how long a freeze can last.
 It wants one, because detection is a regex over a terminal and so can be wrong: any pane showing the words is a candidate, including one showing a diff of `pq` itself, and one that goes idle rather than resuming can never prove it recovered.
 Releasing the freeze there costs a single worktree if the wall was real - the next agent walls, is detected, and the freeze comes back - which is the right way round, since a misread pane should cost a worktree rather than a night.
+
+#### The review gate
+
+Every pull request a task opens gets one independent review before the implementer may call it ready - run by `pq`, not asked of the agent.
+The agent cannot run `/code-review` itself: the skill is reserved for a human typing it, and every agent that was once asked to answered that it could not.
+But in `claude -p` the prompt *is* the human, so `pq` runs `claude -p "/code-review N <level> --comment"` itself, in the task's worktree, with the task's own directory opened to it so it can read the plan and the design files, and the skill posts its findings as inline review comments on the pull request.
+`PQ_REVIEWER_MODEL` (default `opus`) and `PQ_REVIEW_EFFORT` (default `high`) are what it is asked for; note that on the first real runs the skill reported reusing "the level you typed last" at an interactive prompt (`codeReviewLastEffort` in `~/.claude.json`) rather than the level passed, so the level you last typed yourself is the one the reviews run at until that is understood.
+Then `pq` prompts the implementer, through herdr's agent API, to read every comment and resolve each - fix it and push, or reply on the thread with the reasoning for leaving it - and to mark the draft ready with `gh pr ready`.
+Nobody reviews the review.
+The point is that a second pair of eyes has been over the diff, and the first pair has had to answer them, before you read either.
+
+It is a state ladder on the task, one step per tick, so a tick never blocks on it: `pending` once reconcile has seen the pull request, `running` while the reviewer is a background process of its own, `posted` when it has finished, `prompted` once the follow-up is with the implementer, and `ready` when the pull request stops being a draft.
+The reviewer waits for the agent to go quiet first, and probes the pull request once before launching: a title beginning `STUCK:` is skipped outright (telling an agent that stopped for a reason to mark its work ready is the wrong instruction), and a single commit over `PQ_REVIEW_SPLIT_LINES` changed lines earns an extra clause in the follow-up asking for the branch to be restructured into small logical commits before it is marked ready.
+`pq ls` reads `review due`, `reviewing 7m`, `reviewed`, `resolving`, then falls back to `wrapping up`, and the tick summary counts `N reviewing`.
+
+The reviewer runs in the background rather than shielded, because a tick must never block for twenty minutes: everything needed to collect it is on disk, so a `pq run` stopped with Ctrl-C leaves the reviewer alone and a later tick, from any `pq` process, finishes the job.
+Liveness is the process group, not the pid, so a recycled pid is neither counted alive nor killed.
+A pull request that settles mid-review has its reviewer killed before the reap pass closes the workspace it runs in, and `pq rm` kills one too.
+
+Failure is loud, once, and falls back rather than blocking.
+A reviewer that errors or runs past `PQ_REVIEW_TIMEOUT` is retried after `PQ_REVIEW_RETRY`, up to `PQ_REVIEW_MAX_TRIES` launches, and then given up on; the implementer is then told the review did not happen and to review its own diff as a stranger would, fix, push, and mark the pull request ready anyway, and `pq ls` reads `review failed` until it does.
+A reviewer that was refused `gh` and posted nothing is `denied` and never retried, since it cannot succeed until `PQ_REVIEW_TOOLS` changes - and it is reported the same way, on the first task it happens to.
+There is no off switch; `PQ_REVIEW_MAX_TRIES=0` is the honest degraded mode, which skips the reviewer and sends every task straight to the self-review fallback.
+
+A gate that nobody is going to close is `lapsed`: the agent has exited, or has sat idle past the wrap-up grace with the draft still open.
+That is warned about once, counts into "needs you", and reads `review lapsed` in `pq ls` - the comments are there, and resolving them is yours.
 
 #### Tearing a task down
 

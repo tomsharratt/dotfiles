@@ -270,19 +270,18 @@ eq "$([ -s "$WT_LOG" ] && printf called || printf quiet)" "quiet" \
 repo_base_reset
 
 echo "== dispatch_prompt names the base only when there is one ==" >&2
-p_plain=$(dispatch_prompt /tmp/plan.md)
+p_plain=$(dispatch_prompt /tmp/task)
 case "$p_plain" in
   *--base*) bad "a task with no base must get the prompt it always got" ;;
   *) ok ;;
 esac
-p_based=$(dispatch_prompt /tmp/plan.md live-events)
+p_based=$(dispatch_prompt /tmp/task live-events)
 case "$p_based" in
   *"--base live-events"*) ok ;;
   *) bad "a based task's prompt must tell the agent where the PR goes" ;;
 esac
-# The prompt is wrapped in single quotes when it is sent to the pane, so one
-# appearing in it would break the command line - dispatch_task refuses to send
-# such a prompt, which would silently strand every based task.
+# Quote-free by convention (see dispatch_prompt's own comment): the prompt goes
+# to herdr as one argv element now, but the review follow-up shares the rule.
 case "$p_based" in
   *"'"*) bad "the base clause must not introduce a single quote" ;;
   *) ok ;;

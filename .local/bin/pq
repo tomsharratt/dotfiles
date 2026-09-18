@@ -17,8 +17,10 @@
 #   pq add --base B      fork from B and open the PR against it, not the default branch
 #   pq add --urgent      allocate from a reserved range, ahead of every real date
 #   pq add --after T     repeatable: don't dispatch until T's PR has merged
+#   pq add --design P    repeatable: a design file the implementer builds to (auto-detected from the plan too)
 #   pq add --split       split a plan into a stack of standalone parts, wired with --after
 #   pq add --split-dir D queue an already-split directory, skipping the split step
+#   pq evidence [task]   publish a task's screenshots to the pq-evidence branch; prints the markdown to paste
 #   pq after <task>      list a task's blockers and what each is waiting on
 #   pq after <task> T... add blockers to a task already in the queue
 #   pq after <task> --clear   drop them all
@@ -81,6 +83,15 @@
 # at an integration branch that lands there HAS shipped as far as it was ever
 # going to, and one aimed at the trunk that landed somewhere else has not.
 #
+# Between a pull request opening and you reading it, `pq` does two more things.
+# Every implementer is dispatched with a delivery CONTRACT (`contract_write`):
+# small logical commits in reading order, screenshots of every screen touched,
+# a side-by-side comparison against the design files the task carries
+# (`pq add --design`, or detected from the plan's text), and a DRAFT pull request
+# with a review guide. Then the REVIEW GATE runs one independent `/code-review`
+# against the draft in the background and prompts the implementer to resolve
+# what it posted and mark the pull request ready - see the `review gate` section.
+#
 # Once a done task has settled AND been torn down - not on the verdict alone,
 # which would strand its worktree - `pq tick` files it away to `archive/`, keeping only the
 # newest few behind (`PQ_DONE_KEEP`) so `pq ls` stays a list of what still
@@ -95,11 +106,21 @@
 #            done/20260728091500-live-chat-links/        a PR exists; still spending a slot until its agent stops
 #            archive/20260727080000-live-chat-onboarding/  settled history - `pq ls` hides it, tick never walks it
 #            splits/live-chat-mentions-20260728-141230-83421/   a plan mid-split, or one left over
+#            tasks/20260729121005-spotify-scope-fix        a symlink to wherever the task is NOW - the one path
+#                                                          the implementer is ever told, since the real one moves
 #
 #   <task>/plan.md     the settings header + Claude's plan, immutable once added
-#                     (`base:` is optional and absent on most tasks - see `task_base`)
+#                     (`base:` is optional and absent on most tasks - see `task_base`;
+#                      `design:` likewise, a comma-separated list of the files in design/)
 #          after       blockers: one per line, TSV  label <TAB> repo <TAB> branch
 #          state.env   KEY=VALUE runtime facts, written as dispatch progresses
+#          contract.md how the plan is to be delivered - written once, at dispatch, from
+#                      pq's own template (see `contract_write`); the plan carries the work,
+#                      this carries the rules for turning it into a reviewable pull request
+#          design/     the design files the plan was built from, copied in at add time
+#          evidence/   the implementer's screenshots, published by `pq evidence`
+#          review.json the review gate's own `claude -p` output, plus review.err and
+#          review.rc   its stderr and exit code - see the `review gate` section
 #
 #   <split>/source.md     the plan being split, copied in
 #          repos          the repo inventory the splitter was shown: TSV  label <TAB> path, primary first - what --split-dir checks against
@@ -184,6 +205,49 @@ PQ_QUOTA_RETRY="${PQ_QUOTA_RETRY:-600}"           # seconds between "continue" a
 PQ_QUOTA_MAX_TRIES="${PQ_QUOTA_MAX_TRIES:-40}"    # ~7h at that interval, then stop knocking
 PQ_TAIL_LINES="${PQ_TAIL_LINES:-30}"
 
+# How many pull requests Haiku has to read a plan as before `pq add`'s split
+# question defaults to yes - see add_wizard. Below it the outline is still
+# shown, but Enter means no, as it always did.
+PQ_SPLIT_SUGGEST="${PQ_SPLIT_SUGGEST:-3}"
+[[ "$PQ_SPLIT_SUGGEST" =~ ^[0-9]+$ ]] && [ "$PQ_SPLIT_SUGGEST" -ge 1 ] || PQ_SPLIT_SUGGEST=3
+
+# The one branch every task's screenshots are published to (`pq evidence`), in
+# the task's own repo. Never deleted: a merged pull request's description keeps
+# pointing at it.
+PQ_EVIDENCE_BRANCH="${PQ_EVIDENCE_BRANCH:-pq-evidence}"
+
+# How long `herdr agent start` may wait for a fresh Claude Code to come up and
+# read as ready. A cold start with plugins is slow; herdr itself caps this at
+# 300000. Milliseconds, because that is what herdr takes.
+PQ_AGENT_START_MS="${PQ_AGENT_START_MS:-60000}"
+[[ "$PQ_AGENT_START_MS" =~ ^[0-9]+$ ]] && [ "$PQ_AGENT_START_MS" -ge 1000 ] || PQ_AGENT_START_MS=60000
+
+# The review gate - see the `review gate` section. Every pull request a task opens
+# gets one independent `/code-review` run by pq itself, in the background, and the
+# implementer is then told to resolve what it posted and mark the draft ready.
+# There is no off switch: PQ_REVIEW_MAX_TRIES=0 is the honest degraded mode, where
+# the reviewer is never launched and the implementer is sent straight to the
+# self-review fallback.
+PQ_REVIEWER_MODEL="${PQ_REVIEWER_MODEL:-opus}"
+PQ_REVIEW_EFFORT="${PQ_REVIEW_EFFORT:-high}"
+PQ_REVIEW_TIMEOUT="${PQ_REVIEW_TIMEOUT:-1500}"    # seconds a reviewer may run before it is killed
+[[ "$PQ_REVIEW_TIMEOUT" =~ ^[0-9]+$ ]] || PQ_REVIEW_TIMEOUT=1500
+PQ_REVIEW_MAX_TRIES="${PQ_REVIEW_MAX_TRIES:-2}"   # launches (a failed probe counts too) before falling back to self-review
+[[ "$PQ_REVIEW_MAX_TRIES" =~ ^[0-9]+$ ]] || PQ_REVIEW_MAX_TRIES=2
+PQ_REVIEW_RETRY="${PQ_REVIEW_RETRY:-600}"         # seconds between tries
+[[ "$PQ_REVIEW_RETRY" =~ ^[0-9]+$ ]] || PQ_REVIEW_RETRY=600
+PQ_REVIEW_SPLIT_LINES="${PQ_REVIEW_SPLIT_LINES:-150}"  # a single commit over this many changed lines is asked to be restructured
+[[ "$PQ_REVIEW_SPLIT_LINES" =~ ^[0-9]+$ ]] || PQ_REVIEW_SPLIT_LINES=150
+# `acceptEdits` does not auto-approve Bash, and `/code-review --comment` posts
+# through `gh` - so without this the reviewer runs to completion and posts
+# nothing, and the JSON's permission_denials is the only place that shows.
+PQ_REVIEW_TOOLS="${PQ_REVIEW_TOOLS:-Bash(gh:*),Bash(git:*)}"
+# A pull request whose title says the agent stopped for a reason is not reviewed:
+# telling an agent that gave up to "resolve the findings and mark it ready" is
+# the wrong instruction. Brace-free, like the two patterns above, and matched
+# case-insensitively.
+PQ_STUCK_RE="${PQ_STUCK_RE:-^(\[stuck\]|stuck:)}"
+
 # Paths that a trap has to clean up must be globals: an EXIT trap runs after the
 # function has returned, so a `local` it referenced is already out of scope - and
 # under `set -u` that turns the cleanup into an "unbound variable" error instead.
@@ -199,7 +263,8 @@ msg()  { printf 'pq: %s\n' "$*" >&2; }
 warn() { printf '\033[38;2;246;193;119mpq: %s\033[0m\n' "$*" >&2; }
 die()  { printf '\033[38;2;235;111;146mpq: %s\033[0m\n' "$*" >&2; exit 1; }
 
-for d in $STATES; do mkdir -p "$PQ_HOME/$d"; done
+# `tasks` is not a state and nothing walks it - see task_link.
+for d in $STATES tasks; do mkdir -p "$PQ_HOME/$d"; done
 
 # ── plan header ─────────────────────────────────────────────────────────────
 # The header is deliberately flat `key: value`, one per line, no nesting and no
@@ -476,8 +541,28 @@ state_of() {                            # task_dir  -> queue|running|done
   local p=${1%/*}; basename "$p"
 }
 
+# ── the stable path ─────────────────────────────────────────────────────────
+# A task's directory MOVES as its state changes, so any path handed to something
+# outside pq - the implementer's prompt, its contract, the directory it saves
+# screenshots into - names a directory that stops existing the moment reconcile
+# moves the task to done/. Measured on the first task dispatched with a contract:
+# the agent's next screenshot went to `mkdir -p running/<task>/evidence/`, and
+# pq then read that stray directory as a half-dispatched task with no plan.md,
+# tried to resume it every tick, and counted it against the cap.
+#
+# tasks/<name> is the one path that never moves: a symlink, re-pointed by
+# retitle on every transition, and the ONLY path pq ever tells anything outside
+# itself. The state directories stay the truth; this is a handle onto them.
+# `tasks/` is deliberately not in $STATES, so no walker ever sees it as a state.
+task_link() {                           # task_dir
+  ln -sfn "$1" "$PQ_HOME/tasks/$(basename "$1")" 2>/dev/null || true
+}
+task_home() {                           # task_dir -> the stable path to hand out
+  printf '%s/tasks/%s' "$PQ_HOME" "$(basename "$1")"
+}
+
 # Move a task between states, keeping its stamp prefix. The `mv` is the state
-# transition; nothing else records it.
+# transition; nothing else records it - except the stable link, which follows.
 retitle() {                             # task_dir new_state [new_stamp]
   local src=$1 to=$2 stamp=${3:-} name
   name=$(basename "$src")
@@ -486,6 +571,7 @@ retitle() {                             # task_dir new_state [new_stamp]
   [ "$src" = "$dst" ] && { printf '%s' "$dst"; return 0; }
   [ -e "$dst" ] && die "a task already exists at $to/$name"
   mv "$src" "$dst" || die "could not move $src -> $dst"
+  task_link "$dst"
   printf '%s' "$dst"
 }
 
@@ -625,10 +711,19 @@ latest_plan() { recent_plans | head -1 | cut -f2-; }
 # state), so an iOS part and an Android part of the same feature would
 # otherwise both want the same branch. Appended as one more sentence, exactly
 # like the avoid list, and omitted entirely for a single-repo split.
+#
+# Line 1 is `branch<TAB>intent`. Every line after it is one entry of the OUTLINE:
+# the pull requests the plan would naturally be delivered as, in build order, one
+# title per line - a single entry when the plan is one coherent change. `cmd_add`
+# shows it before asking whether to split (see add_wizard), and it is advisory:
+# the Opus splitter finds its own seams. Callers that only want the name read
+# the first line - `IFS=$'\t' read` on a herestring stops there - so the outline
+# costs them nothing and is what keeps this one Haiku call per add.
 name_plan() {                           # plan_file [avoid: comma-separated branches already taken] [repo_label]
   local raw json avoid=${2:-} label=${3:-} prompt
   prompt='Read this plan and reply with ONLY a JSON object, no code fence, no commentary:
-{"branch":"tom/<3-5 dash-separated lowercase words naming the task>","intent":"<2-3 sentences, one line, saying what this sets out to achieve in the author'"'"'s terms - not a description of the diff>"}'
+{"branch":"tom/<3-5 dash-separated lowercase words naming the task>","intent":"<2-3 sentences, one line, saying what this sets out to achieve in the author'"'"'s terms - not a description of the diff>","parts":["<one title per pull request this plan would naturally be delivered as, in build order - a single entry when the plan is one coherent change>"]}
+Each entry in parts names the feature or change that pull request would carry - "Add the checklist step collection to Onboarding", "Rebuild the Getting Started page around the new components" - never a list of files.'
   [ -n "$avoid" ] && prompt="$prompt
 The branch must differ from these, which are already taken: $avoid"
   [ -n "$label" ] && prompt="$prompt
@@ -637,7 +732,15 @@ This part lands in the $label repository, so make the branch name say which one 
   # Be forgiving about a fenced or chatty reply: take the first {...} span.
   json=$(sed -n 's/.*\({.*}\).*/\1/p' <<<"$(tr '\n' ' ' <<<"$raw")" | head -1)
   [ -n "$json" ] || return 0
-  jq -er '[.branch, .intent] | @tsv' 2>/dev/null <<<"$json"
+  jq -er '[.branch, .intent] | @tsv' 2>/dev/null <<<"$json" || return 0
+  # The outline. A tab or newline inside a title would break the line-oriented
+  # contract above, so both are squeezed to spaces, and an empty title is dropped.
+  jq -r '.parts[]? | strings' 2>/dev/null <<<"$json" | tr '\t' ' ' | sed '/^[[:space:]]*$/d'
+}
+
+# The outline half of name_plan's reply - line 2 onwards - or nothing.
+outline_of() {                          # name_plan output -> the part titles, one per line
+  tail -n +2 <<<"${1:-}" | sed '/^[[:space:]]*$/d'
 }
 
 # A branch already spoken for is the one failure that must be caught at add time.
@@ -910,18 +1013,146 @@ pick_after() {
   rm -f "$full"
 }
 
-# The two questions that shape how a task runs, asked right after pick_plan
-# actually chose something - see cmd_add's `interactive` gate. `split` and
-# `split_dir` are reached the same way `after_vals` is above, through bash's
-# dynamic scope - do_split already relies on the identical mechanism (see the
-# warning on cmd_add's own locals) - so this function must never declare
-# `split`, `split_dir`, or `after_explicit` `local` either.
+# ── design files ─────────────────────────────────────────────────────────────
+# A plan written from a Claude Design file describes the design in prose, and an
+# implementer that only ever sees the prose builds to its memory of a picture it
+# never saw - PR #6706 said as much in its own description. So the file travels
+# with the task: `--design PATH` attaches one, and every absolute or ~-prefixed
+# path to a .dc.html/.html/.png/.jpg/.jpeg/.pdf that the plan's text mentions is
+# picked up on its own (AGENTS.md asks the planning session to save the file and
+# cite that path). The files are copied into <task>/design/ inside the staging
+# dance and named in the `design:` header, so a task lands with its design or not
+# at all, and the contract (see contract_write) tells the implementer what to do
+# with them.
+
+design_expand() {                       # path as written -> trimmed, ~ expanded
+  local p=$1
+  p=$(sed 's/^[[:space:]]*//; s/[[:space:]]*$//' <<<"$p")
+  # A LITERAL tilde is what is being matched - the shell never expanded it,
+  # because it came out of a file, not a command line.
+  # shellcheck disable=SC2088
+  case "$p" in "~/"*) p="$HOME/${p#"~/"}" ;; esac
+  printf '%s' "$p"
+}
+
+# Every design-looking path the plan's text mentions and that exists on disk, one
+# per line; a mention that does not exist is warned about by name.
+#
+# Two shapes are tried per line, because Claude Design names its files with
+# spaces ("Onboarding Refresh.dc.html"): first each whitespace-free token that
+# ends in a design extension, and only if none of those exists on disk, the span
+# from the line's last path start to its last design extension - which is exactly
+# the `Design file: /Users/.../Onboarding Refresh.dc.html` line the AGENTS.md
+# rule asks for. Both shapes want the character before the leading `/` to be one
+# that cannot continue a path and not a ':', so `https://claude.ai/design/...` is
+# never read as a path. A `.html.erb` never matches either: the token has to END
+# in the extension, and the span wants the extension followed by something that
+# cannot continue a filename.
+design_mentions() {                     # plan_file -> existing paths, one per line
+  local plan=$1 lines line tok cand found span found_all=""
+  lines=$(grep -E '\.(dc\.html|html|png|jpe?g|pdf)' "$plan" 2>/dev/null)
+  [ -n "$lines" ] || return 0
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    found=""; cand=""
+    while IFS= read -r tok; do
+      [ -n "$tok" ] || continue
+      tok=$(sed -E 's/[.,;:)]+$//' <<<"$tok")
+      case "$tok" in *.dc.html|*.html|*.png|*.jpg|*.jpeg|*.pdf) ;; *) continue ;; esac
+      tok=$(design_expand "$tok")
+      cand="$cand$tok"$'\n'
+      [ -f "$tok" ] && found="$found$tok"$'\n'
+    done <<<"$(grep -oE '(^|[^A-Za-z0-9_./~:-])(~/|/)[^[:space:]`"<>|]+' <<<"$line" | sed -E 's/^[^/~]*//')"
+    if [ -z "$found" ]; then
+      # A leading space so the "preceded by a non-path character" branch always
+      # has a character to match, including for a path that starts the line.
+      span=$(sed -nE 's#^.*[^A-Za-z0-9_./~:-]((~/|/)[^`"<>|]*\.(dc\.html|html|png|jpe?g|pdf))([^A-Za-z0-9_.].*)?$#\1#p' <<<" $line")
+      if [ -n "$span" ]; then
+        span=$(design_expand "$span")
+        if [ -f "$span" ]; then found="$span"$'\n'; cand="$span"$'\n'
+        elif [ -z "$cand" ]; then cand="$span"$'\n'; fi
+      fi
+    fi
+    if [ -n "$found" ]; then
+      found_all="$found_all$found"
+    else
+      while IFS= read -r tok; do
+        [ -n "$tok" ] && warn "the plan mentions a design file that is not on disk: $tok"
+      done <<<"$cand"
+    fi
+  done <<<"$lines"
+  # Deduplicated in order of first mention, not sorted: the plan's own order is
+  # the meaningful one, and a sort by absolute path would order the set by
+  # whichever directory the files happen to live in.
+  [ -n "$found_all" ] && printf '%s' "$found_all" | awk '!seen[$0]++'
+  return 0
+}
+
+# Does the plan read as built from a design at all? This is what decides whether
+# an EMPTY design set is worth a question (add_wizard) or a warning (cmd_add).
+design_hinted() {                       # plan_file -> 0 when it cites Claude Design
+  grep -qE 'claude\.ai/design|\.dc\.html' "$1" 2>/dev/null
+}
+
+# The design files a task carries, one basename per line, from its header.
+design_list() {                         # task_dir
+  local v; v=$(hdr "$1/plan.md" design)
+  [ -n "$v" ] || return 0
+  # A bash substitution, not sed: BSD sed does not read `\n` in a replacement.
+  printf '%s\n' "${v//, /$'\n'}" | sed '/^$/d'
+}
+
+# The three questions that shape how a task runs, asked right after pick_plan
+# actually chose something - see cmd_add's `interactive` gate. `split`,
+# `split_dir`, `outline` and the `design_*` variables are reached the same way
+# `after_vals` is above, through bash's dynamic scope - do_split already relies
+# on the identical mechanism (see the warning on cmd_add's own locals) - so this
+# function must never declare any of them `local`. The `${x:-}` defaults are for
+# callers that predate the newer ones (test/pq-add-pick.sh's wrapper declares
+# only the original four), which under `set -u` would otherwise abort.
+#
+# The split question shows Haiku's outline first when it has more than one
+# entry, so you can see how the plan is read before answering - and Enter means
+# yes once it reaches PQ_SPLIT_SUGGEST entries. The outline is shown to you, not
+# fed to the splitter, which finds its own seams and still shows its table for
+# confirmation before anything is queued.
 add_wizard() {
   if [ "$split" != 1 ] && [ -z "$split_dir" ]; then
-    local ans
-    printf 'pq: split into a stack of parts? [y/N] ' >&2
-    read -r ans || ans=n
-    [[ "${ans:-}" =~ ^[Yy]$ ]] && split=1
+    local ans n=0 t i=0 default=n
+    [ -n "${outline:-}" ] && n=$(grep -c . <<<"$outline")
+    if [ "$n" -gt 1 ]; then
+      msg "Haiku reads this plan as $n separately reviewable pull requests:"
+      while IFS= read -r t; do
+        [ -n "$t" ] || continue
+        i=$((i + 1)); printf 'pq:   %d. %s\n' "$i" "$t" >&2
+      done <<<"$outline"
+      [ "$n" -ge "$PQ_SPLIT_SUGGEST" ] && default=y
+    fi
+    if [ "$default" = y ]; then
+      printf 'pq: split it into a stack of parts? [Y/n] ' >&2
+      read -r ans || ans=n
+      [[ "${ans:-}" =~ ^[Nn] ]] || split=1
+    else
+      printf 'pq: split into a stack of parts? [y/N] ' >&2
+      read -r ans || ans=n
+      [[ "${ans:-}" =~ ^[Yy]$ ]] && split=1
+    fi
+  fi
+  # A plan that reads as built from a design, with no design file found or given,
+  # is the one input the implementer cannot do without - so it is asked for once,
+  # here, where the person who has the file is at the keyboard. Blank goes without,
+  # loudly. `--design` given explicitly skips the question, like every *_explicit.
+  if [ "${design_hinted:-0}" = 1 ] && [ "${design_explicit:-0}" != 1 ] && [ -z "${design_vals:-}" ]; then
+    local dp
+    printf 'pq: this plan was built from a design, but no design file was found on disk - path to it? [Enter for none] ' >&2
+    read -r dp || dp=""
+    dp=$(design_expand "$dp")
+    if [ -n "$dp" ]; then
+      [ -f "$dp" ] || die "no such design file: $dp"
+      design_vals="${design_vals:-}${dp}"$'\n'
+    else
+      warn "no design file - the implementer will build from the plan's prose alone"
+    fi
   fi
   [ "$after_explicit" = 1 ] || pick_after
 }
@@ -953,6 +1184,16 @@ cmd_add() {
   # `interactive` is the same idea for add_wizard: it fires the wizard once,
   # never on the recursive calls do_split and split_queue make into cmd_add.
   local intent="" intent_explicit=0 split=0 split_dir="" yes=0 interactive=0
+  # The design set: paths, newline-joined like every other repeatable option,
+  # gathered from --design, from the plan's own text (design_mentions) and from
+  # the wizard, then validated and copied in one place below. `design_explicit`
+  # follows the *_explicit pattern: given on the command line, the wizard does
+  # not ask. `design_hinted` is whether the plan reads as built from a design at
+  # all - what decides whether an empty set earns a question or a warning.
+  local design_vals="" design_explicit=0 design_hinted=0
+  # Haiku's outline of the plan - the pull requests it would naturally be - read
+  # by add_wizard through dynamic scope, so it must be declared here.
+  local outline=""
   while [ $# -gt 0 ]; do
     case "$1" in
       --branch)    branch=${2:-}; shift 2 ;;
@@ -962,16 +1203,25 @@ cmd_add() {
       --urgent)    urgent=1; shift ;;
       --repo)      repo_vals="${repo_vals}${2:-}"$'\n'; [ -n "$repo" ] || repo=${2:-}; repo_explicit=1; shift 2 ;;
       --after)     after_vals="${after_vals}${2:-}"$'\n'; after_explicit=1; shift 2 ;;
+      --design)    design_vals="${design_vals}${2:-}"$'\n'; design_explicit=1; shift 2 ;;
       --intent)    intent=${2:-}; intent_explicit=1; shift 2 ;;
       --split)     split=1; shift ;;
       --split-dir) split_dir=${2:-}; shift 2 ;;
       -y|--yes)    yes=1; shift ;;
       --json)      as_json=1; shift ;;
-      -h|--help)   die "usage: pq add [plan.md] [--branch B] [--base BRANCH] [--model M] [--effort E] [--urgent] [--repo PATH]... [--after task|branch]... [--intent TEXT] [--split | --split-dir DIR] [-y] [--json]" ;;
+      -h|--help)   die "usage: pq add [plan.md] [--branch B] [--base BRANCH] [--model M] [--effort E] [--urgent] [--repo PATH]... [--after task|branch]... [--design PATH]... [--intent TEXT] [--split | --split-dir DIR] [-y] [--json]" ;;
       -*)          die "unknown option '$1'" ;;
       *)           plan=$1; shift ;;
     esac
   done
+
+  # An explicit design path that does not exist is a typo worth catching before
+  # anything else is paid for - the same reasoning as the --branch checks below.
+  local dv
+  while IFS= read -r dv; do
+    [ -n "$dv" ] || continue
+    [ -f "$(design_expand "$dv")" ] || die "no such design file: $dv"
+  done <<<"$design_vals"
 
   [ -n "$branch" ] && { [ "$split" = 1 ] || [ -n "$split_dir" ]; } && \
     die "--split queues N branches of its own - --branch has no meaning with it"
@@ -1074,10 +1324,82 @@ cmd_add() {
     [ "$basebr" = "$(repo_base "$repo")" ] && basebr=""
   fi
 
+  # The design set, before the wizard: what the plan's text names and exists on
+  # disk joins whatever --design gave, and whether the plan reads as built from a
+  # design at all is what the wizard's question (or the warning below) turns on.
+  # A resumed split reads its source.md, since there is no plan argument then.
+  local design_src=$plan
+  [ -n "$split_dir" ] && design_src="$split_dir/source.md"
+  if [ -f "$design_src" ]; then
+    design_hinted "$design_src" && design_hinted=1
+    local detected; detected=$(design_mentions "$design_src")
+    [ -n "$detected" ] && design_vals="${design_vals}${detected}"$'\n'
+  fi
+
+  # Naming, before the wizard rather than after the split gate where it used to
+  # sit, so Haiku's outline is in hand when the split question is asked. One
+  # call per add either way: the later call is gone, and the outline rides along
+  # in the same reply. Skipped where it always was - a part queued by do_split
+  # supplies both --branch and --intent, and paying Haiku again per part would
+  # double the naming cost for nothing; a resumed split names its parts later.
+  # With --branch given, the cheap checks still come first, so a duplicate add
+  # fails in milliseconds instead of after a round trip - but only when there is
+  # a repo to check against, which the split path may not have yet.
+  local named=""
+  if [ -z "$split_dir" ] && { [ -z "$branch" ] || [ "$intent_explicit" != 1 ]; }; then
+    if [ -n "$branch" ] && [ -n "$repo" ]; then
+      local why0
+      git check-ref-format "refs/heads/$branch" || die "invalid branch name: '$branch'"
+      why0=$(branch_taken "$branch" "$repo") && die "branch '$branch' is already $why0"
+    fi
+    local named_all; named_all=$(name_plan "$plan")
+    named=$(head -1 <<<"$named_all")
+    outline=$(outline_of "$named_all")
+  fi
+
   # The wizard runs only for a plan the picker actually chose, and must run
   # before the split gate below, so $split is decided before do_split would
   # need it.
   [ "$interactive" = 1 ] && add_wizard
+
+  # What the wizard would have said, for an add that never reached it. Never an
+  # auto-split - nothing unattended should turn one task into six - but the
+  # outline is worth seeing in the log, and so is a design the plan leans on
+  # with no file to show for it.
+  if [ "$interactive" != 1 ]; then
+    local n_out=0
+    [ -n "$outline" ] && n_out=$(grep -c . <<<"$outline")
+    if [ "$n_out" -gt 1 ] && [ "$split" != 1 ] && [ -z "$split_dir" ]; then
+      warn "Haiku reads this plan as $n_out separately reviewable pull requests:"
+      local t i=0
+      while IFS= read -r t; do
+        [ -n "$t" ] || continue
+        i=$((i + 1)); printf '\033[38;2;246;193;119mpq:   %d. %s\033[0m\n' "$i" "$t" >&2
+      done <<<"$outline"
+      warn "consider --split"
+    fi
+    if [ "$design_hinted" = 1 ] && [ -z "$design_vals" ]; then
+      warn "the plan was built from a design, but no design file was found on disk or given - the implementer will build from prose; pass --design PATH"
+    fi
+  fi
+
+  # The design set, resolved: every path exists, no two share a basename (they
+  # land in one design/ directory), and the header carries the basenames joined
+  # with ", " - which is why a comma in a filename is refused rather than
+  # written into a list it would then be read out of wrongly.
+  local design_files="" design_names="" design_hdr="" dfile dbase
+  while IFS= read -r dfile; do
+    [ -n "$dfile" ] || continue
+    dfile=$(design_expand "$dfile")
+    [ -f "$dfile" ] || die "no such design file: $dfile"
+    dbase=$(basename "$dfile")
+    case "$dbase" in *,*) die "design filename contains a comma, which the design: header cannot carry: $dbase" ;; esac
+    case $'\n'"$design_files" in *$'\n'"$dfile"$'\n'*) continue ;; esac
+    case $'\n'"$design_names" in *$'\n'"$dbase"$'\n'*) die "two design files share the name '$dbase' - rename one: $dfile" ;; esac
+    design_files="$design_files$dfile"$'\n'
+    design_names="$design_names$dbase"$'\n'
+    design_hdr="${design_hdr:+$design_hdr, }$dbase"
+  done <<<"$design_vals"
 
   # The --branch/--split guard above ran before the wizard could have set
   # split=1 by answering its own question - re-check the same rule now that
@@ -1112,26 +1434,19 @@ cmd_add() {
 
   msg "plan:   $plan"
 
-  # Reject a name we cannot use BEFORE paying for the model call. When --branch was
-  # given we already know the name, so the cheap checks come first and a duplicate
-  # add fails in milliseconds instead of after a round trip to Haiku. Without it we
-  # have no choice: the name is what we are asking for.
-  #
-  # Both branches skip the naming call once `--intent` was explicitly given -
-  # a part queued from `do_split` supplies both --branch and --intent, and
-  # every part in a split paying for Haiku a second time here would double
-  # the naming cost for nothing. Gated on `intent_explicit`, not merely on
-  # `intent` being non-empty: a part whose own intent from the model came
-  # back genuinely empty must not read as "not given yet" and re-ask.
-  local named why
+  # The name. Haiku was asked above, before the wizard, when it was going to be
+  # asked at all; here its answer is taken apart. With --branch given the name is
+  # known and only the intent is read - gated on `intent_explicit`, not merely on
+  # `intent` being non-empty, so a part whose own intent from the model came back
+  # genuinely empty must not read as "not given yet". The cheap checks run again
+  # here for the branch a repo could not be checked against earlier: they are
+  # idempotent, and a duplicate add still fails before anything is written.
+  local why
   if [ -n "$branch" ]; then
     git check-ref-format "refs/heads/$branch" || die "invalid branch name: '$branch'"
     why=$(branch_taken "$branch" "$repo") && die "branch '$branch' is already $why"
-    if [ "$intent_explicit" != 1 ]; then
-      named=$(name_plan "$plan"); [ -n "$named" ] && intent=$(cut -f2 <<<"$named")
-    fi
+    [ "$intent_explicit" = 1 ] || { [ -n "$named" ] && intent=$(cut -f2 <<<"$named"); }
   else
-    named=$(name_plan "$plan")
     if [ -n "$named" ]; then
       branch=$(cut -f1 <<<"$named")
       [ "$intent_explicit" = 1 ] || intent=$(cut -f2 <<<"$named")
@@ -1212,6 +1527,9 @@ cmd_add() {
     # default - which is the whole compatibility story for every task, and every
     # already-queued plan.md, that predates this option.
     [ -n "$basebr" ] && printf 'base:     %s\n' "$basebr"
+    # Same absent-means-none pattern as `base:` - written only when there is
+    # a design set, so every task without one keeps the header it always had.
+    [ -n "$design_hdr" ] && printf 'design:   %s\n' "$design_hdr"
     printf 'model:    %s\n'   "$model"
     printf 'effort:   %s\n'   "$effort"
     printf 'intent:   %s\n'   "${intent:-}"
@@ -1225,12 +1543,23 @@ cmd_add() {
   # built here: a task with a plan but no `after` is exactly the kind of
   # half-formed state this staging dance exists to rule out.
   [ -n "$after_lines" ] && printf '%s' "$after_lines" > "$PQ_STAGING/after"
+  # The design files too, and for the same reason: the header names them, so a
+  # task must never land with a `design:` line and an empty design/.
+  if [ -n "$design_files" ]; then
+    mkdir -p "$PQ_STAGING/design" || die "could not create the task's design/"
+    while IFS= read -r dfile; do
+      [ -n "$dfile" ] || continue
+      cp "$dfile" "$PQ_STAGING/design/" || die "could not copy the design file $dfile"
+    done <<<"$design_files"
+  fi
   mv "$PQ_STAGING" "$dir" || die "could not move the new task into $state/"
   trap - EXIT
+  task_link "$dir"
 
   msg "branch: $branch"
   [ -n "$base_note" ] && msg "$base_note"
   [ -n "$intent" ] && msg "intent: $intent"
+  [ -n "$design_hdr" ] && msg "design: $design_hdr"
   msg "added:  $state/$(basename "$dir")  ($model, effort $effort)"
 
   if [ -n "$after_lines" ]; then
@@ -1260,11 +1589,13 @@ cmd_add() {
       --arg repo "$repo" --arg base "$(task_base "$dir")" \
       --arg model "$model" --arg effort "$effort" \
       --arg intent "$intent" --arg dir "$dir" --argjson after "$(after_json "$dir")" \
+      --arg design "$design_hdr" \
       --arg stamp "$stamp" --argjson urgent "$([ "$urgent" = 1 ] && printf true || printf false)" '
       def str: if . == "" then null else . end;
       { task: $task, stamp: ($stamp|tonumber), urgent: $urgent, state: $state, dir: $dir,
         repo: $repo, branch: $branch, base: ($base|str), model: $model, effort: $effort,
-        intent: ($intent|str), after: $after }'
+        intent: ($intent|str), after: $after,
+        design: (if $design == "" then [] else ($design | split(", ")) end) }'
   else
     printf '%s\n' "$slug"
   fi
@@ -1402,6 +1733,13 @@ splitter_prompt() {                     # candidates: label<TAB>path, primary fi
   # no-primary sentinel row itself, which is not a repository to read from.
   repo_block=$(awk -F'\t' '$1 != "" { printf "- %s: %s\n", $1, $2 }' <<<"$candidates")
 
+  # The design files travel with whichever parts cite them (split_queue matches
+  # on the filename), so the splitter is told to cite - read off cmd_add's
+  # `design_hdr` through dynamic scope, like everything else in here.
+  local design_sentence=""
+  [ -n "${design_hdr:-}" ] && design_sentence="
+The source plan is built from these design files: $design_hdr. A part that implements any of that visual work must name the design file it is built from, by its exact filename, so the right file travels with that part."
+
   if [ -n "$primary_label" ]; then
     repo_sentence="The primary is $primary_label ($primary_path). Use it unless source.md clearly places some of the work in one of the others - never assign a part to a repository the plan does not talk about."
     field_sentence="the label of the repository this part belongs to, EMPTY for the primary"
@@ -1440,6 +1778,7 @@ How to write each part - it will be executed by an agent that sees ONLY that one
 - Every part starts from its own repository's default branch with its declared dependencies already merged. Never tell a part to branch from, rebase onto, or cherry-pick another part's branch.
 - Same shape as the plan you read: a Context section, the specific files to change, the existing functions and patterns to reuse, and a verification section. Real paths, confirmed to exist.
 - Do not start a part's file with '---' - no YAML front matter.
+$design_sentence
 EOF
 }
 
@@ -1450,7 +1789,7 @@ EOF
 # silently drop --model/--effort/--urgent/--after the way a bare
 # `--split-dir DIR --repo REPO` would.
 split_resume_hint() {                   # sd
-  local hint="pq add --split-dir $1 --repo $repo" av
+  local hint="pq add --split-dir $1 --repo $repo" av df
   [ "$model" = "$PQ_DEFAULT_MODEL" ]   || hint="$hint --model $model"
   [ "$effort" = "$PQ_DEFAULT_EFFORT" ] || hint="$hint --effort $effort"
   [ "$urgent" = 1 ]      && hint="$hint --urgent"
@@ -1458,6 +1797,12 @@ split_resume_hint() {                   # sd
     [ -n "$av" ] || continue
     hint="$hint --after $av"
   done <<<"$after_vals"
+  # %q, because Claude Design names its files with spaces and this line is
+  # meant to be pasted into a shell verbatim.
+  while IFS= read -r df; do
+    [ -n "$df" ] || continue
+    hint="$hint --design $(printf '%q' "$df")"
+  done <<<"${design_files:-}"
   printf '%s' "$hint"
 }
 
@@ -1846,11 +2191,41 @@ split_queue() {                         # sd leveled_tsv named_file
   # was handed.
   total=$(wc -l <<<"$leveled" | tr -d ' ')
 
+  # A design file follows every part that names it (splitter_prompt asked for
+  # exactly that). One that NO part names goes to every part, with a warning,
+  # rather than to none: the splitter was told to cite, so silence is far more
+  # likely a miss than a plan whose visual work vanished in the split. Read from
+  # cmd_add's `design_files` through dynamic scope, like `after_vals` above.
+  local uncited="" df dbase
+  while IFS= read -r df; do
+    [ -n "$df" ] || continue
+    dbase=$(basename "$df")
+    if ! grep -qF -- "$dbase" "$sd"/[0-9][0-9]-*.md 2>/dev/null; then
+      uncited="$uncited$df"$'\n'
+      warn "no part names the design file $dbase - attaching it to every part"
+    fi
+  done <<<"${design_files:-}"
+
   while IFS=$'\t' read -r level part repopath label deps; do
     [ -n "$part" ] || continue
     n=$((n + 1))
     row=$(awk -F'\t' -v p="$part" '$1 == p { print; exit }' "$named_file")
     IFS=$'\t' read -r _ branch _ intent <<<"$row"
+
+    # An array, unlike the flag strings below: a design path can contain
+    # spaces, and unquoted word-splitting would cut it in two. Expanded with
+    # the `${a[@]+"${a[@]}"}` idiom so an empty set is safe under bash 3.2's
+    # `set -u`.
+    local design_args=()
+    while IFS= read -r df; do
+      [ -n "$df" ] || continue
+      dbase=$(basename "$df")
+      if grep -qF -- "$dbase" "$sd/$part" 2>/dev/null; then
+        design_args+=(--design "$df")
+      else
+        case $'\n'"$uncited" in *$'\n'"$df"$'\n'*) design_args+=(--design "$df") ;; esac
+      fi
+    done <<<"${design_files:-}"
 
     # Each part's own dependencies resolve to slugs recorded in EARLIER
     # iterations of this same loop - guaranteed to exist because the leveled
@@ -1909,7 +2284,7 @@ $basebr
     # split, not a repo at all).
     out=$(cmd_add "$sd/$part" --repo "$repopath" --branch "$branch" --intent "$intent" \
             --model "$model" --effort "$effort" \
-            $urgentflag $baseflag $afterflags --json)
+            $urgentflag $baseflag $afterflags ${design_args[@]+"${design_args[@]}"} --json)
     rc=$?
     if [ "$rc" != 0 ]; then
       [ "$n" -gt 1 ] && warn "already queued, untouched: $(cut -f2 "$slugmap" | tr '\n' ' ')"
@@ -2308,6 +2683,13 @@ slot_held() {                           # task_dir -> 0 holds, 1 released
   # A dismissed wall reads `idle`, so pq's own verdict has to be consulted before
   # the grace is applied to one - see the note above.
   [ "$(st "$d" PQ_BLOCKED)" = quota ] && status=blocked
+  # So does a review in flight against this task's pull request, for the same
+  # shape of reason: the implementer is idle because it is WAITING - for the
+  # reviewer, then for the follow-up - and releasing the slot would start a fresh
+  # agent beside one about to be told to fix things. Deadline-free here, bounded
+  # by the gate's own bounds (see the `review gate` section); `prompted` is not
+  # in the set, so once the agent owns its PR again the ordinary grace applies.
+  review_inflight "$d" && status=blocked
   case "$status" in
     working|blocked)
       [ -z "$(st "$d" PQ_WRAPUP_SINCE)" ] || st_set "$d" PQ_WRAPUP_SINCE ""
@@ -2349,7 +2731,10 @@ slot_held() {                           # task_dir -> 0 holds, 1 released
 active_slots() {                        # [dry] -> run<TAB>wrap
   local dry=${1:-0} d run=0 wrap=0
   for d in "$PQ_HOME/running"/*/; do
-    [ -d "$d" ] && run=$((run + 1))
+    [ -d "$d" ] || continue
+    # Not a task without its plan - see the reconcile loop's phantom check.
+    [ -f "${d%/}/plan.md" ] || continue
+    run=$((run + 1))
   done
   for d in "$PQ_HOME/done"/*/; do
     [ -d "$d" ] || continue
@@ -2380,8 +2765,10 @@ slot_state() {                          # task_dir -> "wrapping up" | ""
   case "$status" in
     noagent|missing) return 0 ;;
   esac
-  # Same override as slot_held, for the same reason: a dismissed wall reads `idle`.
+  # Same overrides as slot_held, for the same reasons: a dismissed wall reads
+  # `idle`, and so does an agent waiting on the review gate.
   [ "$(st "$d" PQ_BLOCKED)" = quota ] && status=blocked
+  review_inflight "$d" && status=blocked
   case "$status" in
     working|blocked|"") printf 'wrapping up'; return 0 ;;
   esac
@@ -3153,17 +3540,25 @@ merged_into() {                         # repo branch base
 #   MERGED, and that work is present in $base              -> met
 #   no PR yet, a live task owns the branch                -> waiting (normal)
 #   an OPEN row, a live task owns the branch               -> waiting (in review)
-#   a DRAFT row whose owning task has reached done         -> stalled
+#   a DRAFT row whose owning task has reached done AND
+#     whose review gate is over (or never applied)         -> stalled
 #   every row is CLOSED                                    -> dead
 #   no PR, and no task in any state owns the branch        -> orphan
 #   no row and gh never answered                           -> unknown
+#
+# A draft during the review gate is the gate WORKING - every pull request now
+# opens as one and stays one until the implementer has answered the review - so
+# it is only a stalled chain once the gate is settled and the draft is still
+# there. `review_settled` is true for an unset key, which keeps every task from
+# before the gate reading byte-for-byte as it did.
 blocker_state() {                       # repo branch base
   local repo=$1 branch=$2 base=$3 owner
   merged_into "$repo" "$branch" "$base" && { printf 'met'; return; }
   if pr_has_row "$repo" "$branch"; then
     pr_all_closed "$repo" "$branch" && { printf 'dead'; return; }
     owner=$(task_by_branch "$repo" "$branch")
-    if pr_has_draft "$repo" "$branch" && [ -n "$owner" ] && [ "$(state_of "$owner")" = "done" ]; then
+    if pr_has_draft "$repo" "$branch" && [ -n "$owner" ] && [ "$(state_of "$owner")" = "done" ] \
+       && review_settled "$owner"; then
       printf 'stalled'; return
     fi
     printf 'waiting'; return
@@ -3510,6 +3905,13 @@ agent_cell() {                          # task_dir state
       blocked=$(block_cell "$d")
       if [ -n "$blocked" ]; then printf '%s' "$blocked"; return; fi
       if [ "$(pane_state "$(st "$d" PQ_PANE)")" = blocked ]; then printf 'blocked'; return; fi
+      # The review gate, ahead of the slot report: `review due`, `reviewing 7m`,
+      # `reviewed`, `review failed`, `resolving`, `review lapsed` all say more
+      # than `wrapping up` about WHY the slot is held, and `review lapsed` is a
+      # decision for you. Block words keep precedence above, since a blocked
+      # agent wants an answer whatever the gate is doing.
+      local rv; rv=$(review_cell "$d")
+      if [ -n "$rv" ]; then printf '%s' "$rv"; return; fi
       if [ -n "$(slot_state "$d")" ]; then printf 'wrapping up'; return; fi
       if [ -n "$reason" ]; then printf 'held %s' "$reason"; else printf -- '-'; fi
       return
@@ -3612,6 +4014,7 @@ cmd_ls() {
     case "$agent" in
       permission|gone|exited|blocked|unknown) needs=$((needs + 1)) ;;
       dead\ *|stalled\ *|held\ *|base\ *)             needs=$((needs + 1)) ;;
+      review\ lapsed)                                 needs=$((needs + 1)) ;;
     esac
     # Which rows are spending the cap. `running` unconditionally, the same way
     # active_slots counts it; a done row only while its agent is still there.
@@ -3651,6 +4054,8 @@ cmd_ls() {
         --argjson urgent "$(is_urgent "$d" && printf true || printf false)" \
         --arg merged "$merged" --arg closed "$closed" \
         --arg reaped "$reaped" --arg held "$held" \
+        --arg review "$(st "$d" PQ_REVIEW)" --arg review_result "$(st "$d" PQ_REVIEW_RESULT)" \
+        --arg design "$(hdr "$d/plan.md" design)" \
         --argjson holding_slot "$holding" \
         --argjson after "$(after_json "$d")" --argjson blocked "$blocked" '
         def str: if . == "" then null else . end;
@@ -3662,7 +4067,9 @@ cmd_ls() {
           pr_state: ($prstate|str), pr_draft: ($draft == "draft"),
           after: $after, blocked: $blocked, holding_slot: $holding_slot,
           merged: ($merged|str), closed: ($closed|str),
-          reaped: ($reaped|str), held: ($held|str) }' >> "$tbl"
+          reaped: ($reaped|str), held: ($held|str),
+          review: ($review|str), review_result: ($review_result|str),
+          design: (if $design == "" then [] else ($design | split(", ")) end) }' >> "$tbl"
     else
       local row="$slug"
       [ "$multi" = 1 ] && row="${row}${TAB}$(cell "$(basename "${repo:--}")" 20)"
@@ -3866,7 +4273,11 @@ cmd_rm() {
   reaped=$(st "$d" PQ_REAPED)
   printf 'pq: remove task "%s" (%s)? [y/N] ' "$slug" "$st" >&2; read -r ans || ans=n
   [[ "${ans:-}" =~ ^[Yy]$ ]] || { msg "cancelled"; return 0; }
+  # A reviewer still running would go on writing into a directory that is about
+  # to vanish, and then post comments on a pull request pq has forgotten.
+  [ "$(st "$d" PQ_REVIEW)" = running ] && review_kill "$d"
   rm -rf "$d" || die "could not remove $d"
+  rm -f "$PQ_HOME/tasks/$(basename "$d")"
   msg "removed $slug"
   # Removing A is exactly how B gets orphaned - nothing will ever open a PR for
   # a branch pq no longer knows about, so that is the moment to say so.
@@ -3877,44 +4288,325 @@ cmd_rm() {
   esac
 }
 
+# ── evidence ─────────────────────────────────────────────────────────────────
+# Screenshots are what let a pull request be judged without checking it out, and
+# a description can only show an image that has a URL. `pq evidence` gives a
+# task's screenshots one: it publishes <task>/evidence/ to a single branch,
+# `pq-evidence` (PQ_EVIDENCE_BRANCH), in the task's own repo, under <slug>/, and
+# prints the markdown image lines to paste into the description. The contract
+# (contract_write) has the implementer run it just before opening the PR.
+#
+# One branch for every task rather than one per task, so nothing accumulates in
+# the branch list - and never deleted, because a merged pull request's
+# description keeps pointing at it. A per-task branch reaped with the worktree
+# would break the images in every merged PR, which is why `reap_task` and
+# `wt rm` never touch this one. Pushing it runs no CI on supercast (the workflow
+# filters `push` to master), and GitHub's `raw` URLs on a private repo resolve
+# for anyone who can see the repo.
+#
+# All plumbing, in the task's worktree, against a TEMPORARY index: nothing is
+# checked out, the worktree's own index and tree are never touched, and the
+# implementer's uncommitted work is not in the way. A non-fast-forward rejection
+# - two tasks publishing at once - refetches and rebuilds, three times at most.
+# Re-running replaces the slug's files rather than appending, so a second pass
+# after a fix is idempotent.
+
+# The task `pq evidence` is about: by slug (any unique prefix), or, with no
+# argument, the task whose worktree the caller is standing in - which is how the
+# implementer runs it from its own pane.
+evidence_task() {                       # [needle] -> task_dir
+  local needle=${1:-} d wt
+  if [ -n "$needle" ]; then find_task "$needle"; return; fi
+  while IFS= read -r d; do
+    [ -n "$d" ] || continue
+    wt=$(st "$d" PQ_WORKTREE); [ -n "$wt" ] || continue
+    case "$PWD/" in "$wt"/*) printf '%s' "$d"; return 0 ;; esac
+  done <<<"$(all_tasks)"
+  die "not inside a task's worktree - name the task: pq evidence <task>"
+}
+
+cmd_evidence() {
+  local d; d=$(evidence_task "${1:-}") || exit 1
+  local slug repo wt src f files="" n=0
+  slug=$(slug_of "$d"); repo=$(hdr "$d/plan.md" repo)
+  wt=$(st "$d" PQ_WORKTREE); [ -n "$wt" ] && [ -d "$wt" ] || wt=$repo
+  [ -n "$wt" ] && [ -d "$wt" ] || die "$slug: neither its worktree nor its repo exists"
+  src="$d/evidence"
+  for f in "$src"/*.png "$src"/*.jpg "$src"/*.jpeg "$src"/*.gif "$src"/*.webp; do
+    [ -f "$f" ] || continue
+    files="$files$f"$'\n'; n=$((n + 1))
+  done
+  [ "$n" -gt 0 ] || die "$slug: nothing to publish - save screenshots into $src first"
+
+  # Resolved before anything is pushed: the image lines need it, and a push with
+  # no lines to show for it would leave the caller with no way to use it.
+  local owner_repo
+  owner_repo=$(cd "$wt" && gh repo view --json nameWithOwner -q .nameWithOwner 2>/dev/null)
+  [ -n "$owner_repo" ] || die "$slug: could not read the GitHub repository name (gh repo view) - the image urls need it"
+
+  local branch=$PQ_EVIDENCE_BRANCH idx="$d/.evidence.index.$$" parent tree commit blob try ok=0 pargs
+  local ssh="${GIT_SSH_COMMAND:-ssh -o ConnectTimeout=5 -o BatchMode=yes}"
+  trap 'rm -f "$idx"' EXIT
+  for try in 1 2 3; do
+    rm -f "$idx"
+    # The branch may not exist yet, so a failed fetch is fine here; an unreachable
+    # remote is caught by the push below instead.
+    GIT_SSH_COMMAND=$ssh git -C "$wt" fetch --quiet origin "+refs/heads/$branch:refs/remotes/origin/$branch" 2>/dev/null || true
+    parent=$(git -C "$wt" rev-parse --verify --quiet "refs/remotes/origin/$branch" 2>/dev/null) || parent=""
+    pargs=()
+    if [ -n "$parent" ]; then
+      GIT_INDEX_FILE=$idx git -C "$wt" read-tree "$parent" || die "could not read $branch into a temporary index"
+      # Replace, not append: whatever this slug published before goes first.
+      GIT_INDEX_FILE=$idx git -C "$wt" ls-files -z --full-name -- "$slug/" 2>/dev/null \
+        | GIT_INDEX_FILE=$idx git -C "$wt" update-index -z --force-remove --stdin 2>/dev/null || true
+      pargs=(-p "$parent")
+    else
+      GIT_INDEX_FILE=$idx git -C "$wt" read-tree --empty || die "could not create a temporary index"
+    fi
+    while IFS= read -r f; do
+      [ -n "$f" ] || continue
+      blob=$(git -C "$wt" hash-object -w "$f") || die "could not store $f"
+      GIT_INDEX_FILE=$idx git -C "$wt" update-index --add --cacheinfo "100644,$blob,$slug/$(basename "$f")" \
+        || die "could not add $f to the index"
+    done <<<"$files"
+    tree=$(GIT_INDEX_FILE=$idx git -C "$wt" write-tree) || die "could not write the evidence tree"
+    commit=$(git -C "$wt" commit-tree "$tree" ${pargs[@]+"${pargs[@]}"} -m "evidence: $slug") || die "could not write the evidence commit"
+    # No --force, deliberately: a rejected push means somebody else published
+    # since the fetch above, and the right answer is to rebuild on top of them.
+    if GIT_SSH_COMMAND=$ssh git -C "$wt" push --quiet origin "$commit:refs/heads/$branch" 2>/dev/null; then
+      ok=1; break
+    fi
+    [ "$try" -lt 3 ] && msg "$slug: push of $branch was rejected (another task published first?) - rebuilding"
+  done
+  rm -f "$idx"; trap - EXIT
+  [ "$ok" = 1 ] || die "$slug: could not push $branch after 3 attempts - is origin reachable?"
+  msg "$slug: published $n file(s) to $branch/$slug/ (${commit:0:7})"
+
+  # stdout is the markdown, and only the markdown - the implementer pastes it.
+  local b
+  while IFS= read -r f; do
+    [ -n "$f" ] || continue
+    b=$(basename "$f")
+    printf '![%s](https://github.com/%s/raw/%s/%s/%s)\n' "$b" "$owner_repo" "$branch" "$slug" "${b// /%20}"
+  done <<<"$files"
+}
+
 # ── dispatch ────────────────────────────────────────────────────────────────
-# What every implementer is told. Short and fixed: the plan carries the work, this
-# carries only the contract - how to finish, and how to fail without stalling.
+# What every implementer is told. Short and fixed: the plan carries the work, the
+# task's contract.md (contract_write, below) carries how to deliver it, and this
+# carries only the pointer to both - plus the one rule that cannot wait to be read
+# out of a file, which is that nobody is watching.
 #
-# The two exits matter more than anything else here. pq frees a slot when a pull
-# request exists, so an agent that finishes cleanly and simply stops has deadlocked
-# the queue: done, idle, and holding its slot until morning. Leaving that to each
-# plan to remember would mean one forgetful plan costs a whole night, so it lives
-# here where it cannot be forgotten.
+# The delivery rules used to live here, in one long sentence, and outgrew a
+# prompt: commit shape, the draft, the screenshots, the design comparison, what to
+# do when stuck. They are a document now, written per task at DISPATCH rather than
+# at add - so an improvement to the contract reaches every task still queued, while
+# a running agent never sees its own contract change underneath it.
 #
-# It names no review step, and asking for one here is the wrong place to try. This
-# prompt may only name capabilities the model can invoke ITSELF, and Claude Code's
-# `/code-review` and `/security-review` are reserved for a human typing them
-# (`disable-model-invocation`), so every dispatched agent answered the review clause
-# that used to be here with a complaint that it could not run it. A review gate is
-# still wanted; it needs a mechanism pq drives rather than a sentence in a prompt.
+# It still names no review step, for the reason recorded when the clause came out:
+# this prompt may only name capabilities the model can invoke ITSELF, and Claude
+# Code's `/code-review` is reserved for a human typing it (disable-model-invocation),
+# so every agent asked for one answered that it could not. The review gate exists
+# now and is pq's own - see the `review gate` section: pq runs the reviewer in the
+# background once the agent has opened its draft, and prompts the agent afterwards,
+# so nothing here needs to ask.
 #
-# Deliberately free of single quotes - it is wrapped in them below so it survives
-# being re-parsed by the pane's shell, and the inline check in dispatch_task
-# enforces that before anything is sent.
-dispatch_prompt() {                     # plan_path [base]
+# Quote-free by convention now rather than by rule. This used to be wrapped in single
+# quotes and typed into the pane's shell, which is why a quote anywhere in it was
+# refused; it goes to `herdr agent prompt` as one argv element that no shell ever
+# re-parses, so nothing would break. The convention stays because the review
+# follow-up (review_prompt) shares it, and one rule is easier to keep than two.
+dispatch_prompt() {                     # task_dir [base]
   # The base clause is only added when there IS one to add - a task aimed at the
-  # repo default gets the prompt it always got, byte for byte, and `gh pr create`
-  # picks the right target by itself. When the base is something else, saying so
-  # is not optional: `gh pr create` defaults to the DEFAULT branch, so the PR
-  # would open against a trunk that is missing everything this branch forked
-  # from, and its diff would swallow the whole integration branch.
+  # repo default gets the prompt it always got, and `gh pr create` picks the right
+  # target by itself. When the base is something else, saying so is not optional:
+  # `gh pr create` defaults to the DEFAULT branch, so the PR would open against a
+  # trunk that is missing everything this branch forked from, and its diff would
+  # swallow the whole integration branch.
   local base_clause=""
   [ -n "${2:-}" ] && base_clause="This branch was forked from $2, not from the repository default branch, \
 so open your pull request against $2 - pass --base $2 to gh pr create. \
 Do not rebase onto the default branch. "
-  printf '%s' "Read $1 and carry it out. \
+  printf '%s' "Read $1/plan.md and carry it out. \
+$1/contract.md is how to deliver it: read it before you start and follow it to the letter. \
 ${base_clause}\
-Commit, push, and open a pull request whose description opens with the intent line \
-from the plan header, followed by what you actually did. \
-If you get stuck, or the plan turns out not to fit, commit what you have, push, and open \
-a DRAFT pull request whose description explains what blocked you, then stop. \
 Never wait for input - there is nobody watching."
+}
+
+# ── the delivery contract ────────────────────────────────────────────────────
+# Everything pq asks of an implementer beyond the plan, as a file in the task
+# directory. Two things about a pq pull request cost the most time to review: it
+# arrives as one blob - a thousand lines in one commit, with a body that summarises
+# rather than guides - and visual work drifts from the design it was planned
+# against, because the implementer never saw the design. The contract answers
+# both: small logical commits in reading order with a review guide, screenshots
+# of every screen touched, and a side-by-side comparison against the design files
+# the task carries. Then a DRAFT pull request, held for the review gate.
+#
+# Parameterised by the task, so the paths in it are absolute and the dev url is
+# the worktree's own. The repo's conventions (its CLAUDE.md, PR format, test
+# commands) still apply on top - it says so. One sentence per line, as Tom's
+# markdown rule asks, and written once: dispatch_task only calls this when no
+# contract.md exists, so a re-entered dispatch never rewrites a running agent's.
+contract_write() {                      # task_dir
+  local d=$1 repo branch base intent design url wt slug tmp home
+  repo=$(hdr "$d/plan.md" repo);   branch=$(hdr "$d/plan.md" branch)
+  base=$(hdr "$d/plan.md" base);   intent=$(hdr "$d/plan.md" intent)
+  design=$(hdr "$d/plan.md" design)
+  url=$(st "$d" PQ_URL); wt=$(st "$d" PQ_WORKTREE); slug=$(slug_of "$d")
+  # Every path the agent is given is the STABLE one (task_home): the real
+  # directory moves to done/ the moment the pull request is reconciled, while
+  # the agent is still saving screenshots into it.
+  home=$(task_home "$d")
+  tmp="$d/.contract.$$"
+  {
+    cat <<EOF
+# How to deliver this task
+
+This is pq's delivery contract for the task \`$slug\`: branch \`$branch\` in \`$repo\`.
+The plan is in \`$home/plan.md\`; this file is how it becomes a pull request somebody can review.
+The repository's own conventions still apply - its CLAUDE.md, its pull request format, its test and lint commands.
+These rules sit on top of them.
+
+Intent, from the plan header: ${intent:-(none recorded)}
+
+## Working
+
+Work only in this worktree: \`${wt:-$repo}\`.
+Commit as you go.
+One coherent, self-contained step per commit, in the order a reader should meet them - foundations before what is built on them - with a message that says what changed and why.
+A mechanical change (a rename, a move, generated output) is its own commit, and its message says so.
+A non-mechanical commit over about 300 changed lines gets split into smaller ones.
+Never one squashed commit at the end: the commits are how the pull request will be read.
+History may be rewritten (\`git push --force-with-lease\`) only while the pull request is still a draft.
+EOF
+    [ -n "$base" ] && cat <<EOF
+This branch was forked from \`$base\`, not from the default branch.
+Open the pull request against it (\`gh pr create --base $base\`) and never rebase onto the default branch.
+EOF
+    cat <<EOF
+
+## Verifying, before the pull request
+
+Run the repository's tests and lint, per its conventions.
+EOF
+    if [ -n "$url" ]; then
+      cat <<EOF
+The app is served at $url from the \`dev\` tab in this workspace.
+If nothing answers there, look at that tab and restart the server with \`wt dev ${wt:-$repo}\`.
+Log in with the project's development credentials: the ones its seed data (\`db/seeds.rb\`) or its docs name, and \`wt open ${wt:-$repo}\` opens the login page the project's profile points at, with the seed admin pre-filled.
+Before changing any screen the plan names, capture it as it is today.
+Walk every user-facing path the change touches, in the browser.
+\`chrome-devtools-axi\` is on PATH: \`chrome-devtools-axi open <url>\`, \`chrome-devtools-axi resize <width> <height>\`, \`chrome-devtools-axi screenshot <file>\`.
+Export \`CHROME_DEVTOOLS_AXI_CHROME_ARGS=--ignore-certificate-errors\` first, so the \`.test\` domain's certificate does not stop it.
+Be picky: anything that looks off gets fixed, even when the plan did not name it.
+Save screenshots into \`$home/evidence/\`, named \`NN-<screen>-before.png\` and \`NN-<screen>-after.png\`, at 1440px wide and, for any responsive surface, at 390px too.
+EOF
+    else
+      cat <<EOF
+This repository has no dev server profile, so there is no url to open; verify through its tests and whatever the plan names.
+If the change is visible anywhere - a CLI's output, a rendered file - capture it before and after into \`$home/evidence/\` as \`NN-<what>-before.png\` and \`NN-<what>-after.png\`.
+EOF
+    fi
+    [ -n "$design" ] && cat <<EOF
+
+## Design fidelity
+
+The plan was built from these design files, which are in \`$home/design/\`: $design.
+The plan names the artboards that matter.
+Open each file with \`chrome-devtools-axi open file://$home/design/<file>\`, screenshot the target artboard at its native width, and build to it.
+Then screenshot your implementation at the same width and in the same state, and compare the two side by side: layout, spacing, sizes, colour, type, radius, icons, copy, and every state the artboard shows (hover, empty, error, blocked).
+Fix every difference and compare again, until nothing differs or a difference is deliberate - an existing component convention, accessibility, responsiveness - and recorded in the pull request.
+Save the pairs into \`$home/evidence/\` as \`NN-<screen>-design.png\` and \`NN-<screen>-impl.png\`.
+EOF
+    cat <<EOF
+
+## The pull request
+
+Run \`pq evidence $slug\`.
+It publishes everything in \`$home/evidence/\` and prints one markdown image line per file, to paste into the description.
+Open the pull request as a draft (\`gh pr create --draft\`), following the repository's pull request conventions, with the intent line above as the first paragraph of the description.
+Add two sections to it:
+
+- \`## Review guide\`: the commits in reading order, one line each on what to look at; where the risk is; what is purely mechanical.
+- \`## Visual evidence\`: the before/after pairs${design:+ and the design/impl pairs} with a one-line caption each${design:+, then a \`## Design fidelity\` table - element, design, implemented, note - followed by the deliberate deviations}.
+
+Leave it a draft.
+pq runs an independent review of every pull request and will tell you when to resolve its findings and mark the pull request ready.
+If you get stuck, or the plan turns out not to fit the code: commit what you have, push, open a draft pull request whose title begins with \`STUCK:\` and whose description explains what blocked you, then stop.
+Never wait for input - there is nobody watching.
+EOF
+  } > "$tmp" || { rm -f "$tmp"; return 1; }
+  mv "$tmp" "$d/contract.md"
+}
+
+# ── the herdr agent API ──────────────────────────────────────────────────────
+# Starting and prompting the implementer goes through `herdr agent start` and
+# `herdr agent prompt`, never by typing into the pane. Typing was blind: it typed
+# `claude ...` whether or not a shell was there to receive it, and the first sign
+# of trouble was a task that never opened a pull request. The agent API validates
+# instead - `start` returns once the expected agent is detected and ready, and
+# `prompt` refuses a target sitting on a dialog (`agent_blocked`) before sending
+# anything - and a prompt passed as argv is never re-parsed by a shell.
+#
+# herdr answers on stdout with JSON and exits 0 EITHER WAY: an error is an
+# `{"error":{"code":...}}` body, not a non-zero status. So every call here reads
+# the body, and treats no body at all as a failure too.
+herdr_err() {                           # json -> the error code, or nothing on success
+  jq -r '.error.code // empty' 2>/dev/null <<<"${1:-}"
+}
+
+# A live agent's name must match [a-z][a-z0-9_-]{0,31} and be unique among live
+# agents. A slug is [a-z0-9-], may start with a digit, and may run long - so it
+# is shaped rather than used raw, and the optional suffix is for the retry when
+# herdr says the plain name is taken.
+agent_name() {                          # slug [suffix]
+  local n=$1
+  n=$(tr -cd 'a-z0-9_-' <<<"$n")
+  case "$n" in [a-z]*) ;; *) n="t-$n" ;; esac
+  n=${n:0:24}
+  [ -n "${2:-}" ] && n="$n-$2"
+  printf '%s' "$n"
+}
+
+agent_start() {                         # task_dir pane model effort -> 0 an agent is up in the pane
+  local d=$1 pane=$2 model=$3 effort=$4 slug name code rc try
+  slug=$(slug_of "$d")
+  for try in 1 2; do
+    if [ "$try" = 1 ]; then name=$(agent_name "$slug"); else name=$(agent_name "$slug" "$(date -u +%H%M%S)"); fi
+    # Shielded like `wt new`: a Ctrl-C mid-start would otherwise leave a Claude
+    # half-launched with nobody to record it.
+    shielded herdr agent start "$name" --kind claude --pane "$pane" --timeout "$PQ_AGENT_START_MS" \
+      -- --model "$model" --effort "$effort"
+    rc=$?
+    code=$(herdr_err "$SHIELDED_OUT")
+    if [ -z "$code" ] && { [ "$rc" != 0 ] || [ -z "$SHIELDED_OUT" ]; }; then code="herdr exited $rc with no answer"; fi
+    case "$code" in
+      "") return 0 ;;
+      # Up, but on a dialog before it was ready - a trust prompt, a wall. The
+      # agent IS there, which is all this step promises; whether it can be
+      # talked to yet is the prompt's question, this tick or the next.
+      agent_not_ready) warn "$slug: the agent started but is not ready for input yet"; return 0 ;;
+      *name*|*taken*|*exists*|*conflict*|*duplicate*) [ "$try" = 1 ] && continue ;;
+    esac
+    warn "$slug: herdr could not start the agent in $pane - $code"
+    return 1
+  done
+  return 1
+}
+
+# Prints the error code when there is one. 0 sent, 2 the agent is blocked on a
+# dialog (the prompt was not sent, and will go on the first tick after it is
+# answered), 1 anything else.
+agent_prompt() {                        # pane text
+  local out rc code
+  out=$(herdr agent prompt "$1" "$2" 2>/dev/null); rc=$?
+  code=$(herdr_err "$out")
+  if [ -z "$code" ] && { [ "$rc" != 0 ] || [ -z "$out" ]; }; then code="herdr exited $rc with no answer"; fi
+  [ -z "$code" ] && return 0
+  printf '%s' "$code"
+  [ "$code" = agent_blocked ] && return 2
+  return 1
 }
 
 # Start the agent for a task, resuming from wherever a previous tick got to. Each
@@ -3938,7 +4630,7 @@ wt_in() {                               # repo wt-subcommand args...
 }
 
 dispatch_task() {                       # task_dir  -> 0 launched, 1 failed
-  local d=$1 repo branch model effort pane wtjson cmdline prompt
+  local d=$1 repo branch model effort pane wtjson prompt
   repo=$(hdr "$d/plan.md" repo);     branch=$(hdr "$d/plan.md" branch)
   model=$(hdr "$d/plan.md" model);   effort=$(hdr "$d/plan.md" effort)
   # The DECLARED base only. `task_base` would fall back to the repo default,
@@ -3949,13 +4641,21 @@ dispatch_task() {                       # task_dir  -> 0 launched, 1 failed
   [ -n "$repo" ] && [ -n "$branch" ] || { warn "$(slug_of "$d"): plan.md has no repo/branch"; return 1; }
   [ -d "$repo" ] || { warn "$(slug_of "$d"): repo $repo is gone"; return 1; }
 
+  # The stable link exists for any task that came through retitle; this makes it
+  # so for one that did not (a task made before the link existed, a hand-moved
+  # directory), since the prompt below hands it out.
+  task_link "$d"
+
   pane=$(st "$d" PQ_PANE)
+  local fresh=0
   if [ -z "$pane" ] || [ "$(pane_state "$pane")" = missing ]; then
-    # Always --no-dev. A profile's dev server is a whole foreman stack, and at
-    # cap 3 an overnight batch would leave three of them running behind agents
-    # that never look at a browser. The worktree is still provisioned and its
-    # url still routed, so `wt dev` in the worktree brings it up when you come
-    # to look at the PR - which is when the server is actually wanted.
+    # With the dev server, always. It used to be `--no-dev` - a foreman stack
+    # per task behind agents that never opened a browser was the wrong price for
+    # an overnight batch - but batches no longer run overnight, most changes are
+    # visual, and the contract has the implementer verify every screen it
+    # touches in the browser and screenshot it. An agent with no running app to
+    # look at cannot do that. `wt open`'s own autostart stays for a server that
+    # has died by the time you come to look.
     # `wt new` on a brand-new branch forks from the local origin/HEAD with no
     # fetch first, so a stale checkout can hand a task whose blocker just
     # merged a base that predates the very commit it waited for - `pq` says "A
@@ -3985,7 +4685,7 @@ dispatch_task() {                       # task_dir  -> 0 launched, 1 failed
     # letting finish when you Ctrl-C. wt's own progress still goes to stderr and
     # straight to the user; only its stdout (the JSON) is captured.
     # shellcheck disable=SC2086
-    shielded wt_in "$repo" new --no-agent --no-focus --no-dev $baseflag --json "$branch" \
+    shielded wt_in "$repo" new --no-agent --no-focus $baseflag --json "$branch" \
       || { warn "$(slug_of "$d"): wt new failed"; return 1; }
     wtjson=$SHIELDED_OUT
     pane=$(jq -r '.root_pane_id // empty' <<<"$wtjson" 2>/dev/null)
@@ -3993,23 +4693,488 @@ dispatch_task() {                       # task_dir  -> 0 launched, 1 failed
     st_set "$d" PQ_WORKTREE "$(jq -r '.path // ""'         <<<"$wtjson")"
     st_set "$d" PQ_WORKSPACE "$(jq -r '.workspace_id // ""' <<<"$wtjson")"
     st_set "$d" PQ_PANE      "$pane"
+    st_set "$d" PQ_DEV_PANE  "$(jq -r '.dev_pane_id // ""'  <<<"$wtjson")"
     st_set "$d" PQ_URL       "$(jq -r '.url // ""'          <<<"$wtjson")"
     st_set "$d" PQ_PORT      "$(jq -r '.port // ""'         <<<"$wtjson")"
+    fresh=1
   else
     msg "$(slug_of "$d"): worktree already prepared, resuming at the agent"
   fi
 
-  prompt=$(dispatch_prompt "$d/plan.md" "$basebr")
-  case "$prompt$d" in
-    *"'"*) warn "$(slug_of "$d"): prompt or path contains a quote - refusing to send"; return 1 ;;
-  esac
-  cmdline=$(printf "claude --model %s --effort %s '%s'" "${model:-$PQ_DEFAULT_MODEL}" "${effort:-$PQ_DEFAULT_EFFORT}" "$prompt")
-  herdr pane send-text "$pane" "$cmdline" >/dev/null 2>&1 \
-    && herdr pane send-keys "$pane" enter >/dev/null 2>&1 \
-    || { warn "$(slug_of "$d"): could not start the agent in $pane"; return 1; }
+  # The contract, once, before the agent starts - the prompt points at it, so it
+  # has to be there first. Never rewritten: a re-entered dispatch finds the file
+  # and leaves it, so a running agent's contract is as immutable as its plan.
+  if [ ! -f "$d/contract.md" ]; then
+    contract_write "$d" || { warn "$(slug_of "$d"): could not write contract.md"; return 1; }
+  fi
+
+  # Start the agent, unless one is already there. `PQ_STARTED` is the record;
+  # an agent herdr already reports in the pane is the same fact reached the hard
+  # way (a start that succeeded but was interrupted before it was recorded), and
+  # is not started over. A pane pq created THIS call is empty by construction,
+  # and is not in a snapshot taken before it existed anyway.
+  if [ -z "$(st "$d" PQ_STARTED)" ]; then
+    local pst=""
+    [ "$fresh" = 1 ] || pst=$(pane_state "$pane")
+    case "$pst" in
+      noagent|missing|"")
+        agent_start "$d" "$pane" "${model:-$PQ_DEFAULT_MODEL}" "${effort:-$PQ_DEFAULT_EFFORT}" || return 1 ;;
+      *) msg "$(slug_of "$d"): an agent is already in $pane - not starting another" ;;
+    esac
+    st_set "$d" PQ_STARTED "$(now)"
+  fi
+
+  # The prompt, as one argv element. A refusal leaves PQ_LAUNCHED empty, which is
+  # what the resume path in tick_body already retries - so an agent that came up
+  # blocked on a dialog gets its prompt on the first tick after the dialog goes.
+  prompt=$(dispatch_prompt "$(task_home "$d")" "$basebr")
+  local code rc
+  code=$(agent_prompt "$pane" "$prompt"); rc=$?
+  if [ "$rc" != 0 ]; then
+    warn "$(slug_of "$d"): could not deliver the prompt to $pane ($code) - the next tick will retry"
+    return 1
+  fi
   st_set "$d" PQ_LAUNCHED "$(now)"
   msg "$(slug_of "$d"): running ${model:-$PQ_DEFAULT_MODEL}/${effort:-$PQ_DEFAULT_EFFORT} in $pane"
   return 0
+}
+
+# ── review gate ─────────────────────────────────────────────────────────────
+# Every pull request a task opens gets one independent review before the
+# implementer may call it ready - run BY pq, not asked of the agent. The agent
+# cannot run `/code-review` itself (the skill is reserved for a human typing it,
+# see dispatch_prompt), and its contract has it open the pull request as a DRAFT
+# and wait. This section is what happens next: once the agent has gone quiet,
+# pq runs `claude -p "/code-review N --comment"` in the background, in the
+# worktree, which posts inline review comments on the pull request; when that
+# finishes, pq prompts the implementer to resolve every comment and mark the
+# draft ready. Nobody reviews the review. The point is that a second pair of
+# eyes has been over the diff, and that the first pair had to answer them,
+# before Tom reads either.
+#
+# A state machine on PQ_REVIEW, one step per tick per task, so a tick never
+# blocks on it:
+#
+#   (unset)   a task from before the gate existed - never touched
+#   pending   reconcile stamped it: a PR exists and no reviewer has run. Waits
+#             for the agent to stop working, probes the PR once (title, draft,
+#             size), then launches - or skips a STUCK: title outright
+#   running   the reviewer is a background process group of its own; its exit
+#             code lands in review.rc and is collected on a later tick. Bounded
+#             by PQ_REVIEW_TIMEOUT, then killed
+#   posted    the reviewer finished. PQ_REVIEW_RESULT says how - `ok`, or
+#             `failed` / `timeout` / `denied`, for which the follow-up asks for a
+#             self-review instead. Waits for the agent to be promptable, then
+#             delivers
+#   prompted  the follow-up is with the implementer. Ends when the PR stops
+#             being a draft
+#   ready     it did - the gate is over
+#   lapsed    nobody is going to mark it ready: the agent is gone, or sat idle
+#             past the grace with the draft still open. Warned once; it wants you
+#   skipped   never applied - the PR settled first, or was opened STUCK
+#
+# "In flight" is pending|running|posted, and a task in flight holds its slot with
+# no clock (see slot_held): the implementer is idle because it is WAITING, and
+# handing its slot away would start a fresh agent beside one about to be told to
+# fix things. `prompted` is not in flight - the agent owns its PR again and the
+# ordinary wrap-up grace applies. The hold is bounded by the gate's own bounds:
+# MAX_TRIES x (TIMEOUT + RETRY) at the very worst, about seventy minutes, then
+# the fallback prompt. `PQ_WRAPUP_GRACE=0` therefore no longer means
+# release-on-PR for a gated task; it means release once the gate is through.
+#
+# "Settled" is everything else, an unset key included, so a task from before the
+# gate reads exactly as it did - `blocker_state`'s stalled verdict rests on it.
+#
+# Failure is loud, once, and falls back rather than blocking: a reviewer that
+# errors is retried on a backoff and then given up on, and the implementer is
+# told to review its own diff instead - the pull request still gets marked ready,
+# and `pq ls` says the review was not independent. A permission denial on the
+# posting path is never retried (it cannot succeed until PQ_REVIEW_TOOLS changes)
+# but is reported the same way, loudly, on the first task it happens to.
+#
+# The reviewer is launched, not `shielded`: shielded waits, and a tick must never
+# block for twenty minutes. Everything needed to collect it is on disk - review.rc
+# for the exit code, review.json for the output - so a `pq run` stopped with
+# Ctrl-C leaves the reviewer alone and a later tick, from any pq process, finishes
+# the job. Liveness is the PROCESS GROUP, not the pid: the pid on file is the
+# group leader, and a recycled pid is almost never a group leader too, so a
+# stranger is neither counted alive nor killed.
+
+review_inflight() {                     # task_dir -> 0 while the gate holds the slot
+  case "$(st "$1" PQ_REVIEW)" in pending|running|posted) return 0 ;; esac
+  return 1
+}
+review_settled() {                      # task_dir -> 0 when the gate is over, or never applied
+  case "$(st "$1" PQ_REVIEW)" in ""|ready|lapsed|skipped) return 0 ;; esac
+  return 1
+}
+review_alive() {                        # pid (a process group id)
+  [ -n "${1:-}" ] || return 1
+  pgrep -g "$1" >/dev/null 2>&1
+}
+
+# The reviewer itself, one swappable function. `-p` with the skill typed as the
+# user's own prompt: the model may not invoke /code-review, but the user may,
+# and in `-p` the prompt IS the user - verified against a real pull request,
+# which came back with eleven inline comments.
+#
+# PQ_REVIEW_EFFORT is passed twice, as the session's `--effort` and as the
+# skill's own level argument, and neither is known to reach the skill: on both
+# real runs so far its transcript opened with "Reusing xhigh effort (the level
+# you typed last)", which is `codeReviewLastEffort` in ~/.claude.json - the level
+# last typed at an interactive prompt. Until that is understood, the level you
+# last typed yourself is the level pq's reviews run at, and the knob is honest
+# about what it asks for rather than what it gets. Passing it costs nothing.
+#
+# `--allowedTools` is not optional - acceptEdits does not auto-approve Bash, and
+# `--comment` posts through `gh`.
+#
+# `--add-dir` opens the task's own directory (through its stable path) to the
+# reviewer: the plan, the contract, the design files and the evidence. The first
+# real review reached for the design file to check the change against it and was
+# refused, because the task directory is outside the worktree it runs in - and a
+# reviewer that can see what the change was built to is a better reviewer.
+review_cmd() {                          # pr task_home
+  claude -p --model "$PQ_REVIEWER_MODEL" --effort "$PQ_REVIEW_EFFORT" \
+    --permission-mode acceptEdits --allowedTools "$PQ_REVIEW_TOOLS" \
+    --add-dir "$2" \
+    --output-format json "/code-review $1 $PQ_REVIEW_EFFORT --comment"
+}
+
+# One `gh` call, right before launching: is this a STUCK pull request, and is it
+# one commit big enough to want restructuring? Tabs and newlines in a title are
+# squeezed so the TSV stays one line.
+review_probe() {                        # repo pr -> title<TAB>state<TAB>draft|open<TAB>commits<TAB>changed
+  local raw
+  raw=$(cd "$1" 2>/dev/null && gh pr view "$2" --json title,state,isDraft,commits,additions,deletions 2>/dev/null) || return 1
+  jq -er '[(.title | gsub("[\t\n]"; " ")), .state, (if .isDraft then "draft" else "open" end),
+           (.commits | length | tostring), ((.additions + .deletions) | tostring)] | @tsv' <<<"$raw" 2>/dev/null
+}
+
+# How many inline review comments the pull request carries. Read once at launch
+# and once at collection, because the difference is the only honest answer to
+# "did the review post anything": the reviewer's JSON says what it was denied,
+# not what it managed. Empty when gh cannot say.
+review_comments() {                     # repo pr -> count, or nothing
+  (cd "$1" 2>/dev/null && gh api "repos/{owner}/{repo}/pulls/$2/comments" --jq 'length' 2>/dev/null) | tr -dc '0-9'
+}
+
+review_launch() {                       # task_dir pr cwd
+  local d=$1 pr=$2 cwd=$3 pid
+  rm -f "$d/review.rc" "$d/review.json" "$d/review.err" "$d"/review.*.tmp
+  # Job control puts the subshell in a process group of its own, as `shielded`
+  # does - but nobody waits on this one. HUP and INT are ignored so the reviewer
+  # survives the pq that launched it going away; TERM is not, because that is
+  # how review_kill stops it. Every result file is written to a .tmp and moved,
+  # and review.rc last, so its presence means the rest is complete.
+  #
+  # The SUBSHELL's own three descriptors are detached too, not just the
+  # reviewer's inside it. stdin, or a background group reading the terminal
+  # would be stopped with SIGTTIN; stdout and stderr, because whatever launched
+  # this tick may be reading them through a pipe - `out=$(pq tick)` - and a pipe
+  # stays open until its last writer exits. Measured: a monitor capturing the
+  # tick's output hung for the whole review, twenty minutes, and reported the
+  # launch only when the reviewer finished.
+  set -m
+  (
+    trap '' HUP INT
+    rc=1
+    if cd "$cwd" 2>/dev/null; then
+      review_cmd "$pr" "$(task_home "$d")" > "$d/review.json.tmp" 2> "$d/review.err.tmp"; rc=$?
+    else
+      : > "$d/review.json.tmp"
+      printf 'no such directory: %s\n' "$cwd" > "$d/review.err.tmp"
+    fi
+    mv -f "$d/review.json.tmp" "$d/review.json" 2>/dev/null
+    mv -f "$d/review.err.tmp"  "$d/review.err"  2>/dev/null
+    printf '%s' "$rc" > "$d/review.rc.tmp" && mv -f "$d/review.rc.tmp" "$d/review.rc"
+  ) < /dev/null > /dev/null 2>&1 &
+  pid=$!
+  set +m
+  disown "$pid" 2>/dev/null || true
+  st_set "$d" PQ_REVIEW_PID "$pid"
+  st_set "$d" PQ_REVIEW_AT "$(epoch)"
+  st_set "$d" PQ_REVIEW running
+}
+
+review_kill() {                         # task_dir
+  local d=$1 pid; pid=$(st "$d" PQ_REVIEW_PID)
+  if [ -n "$pid" ] && review_alive "$pid"; then
+    kill -TERM -- "-$pid" 2>/dev/null || pkill -TERM -g "$pid" 2>/dev/null || true
+  fi
+  rm -f "$d"/review.*.tmp
+  return 0
+}
+
+# What a finished reviewer amounts to. `denied` means the review could not post:
+# a `gh` command was refused AND the pull request has no more inline comments
+# than it had at launch - the one failure a retry cannot fix, since it will be
+# refused the same way until PQ_REVIEW_TOOLS changes. A `gh` refusal with
+# comments landing anyway is a reviewer that got its job done and was then
+# stopped from, say, editing one of its own comments - worth a warning, still
+# a review. The spike that verified the command saw exactly that: 25 denials
+# (gem sources read outside the worktree, `ruby`, `bundle`, one `gh api -X
+# PATCH`) and eleven comments posted.
+review_collect() {                      # task_dir -> ok | failed | denied
+  local d=$1 rc is_error gh_denied other before after
+  rc=$(cat "$d/review.rc" 2>/dev/null)
+  is_error=$(jq -r 'if type == "object" then ((.is_error // false) | tostring) else "malformed" end' \
+               "$d/review.json" 2>/dev/null) || is_error=malformed
+  gh_denied=$(jq -r '[.permission_denials[]? | select(.tool_name == "Bash"
+                and ((.tool_input.command // "") | test("(^|[;&| ])gh( |$)")))] | length' \
+                "$d/review.json" 2>/dev/null) || gh_denied=0
+  other=$(jq -r '[.permission_denials[]?] | length' "$d/review.json" 2>/dev/null) || other=0
+  if [ "$rc" = 0 ] && [ "$is_error" = false ]; then
+    if [ "${gh_denied:-0}" != 0 ]; then
+      before=$(st "$d" PQ_REVIEW_COMMENTS)
+      after=$(review_comments "$(hdr "$d/plan.md" repo)" "$(st "$d" PQ_PR)")
+      if [ -n "$before" ] && [ -n "$after" ] && [ "$after" -le "$before" ]; then
+        printf 'denied'; return
+      fi
+    fi
+    [ "${other:-0}" = 0 ] || warn "$(slug_of "$d"): the reviewer reached for things it was denied ($other denials, $gh_denied of them gh) - see $d/review.json"
+    printf 'ok'; return
+  fi
+  printf 'failed'
+}
+
+# A try that did not produce a review: back to `pending` on a backoff while
+# there are tries left, else `posted` with the failure as its result, which is
+# what routes the follow-up to the self-review text. `PQ_REVIEW_TRIES` counts
+# launches and probes alike, and the caller has already counted this one.
+review_try_failed() {                   # task_dir result why
+  local d=$1 result=$2 why=$3 slug tries
+  slug=$(slug_of "$d"); tries=$(st "$d" PQ_REVIEW_TRIES); tries=${tries:-0}
+  st_set "$d" PQ_REVIEW_RESULT "$result"
+  if [ "$tries" -lt "$PQ_REVIEW_MAX_TRIES" ]; then
+    st_set "$d" PQ_REVIEW pending
+    st_set "$d" PQ_REVIEW_RETRY_AT "$(( $(epoch) + PQ_REVIEW_RETRY ))"
+    warn "$slug: review attempt $tries failed - $why; retrying in $(( PQ_REVIEW_RETRY / 60 ))m"
+  else
+    st_set "$d" PQ_REVIEW posted
+    warn "$slug: review failed after $tries attempt(s) - $why; the implementer will be asked to self-review instead"
+  fi
+}
+
+# The follow-up the implementer is sent. Quote-free by the same convention as
+# dispatch_prompt. The restructure clause is added only when the probe found one
+# commit over PQ_REVIEW_SPLIT_LINES changed lines: the commits are how the PR
+# gets read, and one blob is the shape this whole change exists to stop.
+review_prompt() {                       # pr result split lines base
+  local pr=$1 result=$2 split=${3:-} lines=${4:-} base=${5:-} splitc="" why text
+  [ "$split" = 1 ] && splitc="The pull request is a single commit of $lines changed lines. \
+Before marking it ready, restructure the branch into small logical commits, each coherent \
+on its own with a message saying why, and push with --force-with-lease. "
+  local tail="Then, if the pull request is still a draft, mark it ready with gh pr ready $pr. \
+If you opened it because you were stuck, do not mark it ready; answer what you can and stop. \
+Never wait for input - there is nobody watching."
+  case "$result" in
+    ok)
+      text="pq has finished an independent review of pull request #$pr and posted its findings \
+as inline review comments. Read every one (gh api repos/{owner}/{repo}/pulls/$pr/comments) and \
+resolve each: fix it and push, or reply on that thread with the reasoning for leaving it. \
+Leave no comment unanswered. ${splitc}${tail}" ;;
+    *)
+      case "$result" in
+        timeout) why="the reviewer ran out of time" ;;
+        denied)  why="the reviewer was denied permission to post" ;;
+        *)       why="the reviewer exited with an error" ;;
+      esac
+      text="pq could not get an independent review of pull request #$pr - $why. \
+Review your own diff as a stranger would (git diff origin/${base:-HEAD}...HEAD) for bugs, \
+missing tests and what the plan did not anticipate; fix and push. ${splitc}${tail}" ;;
+  esac
+  printf '%s' "$text"
+}
+
+# One task, one step. Every write is gated on `dry` at its own site, as reap_task
+# does, because which `would ...` applies depends on state computed first.
+review_task() {                         # task_dir dry
+  local d=$1 dry=$2 state slug repo branch pr num prstate draft pstate tries nowsec settled=0
+  state=$(st "$d" PQ_REVIEW)
+  case "$state" in pending|running|posted|prompted) ;; *) return 0 ;; esac
+  slug=$(slug_of "$d"); repo=$(hdr "$d/plan.md" repo); branch=$(hdr "$d/plan.md" branch)
+  nowsec=$(epoch)
+  num=""; prstate=""; draft=""
+  IFS=$'\t' read -r num prstate draft <<<"$(pr_get "$repo" "$branch")"
+  pr=$(st "$d" PQ_PR); [ -n "$pr" ] || pr=${num:-}
+  case "${prstate:-}" in MERGED|CLOSED) settled=1 ;; esac
+  pstate=$(pane_state "$(st "$d" PQ_PANE)")
+  tries=$(st "$d" PQ_REVIEW_TRIES); tries=${tries:-0}
+
+  # A settled row outranks everything in every state but `prompted`, which has
+  # its own reading of a merge below: the verdict is in, reap is next in this
+  # very tick, and a reviewer still running would be working in a workspace
+  # about to be closed under it.
+  if [ "$settled" = 1 ] && [ "$state" != prompted ]; then
+    [ "$dry" = 1 ] && { msg "would skip $slug's review - #$pr has settled"; return 0; }
+    [ "$state" = running ] && review_kill "$d"
+    st_set "$d" PQ_REVIEW skipped; st_set "$d" PQ_REVIEW_WHY settled
+    msg "$slug: review skipped - #$pr has settled"
+    return 0
+  fi
+
+  case "$state" in
+    pending)
+      [ -n "$pr" ] || return 0
+      # Not while the agent is still going or blocked; not behind a wall pq has
+      # dismissed, which reads idle to herdr and only PQ_BLOCKED says otherwise;
+      # not while herdr is silent; not inside a retry backoff.
+      [ -n "$(st "$d" PQ_BLOCKED)" ] && return 0
+      case "$pstate" in working|blocked|"") return 0 ;; esac
+      local at; at=$(st "$d" PQ_REVIEW_RETRY_AT)
+      [ -n "$at" ] && [ "$nowsec" -lt "$at" ] && return 0
+      if [ "$PQ_REVIEW_MAX_TRIES" = 0 ]; then
+        [ "$dry" = 1 ] && { msg "would send $slug straight to self-review (PQ_REVIEW_MAX_TRIES=0)"; return 0; }
+        st_set "$d" PQ_REVIEW posted; st_set "$d" PQ_REVIEW_RESULT failed
+        return 0
+      fi
+      [ "$dry" = 1 ] && { msg "would probe #$pr and launch a review of $slug"; return 0; }
+      local probe title pstate2 ncommits changed
+      if ! probe=$(review_probe "$repo" "$pr"); then
+        st_set "$d" PQ_REVIEW_TRIES "$((tries + 1))"
+        review_try_failed "$d" failed "could not read #$pr with gh"
+        return 0
+      fi
+      IFS=$'\t' read -r title pstate2 _ ncommits changed <<<"$probe"
+      if grep -qiE "$PQ_STUCK_RE" <<<"$title"; then
+        st_set "$d" PQ_REVIEW skipped; st_set "$d" PQ_REVIEW_WHY stuck
+        msg "$slug: #$pr is a STUCK pull request - not reviewing it; it wants you"
+        return 0
+      fi
+      case "$pstate2" in
+        MERGED|CLOSED)
+          st_set "$d" PQ_REVIEW skipped; st_set "$d" PQ_REVIEW_WHY settled
+          msg "$slug: review skipped - #$pr has settled"
+          return 0 ;;
+      esac
+      if [ "${ncommits:-0}" = 1 ] && [ "${changed:-0}" -gt "$PQ_REVIEW_SPLIT_LINES" ]; then
+        st_set "$d" PQ_REVIEW_SPLIT 1; st_set "$d" PQ_REVIEW_LINES "$changed"
+      fi
+      local cwd; cwd=$(st "$d" PQ_WORKTREE)
+      [ -n "$cwd" ] && [ -d "$cwd" ] || cwd=$repo
+      st_set "$d" PQ_REVIEW_TRIES "$((tries + 1))"
+      st_set "$d" PQ_REVIEW_COMMENTS "$(review_comments "$repo" "$pr")"
+      review_launch "$d" "$pr" "$cwd"
+      msg "$slug: reviewing #$pr with $PQ_REVIEWER_MODEL in the background"
+      ;;
+    running)
+      local pid; pid=$(st "$d" PQ_REVIEW_PID)
+      if [ -f "$d/review.rc" ]; then
+        local result; result=$(review_collect "$d")
+        case "$result" in
+          ok)
+            [ "$dry" = 1 ] && { msg "would record $slug's review as posted"; return 0; }
+            st_set "$d" PQ_REVIEW posted; st_set "$d" PQ_REVIEW_RESULT ok
+            msg "$slug: review of #$pr posted$(fmt_cost "$(jq -r '.total_cost_usd // empty' "$d/review.json" 2>/dev/null)" \
+                                                        "$(jq -r '.duration_ms // empty' "$d/review.json" 2>/dev/null)")" ;;
+          denied)
+            [ "$dry" = 1 ] && { msg "would record $slug's review as denied"; return 0; }
+            st_set "$d" PQ_REVIEW posted; st_set "$d" PQ_REVIEW_RESULT denied
+            warn "$slug: the reviewer was denied permission to post through gh - check PQ_REVIEW_TOOLS; falling back to self-review" ;;
+          *)
+            [ "$dry" = 1 ] && { msg "would count $slug's failed review as a try"; return 0; }
+            review_try_failed "$d" failed "the reviewer exited $(cat "$d/review.rc" 2>/dev/null) - see $d/review.err" ;;
+        esac
+        return 0
+      fi
+      if ! review_alive "$pid"; then
+        [ "$dry" = 1 ] && { msg "would count $slug's vanished reviewer as a failed try"; return 0; }
+        review_try_failed "$d" failed "the reviewer process is gone without leaving an exit code"
+        return 0
+      fi
+      local since; since=$(st "$d" PQ_REVIEW_AT); since=${since:-$nowsec}
+      if [ $(( nowsec - since )) -ge "$PQ_REVIEW_TIMEOUT" ]; then
+        [ "$dry" = 1 ] && { msg "would kill $slug's reviewer - over PQ_REVIEW_TIMEOUT"; return 0; }
+        review_kill "$d"
+        review_try_failed "$d" timeout "ran past ${PQ_REVIEW_TIMEOUT}s"
+      fi
+      ;;
+    posted)
+      case "$pstate" in
+        noagent|missing)
+          [ "$dry" = 1 ] && { msg "would mark $slug's review lapsed - its agent is gone"; return 0; }
+          st_set "$d" PQ_REVIEW lapsed; st_set "$d" PQ_REVIEW_WHY noagent
+          warn "$slug: review posted on #$pr, but its agent is gone - resolve the comments yourself and mark it ready"
+          return 0 ;;
+        idle|done|unknown) ;;
+        *) return 0 ;;                  # working, blocked, or herdr silent
+      esac
+      [ -n "$(st "$d" PQ_BLOCKED)" ] && return 0
+      [ "$dry" = 1 ] && { msg "would prompt $slug to resolve the review of #$pr"; return 0; }
+      local text result base code rc
+      result=$(st "$d" PQ_REVIEW_RESULT); base=$(task_base "$d")
+      text=$(review_prompt "$pr" "${result:-failed}" "$(st "$d" PQ_REVIEW_SPLIT)" "$(st "$d" PQ_REVIEW_LINES)" "$base")
+      code=$(agent_prompt "$(st "$d" PQ_PANE)" "$text"); rc=$?
+      case "$rc" in
+        0)
+          st_set "$d" PQ_REVIEW prompted; st_set "$d" PQ_REVIEW_PROMPTED "$(now)"; st_set "$d" PQ_REVIEW_WAIT ""
+          # This tick's snapshot predates the prompt and still reads idle, so a
+          # wrap-up clock started under the hold would release the slot moments
+          # after the agent was handed more work.
+          [ -z "$(st "$d" PQ_WRAPUP_SINCE)" ] || st_set "$d" PQ_WRAPUP_SINCE ""
+          msg "$slug: asked to resolve the review of #$pr and mark it ready" ;;
+        2)
+          # The existing `permission` handling is not fought: the prompt goes on
+          # the first tick after you answer the dialog.
+          [ "$(st "$d" PQ_REVIEW_WAIT)" = blocked ] || { st_set "$d" PQ_REVIEW_WAIT blocked
+            msg "$slug: the agent is on a dialog - the review follow-up waits for you to answer it"; } ;;
+        *)
+          [ "$(st "$d" PQ_REVIEW_WAIT)" = error ] || { st_set "$d" PQ_REVIEW_WAIT error
+            warn "$slug: could not deliver the review follow-up ($code) - retrying each tick"; } ;;
+      esac
+      ;;
+    prompted)
+      case "${prstate:-}" in
+        OPEN)
+          if [ -z "${draft:-}" ]; then
+            [ "$dry" = 1 ] && { msg "would close $slug's review gate - #$pr is no longer a draft"; return 0; }
+            st_set "$d" PQ_REVIEW ready; st_set "$d" PQ_REVIEW_WAIT ""
+            msg "$slug: #$pr marked ready - the review gate is done"
+            return 0
+          fi ;;
+        MERGED)
+          # Merged from the draft, or marked ready and merged between two ticks:
+          # either way the work shipped, which is what ready meant.
+          [ "$dry" = 1 ] && return 0
+          st_set "$d" PQ_REVIEW ready; return 0 ;;
+        CLOSED)
+          [ "$dry" = 1 ] && return 0
+          st_set "$d" PQ_REVIEW skipped; st_set "$d" PQ_REVIEW_WHY settled; return 0 ;;
+        *) return 0 ;;                  # no row this tick - nothing to judge
+      esac
+      # Still a draft.
+      case "$pstate" in
+        noagent|missing)
+          [ "$dry" = 1 ] && return 0
+          st_set "$d" PQ_REVIEW lapsed; st_set "$d" PQ_REVIEW_WHY noagent
+          warn "$slug: #$pr is still a draft and its agent is gone - look at it" ;;
+        idle|done)
+          # The ordinary wrap-up clock, read rather than kept twice: past the
+          # grace, the slot is going anyway, and the draft is nobody's now.
+          local since; since=$(epoch_of "$(st "$d" PQ_WRAPUP_SINCE)")
+          if [ -n "$since" ] && [ $(( nowsec - since )) -ge "$PQ_WRAPUP_GRACE" ]; then
+            [ "$dry" = 1 ] && return 0
+            st_set "$d" PQ_REVIEW lapsed; st_set "$d" PQ_REVIEW_WHY idle
+            warn "$slug: asked to mark #$pr ready, but it is still a draft and the agent has gone quiet - look at it"
+          fi ;;
+      esac
+      ;;
+  esac
+  return 0
+}
+
+# What `pq ls` says about the gate, or nothing when it has nothing to say.
+# ASCII only, like every cell.
+review_cell() {                         # task_dir
+  local d=$1
+  case "$(st "$d" PQ_REVIEW)" in
+    pending)  printf 'review due' ;;
+    running)  printf 'reviewing %s' "$(age_since "$(st "$d" PQ_REVIEW_AT)")" ;;
+    posted)   case "$(st "$d" PQ_REVIEW_RESULT)" in ok) printf 'reviewed' ;; *) printf 'review failed' ;; esac ;;
+    prompted) printf 'resolving' ;;
+    lapsed)   printf 'review lapsed' ;;
+  esac
 }
 
 # ── reap ────────────────────────────────────────────────────────────────────
@@ -4167,6 +5332,10 @@ reap_task() {                           # task_dir dry -> 0 torn down, 2 would (
   fi
 
   # 4. Two holds, both only once there is a verdict (just now, or on an earlier pass).
+  #    Invariant, not a check: the review gate (pass 1.22) runs before this one in
+  #    the same tick and has already killed any reviewer still running against a
+  #    settled pull request - so by the time `wt rm` closes the workspace below,
+  #    nothing of pq's is working inside it. Reorder the passes and that breaks.
   if [ "$settled" = 1 ]; then
     # The guard that matters most: closing the Herdr workspace pq is itself
     # running in would kill this pane partway through the teardown. Guarded on
@@ -4398,6 +5567,15 @@ tick_body() {                           # cap dry
   if [ "${#running[@]}" -gt 0 ]; then
     for d in "${running[@]}"; do
       slug=$(slug_of "$d"); branch=$(hdr "$d/plan.md" branch)
+      # A directory with no plan.md is not a task pq made - the staging dance
+      # rules that out - but something writing into a moved task's OLD path
+      # recreates one (see task_link). Said once, with the fix, rather than
+      # "dispatch was interrupted" every tick; active_slots does not count it.
+      if [ ! -f "$d/plan.md" ]; then
+        [ -n "$(st "$d" PQ_PHANTOM)" ] || { st_set "$d" PQ_PHANTOM "$(now)"
+          warn "running/$(basename "$d") has no plan.md - not a task pq made (a stray write into a moved task's old path?) - remove it: rm -rf $d"; }
+        continue
+      fi
       local num prstate draft
       IFS=$'\t' read -r num prstate draft <<<"$(pr_get "$(hdr "$d/plan.md" repo)" "$branch")"
       if [ -n "${num:-}" ]; then
@@ -4406,6 +5584,9 @@ tick_body() {                           # cap dry
           msg "would finish $slug (#$num $what)"
         else
           st_set "$d" PQ_PR "$num"; st_set "$d" PQ_FINISHED "$(now)"
+          # The review gate opens here, once, in the same cluster - see the
+          # `review gate` section for what happens to it from the next pass on.
+          st_set "$d" PQ_REVIEW pending
           retitle "$d" done >/dev/null
           msg "finished $slug - #$num $what"
         fi
@@ -4457,6 +5638,22 @@ tick_body() {                           # cap dry
       check_stall "$d"
     done
   fi
+
+  # 1.22 The review gate, one step per task - see the `review gate` section.
+  # After reconcile, so a task that finished this tick is examined this tick;
+  # after check_stall, because a dismissed wall reads `idle` to herdr and only
+  # PQ_BLOCKED says otherwise; before reap, so a settled PR stops its reviewer
+  # before `wt rm` closes the workspace it runs in; before active_slots, so the
+  # hold it puts on a slot is counted on the same tick. Reaped tasks have no pane
+  # and no worktree left, and nothing here applies to them.
+  local n_reviewing=0
+  for d in "$PQ_HOME/done"/*/; do
+    [ -d "$d" ] || continue
+    d=${d%/}
+    [ -n "$(st "$d" PQ_REAPED)" ] && continue
+    review_task "$d" "$dry"
+    review_inflight "$d" && n_reviewing=$((n_reviewing + 1))
+  done
 
   # 1.25 Reap - tear down what merged, once the agent has stopped and pq is not
   # itself sitting in the workspace about to be closed. Runs after reconcile, so
@@ -4608,6 +5805,7 @@ $([ -n "$walled_by" ] && printf ', %s - starting nothing' "$(walled_note "$walle
 $([ "$started" -gt 0 ] && printf ', %s started' "$started")\
 $([ "$would" -gt 0 ] && printf ', %s would start' "$would")\
 $([ "$waiting" -gt 0 ] && printf ', %s waiting on a merge' "$waiting")\
+$([ "$n_reviewing" -gt 0 ] && printf ', %s reviewing' "$n_reviewing")\
 $([ "$n_torn" -gt 0 ] && printf ', %s torn down' "$n_torn")\
 $([ "$would_torn" -gt 0 ] && printf ', %s would tear down' "$would_torn")$reap_note\
 $([ "$n_arch" -gt 0 ] && printf ', %s %s' "$n_arch" "$([ "$dry" = 1 ] && printf 'would archive' || printf 'archived')")"
@@ -4722,7 +5920,8 @@ main() {
     cap)        shift; cmd_cap "$@" ;;
     ls|list)    shift; cmd_ls "$@" ;;
     rm|remove)  shift; cmd_rm "$@" ;;
-    *) die "usage: pq {add [plan] [--base B] [--urgent] [--after task|branch]... [--split | --split-dir DIR] [-y] [--json] | after <task> [<task|branch>... | --clear] | base <task> [<branch> | --clear] | ls [--all] [--json] | tick [--cap N] [--dry-run] | run [--interval S] [--cap N] | cap [N] | rm <task>}" ;;
+    evidence)   shift; cmd_evidence "$@" ;;
+    *) die "usage: pq {add [plan] [--base B] [--urgent] [--after task|branch]... [--design PATH]... [--split | --split-dir DIR] [-y] [--json] | after <task> [<task|branch>... | --clear] | base <task> [<branch> | --clear] | ls [--all] [--json] | tick [--cap N] [--dry-run] | run [--interval S] [--cap N] | cap [N] | rm <task> | evidence [task]}" ;;
   esac
 }
 if [ "${BASH_SOURCE[0]}" = "$0" ]; then main "$@"; fi
