@@ -1043,6 +1043,24 @@ cmd_run() {
   exec "$@"
 }
 
+# `wt run` with RAILS_ENV=test already set, so the profile's wt_env hands the
+# command the worktree's TEST database instead of its dev copy.
+#
+# It has to be declared by the caller, and nothing downstream can do it: a spec
+# suite sets RAILS_ENV itself, from inside its own ruby process (supercast's
+# spec/rails_helper.rb does it on line 4), which is long after wt_env has already
+# chosen a database. So the intent has to arrive before the env is built, and
+# making it a command rather than a documented convention is what stops it being
+# forgotten - which matters because forgetting it is silent, and lands the suite on
+# a database shared with every other worktree on the machine.
+#
+# Exported rather than passed as a temporary assignment: wt_env reads it, and the
+# exec'd command has to inherit it too.
+cmd_test() {
+  export RAILS_ENV=test
+  cmd_run "$@"
+}
+
 # Open the worktree's dev url in the browser. Which url (subdomain, path, any
 # pre-filled query) is project-specific, so a profile defines it via wt_open_url;
 # with none we fall back to the worktree's base url. `wt open` uses the current
@@ -1356,12 +1374,13 @@ main() {
     new)        shift; cmd_new "$@" ;;
     dev)        shift; cmd_dev "$@" ;;
     run)        shift; cmd_run "$@" ;;
+    test)       shift; cmd_test "$@" ;;
     open)       shift; cmd_open "$@" ;;
     provision)  shift; cmd_provision "$@" ;;
     rm|remove)  shift; cmd_rm "$@" ;;
     ls|list)    shift; cmd_ls "$@" ;;
     gc)         shift; cmd_gc "$@" ;;
-    *) die "usage: wt {new [--no-agent] [--no-dev] [--no-focus] [--json] [name] | dev <path> | run [cmd...] | open [name] | provision <path> | rm [-y] [name] | ls | gc [--settled] [--sweep] [-y]}" ;;
+    *) die "usage: wt {new [--no-agent] [--no-dev] [--no-focus] [--json] [name] | dev <path> | run [cmd...] | test [cmd...] | open [name] | provision <path> | rm [-y] [name] | ls | gc [--settled] [--sweep] [-y]}" ;;
   esac
 }
 if [ "${BASH_SOURCE[0]}" = "$0" ]; then main "$@"; fi

@@ -14,9 +14,11 @@ case "$(uname -s)" in
 esac
 
 # Volatile per-tool runtime files kept alongside tracked config (herdr stores its
-# sockets, logs, and session state in ~/.config/herdr). Never sync these, and keep
-# --delete from removing them from the destination (rsync protects excluded files).
-config_excludes=(--exclude='*.sock' --exclude='*.log' --exclude='/session.json' --exclude='/release-notes.json')
+# sockets, logs, session state and a plugin lock in ~/.config/herdr). Never sync
+# these, and keep --delete from removing them from the destination (rsync protects
+# excluded files) - .plugins.lock is held by a RUNNING herdr, so deleting it on an
+# install is not merely untidy.
+config_excludes=(--exclude='*.sock' --exclude='*.log' --exclude='/session.json' --exclude='/release-notes.json' --exclude='/.plugins.lock')
 
 for dir in "$repo"/.config/*/; do
   [ -d "$dir" ] || continue
