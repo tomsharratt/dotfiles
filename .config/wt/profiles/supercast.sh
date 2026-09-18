@@ -31,6 +31,25 @@ WT_AGENT="claude"
 # Slugs are ASCII by construction (slugify), so bytes and characters agree.
 _wt_db() { local s=${1:-$WT_SLUG}; s="supercast-web_development_${s//-/_}"; printf '%s' "${s:0:63}"; }
 
+# The worktree's own TEST database, separate from the dev copy above.
+#
+# Without one, `RAILS_ENV=test` in a worktree lands in one of two wrong places.
+# database.yml's `test:` entry carries BOTH `url:` (reading DATABASE_URL) and an
+# explicit `database: supercast-web_test`, and ActiveRecord merges the url on top
+# of the yaml (url_config.rb), so DATABASE_URL wins: with wt_env loaded a spec run
+# loads schema over the dev data this worktree's own server is serving, and with no
+# DATABASE_URL at all it falls through to the single machine-wide
+# supercast-web_test that every other worktree is using too - which is where the
+# PG::ObjectInUse, re-appearing PendingMigrationError and truncation deadlocks
+# between unrelated worktrees came from.
+#
+# INFIXED, not suffixed. _wt_db already truncates to 63 bytes (see above), so
+# "$(_wt_db)_test" is byte-identical to _wt_db's own output for any slug of 37
+# characters or more - the test database would BE the dev database, silently, for
+# exactly the long slugs that caused the last naming incident. This prefix is 31
+# bytes, leaving 32 for the underscored slug.
+_wt_test_db() { local s=${1:-$WT_SLUG}; s="supercast-web_development_test_${s//-/_}"; printf '%s' "${s:0:63}"; }
+
 # Drop a db, first terminating any connections to it (a still-running dev server)
 # so dropdb can't fail on "database is being accessed by other users". Silent -
 # the caller prints its own context. Returns non-zero if the db doesn't exist or
@@ -42,6 +61,20 @@ _wt_dropdb() {
     "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname='$db' AND pid<>pg_backend_pid();" \
     >/dev/null 2>&1
   dropdb "$db"
+}
+
+# Drop a db and SAY what happened. _wt_dropdb returns non-zero both for "the drop
+# failed" and for "it was never there", and the bare `_wt_dropdb x && msg ...` this
+# replaces printed nothing in either case - so a database that genuinely could not
+# be dropped (a connection wt could not terminate) was reclaimed silently in the
+# same way as one that had already gone. Only the first of those deserves a warning,
+# so re-check the list afterwards to tell them apart.
+_wt_drop_reported() {                   # db label
+  local db=$1 label=$2
+  if _wt_dropdb "$db"; then msg "dropped $label$db"; return 0; fi
+  psql -lqtA 2>/dev/null | cut -d'|' -f1 | grep -qx "$db" \
+    && warn "could not drop $label$db - still on disk"
+  return 0
 }
 
 # Point puma-dev's <slug>.test at this worktree's port, restarting the daemon when that
@@ -89,8 +122,8 @@ _wt_puma_dev_route() {
 }
 
 wt_provision() {
-  local canonical=$WT_REPO db key rel
-  db=$(_wt_db)
+  local canonical=$WT_REPO db tdb key rel
+  db=$(_wt_db); tdb=$(_wt_test_db)
 
   # 1. Link the gitignored secrets a fresh checkout needs to boot.
   for key in "$canonical"/config/master.key "$canonical"/config/credentials/*.key; do
@@ -103,7 +136,17 @@ wt_provision() {
     ln -s "$canonical/node_modules" "$WT_PATH/node_modules"; msg "linked node_modules"
   fi
 
-  # 2. Isolated database, always a fresh copy of the current dev db. Re-running
+  # 2. Gems, before anything here runs bin/rails. node_modules is shared by
+  #    symlink above, but the gem set is not: a worktree forked from a fresher
+  #    origin/master whose lockfile wants gems the shared asdf gem set does not
+  #    have dies on the first bin/rails with Bundler::GemNotFound. That used to
+  #    surface as "db:migrate failed" and send you looking at wt or at postgres.
+  msg "installing gems"
+  if ! ( cd "$WT_PATH" && bundle install --quiet ); then
+    warn "bundle install failed - bin/rails cannot run in this worktree"; return 1
+  fi
+
+  # 3. Isolated database, always a fresh copy of the current dev db. Re-running
   #    provision RESETS it: an existing worktree db is dropped (terminating the
   #    dev server if it's still attached) and re-seeded, so provision is the way
   #    back to a clean copy. A logical dump is used rather than CREATE DATABASE
@@ -120,13 +163,45 @@ wt_provision() {
     warn "seeding $db from the dev db failed"; return 1
   fi
 
-  # 3. Apply this branch's own migrations to the isolated db (safe - nothing shared).
+  # 4. Apply this branch's own migrations to the isolated db (safe - nothing shared).
   msg "migrating $db"
   if ! ( cd "$WT_PATH" && DATABASE_URL="postgres:///$db" bin/rails db:migrate >/dev/null ); then
     warn "db:migrate failed - fix before testing"; return 1
   fi
 
-  # 4. Seed feature flags so the worktree matches dev instead of starting with
+  # 5. This worktree's own test database. Schema only, never a copy of dev: a test
+  #    database is meant to start empty, and rails_helper's maintain_test_schema!
+  #    keeps it current from here - so provisioning only has to make it exist at
+  #    the right schema. Loaded under RAILS_ENV=test so ar_internal_metadata
+  #    records `test` and a spec run never trips EnvironmentMismatchError. Reset on
+  #    re-provision, the same contract as the dev copy above.
+  if psql -lqtA 2>/dev/null | cut -d'|' -f1 | grep -qx "$tdb"; then
+    msg "resetting test database $tdb"
+    _wt_dropdb "$tdb" || { warn "dropping $tdb failed"; return 1; }
+  else
+    msg "creating test database $tdb"
+  fi
+  createdb "$tdb" || { warn "createdb $tdb failed"; return 1; }
+  if ! ( cd "$WT_PATH" && RAILS_ENV=test DATABASE_URL="postgres://localhost/$tdb" \
+           bin/rails db:schema:load >/dev/null ); then
+    warn "loading the schema into $tdb failed - fix before testing"; return 1
+  fi
+
+  # 6. Build the assets a full-page render needs. app/assets/builds/ is gitignored
+  #    and empty in a fresh worktree, so every request or feature spec rendering
+  #    through a layout 500s with Propshaft::MissingAssetError - which reads like
+  #    the branch broke rendering, in specs it never touched. These are the two
+  #    commands CI's setup-build action runs. They go stale the moment a view is
+  #    edited, so anyone doing visual work still rebuilds; the point is that a
+  #    fresh worktree runs its specs without first diagnosing this.
+  #    Not fatal: a worktree with no built assets is still a working worktree.
+  msg "building assets"
+  if ! ( cd "$WT_PATH" && yarn build >/dev/null 2>&1 \
+           && bin/rails tailwindcss:build >/dev/null 2>&1 ); then
+    warn "building assets failed - full-page specs will 500 until this is fixed"
+  fi
+
+  # 7. Seed feature flags so the worktree matches dev instead of starting with
   #    every flag off. flipper (config/initializers/features.rb -> Redis.new,
   #    which honors REDIS_URL) lives on this worktree's redis db index, and a
   #    fresh index is empty. flipper-redis keeps a SET `flipper_features` of
@@ -149,7 +224,7 @@ wt_provision() {
     [ "${n:-0}" -gt 0 ] 2>/dev/null && msg "seeded $n feature flags into redis db $WT_REDIS (from dev)"
   fi
 
-  # 5. Route puma-dev's <slug>.test at this worktree's port.
+  # 8. Route puma-dev's <slug>.test at this worktree's port.
   _wt_puma_dev_route
 
   # Record human-facing facts for `wt ls`.
@@ -164,9 +239,31 @@ wt_provision() {
 # on the same function is what stops a console from silently reading the canonical
 # dev db while the server reads the isolated one.
 wt_env() {
-  local db; db=$(_wt_db)
   export PORT="$WT_PORT"
-  export DATABASE_URL="postgres:///$db"
+  # WHICH database depends on what is about to run, and that is decided here
+  # because DATABASE_URL beats database.yml's own `database:` key in every
+  # environment (see _wt_test_db). That precedence is the mechanism rather than a
+  # problem: aim it at the test database for a test command and at the dev copy
+  # otherwise, and both environments get this worktree's own database.
+  #
+  # Rails offers nothing environment-specific to use instead. It resolves
+  # <CONFIG_NAME>_DATABASE_URL - PRIMARY_DATABASE_URL here - keyed on the database
+  # config's name rather than on the environment, and skips that lookup entirely
+  # for a config whose yaml already carries a `url:` key, which supercast's do.
+  # TEST_DATABASE_URL is not honored anywhere in activerecord or railties.
+  #
+  # The test url names localhost EXPLICITLY, and must. DatabaseCleaner's safeguard
+  # raises on a DATABASE_URL it reads as remote; it allows localhost, 127.0.0.1 and
+  # *.local, and returns early when there is no host - but
+  # URI.parse("postgres:///x").host is "", an empty string, which is truthy in
+  # ruby, so the socket form sails past that no-host check, matches none of the
+  # allowed hosts and is rejected. postgres://localhost/x is allowed outright,
+  # which is why no DATABASE_CLEANER_ALLOW_REMOTE_DATABASE_URL is needed.
+  if [ "${RAILS_ENV:-}" = test ]; then
+    export DATABASE_URL="postgres://localhost/$(_wt_test_db)"
+  else
+    export DATABASE_URL="postgres:///$(_wt_db)"
+  fi
   export REDIS_URL="redis://localhost:6379/${WT_REDIS:-0}"
   export LOCAL_DOMAIN="$WT_DOMAIN"
   # Scope the session cookie to THIS worktree's host. figaro loads config/application.yml,
@@ -227,6 +324,11 @@ wt_dev() {
 #   - a database must carry the supercast-web_development_ prefix WITH something after
 #     it, so the canonical supercast-web_development can never match.
 #
+# That prefix also matches a worktree's TEST database (supercast-web_development_test_*),
+# so the live list below is built from BOTH names for every live slug. Building it from
+# _wt_db alone would leave every live worktree's test database looking like an orphan and
+# drop it mid-suite - the same class of failure as the truncation bug described below.
+#
 # The databases are matched by NAME, not by a slug read back out of the name. That
 # reverse mapping cannot be done safely: _wt_db truncates to postgres's 63-byte
 # identifier limit, so a long slug's db name has no slug to recover - and the
@@ -242,7 +344,9 @@ wt_sweep() {
   # single line and matches nothing, which is the same live-database-looks-orphaned
   # failure this rewrite exists to remove.
   livedbs=$(while IFS= read -r slug; do
-    [ -n "$slug" ] && printf '%s\n' "$(_wt_db "$slug")"
+    [ -n "$slug" ] || continue
+    printf '%s\n' "$(_wt_db "$slug")"
+    printf '%s\n' "$(_wt_test_db "$slug")"
   done <<<"$live")
 
   for f in "$HOME"/.puma-dev/*; do
@@ -264,7 +368,7 @@ wt_sweep() {
 }
 
 wt_teardown() {
-  local db pf; db=$(_wt_db); pf="${TMPDIR:-/tmp}/wt-${WT_SLUG}.Procfile"
+  local db tdb pf; db=$(_wt_db); tdb=$(_wt_test_db); pf="${TMPDIR:-/tmp}/wt-${WT_SLUG}.Procfile"
   # -e first: `rm -f` succeeds on a path that was never there, so without the test this
   # reports removing an entry that never existed (every worktree created outside wt).
   [ -e "$HOME/.puma-dev/$WT_SLUG" ] && rm -f "$HOME/.puma-dev/$WT_SLUG" \
@@ -274,7 +378,15 @@ wt_teardown() {
   if [ "${WT_REDIS:-0}" -gt 0 ] 2>/dev/null; then
     redis-cli -n "$WT_REDIS" flushdb >/dev/null 2>&1 && msg "flushed redis db $WT_REDIS"
   fi
-  _wt_dropdb "$db" && msg "dropped database $db"
+  _wt_drop_reported "$db" "database "
+  _wt_drop_reported "$tdb" "test database "
   # wt_dev writes this outside the repo (see there); nothing else removes it.
-  [ -e "$pf" ] && rm -f "$pf"
+  # No -e guard: `rm -f` is already silent about a path that was never there, and
+  # as the LAST statement the guard made this function return non-zero for every
+  # worktree that never ran a dev server - which is every --no-dev worktree, so
+  # every pq task - and `wt rm` reported "teardown reported errors" after a
+  # completely clean teardown. Each step above now reports its own failure, so the
+  # function's own status carries no information and should not invent any.
+  rm -f "$pf"
+  return 0
 }

@@ -41,6 +41,7 @@ A repo with no profile still gets a worktree + Claude - it just has no dev serve
 For `supercast` (`~/.config/wt/profiles/supercast.sh`) each worktree gets:
 
 - its own postgres database - a logical copy of `supercast-web_development`, so migrations and data changes never touch the shared dev db or the other worktrees;
+- its own **test** database, so `wt test bundle exec rspec` never shares `supercast-web_test` with another worktree - see "Running tests in a worktree" below;
 - its own redis db index, so Sidekiq queues don't collide;
 - its own puma-dev url `https://<name>.test` on its own port.
 
@@ -62,6 +63,8 @@ Commands:
 wt new [name]        create/open an isolated worktree, provision, start dev + Claude
 wt dev  <path>       run a worktree's dev server (this is the dev pane's command)
 wt run  [cmd...]     run a command with the worktree's isolated env loaded
+wt test [cmd...]     the same, with RAILS_ENV=test, so the command gets the
+                     worktree's own test database rather than its dev copy
 wt open [name]       open the worktree's dev url in the browser, starting the
                      dev server first if nothing is serving it yet, or hand the
                      command to the profile's own open action (build, install
@@ -74,6 +77,22 @@ wt rm  [-y] [name]   tear a worktree down (drop db, free port, remove worktree)
 wt ls                list worktrees with their allocated port / redis / url / db
 wt gc                reclaim resources from worktrees removed outside wt rm
 ```
+
+#### Running tests in a worktree
+
+`wt test <cmd>` is `wt run` with `RAILS_ENV=test`, and it exists because that one variable decides which database a spec run destroys.
+
+`supercast/config/database.yml`'s `test:` entry carries both `url:` (reading `DATABASE_URL`) and an explicit `database: supercast-web_test`, and ActiveRecord merges the url *on top of* the yaml - so `DATABASE_URL` wins in every environment, not just development.
+That left two wrong answers and no right one.
+`wt run bundle exec rspec` handed the suite the worktree's **dev** database, so it loaded schema over the data that worktree's own dev server was serving.
+A bare `bundle exec rspec` set nothing at all and fell through to the single machine-wide `supercast-web_test` - which is where `PG::ObjectInUse`, `PendingMigrationError` re-appearing seconds after migrations applied cleanly, and truncation deadlocks in specs belonging to a completely different branch all came from.
+
+So each worktree now provisions a second database, and `wt test` is what points `DATABASE_URL` at it.
+Use `wt test` for anything running under `RAILS_ENV=test`, and plain `wt run` for everything else - `bin/rails console`, `runner`, `db:migrate` - which still wants the dev copy.
+
+Two things it does not fix.
+A bare `bundle exec rspec` that bypasses `wt` entirely still lands on the shared `supercast-web_test`; making *that* safe would need `database.yml` to name a variable only worktrees set.
+And the test **redis** index is still shared, because `config/initializers/redis.rb` hardcodes db 15 in test with no override - so Redis-backed specs can still race a concurrent run even though the databases no longer do.
 
 `wt new` layers three things on top of "prepare a worktree", and each can be dropped so the command can be driven by a script rather than by `prefix+t`:
 

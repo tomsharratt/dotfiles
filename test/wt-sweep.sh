@@ -43,7 +43,7 @@ EOF
 cat > "$STUBBIN/dropdb" <<EOF
 #!/bin/sh
 printf '%s\n' "\$1" >> "$DROP_LOG"
-exit 0
+exit "\${DROPDB_RC:-0}"
 EOF
 chmod +x "$STUBBIN/psql" "$STUBBIN/dropdb"
 export PATH="$STUBBIN:$PATH"
@@ -137,6 +137,124 @@ export WT_LIVE_SLUGS=$(printf '%s\n%s\n' "$LONG_SLUG" "$SHORT_SLUG")
 : > "$DROP_LOG"
 wt_sweep >/dev/null 2>&1
 eq "$(cat "$DROP_LOG")" "$orphan_db" "only the orphan is dropped"
+
+echo "== _wt_test_db names a DIFFERENT database, at every slug length ==" >&2
+# The bug this naming exists to prevent: _wt_db truncates to 63 bytes, so simply
+# SUFFIXING it is a no-op for any slug long enough to already be at the cap - the
+# "test" database would be the dev database, silently, for exactly the long slugs
+# that caused the truncation incident. Demonstrate that the naive form collides
+# and that the real one does not.
+naive=$(printf '%s' "$(_wt_db "$LONG_SLUG")_test"); naive=${naive:0:63}
+eq "$naive" "$(_wt_db "$LONG_SLUG")" \
+  "precondition: suffixing a capped name collides with it exactly - this is the trap"
+long_tdb=$(_wt_test_db "$LONG_SLUG")
+[ "$long_tdb" != "$(_wt_db "$LONG_SLUG")" ] && ok \
+  || bad "a long slug's test database must never be its dev database"
+eq "${#long_tdb}" 63 "and must still be capped at postgres's 63-byte limit"
+case "$long_tdb" in
+  supercast-web_development_test_*) ok ;;
+  *) bad "the test database must carry the test infix (got '$long_tdb')" ;;
+esac
+short_tdb=$(_wt_test_db "$SHORT_SLUG")
+eq "$short_tdb" "supercast-web_development_test_tom_login_code_submit_button" \
+  "a slug within the limit is untouched"
+[ "$short_tdb" != "$(_wt_db "$SHORT_SLUG")" ] && ok \
+  || bad "a short slug's test database must differ from its dev database too"
+WT_SLUG=$SHORT_SLUG
+eq "$(_wt_test_db)" "$short_tdb" "and it defaults to WT_SLUG like _wt_db does"
+
+echo "== wt_sweep never sweeps a LIVE worktree's TEST database ==" >&2
+# The sweep matches on the supercast-web_development_ prefix, which a test
+# database also carries - so unless the live list is built from BOTH names, every
+# live worktree's test database looks like an orphan and gets dropped mid-suite.
+orphan_tdb=$(_wt_test_db tom-long-gone-branch)
+cat > "$DB_LIST" <<EOF
+supercast-web_development
+$long_db
+$long_tdb
+$short_db
+$short_tdb
+$orphan_db
+$orphan_tdb
+EOF
+export WT_LIVE_SLUGS=$(printf '%s\n%s\n' "$LONG_SLUG" "$SHORT_SLUG")
+preview=$(WT_SWEEP_DRY=1 wt_sweep 2>/dev/null)
+for db in "$long_tdb" "$short_tdb"; do
+  case "$preview" in
+    *"$db"*) bad "a live worktree's test database must never be swept - this is the data loss ($db)" ;;
+    *) ok ;;
+  esac
+done
+eq "$(grep -c '^database ' <<<"$preview")" 2 \
+  "only the dead worktree's two databases are orphans"
+
+echo "== a real sweep reclaims a dead worktree's test database ==" >&2
+: > "$DROP_LOG"
+wt_sweep >/dev/null 2>&1
+eq "$(sort < "$DROP_LOG" | tr '\n' ' ')" "$(printf '%s\n%s\n' "$orphan_db" "$orphan_tdb" | sort | tr '\n' ' ')" \
+  "both of the orphan's databases are dropped, and nothing else is"
+
+echo "== wt_teardown reclaims BOTH of a worktree's databases ==" >&2
+# The leak this prevents: a test database dropped by nothing is a database per
+# worktree left behind for ever, and the sweep is the only other thing that would
+# ever find it. WT_SLUG names a worktree with no puma-dev entry and no Procfile, so
+# the two `rm -f` branches are skipped on their own -e guards, and WT_REDIS=0 keeps
+# the redis flush off db 0 - leaving the database drops as the only side effect.
+WT_SLUG=tom-teardown-case
+WT_REDIS=0
+td_db=$(_wt_db); td_tdb=$(_wt_test_db)
+printf '%s\n%s\n' "$td_db" "$td_tdb" > "$DB_LIST"
+: > "$DROP_LOG"
+wt_teardown >/dev/null 2>&1
+eq "$(sort < "$DROP_LOG" | tr '\n' ' ')" "$(printf '%s\n%s\n' "$td_db" "$td_tdb" | sort | tr '\n' ' ')" \
+  "both the dev and the test database are dropped"
+
+echo "== wt_teardown on a worktree that never had a test database is quiet ==" >&2
+# _wt_dropdb returns non-zero for a database that is not there, and every caller
+# is `_wt_dropdb x && msg ...`, so a worktree provisioned before test databases
+# existed must tear down reporting only the one it has.
+printf '%s\n' "$td_db" > "$DB_LIST"
+: > "$DROP_LOG"
+out=$(wt_teardown 2>&1)
+eq "$(cat "$DROP_LOG")" "$td_db" "only the database that exists is handed to dropdb"
+case "$out" in
+  *"dropped test database"*) bad "it must not claim to have dropped a test database that was never there" ;;
+  *) ok ;;
+esac
+
+echo "== wt_teardown's own exit status never invents a failure ==" >&2
+# The bug: its last statement used to be `[ -e "$pf" ] && rm -f "$pf"`, so a
+# worktree that never ran a dev server - every --no-dev worktree, which is every
+# pq task - made the function return non-zero after a completely clean teardown,
+# and `wt rm` printed "teardown reported errors" on top of it.
+printf '%s\n%s\n' "$td_db" "$td_tdb" > "$DB_LIST"
+: > "$DROP_LOG"
+wt_teardown >/dev/null 2>&1 && ok \
+  || bad "a clean teardown with no Procfile must not report failure"
+printf '%s\n' "$td_db" > "$DB_LIST"
+: > "$DROP_LOG"
+wt_teardown >/dev/null 2>&1 && ok \
+  || bad "nor must one whose test database was never created"
+
+echo "== but a drop that genuinely fails is said out loud ==" >&2
+# Silence here is what the old `_wt_dropdb x && msg ...` gave: a database still on
+# disk because its connections could not be terminated looked exactly like one
+# that had already gone.
+printf '%s\n%s\n' "$td_db" "$td_tdb" > "$DB_LIST"
+: > "$DROP_LOG"
+out=$(DROPDB_RC=1 wt_teardown 2>&1)
+case "$out" in
+  *"could not drop database $td_db"*) ok ;;
+  *) bad "a failed drop of the dev database must warn (got '$out')" ;;
+esac
+case "$out" in
+  *"could not drop test database $td_tdb"*) ok ;;
+  *) bad "a failed drop of the test database must warn too (got '$out')" ;;
+esac
+case "$out" in
+  *"dropped database"*) bad "and must not also claim success" ;;
+  *) ok ;;
+esac
 
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]
