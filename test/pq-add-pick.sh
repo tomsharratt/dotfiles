@@ -351,19 +351,22 @@ mk_task queue 030 task-e "$REPO2" tom/task-e >/dev/null
 err=$(run_pick_after "$REPO" <<<$'\n' 2>&1 >/dev/null)
 case "$err" in *PROJECT*) ok ;; *) bad "candidates spanning two repos should show a PROJECT column" ;; esac
 
-echo "== add_wizard: split=1 and after_explicit=1 together ask nothing at all ==" >&2
+echo "== add_wizard: every question already decided asks nothing at all ==" >&2
 reset_tasks
-run_wizard() {                          # split after_explicit -> "split=X after_vals=[Y]"
+# `model_explicit` defaults to 1 so the cases that are about the OTHER questions
+# stay about them - the model cases below pass 0 explicitly.
+run_wizard() {                          # split after_explicit [model_explicit] -> "split=X model=M after_vals=[Y]"
   local split=$1 split_dir="" after_vals="" after_explicit=$2 repo=$REPO
+  local model=$PQ_DEFAULT_MODEL model_explicit=${3:-1}
   add_wizard
-  printf 'split=%s after_vals=[%s]' "$split" "$after_vals"
+  printf 'split=%s model=%s after_vals=[%s]' "$split" "$model" "$after_vals"
 }
 out=$(run_wizard 1 1 </dev/null)
-eq "$out" "split=1 after_vals=[]" "both already decided: no prompt should even try to read stdin"
+eq "$out" "split=1 model=sonnet after_vals=[]" "all already decided: no prompt should even try to read stdin"
 
 echo "== add_wizard: answering y to the split question sets split=1 ==" >&2
 out=$(run_wizard 0 1 <<<$'y\n')
-eq "$out" "split=1 after_vals=[]" "y at the split prompt should set split=1; after_explicit=1 skips the blocker prompt"
+eq "$out" "split=1 model=sonnet after_vals=[]" "y at the split prompt should set split=1; after_explicit=1 skips the blocker prompt"
 
 echo "== add_wizard: split already 1 skips that question; the blocker prompt still runs ==" >&2
 mk_task queue 010 task-a "$REPO" tom/task-a >/dev/null
@@ -371,8 +374,49 @@ mk_task queue 010 task-a "$REPO" tom/task-a >/dev/null
 # captures stdout, but pick_after's prompt goes to stderr, so without this the
 # "block on which?" line leaks into the suite's own output.
 out=$(run_wizard 1 0 <<<$'1\n' 2>/dev/null)
-eq "$out" "split=1 after_vals=[task-a"$'\n'"]" \
+eq "$out" "split=1 model=sonnet after_vals=[task-a"$'\n'"]" \
   "split=1 skips its question outright; picking 1 at the blocker prompt selects task-a"
+
+echo "== add_wizard: the model question - Enter takes PQ_DEFAULT_MODEL ==" >&2
+reset_tasks
+out=$(run_wizard 1 1 0 <<<$'\n' 2>/dev/null)
+eq "$out" "split=1 model=sonnet after_vals=[]" "Enter should take the default, sonnet"
+
+echo "== add_wizard: each of the three names is taken ==" >&2
+for m in sonnet opus fable; do
+  out=$(run_wizard 1 1 0 <<<"$m" 2>/dev/null)
+  eq "$out" "split=1 model=$m after_vals=[]" "'$m' should be taken as the model"
+done
+
+echo "== add_wizard: an initial and any case are taken too ==" >&2
+out=$(run_wizard 1 1 0 <<<$'o\n' 2>/dev/null)
+eq "$out" "split=1 model=opus after_vals=[]" "a bare 'o' should mean opus"
+out=$(run_wizard 1 1 0 <<<$'Fable\n' 2>/dev/null)
+eq "$out" "split=1 model=fable after_vals=[]" "'Fable' should mean fable"
+
+echo "== add_wizard: an unknown answer re-prompts and recovers ==" >&2
+err=$(run_wizard 1 1 0 <<<$'haiku\nopus\n' 2>&1 >/dev/null)
+case "$err" in *"pick one of sonnet, opus or fable"*) ok ;; *) bad "an unknown model should say what is on offer (got: $err)" ;; esac
+out=$(run_wizard 1 1 0 <<<$'haiku\nopus\n' 2>/dev/null)
+eq "$out" "split=1 model=opus after_vals=[]" "the retry after an unknown answer should stick"
+
+echo "== add_wizard: EOF at the model question is Enter, not a hang ==" >&2
+out=$(run_wizard 1 1 0 </dev/null 2>/dev/null)
+eq "$out" "split=1 model=sonnet after_vals=[]" "EOF should take the default rather than spin"
+
+echo "== add_wizard: PQ_DEFAULT_MODEL is what Enter takes, not a hardcoded sonnet ==" >&2
+out=$(PQ_DEFAULT_MODEL=opus run_wizard 1 1 0 <<<$'\n' 2>/dev/null)
+eq "$out" "split=1 model=opus after_vals=[]" "an overridden default should be what Enter takes"
+
+echo "== add_wizard: --model given explicitly skips the question ==" >&2
+skip_wizard() {                         # model -> the model add_wizard leaves behind
+  local split=1 split_dir="" after_vals="" after_explicit=1 repo=$REPO
+  local model=$1 model_explicit=1
+  add_wizard
+  printf '%s' "$model"
+}
+out=$(skip_wizard haiku </dev/null 2>/dev/null)
+eq "$out" "haiku" "--model is not held to the three, and its value survives the wizard untouched"
 
 echo "== wiring: bare 'main add' with no tty queues latest_plan() ==" >&2
 reset_plans

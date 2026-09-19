@@ -171,9 +171,12 @@ The keys are offered only when there is more than one page, and paging past eith
 Row numbers are absolute: row 11 is the eleventh-newest plan whichever page you are looking at, so a number always means the same plan and any listed row can be picked from any page.
 Pick a number - Enter takes the top row of the page you are on, which is the most recent plan on page one - and it previews the plan before asking `use this plan? [y/N]`; answering `n` returns to the number prompt, on the page you were reading, rather than aborting the whole command.
 That `n` is "no", not "next page" - the two prompts read the key differently, and each one's hint says which is in force.
-Once you confirm, it asks the two things that actually shape how a task runs: whether to split it into a stack of small PRs, and which of the tasks already queued or running it should wait on.
+Once you confirm, it asks the three things that actually shape how a task runs: whether to split it into a stack of small PRs, which model should run it, and which of the tasks already queued or running it should wait on.
+The model question offers `sonnet`, `opus` and `fable`, and Enter takes `PQ_DEFAULT_MODEL` (`sonnet` unless you have overridden it); an initial and any case will do.
+Only what is typed at the prompt is held to those three - `--model` itself still takes any id `claude --model` accepts.
+`--effort` stays a flag, with no question of its own.
 
-Passing a flag the wizard would otherwise ask about skips just that one question - `pq add --split` picks a plan and skips straight past the split question (it still asks about blockers), `pq add --after some-task` picks a plan and skips straight past the blocker question (it still asks about splitting).
+Passing a flag the wizard would otherwise ask about skips just that one question and leaves the rest standing - `pq add --split` skips the split question, `pq add --model opus` skips the model question, `pq add --after some-task` skips the blocker question, and any combination of them skips exactly the questions it has already answered.
 
 `-y` and no tty (a script, a cron run, an agent) skip the picker altogether and take the newest plan without asking anything - exactly what `pq add` has always done.
 A plan path given explicitly skips the picker too, but uses exactly that plan rather than the newest one - also unchanged from before.

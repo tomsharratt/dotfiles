@@ -204,6 +204,11 @@ echo "== add_wizard: the design question, asked only when it should be ==" >&2
 run_wizard() {                          # split hinted explicit outline -> "split=X design=[Y]"
   local split=$1 split_dir="" after_vals="" after_explicit=1 repo=$REPO
   local design_hinted=$2 design_explicit=$3 design_vals="" outline=$4
+  # model_explicit=1 so the wizard's model question never fires here: every
+  # case below feeds it exactly the line the DESIGN question should read, and a
+  # question in front of it would eat that line. The model question's own cases
+  # live in test/pq-add-pick.sh.
+  local model=$PQ_DEFAULT_MODEL model_explicit=1
   add_wizard
   printf 'split=%s design=[%s]' "$split" "$design_vals"
 }
