@@ -229,7 +229,7 @@ PQ_AGENT_START_MS="${PQ_AGENT_START_MS:-60000}"
 # the reviewer is never launched and the implementer is sent straight to the
 # self-review fallback.
 PQ_REVIEWER_MODEL="${PQ_REVIEWER_MODEL:-opus}"
-PQ_REVIEW_EFFORT="${PQ_REVIEW_EFFORT:-high}"
+PQ_REVIEW_EFFORT="${PQ_REVIEW_EFFORT:-xhigh}"
 PQ_REVIEW_TIMEOUT="${PQ_REVIEW_TIMEOUT:-1500}"    # seconds a reviewer may run before it is killed
 [[ "$PQ_REVIEW_TIMEOUT" =~ ^[0-9]+$ ]] || PQ_REVIEW_TIMEOUT=1500
 PQ_REVIEW_MAX_TRIES="${PQ_REVIEW_MAX_TRIES:-2}"   # launches (a failed probe counts too) before falling back to self-review
@@ -4825,6 +4825,11 @@ review_alive() {                        # pid (a process group id)
 # last typed at an interactive prompt. Until that is understood, the level you
 # last typed yourself is the level pq's reviews run at, and the knob is honest
 # about what it asks for rather than what it gets. Passing it costs nothing.
+#
+# It asks for `xhigh`, which is what the implementer and the splitter already
+# run at (PQ_DEFAULT_EFFORT, PQ_SPLITTER_EFFORT). The reviewer reads a diff it
+# did not write, against a plan and a design it has to go and find, and is the
+# only pass before Tom - it is the last place to economise.
 #
 # `--allowedTools` is not optional - acceptEdits does not auto-approve Bash, and
 # `--comment` posts through `gh`.

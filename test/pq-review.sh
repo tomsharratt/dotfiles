@@ -100,7 +100,7 @@ PQ_REVIEW_TIMEOUT=1500
 PQ_REVIEW_MAX_TRIES=2
 PQ_REVIEW_RETRY=600
 PQ_REVIEW_SPLIT_LINES=150
-PQ_REVIEW_EFFORT=high
+PQ_REVIEW_EFFORT=high                   # deliberately not the default (xhigh), so the assertions below prove the knob is passed through
 
 # The clock is pinned, as in test/pq-slots.sh: the gate's timeout, retry and
 # grace comparisons all sit on boundaries, and `epoch` is what review_task reads.
