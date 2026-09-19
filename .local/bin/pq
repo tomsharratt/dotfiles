@@ -4819,12 +4819,24 @@ review_alive() {                        # pid (a process group id)
 # which came back with eleven inline comments.
 #
 # PQ_REVIEW_EFFORT is passed twice, as the session's `--effort` and as the
-# skill's own level argument, and neither is known to reach the skill: on both
-# real runs so far its transcript opened with "Reusing xhigh effort (the level
-# you typed last)", which is `codeReviewLastEffort` in ~/.claude.json - the level
-# last typed at an interactive prompt. Until that is understood, the level you
-# last typed yourself is the level pq's reviews run at, and the knob is honest
-# about what it asks for rather than what it gets. Passing it costs nothing.
+# skill's own level argument. ARGUMENT ORDER IS LOAD-BEARING for the second one:
+# the skill takes the level as the FIRST non-flag token and everything after it
+# as the target, so `/code-review <level> --comment <pr>` and never the other
+# way round. Its usage string says as much - `[low|medium|high|xhigh|max]
+# [--fix] [--comment] [<pr#>|<branch>|<path>]` - and the parser behind it takes
+# the first token, tries to read it as a level, and on failure treats the WHOLE
+# remainder as the target and silently falls back to `codeReviewLastEffort` in
+# ~/.claude.json, the level last typed at an interactive prompt.
+#
+# This used to send the pull request first, which lost both halves: the level
+# was ignored, and the target became the string "42 xhigh" rather than "42".
+# That is what "Reusing xhigh effort (the level you typed last)" at the top of
+# every early transcript was saying, and it read as harmless because the level
+# last typed on this machine happened to be xhigh too.
+#
+# `--comment`, `--fix`, `--post` and `--no-post` are stripped from anywhere in
+# the string before the level is read, so only the level and the target are
+# order-sensitive.
 #
 # It asks for `xhigh`, which is what the implementer and the splitter already
 # run at (PQ_DEFAULT_EFFORT, PQ_SPLITTER_EFFORT). The reviewer reads a diff it
@@ -4843,7 +4855,7 @@ review_cmd() {                          # pr task_home
   claude -p --model "$PQ_REVIEWER_MODEL" --effort "$PQ_REVIEW_EFFORT" \
     --permission-mode acceptEdits --allowedTools "$PQ_REVIEW_TOOLS" \
     --add-dir "$2" \
-    --output-format json "/code-review $1 $PQ_REVIEW_EFFORT --comment"
+    --output-format json "/code-review $PQ_REVIEW_EFFORT --comment $1"
 }
 
 # One `gh` call, right before launching: is this a STUCK pull request, and is it

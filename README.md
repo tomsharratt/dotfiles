@@ -402,8 +402,11 @@ Releasing the freeze there costs a single worktree if the wall was real - the ne
 
 Every pull request a task opens gets one independent review before the implementer may call it ready - run by `pq`, not asked of the agent.
 The agent cannot run `/code-review` itself: the skill is reserved for a human typing it, and every agent that was once asked to answered that it could not.
-But in `claude -p` the prompt *is* the human, so `pq` runs `claude -p "/code-review N <level> --comment"` itself, in the task's worktree, with the task's own directory opened to it so it can read the plan and the design files, and the skill posts its findings as inline review comments on the pull request.
-`PQ_REVIEWER_MODEL` (default `opus`) and `PQ_REVIEW_EFFORT` (default `xhigh`) are what it is asked for; note that on the first real runs the skill reported reusing "the level you typed last" at an interactive prompt (`codeReviewLastEffort` in `~/.claude.json`) rather than the level passed, so the level you last typed yourself is the one the reviews run at until that is understood.
+But in `claude -p` the prompt *is* the human, so `pq` runs `claude -p "/code-review <level> --comment N"` itself, in the task's worktree, with the task's own directory opened to it so it can read the plan and the design files, and the skill posts its findings as inline review comments on the pull request.
+`PQ_REVIEWER_MODEL` (default `opus`) and `PQ_REVIEW_EFFORT` (default `xhigh`) are what it runs at, the second passed both as the session's `--effort` and as the skill's own level argument.
+The order of that prompt is load-bearing, and was wrong for the gate's first few runs.
+The skill reads the first non-flag token as the level and everything after it as the target, so sending the pull request first (`/code-review N <level> --comment`) meant the level was ignored - silently falling back to `codeReviewLastEffort` in `~/.claude.json`, the level last typed at an interactive prompt, which is what "Reusing xhigh effort (the level you typed last)" at the top of those transcripts was reporting - and the target became the string `N <level>` rather than the pull request number.
+It read as harmless only because the level last typed on this machine happened to be `xhigh` as well.
 Then `pq` prompts the implementer, through herdr's agent API, to read every comment and resolve each - fix it and push, or reply on the thread with the reasoning for leaving it - and to mark the draft ready with `gh pr ready`.
 Nobody reviews the review.
 The point is that a second pair of eyes has been over the diff, and the first pair has had to answer them, before you read either.

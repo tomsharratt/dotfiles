@@ -263,7 +263,10 @@ has "$line" "	--permission-mode	acceptEdits	" "accepting edits"
 has "$line" "	--allowedTools	Bash(gh:*),Bash(git:*)	" "with gh and git allowed, or it cannot post"
 has "$line" "	--output-format	json	" "and JSON out"
 has "$line" "	--add-dir	$PQ_HOME/tasks/$(basename "$G")	" "with the task's own directory opened to it, through the stable path"
-has "$line" "	/code-review 42 high --comment	" "the skill, the PR, the level, and --comment as the prompt"
+# The level must come FIRST and the target last: the skill reads the first
+# non-flag token as the level and everything after it as the target, so the
+# other order loses both - see the comment above review_cmd.
+has "$line" "	/code-review high --comment 42	" "the skill, the level FIRST, --comment, then the PR as the target"
 PID=$(st "$G" PQ_REVIEW_PID)
 [ -n "$PID" ] && review_alive "$PID" && ok || bad "the process group is recorded and alive"
 [ -f "$G/review.rc" ] && bad "no exit code yet while it runs" || ok
