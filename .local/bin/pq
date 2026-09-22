@@ -238,10 +238,12 @@ PQ_REVIEW_RETRY="${PQ_REVIEW_RETRY:-600}"         # seconds between tries
 [[ "$PQ_REVIEW_RETRY" =~ ^[0-9]+$ ]] || PQ_REVIEW_RETRY=600
 PQ_REVIEW_SPLIT_LINES="${PQ_REVIEW_SPLIT_LINES:-150}"  # a single commit over this many changed lines is asked to be restructured
 [[ "$PQ_REVIEW_SPLIT_LINES" =~ ^[0-9]+$ ]] || PQ_REVIEW_SPLIT_LINES=150
-# `acceptEdits` does not auto-approve Bash, and `/code-review --comment` posts
-# through `gh` - so without this the reviewer runs to completion and posts
-# nothing, and the JSON's permission_denials is the only place that shows.
-PQ_REVIEW_TOOLS="${PQ_REVIEW_TOOLS:-Bash(gh:*),Bash(git:*)}"
+# `/code-review --comment` posts through `gh`, and a reviewer refused there runs
+# to completion and posts nothing, with the JSON's permission_denials the only
+# place that shows. Posting is its whole output, so it is allowed by rule rather
+# than left to auto mode's classifier - see review_cmd, which also says why `git`
+# is not.
+PQ_REVIEW_TOOLS="${PQ_REVIEW_TOOLS:-Bash(gh:*)}"
 # A pull request whose title says the agent stopped for a reason is not reviewed:
 # telling an agent that gave up to "resolve the findings and mark it ready" is
 # the wrong instruction. Brace-free, like the two patterns above, and matched
@@ -4871,8 +4873,56 @@ review_alive() {                        # pid (a process group id)
 # did not write, against a plan and a design it has to go and find, and is the
 # only pass before Tom - it is the last place to economise.
 #
-# `--allowedTools` is not optional - acceptEdits does not auto-approve Bash, and
-# `--comment` posts through `gh`.
+# The reviewer is read-only apart from what it posts, and that is enforced by
+# deny rules, not by the permission mode, because no mode means it. acceptEdits,
+# which this ran under first, is the one that PRE-APPROVES edits: measured in
+# `-p` with the old allowlist, it edited a file, created one and threw an edit
+# away with `git checkout --`, and was denied nothing. Deny rules win over allow
+# rules and over the classifier in every mode, so:
+#
+#   Edit(/$HOME/**)   no Edit, Write or NotebookEdit anywhere under the home
+#                     directory - the worktree, the task directory, every other
+#                     repo (`//` is how a rule spells an absolute path). The
+#                     payload the skill stages before posting goes to a new file
+#                     in a `mktemp -d` directory instead; review_brief says so,
+#                     or the reviewer would learn it by being refused, and
+#                     review_collect would warn about that on every review. A
+#                     directory, not `mktemp` itself: Write refuses to fill a
+#                     file that exists and has not been read, which is what
+#                     `mktemp` hands back
+#   gh pr ready|merge|close
+#                     the implementer marks the draft ready once it has answered
+#                     the review, and a reviewer doing it would end the gate with
+#                     nothing resolved. Best-effort, as prefix rules are: `gh api`
+#                     reaches the same endpoints
+#   git checkout|switch|restore|reset|stash|clean|commit|push
+#                     the worktree is the implementer's, uncommitted work and
+#                     all, and these are the verbs that discard it or write over
+#                     its branch. Best-effort the same way (`git -C . checkout`
+#                     slips past a prefix); what they miss is auto's to judge
+#
+# Everything else is `--permission-mode auto`, the mode the implementer already
+# runs in - it gets it from `defaultMode` in settings.json; this passes it
+# explicitly because the reviewer used to override it. A reviewer explores with
+# Bash, and under acceptEdits in `-p` there is nobody to approve a command off
+# the allowlist. The first review of a real feature was refused seven read-only
+# commands, and sent its two most serious findings out unverified because the
+# gem source that would have settled them was out of reach. A longer allowlist
+# does not fix that: replayed under acceptEdits with gh, git, wt, bundle, find,
+# tail, ls, grep, sed, head and cat all allowed, all seven were refused again -
+# for a `$(...)`, a `$PATH` expansion, an env-var prefix and paths outside the
+# working directories, none of which an allow rule reaches. Under auto all seven
+# ran. Not bypassPermissions: the reviewer runs unattended, with `gh` write
+# access, reading text another agent wrote, and auto still stops what it was
+# never asked to do.
+#
+# `--allowedTools` is `gh` alone (PQ_REVIEW_TOOLS): posting is the reviewer's
+# whole output, so a rule allows it rather than the classifier's judgement.
+# `git` used to be there too, and a blanket `git` rule is exactly what let
+# `git checkout --` through unjudged; under auto the reads need no rule.
+#
+# `--append-system-prompt` carries what the skill's prompt cannot - everything
+# after the level is the target - see review_brief.
 #
 # `--add-dir` opens the task's own directory (through its stable path) to the
 # reviewer: the plan, the contract, the design files and the evidence. The first
@@ -4881,9 +4931,24 @@ review_alive() {                        # pid (a process group id)
 # reviewer that can see what the change was built to is a better reviewer.
 review_cmd() {                          # pr task_home
   claude -p --model "$PQ_REVIEWER_MODEL" --effort "$PQ_REVIEW_EFFORT" \
-    --permission-mode acceptEdits --allowedTools "$PQ_REVIEW_TOOLS" \
+    --permission-mode auto --allowedTools "$PQ_REVIEW_TOOLS" \
+    --disallowedTools "Edit(/$HOME/**)" "Bash(gh pr ready:*)" "Bash(gh pr merge:*)" "Bash(gh pr close:*)" \
+      "Bash(git checkout:*)" "Bash(git switch:*)" "Bash(git restore:*)" "Bash(git reset:*)" \
+      "Bash(git stash:*)" "Bash(git clean:*)" "Bash(git commit:*)" "Bash(git push:*)" \
+    --append-system-prompt "$(review_brief "$1")" \
     --add-dir "$2" \
     --output-format json "/code-review $PQ_REVIEW_EFFORT --comment $1"
+}
+
+# What the reviewer is told beside the skill: what it may touch, where its
+# scratch goes, and how to run anything in the worktree. One line, and
+# quote-free by the same convention as dispatch_prompt. The `wt` clause is there
+# because the reviewer inherits `pq run`'s environment, not the worktree's: a
+# bare `bundle exec rspec` from it lands on the machine's shared test database,
+# which is where the cross-branch deadlocks in the README came from, while
+# `wt run` and `wt test` find this worktree's own from the directory they run in.
+review_brief() {                        # pr
+  printf '%s' "You are reviewing pull request #$1 from inside the worktree of the agent that wrote it, which is still working there. Your only output is the review you post on the pull request. Change nothing else: no file edits, no commits, no checkouts, no pushes, and do not mark the pull request ready, merge it or close it - its author does that once it has answered your review. Write the review payload, and any other scratch file, as a new file inside a directory made with \`mktemp -d\`, never inside the worktree. This worktree has its own databases, ports and environment: run project commands through \`wt run <cmd>\`, and anything that runs in the test environment, such as specs, through \`wt test <cmd>\` - only the specs a finding needs. A bare \`bundle exec\` or \`bin/rails\` uses the shared databases of the whole machine instead."
 }
 
 # One `gh` call, right before launching: is this a STUCK pull request, and is it

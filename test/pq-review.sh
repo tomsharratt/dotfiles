@@ -259,8 +259,17 @@ line=$(head -1 "$CLAUDE_LOG")
 eq "$(cut -f1 <<<"$line")" "$WT" "it runs in the task's worktree"
 has "$line" "	-p	" "in print mode"
 has "$line" "	--model	opus	" "with the reviewer model"
-has "$line" "	--permission-mode	acceptEdits	" "accepting edits"
-has "$line" "	--allowedTools	Bash(gh:*),Bash(git:*)	" "with gh and git allowed, or it cannot post"
+has "$line" "	--permission-mode	auto	" "in auto mode, like the implementer"
+has "$line" "	--allowedTools	Bash(gh:*)	" "with gh allowed, or it cannot post - and git left to the classifier"
+has "$line" "	--disallowedTools	Edit(/$HOME/**)	Bash(gh pr ready:*)	Bash(gh pr merge:*)	Bash(gh pr close:*)	" \
+  "read-only under home, and the draft left for its author to mark ready"
+has "$line" "	Bash(git checkout:*)	Bash(git switch:*)	Bash(git restore:*)	Bash(git reset:*)	Bash(git stash:*)	Bash(git clean:*)	Bash(git commit:*)	Bash(git push:*)	--append-system-prompt	" \
+  "and none of the git verbs that discard the implementer's work or write over its branch"
+has "$line" "	--append-system-prompt	You are reviewing pull request #42 " "briefed on this pull request"
+has "$line" "through \`wt test <cmd>\`" "and told to run specs through wt test, not on the shared database"
+# One line, or this stub's log - one call per line - would split it; quote-free
+# by the convention dispatch_prompt keeps.
+case "$(review_brief 42)" in *"'"*|*$'\n'*) bad "the brief must be one line and quote-free" ;; *) ok ;; esac
 has "$line" "	--output-format	json	" "and JSON out"
 has "$line" "	--add-dir	$PQ_HOME/tasks/$(basename "$G")	" "with the task's own directory opened to it, through the stable path"
 # The level must come FIRST and the target last: the skill reads the first
