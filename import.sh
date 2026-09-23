@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Pull configs from the current environment back into this repo.
-# Only syncs the dirs/files that are already tracked here — never expands
+# Only syncs the dirs/files that are already tracked here - never expands
 # the set of things this repo manages.
 
 set -euo pipefail
