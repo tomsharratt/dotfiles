@@ -237,6 +237,10 @@ eq "$(reset_hint "$(printf 'session 70%% (resets Sat 1:00am)')")" "1:00am" \
    "a weekday is dropped: parse_reset reads a bare clock time as the next time it comes round"
 eq "$(reset_hint "You've hit your session limit · resets 3pm (PDT)")" "3pm (PDT" \
    "a timezone suffix is left for parse_reset, which already trims it"
+eq "$(reset_hint "You've hit your session limit · resets Thu 12:10am (America/Toronto)")" "12:10am (America/Toronto" \
+   "a weekday is dropped with a timezone after it too - a reset past midnight names both"
+eq "$(reset_hint "session 70% (resets Sat 1:00am)")" "1:00am" "and without one, as before"
+eq "$(reset_hint 'resets Jul 28, 8pm (PDT)')" "Jul 28, 8pm (PDT" "while a month with a timezone still survives"
 eq "$(reset_hint 'nothing here')" "" "no hint at all is empty, and the caller polls"
 
 echo "== reset_hint must not mistake a MONTH for a weekday ==" >&2

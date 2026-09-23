@@ -2944,10 +2944,14 @@ reset_hint() {                          # pane text -> the time the wall names
     # The weekday strip is anchored to a whole bare clock time on purpose: a
     # leading three-letter word is a weekday in "Sat 1:00am" and a MONTH in
     # "Jul 28, 8pm", and dropping the month would move the reset by up to a year.
+    # A timezone may follow the clock time and is kept for parse_reset to trim:
+    # a wall whose reset falls after midnight reads "resets Thu 12:10am
+    # (America/Toronto)", and with the strip anchored to the clock time alone
+    # that line never parsed - pq fell back to whatever the statusline named.
     hint=$(sed -n 's/.*[Rr]esets \(.*\)$/\1/p' <<<"$cand" \
       | sed 's/[^0-9A-Za-z:,() ]*$//
              s/)$//
-             s/^[A-Za-z][a-z][a-z] \([0-9]\{1,2\}\(:[0-9][0-9]\)*[APap][Mm]\)$/\1/')
+             s/^[A-Za-z][a-z][a-z] \([0-9]\{1,2\}\(:[0-9][0-9]\)*[APap][Mm]\)\( (.*\)*$/\1\3/')
     [ -n "$hint" ] || continue
     parse_reset "$hint" >/dev/null 2>&1 || continue
     printf '%s' "$hint"; return 0
