@@ -53,12 +53,12 @@ reset_tasks() {
 PLAN="$PQ_HOME/.test-plan.md"
 printf '# Test plan\n\nDo the thing.\n' > "$PLAN"
 
-# --branch is mandatory here: the claude stub above fails closed, so
+# A branch is handed in here: the claude stub above fails closed, so
 # name_plan never derives one, and cmd_add would otherwise die before it ever
 # allocates a stamp.
 add_task() {                             # branch [extra cmd_add args...] -> slug
   local branch=$1; shift
-  cmd_add "$PLAN" --repo "$REPO" --branch "$branch" -y "$@" 2>/dev/null
+  cmd_add "$PLAN" "$branch" "" --repo "$REPO" "$@" 2>/dev/null
 }
 
 queue_slugs() {

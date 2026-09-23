@@ -137,7 +137,7 @@ Dispatch runs `wt new` in that repo, which picks up its profile, and everything 
 Branch *lookups* are keyed on the repo as well as the name, but a task's slug is a single global namespace, so two live tasks can never share a branch leaf even across two different projects - `tom/fix-timezone` cannot be queued in both at once.
 
 ```
-pq add                   pick a plan and add it to the queue (-y, or no tty: the newest)
+pq add                   pick a plan and add it to the queue
 pq add --urgent          allocate from a reserved range, ahead of every real date
 pq add --after T         repeatable, at add time: don't dispatch until T's PR has merged
 pq add --design PATH     repeatable: a design file the implementer builds to (auto-detected from the plan too)
@@ -178,7 +178,7 @@ Only what is typed at the prompt is held to those three - `--model` itself still
 
 Passing a flag the wizard would otherwise ask about skips just that one question and leaves the rest standing - `pq add --split` skips the split question, `pq add --model opus` skips the model question, `pq add --after some-task` skips the blocker question, and any combination of them skips exactly the questions it has already answered.
 
-`-y` and no tty (a script, a cron run, an agent) skip the picker altogether and take the newest plan without asking anything.
+There is no unattended add: with no terminal to ask at, `pq add` stops rather than guessing which plan you meant.
 
 #### Delivering a reviewable pull request
 
@@ -210,7 +210,7 @@ So the file travels with the task.
 The rule in `AGENTS.md` closes the loop from the planning side: a plan built from a Claude Design file saves that file to `~/.claude/plans/designs/` and cites the absolute path on its own line, so `pq add` finds it.
 
 The files are copied into `<task>/design/` inside the same staging step that writes `plan.md`, so a task lands with its design or not at all, and the `design:` header lists them - absent, like `base:`, when there are none.
-A plan that reads as built from a design (it cites `claude.ai/design` or a `.dc.html`) with no file found gets one question at the wizard - the path, or Enter to go without, loudly - and a warning under `-y`.
+A plan that reads as built from a design (it cites `claude.ai/design` or a `.dc.html`) with no file found gets one question at the wizard - the path, or Enter to go without, loudly.
 On a split, each part carries the design files it names by filename (the splitter is told to cite them), and a file no part names goes to every part with a warning rather than to none.
 The contract then tells the implementer exactly what to do with them.
 
@@ -247,8 +247,6 @@ That is also what makes a cross-repo blocker work for free, and lets a blocker n
 
 Merge state comes from the forge, never from git ancestry: a squash-merged branch's tip is not an ancestor of its default branch, so `git branch --merged` misses every real merge.
 `pq` asks `gh` instead, and only trusts a `MERGED` pull request whose base is genuinely the repo's default branch - merged into some other branch does not count.
-
-`pq add` prints the new task's slug on stdout - everything else it prints is for a human, on stderr.
 
 `pq after <task>` answers "why has this not started": per blocker, both the state of the task that owns the branch and the state of its pull request, since either one can be the reason and the fix differs.
 A blocker that has already merged is fine to add - `pq` says so rather than refusing.
@@ -321,14 +319,13 @@ The Haiku call that names every task also returns an outline: the pull requests 
 When the outline has more than one entry the wizard lists it and asks whether to queue one task per pull request, with Enter meaning yes; a plan with a one-entry outline is not asked at all.
 The outline is shown to you, not fed to the splitter, which reads the plan's pull requests off the plan itself and still shows its table for confirmation before anything is queued, so a split that comes out differently from the outline is visible before it costs anything.
 `--split` is still the way in when Haiku has missed a plan that lays out several.
-A non-interactive add (`-y` or no tty) never auto-splits, even a plan that asks for it; it prints the same outline as a warning and queues the plan as one task, saying how to redo it with `--split`.
 
 The load-bearing constraint is that parts wait for merges, never for branches - no part is ever built on top of a sibling's branch.
 Each part starts from the default branch with its declared dependencies already merged, and every part is written for an agent that sees only that one file: it never mentions another part, its filename, or its branch.
 `pq` validates this before anything is queued - full coverage of the original plan, no missing or forgotten parts, no cycles, and no part referencing a sibling by name - and refuses to queue anything if a check fails.
 
 The split artifacts land in `$PQ_HOME/splits/<plan>-<stamp>-<pid>/`: the source plan, one `NN-short-slug.md` per part, and `graph.tsv` recording which parts must merge before which others.
-Before queueing anything, `pq` shows a table of the parts, their wave (how many merges deep they are), their branch, and what each waits on, then asks to confirm - `-y` skips the prompt, but `--json` does not, so a caller after machine-readable output never gets tasks queued unlooked-at.
+Before queueing anything, `pq` shows a table of the parts, their wave (how many merges deep they are), their branch, and what each waits on, then asks to confirm.
 Declining leaves the split directory on disk and costs nothing: `pq add --split-dir <dir>` resumes from it later, without paying for the Opus session again, which is what makes hand-editing a part before it ships a first-class path.
 
 `--after` on the split itself only applies to the root parts - the ones with no dependency inside the split - since `pq after`'s own reporting already surfaces the rest of the chain to anyone asking why a downstream part hasn't started.
@@ -337,7 +334,7 @@ A plan that names more than one checkout - a mobile feature spanning the Rails m
 The splitter is shown every git checkout sitting alongside the primary, or under `PQ_REPOS_DIR` if you'd rather point it somewhere else, and told to use the primary unless the plan clearly places some of the work elsewhere - it never assigns a part to a repository the plan doesn't talk about.
 A part belongs to exactly one repository, because a part is one pull request; work that genuinely spans two repositories is two parts, wired with an ordinary `--after` the same way an intra-repo dependency is - a client part waiting on the server part it needs is just that edge crossing a repo boundary.
 `--repo PATH` is repeatable and is the escape hatch for the discovery, not the normal path: passing it once still lets the scan contribute, which is how you fix a wrong cwd without silently turning multi-repo splitting off, and only passing it two or more times narrows the set to exactly those repos.
-`-y` accepts the splitter's repo assignment sight unseen - the confirmation table, which grows a `REPO` column once a split actually spans more than one repository, always prints to stderr before that early return, so it is the audit trail even when nothing pauses to ask.
+The repo assignment is yours to check at the confirmation: the table grows a `REPO` column once a split actually spans more than one repository.
 
 Running `pq add --split` from `~/projects` itself - a directory that holds several checkouts but is not a checkout of anything - works the same way in reverse: instead of scanning the primary's siblings, `pq` discovers `~/projects`' own immediate children that are git repositories and offers those as the candidate set.
 There is no primary in that case, deliberately: nothing among a container's children is privileged as a default the splitter can fall back into, so every part's repository assignment becomes required rather than optional, and a part left unassigned fails validation instead of silently landing wherever the primary would have been.

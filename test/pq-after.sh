@@ -322,7 +322,7 @@ echo "== pq add: stdout is exactly the slug ==" >&2
 reset_tasks
 PLAN_FILE="$PQ_HOME/.test-plan.md"
 printf '# Test plan\n\nDo the thing.\n' > "$PLAN_FILE"
-add_out=$(cmd_add "$PLAN_FILE" --branch tom/add-stdout-test --repo "$REPO" 2>"$PQ_HOME/.add.stderr")
+add_out=$(cmd_add "$PLAN_FILE" tom/add-stdout-test "" --repo "$REPO" 2>"$PQ_HOME/.add.stderr")
 add_rc=$?
 [ "$add_rc" -eq 0 ] && ok || bad "pq add should succeed (rc=$add_rc): $(cat "$PQ_HOME/.add.stderr")"
 lines=$(printf '%s\n' "$add_out" | wc -l | tr -d ' ')
@@ -330,9 +330,9 @@ eq "$lines" "1" "pq add stdout should be exactly one line"
 eq "$add_out" "add-stdout-test" "pq add stdout should be the slug, nothing else"
 if find_task "$add_out" >/dev/null 2>&1; then ok; else bad "find_task should resolve the printed slug"; fi
 
-# Chaining: b=$(pq add planB.md --after "$a") - the whole point of the stdout
-# contract.
-b_out=$(cmd_add "$PLAN_FILE" --branch tom/add-chain-b --repo "$REPO" --after "$add_out" 2>"$PQ_HOME/.add.stderr")
+# Chaining through the printed slug, the way split_queue wires each part's
+# --after from the slugs of the parts queued before it.
+b_out=$(cmd_add "$PLAN_FILE" tom/add-chain-b "" --repo "$REPO" --after "$add_out" 2>"$PQ_HOME/.add.stderr")
 b_rc=$?
 [ "$b_rc" -eq 0 ] && ok || bad "chained pq add should succeed: $(cat "$PQ_HOME/.add.stderr")"
 b_dir=$(find_task "$b_out" 2>/dev/null)
@@ -340,11 +340,9 @@ if [ -n "$b_dir" ] && [ -f "$b_dir/after" ]; then ok; else bad "chained add shou
 verdict=$(after_state "$b_dir" 2>/dev/null); verdict=${verdict%%$'\t'*}
 case "$verdict" in waiting\ *) ok ;; *) bad "B should be waiting on A right after being chained (got '$verdict')" ;; esac
 
-echo "== --json smoke test ==" >&2
-add_json=$(cmd_add "$PLAN_FILE" --branch tom/add-json-test --repo "$REPO" --after "$add_out" \
-             --json 2>"$PQ_HOME/.add.stderr")
-if printf '%s' "$add_json" | jq -e '.after | length == 1 and .[0].label == "add-stdout-test"' >/dev/null 2>&1
-then ok; else bad "pq add --json should carry the resolved blocker (got '$add_json')"; fi
+echo "== an --after blocker is recorded, and pq ls --json sees the task blocked ==" >&2
+add_json=$(cmd_add "$PLAN_FILE" tom/add-json-test "" --repo "$REPO" --after "$add_out" 2>"$PQ_HOME/.add.stderr")
+eq "$(cut -f1 "$(find_task "$add_json")/after")" "add-stdout-test" "the blocker is recorded under its own label"
 
 ls_json=$(main ls --json 2>/dev/null)
 if printf '%s' "$ls_json" \
@@ -361,19 +359,25 @@ base_via_subshell=$(repo_base "$REPO")
 repo_base_reset
 [ ! -f "$PQ_HOME/.base.$$" ] && ok || bad "repo_base_reset should have removed the memo file, not left it forever"
 
-echo "== regression: cmd_add --after --json keeps the SAME cache for after_json ==" >&2
+echo "== cmd_add --after reports an already-merged blocker and leaves no PR cache behind ==" >&2
 # A real MERGED row, through the actual pr_load -> gh -> jq pipeline (via the
-# canned gh stub above) rather than a hand-primed cache - this is what the
-# fixed ordering bug looked like: the merge-check loop reported "already
-# merged" from a live cache, then --json's after_json read a cache already
-# deleted out from under it and called the same blocker "unknown".
-merged_out=$(cmd_add "$PLAN_FILE" --branch tom/already-merged --repo "$REPO" 2>"$PQ_HOME/.add.stderr")
+# canned gh stub above) rather than a hand-primed cache. cmd_add runs in a
+# command substitution here, as it does for every part split_queue queues, so
+# its $$ - and the cache it names after it - is this script's.
+merged_out=$(cmd_add "$PLAN_FILE" tom/already-merged "" --repo "$REPO" 2>"$PQ_HOME/.add.stderr")
 merged_rc=$?
 [ "$merged_rc" -eq 0 ] && ok || bad "adding the already-merged task should succeed: $(cat "$PQ_HOME/.add.stderr")"
-merged_json=$(cmd_add "$PLAN_FILE" --branch tom/depends-on-merged --repo "$REPO" \
-                --after "$merged_out" --json 2>"$PQ_HOME/.add.stderr")
-if printf '%s' "$merged_json" | jq -e '.after[0].state == "met"' >/dev/null 2>&1
-then ok; else bad "an already-merged blocker should read 'met' in the same pq add --json call (got '$merged_json')"; fi
+( cmd_add "$PLAN_FILE" tom/depends-on-merged "" --repo "$REPO" --after "$merged_out" ) \
+  >/dev/null 2>"$PQ_HOME/.add.stderr"
+case "$(cat "$PQ_HOME/.add.stderr")" in
+  *"after $merged_out: already in"*) ok ;;
+  *) bad "an already-merged blocker should be reported as nothing to wait for (got: $(cat "$PQ_HOME/.add.stderr"))" ;;
+esac
+if [ -e "$PQ_HOME/.pr.$$" ] || [ -e "$PQ_HOME/.pr.$$.ans" ]; then
+  bad "cmd_add --after should remove its PR cache once it is done with it"
+else
+  ok
+fi
 
 printf '\n%d passed, %d failed\n' "$pass" "$fail" >&2
 [ "$fail" -eq 0 ]

@@ -13,7 +13,7 @@
 # `pq`, and `pq` reaches it through one narrow seam (`wt new --no-agent --no-focus
 # --json`).
 #
-#   pq add               pick a plan and add it to the queue (-y, or no tty: the newest)
+#   pq add               pick a plan and add it to the queue
 #   pq add --base B      fork from B and open the PR against it, not the default branch
 #   pq add --urgent      allocate from a reserved range, ahead of every real date
 #   pq add --after T     repeatable: don't dispatch until T's PR has merged
@@ -691,7 +691,7 @@ dependents_of() {                       # repo branch
 }
 
 # ── add ─────────────────────────────────────────────────────────────────────
-# The newest plan Claude wrote, now or ever edited. Claude Code names these
+# The plans Claude wrote, newest first, for the picker. Claude Code names these
 # itself, from the prompt that started the session, so the filename is never
 # a task name - see name_plan.
 
@@ -708,15 +708,13 @@ recent_plans() {                        # -> epoch<TAB>path, newest first
     | sort -t$'\t' -k1,1nr -k2,2
 }
 
-latest_plan() { recent_plans | head -1 | cut -f2-; }
-
 # Ask a small model for a branch name and a one-line statement of intent, from the
 # plan itself. Both are things a human reads later - the branch on a pull request,
 # the intent at the top of its description - and neither can be derived from the
 # filename, which is auto-generated ("floofy-hugging-dragonfly.md").
 #
 # Prints "branch<TAB>intent", or nothing if the model could not be reached or gave
-# something unusable; the caller then insists on --branch rather than inventing one.
+# something unusable; the caller then stops rather than inventing one.
 #
 # The optional second argument is a comma-separated avoid list: branches already
 # spoken for by a sibling part in the same split, appended as one more sentence
@@ -767,7 +765,7 @@ This part lands in the $label repository, so make the branch name say which one 
   # and put back once. Every word the model chose is kept - any other slash
   # becomes a dash rather than cutting the name down, since on a multi-repo
   # split an ios/ or android/ may be the only thing telling two parts apart.
-  # A reply with no words at all stays empty, and the caller asks for --branch.
+  # A reply with no words at all stays empty, and the caller stops.
   jq -er '[(.branch // "" | sub("^tom/"; "") | gsub("/"; "-") | if . == "" then "" else "tom/" + . end), .intent] | @tsv' \
     2>/dev/null <<<"$json" || return 0
   # The outline. A tab or newline inside a title would break the line-oriented
@@ -875,9 +873,14 @@ pick_page() {                           # rows lo hi out_tsv
   return 0
 }
 
+# Whether there is someone at a terminal to ask. A function rather than a bare
+# `[ -t 0 ]` at the one place pq add asks it, so a test can stand in for the
+# terminal and drive the picker and the wizard with scripted answers.
+at_terminal() { [ -t 0 ]; }
+
 # Exit codes carry meaning, the way reap_task's already do: 0 chose one (its
 # path on stdout), 1 declined/`q`/EOF, 2 nothing in $PLANS_DIR to pick from -
-# the caller falls through to the existing "none found" error on that one.
+# the caller stops on that one, with nothing to add.
 # Everything a human reads goes to stderr: pick_plan is consumed by a command
 # substitution, and any leakage on stdout would silently corrupt $plan, the
 # `source:` header, and the staged plan.md.
@@ -1215,19 +1218,22 @@ add_wizard() {
   [ "$after_explicit" = 1 ] || pick_after
 }
 
-# The plan comes first and is never a flag: `pq add` itself always passes an
-# empty one, which means pick it (or take the newest - see the picker gate
-# below), and a plan is named only by pq's own callers - split_queue, one part
-# at a time. There is no `pq add plan.md`: the wizard is the way in, and a path
-# on the command line is refused as an unknown argument.
-cmd_add() {                             # plan ("" to pick) [flags...]
+# The plan and the name the task goes by come first, and are never flags.
+# `pq add` itself passes all three empty: the plan is picked at the wizard and
+# Haiku names it. Only pq's own caller fills them in - split_queue, one part at
+# a time, with a part it wrote and a name it already chose - and a branch given
+# means the intent was given too, so it is taken as it came, even empty. None
+# of it is on the command line: the wizard is the way in, and a plan path,
+# --branch or --intent typed there is refused.
+cmd_add() {                             # plan branch intent ("" "" "" to pick and name) [flags...]
+  [ $# -ge 3 ] || die "internal error: cmd_add takes a plan, a branch and an intent before its flags"
   # `model_explicit` is the *_explicit pattern again, and it is needed rather
   # than a `[ "$model" != "$PQ_DEFAULT_MODEL" ]` test: `--model sonnet` and no
   # flag at all leave `model` identical, and only one of the two should still
   # be asked about by add_wizard.
-  local plan=${1:-} branch="" model=$PQ_DEFAULT_MODEL model_explicit=0 effort=$PQ_DEFAULT_EFFORT
-  [ $# -gt 0 ] && shift
-  local urgent=0 repo="" repo_explicit=0 as_json=0
+  local plan=$1 branch=$2 intent=$3 model=$PQ_DEFAULT_MODEL model_explicit=0 effort=$PQ_DEFAULT_EFFORT
+  shift 3
+  local urgent=0 repo="" repo_explicit=0
   # `basebr` rather than `base`: the blocker-hint loop at the end of this
   # function already declares a `local base`, and `split_queue` reads THIS one
   # through bash's dynamic scope (as it already does for $urgent), so
@@ -1243,15 +1249,14 @@ cmd_add() {                             # plan ("" to pick) [flags...]
   # decide whether the scan still contributes (see the asymmetry documented
   # on do_split's own --repo handling).
   local repo_vals=""
-  # `intent` moves above the parse loop so `--intent` can set it before the
-  # naming step decides whether it still needs to ask Haiku. `split` and
-  # `split_dir` MUST stay local here too: `do_split` recurses back into this
-  # very function once per part, through bash's ordinary dynamic scope, and it
-  # is these two `local`s - shadowing whatever the recursive call passed - that
-  # stop that recursion rather than forking every part into its own split.
+  # `split` and `split_dir` MUST stay local here: `do_split` recurses back into
+  # this very function once per part, through bash's ordinary dynamic scope,
+  # and it is these two `local`s - shadowing whatever the recursive call
+  # passed - that stop that recursion rather than forking every part into its
+  # own split.
   # `interactive` is the same idea for add_wizard: it fires the wizard once,
   # never on the recursive calls do_split and split_queue make into cmd_add.
-  local intent="" intent_explicit=0 split=0 split_dir="" yes=0 interactive=0
+  local split=0 split_dir="" interactive=0
   # The design set: paths, newline-joined like every other repeatable option,
   # gathered from --design, from the plan's own text (design_mentions) and from
   # the wizard, then validated and copied in one place below. `design_explicit`
@@ -1264,7 +1269,6 @@ cmd_add() {                             # plan ("" to pick) [flags...]
   local outline=""
   while [ $# -gt 0 ]; do
     case "$1" in
-      --branch)    branch=${2:-}; shift 2 ;;
       --base)      basebr=${2:-}; basebr=${basebr#origin/}; shift 2 ;;
       --model)     model=${2:-}; model_explicit=1; shift 2 ;;
       --effort)    effort=${2:-}; shift 2 ;;
@@ -1272,27 +1276,22 @@ cmd_add() {                             # plan ("" to pick) [flags...]
       --repo)      repo_vals="${repo_vals}${2:-}"$'\n'; [ -n "$repo" ] || repo=${2:-}; repo_explicit=1; shift 2 ;;
       --after)     after_vals="${after_vals}${2:-}"$'\n'; after_explicit=1; shift 2 ;;
       --design)    design_vals="${design_vals}${2:-}"$'\n'; design_explicit=1; shift 2 ;;
-      --intent)    intent=${2:-}; intent_explicit=1; shift 2 ;;
       --split)     split=1; shift ;;
       --split-dir) split_dir=${2:-}; shift 2 ;;
-      -y|--yes)    yes=1; shift ;;
-      --json)      as_json=1; shift ;;
-      -h|--help)   die "usage: pq add [--branch B] [--base BRANCH] [--model M] [--effort E] [--urgent] [--repo PATH]... [--after task|branch]... [--design PATH]... [--intent TEXT] [--split | --split-dir DIR] [-y] [--json]" ;;
+      -h|--help)   die "usage: pq add [--base BRANCH] [--model M] [--effort E] [--urgent] [--repo PATH]... [--after task|branch]... [--design PATH]... [--split | --split-dir DIR]" ;;
       -*)          die "unknown option '$1'" ;;
-      *)           die "pq add takes no plan path - it asks which plan (or takes the newest with -y): '$1'" ;;
+      *)           die "pq add takes no plan path - it asks which plan: '$1'" ;;
     esac
   done
 
   # An explicit design path that does not exist is a typo worth catching before
-  # anything else is paid for - the same reasoning as the --branch checks below.
+  # anything else is paid for - the same reasoning as the branch checks below.
   local dv
   while IFS= read -r dv; do
     [ -n "$dv" ] || continue
     [ -f "$(design_expand "$dv")" ] || die "no such design file: $dv"
   done <<<"$design_vals"
 
-  [ -n "$branch" ] && { [ "$split" = 1 ] || [ -n "$split_dir" ]; } && \
-    die "--split queues N branches of its own - --branch has no meaning with it"
   [ "$split" = 1 ] && [ -n "$split_dir" ] && \
     die "--split and --split-dir are mutually exclusive - pick one"
 
@@ -1307,21 +1306,19 @@ cmd_add() {                             # plan ("" to pick) [flags...]
   if [ -n "$split_dir" ]; then
     [ -d "$split_dir" ] || die "no such split directory: $split_dir"
   else
-    # The interactive picker fires only when nothing else already answered
-    # "which plan": a plan handed in by the caller wins (every recursive
-    # cmd_add call split_queue makes, one per part, never reaches it), `-y`
-    # already means "don't ask me", and no tty is what keeps `a=$(pq add)`
-    # working in a script, a cron run, or an agent.
-    if [ -z "$plan" ] && [ "$yes" != 1 ] && [ -t 0 ]; then
+    # The plan is picked at the wizard, unless pq's own caller handed one in
+    # (every recursive cmd_add call split_queue makes, one per part). There
+    # is no unattended add: with no terminal to ask at, `pq add` stops.
+    if [ -z "$plan" ]; then
+      at_terminal || die "pq add asks which plan to add - run it at a terminal"
       local picked
       picked=$(pick_plan)
       case $? in
         0) plan=$picked; interactive=1 ;;
         1) die "no plan chosen" ;;
-      esac                              # 2: nothing to pick, fall through
+        *) die "no plans in $PLANS_DIR to add" ;;
+      esac
     fi
-    [ -n "$plan" ] || plan=$(latest_plan)
-    [ -n "$plan" ] || die "no plan given and none found in $PLANS_DIR"
     [ -f "$plan" ] || die "no such plan: $plan"
   fi
 
@@ -1404,19 +1401,11 @@ cmd_add() {                             # plan ("" to pick) [flags...]
   # Naming, before the wizard rather than after the split gate where it used to
   # sit, so Haiku's outline is in hand when the split question would be asked. One
   # call per add either way: the later call is gone, and the outline rides along
-  # in the same reply. Skipped where it always was - a part queued by do_split
-  # supplies both --branch and --intent, and paying Haiku again per part would
-  # double the naming cost for nothing; a resumed split names its parts later.
-  # With --branch given, the cheap checks still come first, so a duplicate add
-  # fails in milliseconds instead of after a round trip - but only when there is
-  # a repo to check against, which the split path may not have yet.
+  # in the same reply. Skipped for a part queued by split_queue, which arrives
+  # already named - paying Haiku again per part would double the naming cost
+  # for nothing - and for a resumed split, which names its parts later.
   local named=""
-  if [ -z "$split_dir" ] && { [ -z "$branch" ] || [ "$intent_explicit" != 1 ]; }; then
-    if [ -n "$branch" ] && [ -n "$repo" ]; then
-      local why0
-      git check-ref-format "refs/heads/$branch" || die "invalid branch name: '$branch'"
-      why0=$(branch_taken "$branch" "$repo") && die "branch '$branch' is already $why0"
-    fi
+  if [ -z "$split_dir" ] && [ -z "$branch" ]; then
     local named_all; named_all=$(name_plan "$plan")
     named=$(head -1 <<<"$named_all")
     outline=$(outline_of "$named_all")
@@ -1427,27 +1416,11 @@ cmd_add() {                             # plan ("" to pick) [flags...]
   # need it.
   [ "$interactive" = 1 ] && add_wizard
 
-  # What the wizard would have said, for an add that never reached it. Never an
-  # auto-split - nothing unattended should turn one task into six, even when the
-  # plan asks for six, since the splitter is an Opus session and its table is
-  # meant to be looked at - but a plan that lays out several pull requests is
-  # worth saying so in the log, and so is a design the plan leans on with no
-  # file to show for it.
-  if [ "$interactive" != 1 ]; then
-    local n_out=0
-    [ -n "$outline" ] && n_out=$(grep -c . <<<"$outline")
-    if [ "$n_out" -gt 1 ] && [ "$split" != 1 ] && [ -z "$split_dir" ]; then
-      warn "this plan lays out $n_out pull requests:"
-      local t i=0
-      while IFS= read -r t; do
-        [ -n "$t" ] || continue
-        i=$((i + 1)); printf '\033[38;2;246;193;119mpq:   %d. %s\033[0m\n' "$i" "$t" >&2
-      done <<<"$outline"
-      warn "queued as one task all the same - pq rm it and add it again with --split for one task per pull request"
-    fi
-    if [ "$design_hinted" = 1 ] && [ -z "$design_vals" ]; then
-      warn "the plan was built from a design, but no design file was found on disk or given - the implementer will build from prose; pass --design PATH"
-    fi
+  # What the wizard's design question would have caught, for an add that never
+  # reached it - a split part, or a resumed split: a design the plan leans on
+  # with no file to show for it.
+  if [ "$interactive" != 1 ] && [ "$design_hinted" = 1 ] && [ -z "$design_vals" ]; then
+    warn "the plan was built from a design, but no design file was found on disk or given - the implementer will build from prose; pass --design PATH"
   fi
 
   # The design set, resolved: every path exists, no two share a basename (they
@@ -1468,14 +1441,8 @@ cmd_add() {                             # plan ("" to pick) [flags...]
     design_hdr="${design_hdr:+$design_hdr, }$dbase"
   done <<<"$design_vals"
 
-  # The --branch/--split guard above ran before the wizard could have set
-  # split=1 by answering its own question - re-check the same rule now that
-  # the wizard has had its say, or "queue one task per pull request? y" would
-  # silently drop an explicit --branch instead of refusing it.
-  [ -n "$branch" ] && [ "$split" = 1 ] && \
-    die "--split queues N branches of its own - --branch has no meaning with it"
-
-  # Same reasoning, same fix: a repeatable --repo given alongside a plan the
+  # The --repo check above ran before the wizard could have set split=1 by
+  # answering its own question: a repeatable --repo given alongside a plan the
   # picker chose interactively must not be rejected just because the wizard
   # hadn't yet answered "queue one task per pull request?" when the first check
   # ran - $repo_n itself does not change, only $split does.
@@ -1502,26 +1469,18 @@ cmd_add() {                             # plan ("" to pick) [flags...]
   msg "plan:   $plan"
 
   # The name. Haiku was asked above, before the wizard, when it was going to be
-  # asked at all; here its answer is taken apart. With --branch given the name is
-  # known and only the intent is read - gated on `intent_explicit`, not merely on
-  # `intent` being non-empty, so a part whose own intent from the model came back
-  # genuinely empty must not read as "not given yet". The cheap checks run again
-  # here for the branch a repo could not be checked against earlier: they are
-  # idempotent, and a duplicate add still fails before anything is written.
+  # asked at all; here its answer is taken apart. A part arrives named, intent
+  # and all - an empty intent from its own naming call included - so only an
+  # unnamed task reads Haiku's reply. Either way the branch is checked before
+  # anything is written.
   local why
-  if [ -n "$branch" ]; then
-    git check-ref-format "refs/heads/$branch" || die "invalid branch name: '$branch'"
-    why=$(branch_taken "$branch" "$repo") && die "branch '$branch' is already $why"
-    [ "$intent_explicit" = 1 ] || { [ -n "$named" ] && intent=$(cut -f2 <<<"$named"); }
-  else
-    if [ -n "$named" ]; then
-      branch=$(cut -f1 <<<"$named")
-      [ "$intent_explicit" = 1 ] || intent=$(cut -f2 <<<"$named")
-    fi
-    [ -n "$branch" ] || die "could not derive a branch name from the plan - pass --branch"
-    git check-ref-format "refs/heads/$branch" || die "invalid branch name: '$branch'"
-    why=$(branch_taken "$branch" "$repo") && die "branch '$branch' is already $why"
+  if [ -z "$branch" ] && [ -n "$named" ]; then
+    branch=$(cut -f1 <<<"$named")
+    intent=$(cut -f2 <<<"$named")
   fi
+  [ -n "$branch" ] || die "could not name the plan - Haiku gave no usable branch; try pq add again"
+  git check-ref-format "refs/heads/$branch" || die "invalid branch name: '$branch'"
+  why=$(branch_taken "$branch" "$repo") && die "branch '$branch' is already $why"
 
   # Validated at ADD time, not at dispatch: a typo here would otherwise sit in the
   # queue until 3am and then either fork the wrong branch or refuse to start, and
@@ -1641,31 +1600,11 @@ cmd_add() {                             # plan ("" to pick) [flags...]
         msg "after $label ($abranch)"
       fi
     done <<<"$after_lines"
-    # NOT cleaned up here: --json below still needs this same PR_CACHE/PR_ANS
-    # for after_json to report each blocker's state, rather than reading an
-    # already-deleted cache and calling everything "unknown" right after this
-    # loop just said "already merged" from the live one.
   fi
 
-  # The slug on stdout is the handle a caller needs - `a=$(pq add -y)`, or
-  # split_queue reading the --json form of each part it queues - and pq's own
-  # convention is that stdout stays machine-readable while everything a human
-  # reads goes to stderr.
-  if [ "$as_json" = 1 ]; then
-    jq -nc --arg task "$slug" --arg state "$state" --arg branch "$branch" \
-      --arg repo "$repo" --arg base "$(task_base "$dir")" \
-      --arg model "$model" --arg effort "$effort" \
-      --arg intent "$intent" --arg dir "$dir" --argjson after "$(after_json "$dir")" \
-      --arg design "$design_hdr" \
-      --arg stamp "$stamp" --argjson urgent "$([ "$urgent" = 1 ] && printf true || printf false)" '
-      def str: if . == "" then null else . end;
-      { task: $task, stamp: ($stamp|tonumber), urgent: $urgent, state: $state, dir: $dir,
-        repo: $repo, branch: $branch, base: ($base|str), model: $model, effort: $effort,
-        intent: ($intent|str), after: $after,
-        design: (if $design == "" then [] else ($design | split(", ")) end) }'
-  else
-    printf '%s\n' "$slug"
-  fi
+  # The slug is the one thing on stdout - split_queue reads it back for every
+  # part it queues - and everything a human reads goes to stderr.
+  printf '%s\n' "$slug"
   rm -f "$PR_CACHE" "$PR_ANS"
   repo_base_reset
 }
@@ -1780,8 +1719,8 @@ repo_candidates_container() {           # dir -> label<TAB>path, sorted by label
 #
 # `do_split` reads `cmd_add`'s locals through bash's dynamic scope (`plan`,
 # `repo`, `repo_explicit`, `repo_vals`, `model`, `effort`, `urgent`, `after_vals`,
-# `as_json`, `yes`, `split_dir`) and is only ever called from there - hence no
-# arguments of its own.
+# `split_dir`) and is only ever called from there - hence no arguments of its
+# own.
 
 # The prompt the splitter session is given, passed as an argv element (unlike
 # `dispatch_prompt`, never typed into a pane's shell) so it has no quote
@@ -2140,8 +2079,7 @@ split_levels() {                        # sd -> prints level<TAB>part<TAB>repo(p
 # A collision - with git, with a live task, or with a sibling already named
 # in this pass - gets one retry with an avoid list; a second is a hard error
 # naming both parts, with nothing queued. A part that yields no name at all
-# is also a hard error: `cmd_add`'s "pass --branch" advice has no meaning
-# inside a split.
+# is also a hard error, the same as it is for a plain add.
 split_name_parts() {                    # sd leveled_tsv multi
   local sd=$1 leveled=$2 multi=$3
   local named_file="$sd/.named.tsv"
@@ -2177,17 +2115,15 @@ split_name_parts() {                    # sd leveled_tsv multi
   done <<<"$leveled"
 }
 
-# Shown before anything is queued, then "[y/N]" unless `-y`. Built as a TSV
+# Shown before anything is queued, then "[y/N]". Built as a TSV
 # and passed to the existing `render_table`, so columns pad to their widest
 # cell like `pq ls` and `wt ls` - every cell but REPO is ASCII by construction
 # (the filename charset check and `check-ref-format`), which `render_table`
 # requires, since macOS `awk`'s `length()` counts bytes - REPO alone goes
 # through `cell()`.
 #
-# All of it goes to stderr: `pq add --split`'s stdout contract is the slugs
-# (or, with --json, the JSON array), the same as an ordinary `pq add`'s
-# stdout is just the slug - a caller piping this for a slug list must never
-# see the table.
+# All of it goes to stderr: `pq add --split`'s stdout is the slugs it
+# queued, the same as an ordinary `pq add`'s stdout is just the slug.
 split_confirm() {                       # sd leveled_tsv named_file cost_str multi -> 0 confirmed, 1 declined
   local sd=$1 leveled=$2 named_file=$3 cost_str=${4:-} multi=${5:-0}
   local tbl="$PQ_HOME/.splitconfirm.$$"
@@ -2224,7 +2160,6 @@ split_confirm() {                       # sd leveled_tsv named_file cost_str mul
 
   [ "$nwaves" -gt 1 ] && msg "wave 2 runs in parallel once wave 1 has merged"
 
-  [ "$yes" = 1 ] && return 0
   printf 'pq: queue all %s? [y/N] ' "$nparts" >&2
   read -r ans || ans=n
   [[ "${ans:-}" =~ ^[Yy]$ ]]
@@ -2244,7 +2179,6 @@ split_confirm() {                       # sd leveled_tsv named_file cost_str mul
 split_queue() {                         # sd leveled_tsv named_file
   local sd=$1 leveled=$2 named_file=$3
   local slugmap="$PQ_HOME/.splitslugs.$$"; : > "$slugmap"
-  local objects="$PQ_HOME/.splitjson.$$"; : > "$objects"
   local urgentflag=""; [ "$urgent" = 1 ] && urgentflag=--urgent
   # A stack is the case `--base` exists for, so a `--base` that reached `--split`
   # and then applied to none of the parts it queued would be the one shape
@@ -2353,9 +2287,9 @@ $basebr
     # Each part's OWN repo, resolved by split_levels - never the shared
     # `$repo`, which is only ever the primary (or, in a no-primary container
     # split, not a repo at all).
-    out=$(cmd_add "$sd/$part" --repo "$repopath" --branch "$branch" --intent "$intent" \
+    out=$(cmd_add "$sd/$part" "$branch" "$intent" --repo "$repopath" \
             --model "$model" --effort "$effort" \
-            $urgentflag $baseflag $afterflags ${design_args[@]+"${design_args[@]}"} --json)
+            $urgentflag $baseflag $afterflags ${design_args[@]+"${design_args[@]}"})
     rc=$?
     if [ "$rc" != 0 ]; then
       [ "$n" -gt 1 ] && warn "already queued, untouched: $(cut -f2 "$slugmap" | tr '\n' ' ')"
@@ -2367,11 +2301,14 @@ $basebr
       die "$part failed to queue ($n of $total) - finish the rest with: $(split_resume_hint "$sd")  (check pq ls first - re-naming could duplicate what's already queued)"
     fi
 
-    task=$(jq -r '.task // empty' <<<"$out")
-    [ -n "$task" ] || die "internal error: $part queued but returned no task slug ($sd)"
+    # cmd_add's stdout is the slug and nothing else; anything more is a
+    # message that went to the wrong stream, and a slug read out of it would be
+    # wrong - `after` for every later part is wired from this map.
+    task=$out
+    { [ -n "$task" ] && [ "$(wc -l <<<"$task" | tr -d ' ')" = 1 ]; } \
+      || die "internal error: $part queued but did not return exactly one task slug ($sd): $out"
     printf '%s\t%s\n' "$part" "$task" >> "$slugmap"
-    printf '%s\n' "$out" >> "$objects"
-    [ "$as_json" = 1 ] || printf '%s\n' "$task"
+    printf '%s\n' "$task"
   done <<<"$leveled"
 
   # A --base that reached here and matched nothing is worth saying out loud
@@ -2379,8 +2316,7 @@ $basebr
   [ -n "${basebr:-}" ] && [ "$n_based" = 0 ] && \
     warn "--base $basebr applied to no part - none of them are in $repo"
 
-  [ "$as_json" = 1 ] && jq -s '.' "$objects"
-  rm -f "$slugmap" "$objects"
+  rm -f "$slugmap"
 }
 
 do_split() {
@@ -3771,9 +3707,9 @@ base_check() {                          # task_dir -> "basegone <branch>" | ""
   printf 'basegone %s' "$b"
 }
 
-# {label, repo, branch, state} for every blocker, for cmd_ls --json and
-# cmd_add --json - assumes PR_CACHE/PR_ANS already cover every blocker's
-# (repo, branch), same as after_state assumes.
+# {label, repo, branch, state} for every blocker, for cmd_ls --json - assumes
+# PR_CACHE/PR_ANS already cover every blocker's (repo, branch), same as
+# after_state assumes.
 after_json() {                          # task_dir
   local d=$1 label repo branch base st
   [ -f "$d/after" ] || { printf '[]'; return; }
@@ -6063,7 +5999,7 @@ cmd_run() {
 # non-zero, which would kill any test running under `set -e`.
 main() {
   case "${1:-}" in
-    add)        shift; cmd_add "" "$@" ;;
+    add)        shift; cmd_add "" "" "" "$@" ;;
     after)      shift; cmd_after "$@" ;;
     base)       shift; cmd_base "$@" ;;
     tick)       shift; cmd_tick "$@" ;;
@@ -6072,7 +6008,7 @@ main() {
     ls|list)    shift; cmd_ls "$@" ;;
     rm|remove)  shift; cmd_rm "$@" ;;
     evidence)   shift; cmd_evidence "$@" ;;
-    *) die "usage: pq {add [--base B] [--urgent] [--after task|branch]... [--design PATH]... [--split | --split-dir DIR] [-y] [--json] | after <task> [<task|branch>... | --clear] | base <task> [<branch> | --clear] | ls [--all] [--json] | tick [--cap N] [--dry-run] | run [--interval S] [--cap N] | cap [N] | rm <task> | evidence [task]}" ;;
+    *) die "usage: pq {add [--base B] [--urgent] [--after task|branch]... [--design PATH]... [--split | --split-dir DIR] | after <task> [<task|branch>... | --clear] | base <task> [<branch> | --clear] | ls [--all] [--json] | tick [--cap N] [--dry-run] | run [--interval S] [--cap N] | cap [N] | rm <task> | evidence [task]}" ;;
   esac
 }
 if [ "${BASH_SOURCE[0]}" = "$0" ]; then main "$@"; fi

@@ -173,6 +173,7 @@ bad() { fail=$((fail + 1)); printf 'FAIL: %s\n' "$1" >&2; }
 eq() {                                   # got want msg
   [ "$1" = "$2" ] && ok || bad "$3 (got '$1', want '$2')"
 }
+has() { case "$1" in *"$2"*) ok ;; *) bad "$3 (got '$1')" ;; esac; }
 
 cleanup() { rm -rf "$PQ_HOME" "$STUBBIN" "$PQ_REPOS_DIR" "${SIBLINGROOT:-}" "${REPO:-}" "${REPO2:-}" "${CONTAINERROOT:-}"; }
 trap cleanup EXIT
@@ -273,7 +274,7 @@ echo "== happy path: a four-part diamond, fresh --split ==" >&2
 reset_tasks
 PLAN="$PQ_HOME/.diamond-plan.md"
 printf 'FIXTURE: diamond\n\nA whole feature.\n' > "$PLAN"
-out=$(cmd_add "$PLAN" --repo "$REPO" --split -y 2>"$PQ_HOME/.err")
+out=$(cmd_add "$PLAN" "" "" --repo "$REPO" --split <<<y 2>"$PQ_HOME/.err")
 rc=$?
 err=$(cat "$PQ_HOME/.err")
 [ "$rc" -eq 0 ] && ok || bad "happy path should succeed (rc=$rc): $err"
@@ -321,7 +322,7 @@ case "$tick_out" in
   *) bad "tick --dry-run should skip admin, which waits on both parser and notify (got: $tick_out)" ;;
 esac
 
-echo "== --split --json emits one object per part with resolved blockers ==" >&2
+echo "== --split-dir prints one slug per part and wires each part's blockers from them ==" >&2
 reset_tasks
 SD=$(new_split_dir diamond-json)
 printf 'MARKER: schema\nAdd the columns.\n'          > "$SD/01-schema.md"
@@ -334,22 +335,23 @@ printf 'MARKER: admin\nAdd the admin UI.\n'           > "$SD/04-admin.md"
   printf '03-notify.md\t01-schema.md\n'
   printf '04-admin.md\t02-parser.md,03-notify.md\n'
 } > "$SD/graph.tsv"
-json_out=$(main add --split-dir "$SD" --repo "$REPO" -y --json 2>"$PQ_HOME/.err")
+slugs_out=$(main add --split-dir "$SD" --repo "$REPO" <<<y 2>"$PQ_HOME/.err")
 rc=$?
-[ "$rc" -eq 0 ] && ok || bad "--split-dir --json should succeed: $(cat "$PQ_HOME/.err")"
-if printf '%s' "$json_out" | jq -e 'length == 4' >/dev/null 2>&1; then ok
-else bad "should emit exactly 4 objects (got '$json_out')"; fi
-if printf '%s' "$json_out" | jq -e '.[1].after | length == 1' >/dev/null 2>&1; then ok
-else bad "part 2's object should carry its one resolved blocker"; fi
-if printf '%s' "$json_out" | jq -e '.[3].after | length == 2' >/dev/null 2>&1; then ok
-else bad "part 4's object should carry its two resolved blockers"; fi
+[ "$rc" -eq 0 ] && ok || bad "--split-dir should succeed: $(cat "$PQ_HOME/.err")"
+eq "$(grep -c . <<<"$slugs_out")" "4" "stdout is exactly the four slugs"
+while IFS= read -r s1; do
+  find_task "$s1" >/dev/null 2>&1 && ok || bad "each printed slug should be a queued task (got '$s1')"
+done <<<"$slugs_out"
+eq "$(grep -c . "$(find_task "$(sed -n 2p <<<"$slugs_out")")/after")" "1" "part 2 waits on its one blocker"
+eq "$(cut -f1 "$(find_task "$(sed -n 4p <<<"$slugs_out")")/after" | sort | tr '\n' ' ')" \
+  "$(sed -n '2,3p' <<<"$slugs_out" | sort | tr '\n' ' ')" "part 4 waits on parts 2 and 3, by the slugs printed for them"
 
 echo "== declining queues nothing; --split-dir then resumes without a second opus call ==" >&2
 reset_tasks
 : > "$SPLIT_COUNTER"
 PLAN="$PQ_HOME/.solo-plan.md"
 printf 'FIXTURE: solo\n\nOne small thing.\n' > "$PLAN"
-declined_out=$(cmd_add "$PLAN" --repo "$REPO" --split < /dev/null 2>"$PQ_HOME/.err")
+declined_out=$(cmd_add "$PLAN" "" "" --repo "$REPO" --split < /dev/null 2>"$PQ_HOME/.err")
 rc=$?
 [ "$rc" -eq 0 ] && ok || bad "declining should still exit 0: $(cat "$PQ_HOME/.err")"
 eq "$declined_out" "" "declining should print nothing to stdout"
@@ -363,7 +365,7 @@ case "$(cat "$PQ_HOME/.err")" in
 esac
 
 SD=$(ls -d "$PQ_HOME/splits"/*solo*/ | head -1); SD=${SD%/}
-resumed_out=$(main add --split-dir "$SD" --repo "$REPO" -y 2>"$PQ_HOME/.err")
+resumed_out=$(main add --split-dir "$SD" --repo "$REPO" <<<y 2>"$PQ_HOME/.err")
 rc=$?
 [ "$rc" -eq 0 ] && ok || bad "resuming via --split-dir should succeed: $(cat "$PQ_HOME/.err")"
 eq "$resumed_out" "do-solo-thing" "resuming should queue the one part"
@@ -378,7 +380,7 @@ reset_tasks
 : > "$SPLIT_COUNTER"
 PLAN2="$PQ_HOME/.solo-plan2.md"
 printf 'FIXTURE: solo\n\nOne small thing.\n' > "$PLAN2"
-cmd_add "$PLAN2" --repo "$REPO" --split --urgent < /dev/null 2>"$PQ_HOME/.err" >/dev/null
+cmd_add "$PLAN2" "" "" --repo "$REPO" --split --urgent < /dev/null 2>"$PQ_HOME/.err" >/dev/null
 case "$(cat "$PQ_HOME/.err")" in
   *"--urgent"*) ok ;;
   *) bad "an explicitly-given --urgent should survive into the resume hint (got: $(cat "$PQ_HOME/.err"))" ;;
@@ -389,7 +391,7 @@ reset_tasks
 SD=$(new_split_dir no-newline)
 printf 'MARKER: solo\nDo the one thing.\n' > "$SD/01-solo.md"
 printf '%s' "01-solo.md" > "$SD/graph.tsv"        # no tab, no newline at all
-out=$(main add --split-dir "$SD" --repo "$REPO" -y 2>"$PQ_HOME/.err")
+out=$(main add --split-dir "$SD" --repo "$REPO" <<<y 2>"$PQ_HOME/.err")
 rc=$?
 [ "$rc" -eq 0 ] && ok || bad "a tab-less, newline-less graph.tsv should still queue: $(cat "$PQ_HOME/.err")"
 eq "$out" "do-solo-thing" "it should still queue the one part"
@@ -402,7 +404,7 @@ SD=$(new_split_dir space-after-comma)
 printf 'MARKER: schema\nAdd columns.\n' > "$SD/01-schema.md"
 printf 'MARKER: parser\nParse.\n' > "$SD/02-parser.md"
 printf '01-schema.md\t\n02-parser.md\t 01-schema.md\n' > "$SD/graph.tsv"     # note the space before 01-schema.md
-out=$(main add --split-dir "$SD" --repo "$REPO" -y 2>"$PQ_HOME/.err")
+out=$(main add --split-dir "$SD" --repo "$REPO" <<<y 2>"$PQ_HOME/.err")
 rc=$?
 [ "$rc" -eq 0 ] && ok || bad "a space after the comma must not fail the split: $(cat "$PQ_HOME/.err")"
 eq "$(queue_count)" "2" "both parts should have queued despite the stray space"
@@ -414,40 +416,44 @@ reset_tasks
 SD=$(new_split_dir split-and-split-dir)
 printf 'MARKER: solo\nDo the one thing.\n' > "$SD/01-solo.md"
 printf '01-solo.md\t\n' > "$SD/graph.tsv"
-if ( main add --split-dir "$SD" --repo "$REPO" --split -y ) >/dev/null 2>&1; then
+if ( main add --split-dir "$SD" --repo "$REPO" --split <<<y ) >/dev/null 2>&1; then
   bad "--split and --split-dir together should be rejected"
 else
   ok
 fi
 eq "$(queue_count)" "0" "--split + --split-dir: nothing queued"
 
-echo "== --json alone still prompts; -y is the only thing that skips it ==" >&2
+echo "== the confirm always asks: y queues, no answer declines ==" >&2
 reset_tasks
-SD=$(new_split_dir json-prompts-yes)
+SD=$(new_split_dir prompts-yes)
 printf 'MARKER: solo\nDo the one thing.\n' > "$SD/01-solo.md"
 printf '01-solo.md\t\n' > "$SD/graph.tsv"
-accepted=$(main add --split-dir "$SD" --repo "$REPO" --json <<<"y" 2>"$PQ_HOME/.err")
-[ -n "$accepted" ] && printf '%s' "$accepted" | jq -e 'length == 1' >/dev/null 2>&1 && ok \
-  || bad "--json with 'y' piped in should still queue (got '$accepted')"
+accepted=$(main add --split-dir "$SD" --repo "$REPO" <<<"y" 2>"$PQ_HOME/.err")
+eq "$(grep -c . <<<"$accepted")" "1" "'y' queues the one part"
+has "$(cat "$PQ_HOME/.err")" "queue all 1? [y/N]" "after asking"
 
 reset_tasks
-SD=$(new_split_dir json-prompts-no)
+SD=$(new_split_dir prompts-no)
 printf 'MARKER: solo\nDo the one thing.\n' > "$SD/01-solo.md"
 printf '01-solo.md\t\n' > "$SD/graph.tsv"
-declined=$(main add --split-dir "$SD" --repo "$REPO" --json < /dev/null 2>"$PQ_HOME/.err")
-eq "$declined" "" "--json with nothing piped in should decline, not silently queue"
-eq "$(queue_count)" "0" "a declined --json split queues nothing"
+declined=$(main add --split-dir "$SD" --repo "$REPO" < /dev/null 2>"$PQ_HOME/.err")
+eq "$declined" "" "nothing piped in declines, and prints no slug"
+eq "$(queue_count)" "0" "a declined split queues nothing"
 
-echo "== --split with --branch is rejected ==" >&2
+echo "== pq add refuses -y, --json, --branch and --intent - none of them are its flags ==" >&2
 reset_tasks
 before_splits=$(ls -d "$PQ_HOME/splits"/*/ 2>/dev/null | wc -l | tr -d ' ')
-if ( cmd_add "$PLAN" --repo "$REPO" --split --branch tom/whatever -y ) >/dev/null 2>"$PQ_HOME/.err"; then
-  bad "--split with --branch should be rejected"
-else
-  ok
-fi
+for gone in "-y" "--json" "--branch tom/whatever" "--intent something"; do
+  # shellcheck disable=SC2086  # $gone is a flag and, for two of them, its value
+  if ( main add --repo "$REPO" --split $gone </dev/null ) >/dev/null 2>"$PQ_HOME/.err"; then
+    bad "pq add $gone should be refused"
+  else
+    has "$(cat "$PQ_HOME/.err")" "unknown option '${gone%% *}'" "pq add $gone is an unknown option"
+  fi
+done
 after_splits=$(ls -d "$PQ_HOME/splits"/*/ 2>/dev/null | wc -l | tr -d ' ')
-eq "$after_splits" "$before_splits" "a rejected --split --branch should not create a split directory"
+eq "$after_splits" "$before_splits" "a refused flag creates no split directory"
+eq "$(queue_count)" "0" "and queues nothing"
 
 echo "== sibling branch collision: retry with the avoid-list resolves it ==" >&2
 reset_tasks
@@ -455,7 +461,7 @@ SD=$(new_split_dir collide-resolves)
 printf 'MARKER: collide-a\nDo A.\n' > "$SD/01-alpha.md"
 printf 'MARKER: collide-b\nDo B.\n' > "$SD/02-beta.md"
 { printf '01-alpha.md\t\n02-beta.md\t\n'; } > "$SD/graph.tsv"
-out=$(main add --split-dir "$SD" --repo "$REPO" -y 2>"$PQ_HOME/.err")
+out=$(main add --split-dir "$SD" --repo "$REPO" <<<y 2>"$PQ_HOME/.err")
 rc=$?
 [ "$rc" -eq 0 ] && ok || bad "a resolvable collision should still succeed: $(cat "$PQ_HOME/.err")"
 eq "$(queue_count)" "2" "both parts should have queued after the retry"
@@ -467,7 +473,7 @@ SD=$(new_split_dir collide-forever)
 printf 'MARKER: forever-a\nDo A.\n' > "$SD/01-x.md"
 printf 'MARKER: forever-b\nDo B.\n' > "$SD/02-y.md"
 { printf '01-x.md\t\n02-y.md\t\n'; } > "$SD/graph.tsv"
-if ( main add --split-dir "$SD" --repo "$REPO" -y ) >/dev/null 2>"$PQ_HOME/.err"; then
+if ( main add --split-dir "$SD" --repo "$REPO" <<<y ) >/dev/null 2>"$PQ_HOME/.err"; then
   bad "an unresolvable collision should fail the whole split"
 else
   ok
@@ -480,7 +486,7 @@ reset_tasks
 SD=$(new_split_dir val-unknown-dep)
 printf 'MARKER: alpha\nA.\n' > "$SD/01-a.md"
 printf '01-a.md\t99-nonexistent.md\n' > "$SD/graph.tsv"
-( main add --split-dir "$SD" --repo "$REPO" -y ) >/dev/null 2>&1 && bad "an unknown dependency should be rejected" || ok
+( main add --split-dir "$SD" --repo "$REPO" <<<y ) >/dev/null 2>&1 && bad "an unknown dependency should be rejected" || ok
 eq "$(queue_count)" "0" "unknown dependency: nothing queued"
 
 reset_tasks
@@ -488,21 +494,21 @@ SD=$(new_split_dir val-forgotten-file)
 printf 'MARKER: alpha\nA.\n' > "$SD/01-a.md"
 printf 'MARKER: bravo\nB.\n' > "$SD/02-b.md"
 printf '01-a.md\t\n' > "$SD/graph.tsv"          # 02-b.md exists but is never listed
-( main add --split-dir "$SD" --repo "$REPO" -y ) >/dev/null 2>&1 && bad "a *.md missing from graph.tsv should be rejected" || ok
+( main add --split-dir "$SD" --repo "$REPO" <<<y ) >/dev/null 2>&1 && bad "a *.md missing from graph.tsv should be rejected" || ok
 eq "$(queue_count)" "0" "forgotten file: nothing queued"
 
 reset_tasks
 SD=$(new_split_dir val-bad-filename)
 printf 'MARKER: alpha\nA.\n' > "$SD/weird_name.md"
 printf 'weird_name.md\t\n' > "$SD/graph.tsv"
-( main add --split-dir "$SD" --repo "$REPO" -y ) >/dev/null 2>&1 && bad "a badly-formed part filename should be rejected" || ok
+( main add --split-dir "$SD" --repo "$REPO" <<<y ) >/dev/null 2>&1 && bad "a badly-formed part filename should be rejected" || ok
 eq "$(queue_count)" "0" "bad filename: nothing queued"
 
 reset_tasks
 SD=$(new_split_dir val-duplicate-part)
 printf 'MARKER: alpha\nA.\n' > "$SD/01-a.md"
 printf '01-a.md\t\n01-a.md\t\n' > "$SD/graph.tsv"           # listed twice, exists once
-dup_err=$( ( main add --split-dir "$SD" --repo "$REPO" -y ) 2>&1 >/dev/null )
+dup_err=$( ( main add --split-dir "$SD" --repo "$REPO" <<<y ) 2>&1 >/dev/null )
 case "$dup_err" in
   *"more than once"*) ok ;;
   *) bad "a duplicated graph.tsv line should be diagnosed as a duplicate, not a missing file (got '$dup_err')" ;;
@@ -514,7 +520,7 @@ SD=$(new_split_dir val-cycle)
 printf 'MARKER: alpha\nA.\n' > "$SD/01-a.md"
 printf 'MARKER: bravo\nB.\n' > "$SD/02-b.md"
 { printf '01-a.md\t02-b.md\n02-b.md\t01-a.md\n'; } > "$SD/graph.tsv"
-( main add --split-dir "$SD" --repo "$REPO" -y ) >/dev/null 2>&1 && bad "a cycle should be rejected" || ok
+( main add --split-dir "$SD" --repo "$REPO" <<<y ) >/dev/null 2>&1 && bad "a cycle should be rejected" || ok
 eq "$(queue_count)" "0" "cycle: nothing queued"
 
 reset_tasks
@@ -522,26 +528,26 @@ SD=$(new_split_dir val-sibling-ref)
 printf 'MARKER: alpha\nThis references 02-b.md somewhere in its text.\n' > "$SD/01-a.md"
 printf 'MARKER: bravo\nNothing special.\n' > "$SD/02-b.md"
 printf '01-a.md\t\n02-b.md\t\n' > "$SD/graph.tsv"
-( main add --split-dir "$SD" --repo "$REPO" -y ) >/dev/null 2>&1 && bad "a part naming a sibling should be rejected" || ok
+( main add --split-dir "$SD" --repo "$REPO" <<<y ) >/dev/null 2>&1 && bad "a part naming a sibling should be rejected" || ok
 eq "$(queue_count)" "0" "sibling reference: nothing queued"
 
 reset_tasks
 SD=$(new_split_dir val-dash-fence)
 printf -- '---\nMARKER: alpha\nA.\n' > "$SD/01-a.md"
 printf '01-a.md\t\n' > "$SD/graph.tsv"
-( main add --split-dir "$SD" --repo "$REPO" -y ) >/dev/null 2>&1 && bad "a part starting with '---' should be rejected" || ok
+( main add --split-dir "$SD" --repo "$REPO" <<<y ) >/dev/null 2>&1 && bad "a part starting with '---' should be rejected" || ok
 eq "$(queue_count)" "0" "dash fence: nothing queued"
 
 reset_tasks
 SD=$(new_split_dir val-zero-parts)
 : > "$SD/graph.tsv"
-( main add --split-dir "$SD" --repo "$REPO" -y ) >/dev/null 2>&1 && bad "zero parts should be rejected" || ok
+( main add --split-dir "$SD" --repo "$REPO" <<<y ) >/dev/null 2>&1 && bad "zero parts should be rejected" || ok
 eq "$(queue_count)" "0" "zero parts: nothing queued"
 
 reset_tasks
 SD=$(new_split_dir val-thirteen-parts)
 for i in 01 02 03 04 05 06 07 08 09 10 11 12 13; do printf '%s-p.md\t\n' "$i"; done > "$SD/graph.tsv"
-( main add --split-dir "$SD" --repo "$REPO" -y ) >/dev/null 2>&1 && bad "thirteen parts should be rejected" || ok
+( main add --split-dir "$SD" --repo "$REPO" <<<y ) >/dev/null 2>&1 && bad "thirteen parts should be rejected" || ok
 eq "$(queue_count)" "0" "thirteen parts: nothing queued"
 
 reset_tasks
@@ -560,7 +566,7 @@ eq "$(queue_count)" "0" "repo mismatch: nothing queued"
 # Passing --repo explicitly is how you say "yes, I mean it" - same mismatch,
 # but now allowed.
 reset_tasks
-if ( cd "$REPO2" && main add --split-dir "$SD" --repo "$REPO2" -y ) >/dev/null 2>&1; then ok
+if ( cd "$REPO2" && main add --split-dir "$SD" --repo "$REPO2" <<<y ) >/dev/null 2>&1; then ok
 else bad "an EXPLICIT --repo should override the mismatch guard"; fi
 
 # ── multi-repo splits ────────────────────────────────────────────────────────
@@ -571,7 +577,7 @@ SD=$(new_split_dir_repos multirepo-basic repo2)
 printf 'MARKER: mr-server\nDo the server part.\n' > "$SD/01-server.md"
 printf 'MARKER: mr-client\nDo the client part.\n' > "$SD/02-client.md"
 printf '01-server.md\t\n02-client.md\t01-server.md\trepo2\n' > "$SD/graph.tsv"
-out=$(main add --split-dir "$SD" --repo "$REPO" -y 2>"$PQ_HOME/.err")
+out=$(main add --split-dir "$SD" --repo "$REPO" <<<y 2>"$PQ_HOME/.err")
 rc=$?
 [ "$rc" -eq 0 ] && ok || bad "a 3-column multi-repo split should succeed: $(cat "$PQ_HOME/.err")"
 t_server=$(find_task mr-server-thing); t_client=$(find_task mr-client-thing)
@@ -585,7 +591,7 @@ reset_tasks
 SD=$(new_split_dir_repos multirepo-badlabel repo2)
 printf 'MARKER: mr-server\nA.\n' > "$SD/01-a.md"
 printf '01-a.md\t\tnonexistent-label\n' > "$SD/graph.tsv"
-( main add --split-dir "$SD" --repo "$REPO" -y ) >/dev/null 2>&1 && bad "an unknown repo label should be rejected" || ok
+( main add --split-dir "$SD" --repo "$REPO" <<<y ) >/dev/null 2>&1 && bad "an unknown repo label should be rejected" || ok
 eq "$(queue_count)" "0" "unknown repo label: nothing queued"
 
 echo "== multi-repo: a plain 2-column graph.tsv still lands everything in the primary ==" >&2
@@ -593,7 +599,7 @@ reset_tasks
 SD=$(new_split_dir_repos multirepo-2col repo2)
 printf 'MARKER: mr-solo2col\nOne repo, one part.\n' > "$SD/01-solo2col.md"
 printf '01-solo2col.md\t\n' > "$SD/graph.tsv"
-out=$(main add --split-dir "$SD" --repo "$REPO" -y 2>"$PQ_HOME/.err")
+out=$(main add --split-dir "$SD" --repo "$REPO" <<<y 2>"$PQ_HOME/.err")
 rc=$?
 [ "$rc" -eq 0 ] && ok || bad "a 2-column graph.tsv alongside a repos file should still work: $(cat "$PQ_HOME/.err")"
 t=$(find_task mr-solo2col-thing)
@@ -605,7 +611,7 @@ SD=$(new_split_dir legacy-resume)
 printf 'MARKER: solo\nDo the one thing.\n' > "$SD/01-solo.md"
 printf '01-solo.md\t\n' > "$SD/graph.tsv"
 [ -f "$SD/repos" ] && bad "should not have a repos file yet" || ok
-out=$(main add --split-dir "$SD" --repo "$REPO" -y 2>"$PQ_HOME/.err")
+out=$(main add --split-dir "$SD" --repo "$REPO" <<<y 2>"$PQ_HOME/.err")
 rc=$?
 [ "$rc" -eq 0 ] && ok || bad "resuming a legacy (repo-only) split dir should still work: $(cat "$PQ_HOME/.err")"
 eq "$out" "do-solo-thing" "it should still queue the one part"
@@ -618,7 +624,7 @@ git -C "$REPO" branch tom/mr-branchcheck-thing >/dev/null
 SD=$(new_split_dir_repos multirepo-branchcheck repo2)
 printf 'MARKER: mr-branchcheck\nClaims a branch that exists in REPO but not REPO2.\n' > "$SD/01-bc.md"
 printf '01-bc.md\t\trepo2\n' > "$SD/graph.tsv"
-out=$(main add --split-dir "$SD" --repo "$REPO" -y 2>"$PQ_HOME/.err")
+out=$(main add --split-dir "$SD" --repo "$REPO" <<<y 2>"$PQ_HOME/.err")
 rc=$?
 [ "$rc" -eq 0 ] && ok || bad "a part assigned to REPO2 must not be refused for a branch only live in REPO: $(cat "$PQ_HOME/.err")"
 eq "$out" "mr-branchcheck-thing" "it should queue under its own name"
@@ -630,7 +636,7 @@ SD=$(new_split_dir_repos multirepo-column repo2)
 printf 'MARKER: mr-server\nA.\n' > "$SD/01-server.md"
 printf 'MARKER: mr-client\nB.\n' > "$SD/02-client.md"
 printf '01-server.md\t\n02-client.md\t01-server.md\trepo2\n' > "$SD/graph.tsv"
-main add --split-dir "$SD" --repo "$REPO" -y >/dev/null 2>"$PQ_HOME/.err"
+main add --split-dir "$SD" --repo "$REPO" <<<y >/dev/null 2>"$PQ_HOME/.err"
 case "$(cat "$PQ_HOME/.err")" in
   *"REPO"*) ok ;;
   *) bad "a multi-repo split's confirm table should show a REPO column (got: $(cat "$PQ_HOME/.err"))" ;;
@@ -651,7 +657,7 @@ reset_tasks
 SD2=$(new_split_dir single-repo-column)
 printf 'MARKER: solo\nDo the one thing.\n' > "$SD2/01-solo.md"
 printf '01-solo.md\t\n' > "$SD2/graph.tsv"
-main add --split-dir "$SD2" --repo "$REPO" -y >/dev/null 2>"$PQ_HOME/.err"
+main add --split-dir "$SD2" --repo "$REPO" <<<y >/dev/null 2>"$PQ_HOME/.err"
 case "$(cat "$PQ_HOME/.err")" in
   *"REPO"*) bad "a single-repo split's confirm table should not show a REPO column (got: $(cat "$PQ_HOME/.err"))" ;;
   *) ok ;;
@@ -664,7 +670,7 @@ SD=$(new_split_dir_repos multirepo-hint repo2)
 printf 'MARKER: mr-server\nA.\n' > "$SD/01-server.md"
 printf 'MARKER: mr-client\nB.\n' > "$SD/02-client.md"
 printf '01-server.md\t\n02-client.md\t01-server.md\trepo2\n' > "$SD/graph.tsv"
-main add --split-dir "$SD" --repo "$REPO" -y >/dev/null 2>&1
+main add --split-dir "$SD" --repo "$REPO" <<<y >/dev/null 2>&1
 case "$(awk -F'\t' '$1 == "haiku" { print }' "$CALL_LOG")" in
   *"lands in the repo2 repository"*) ok ;;
   *) bad "a multi-repo split's naming call should carry the repo hint with the recorded label 'repo2', not a recomputed basename" ;;
@@ -675,7 +681,7 @@ reset_tasks
 SD2=$(new_split_dir single-repo-hint)
 printf 'MARKER: solo\nDo the one thing.\n' > "$SD2/01-solo.md"
 printf '01-solo.md\t\n' > "$SD2/graph.tsv"
-main add --split-dir "$SD2" --repo "$REPO" -y >/dev/null 2>&1
+main add --split-dir "$SD2" --repo "$REPO" <<<y >/dev/null 2>&1
 case "$(awk -F'\t' '$1 == "haiku" { print }' "$CALL_LOG")" in
   *"lands in the"*) bad "a single-repo split's naming call should not carry the repo hint" ;;
   *) ok ;;
@@ -705,7 +711,7 @@ echo "== multi-repo: explicit --repo (two or more) restricts the candidate set -
 reset_tasks
 PLANMR="$PQ_HOME/.multirepo-badlabel-plan.md"
 printf 'FIXTURE: multirepo-badlabel\n\nA plan.\n' > "$PLANMR"
-if ( cmd_add "$PLANMR" --repo "$REPO" --repo "$REPO2" --split -y ) >/dev/null 2>&1; then
+if ( cmd_add "$PLANMR" "" "" --repo "$REPO" --repo "$REPO2" --split <<<y ) >/dev/null 2>&1; then
   bad "a label outside the explicit --repo set should be rejected"
 else
   ok
@@ -716,7 +722,7 @@ echo "== multi-repo: a SINGLE --repo does not restrict the set - the scan still 
 reset_tasks
 PLANMR2="$PQ_HOME/.multirepo-plan.md"
 printf 'FIXTURE: multirepo\n\nA plan.\n' > "$PLANMR2"
-out=$(PQ_REPOS_DIR="$SIBLINGROOT" cmd_add "$PLANMR2" --repo "$REPO" --split -y 2>"$PQ_HOME/.err")
+out=$(PQ_REPOS_DIR="$SIBLINGROOT" cmd_add "$PLANMR2" "" "" --repo "$REPO" --split <<<y 2>"$PQ_HOME/.err")
 rc=$?
 [ "$rc" -eq 0 ] && ok || bad "a scanned sibling should still queue with a single --repo: $(cat "$PQ_HOME/.err")"
 t_a=$(find_task mr-a-thing); t_b=$(find_task mr-b-thing)
@@ -729,7 +735,7 @@ eq "$(hdr "$t_b/plan.md" repo)" "$(cd "$REPO2" && pwd -P)" "the scanned sibling 
 
 echo "== a non-split pq add with two --repo values is rejected ==" >&2
 reset_tasks
-if ( cmd_add "/nonexistent-plan-file-xyz.md" --repo "$REPO" --repo "$REPO2" -y ) >/dev/null 2>&1; then
+if ( cmd_add "/nonexistent-plan-file-xyz.md" "" "" --repo "$REPO" --repo "$REPO2" ) >/dev/null 2>&1; then
   bad "a non-split add with two --repo values should be rejected"
 else
   ok
@@ -741,7 +747,7 @@ reset_tasks
 : > "$CALL_LOG"
 PLANMR3="$PQ_HOME/.multirepo-plan3.md"
 printf 'FIXTURE: multirepo\n\nA plan.\n' > "$PLANMR3"
-cmd_add "$PLANMR3" --repo "$REPO" --repo "$REPO2" --split -y >/dev/null 2>&1
+cmd_add "$PLANMR3" "" "" --repo "$REPO" --repo "$REPO2" --split <<<y >/dev/null 2>&1
 opusargs=$(awk -F'\t' '$1 == "opus" { print $2; exit }' "$CALL_LOG")
 addcount=$(grep -o -- '--add-dir' <<<"$opusargs" | wc -l | tr -d ' ')
 eq "$addcount" "2" "one --add-dir per candidate (primary + REPO2)"
@@ -750,7 +756,7 @@ echo "== multi-repo: a candidate left dirty by the splitter is warned about, nam
 reset_tasks
 PLANMR4="$PQ_HOME/.multirepo-dirty-plan.md"
 printf 'FIXTURE: multirepo-dirty\n\nA plan.\n' > "$PLANMR4"
-cmd_add "$PLANMR4" --repo "$REPO" --repo "$REPO2" --split -y >/dev/null 2>"$PQ_HOME/.err"
+cmd_add "$PLANMR4" "" "" --repo "$REPO" --repo "$REPO2" --split <<<y >/dev/null 2>"$PQ_HOME/.err"
 case "$(cat "$PQ_HOME/.err")" in
   *"$REPO2"*"dirty"*) ok ;;
   *) bad "leaving REPO2 dirty should warn naming REPO2 (got: $(cat "$PQ_HOME/.err"))" ;;
@@ -784,7 +790,7 @@ echo "== a split-level --after containing / is refused when 2+ --repo are given 
 reset_tasks
 PLANMR16="$PQ_HOME/.multirepo-rawafter-plan.md"
 printf 'FIXTURE: multirepo\n\nA plan.\n' > "$PLANMR16"
-if ( cmd_add "$PLANMR16" --repo "$REPO" --repo "$REPO2" --split --after tom/some-raw-branch -y ) >/dev/null 2>&1; then
+if ( cmd_add "$PLANMR16" "" "" --repo "$REPO" --repo "$REPO2" --split --after tom/some-raw-branch <<<y ) >/dev/null 2>&1; then
   bad "a raw branch --after should be refused when --repo is given 2+ times"
 else
   ok
@@ -796,7 +802,7 @@ reset_tasks
 SD=$(new_split_dir_repos multirepo-rawafter-resume repo2)
 printf 'MARKER: mr-server\nA.\n' > "$SD/01-server.md"
 printf '01-server.md\t\n' > "$SD/graph.tsv"
-out=$(main add --split-dir "$SD" --repo "$REPO" --after tom/some-raw-branch -y 2>"$PQ_HOME/.err")
+out=$(main add --split-dir "$SD" --repo "$REPO" --after tom/some-raw-branch <<<y 2>"$PQ_HOME/.err")
 rc=$?
 [ "$rc" -eq 0 ] && ok \
   || bad "resuming with only ONE --repo must not trip the multi-repo refusal just because \$sd/repos already has two candidates: $(cat "$PQ_HOME/.err")"
@@ -806,7 +812,7 @@ reset_tasks
 SD2=$(new_split_dir single-repo-rawafter)
 printf 'MARKER: solo\nDo the one thing.\n' > "$SD2/01-solo.md"
 printf '01-solo.md\t\n' > "$SD2/graph.tsv"
-out=$(main add --split-dir "$SD2" --repo "$REPO" --after tom/some-raw-branch -y 2>"$PQ_HOME/.err")
+out=$(main add --split-dir "$SD2" --repo "$REPO" --after tom/some-raw-branch <<<y 2>"$PQ_HOME/.err")
 rc=$?
 [ "$rc" -eq 0 ] && ok || bad "a raw branch --after should still work on a single-repo split: $(cat "$PQ_HOME/.err")"
 t=$(find_task do-solo-thing)
@@ -823,7 +829,7 @@ printf 'FIXTURE: container\n\nA plan.\n' > "$PLANC"
 # sibling-scan tests stay single-repo - repo_candidates_container reads that
 # same override, so it must be cleared here or the container scan would look
 # in the wrong place entirely and find nothing.
-out=$(PQ_REPOS_DIR= cmd_add "$PLANC" --repo "$CONTAINERROOT" --split -y 2>"$PQ_HOME/.err")
+out=$(PQ_REPOS_DIR= cmd_add "$PLANC" "" "" --repo "$CONTAINERROOT" --split <<<y 2>"$PQ_HOME/.err")
 rc=$?
 [ "$rc" -eq 0 ] && ok || bad "container-mode split should succeed: $(cat "$PQ_HOME/.err")"
 t_a=$(find_task ctr-a-thing); t_b=$(find_task ctr-b-thing)
@@ -834,7 +840,7 @@ echo "== container mode: cwd itself (not --repo) being a non-repo container trig
 reset_tasks
 PLANCWD="$PQ_HOME/.container-cwd-plan.md"
 printf 'FIXTURE: container\n\nA plan.\n' > "$PLANCWD"
-out=$(cd "$CONTAINERROOT" && PQ_REPOS_DIR= cmd_add "$PLANCWD" --split -y 2>"$PQ_HOME/.err")
+out=$(cd "$CONTAINERROOT" && PQ_REPOS_DIR= cmd_add "$PLANCWD" "" "" --split <<<y 2>"$PQ_HOME/.err")
 rc=$?
 [ "$rc" -eq 0 ] && ok || bad "running from cwd=container should discover its children: $(cat "$PQ_HOME/.err")"
 t_a=$(find_task ctr-a-thing)
@@ -850,7 +856,7 @@ printf 'MARKER: ctr-b\nB.\n' > "$SDEMPTY/02-b.md"
   printf '01-a.md\t\t%s\n' "$labela"
   printf '02-b.md\t\n'
 } > "$SDEMPTY/graph.tsv"
-if ( main add --split-dir "$SDEMPTY" -y ) >/dev/null 2>"$PQ_HOME/.err"; then
+if ( main add --split-dir "$SDEMPTY" <<<y ) >/dev/null 2>"$PQ_HOME/.err"; then
   bad "an empty repo field in a no-primary split should die"
 else
   ok
@@ -872,7 +878,7 @@ SDONE=$(new_split_dir_container_one container-onechild)
 labelone=$(basename "$CONTAINERONECHILD")
 printf 'MARKER: ctr-solo\nDo the one thing.\n' > "$SDONE/01-solo.md"
 printf '01-solo.md\t\t%s\n' "$labelone" > "$SDONE/graph.tsv"
-out=$(main add --split-dir "$SDONE" -y 2>"$PQ_HOME/.err")
+out=$(main add --split-dir "$SDONE" <<<y 2>"$PQ_HOME/.err")
 rc=$?
 [ "$rc" -eq 0 ] && ok || bad "single-child container split should still succeed: $(cat "$PQ_HOME/.err")"
 case "$(awk -F'\t' '$1 == "haiku" { print }' "$CALL_LOG")" in
@@ -891,7 +897,7 @@ mkdir -p "$EMPTYCONTAINER/not-a-repo"
 reset_tasks
 PLANEMPTY="$PQ_HOME/.container-empty-plan.md"
 printf 'FIXTURE: container\n\nA plan.\n' > "$PLANEMPTY"
-if ( PQ_REPOS_DIR= cmd_add "$PLANEMPTY" --repo "$EMPTYCONTAINER" --split -y ) >/dev/null 2>"$PQ_HOME/.err"; then
+if ( PQ_REPOS_DIR= cmd_add "$PLANEMPTY" "" "" --repo "$EMPTYCONTAINER" --split <<<y ) >/dev/null 2>"$PQ_HOME/.err"; then
   bad "a container with no git-repo children should die"
 else
   ok
@@ -929,7 +935,7 @@ echo "== container mode: a raw-branch --after is refused even with NO explicit -
 reset_tasks
 PLANRAW="$PQ_HOME/.container-rawafter-plan.md"
 printf 'FIXTURE: container\n\nA plan.\n' > "$PLANRAW"
-if ( PQ_REPOS_DIR= cmd_add "$PLANRAW" --repo "$CONTAINERROOT" --split --after tom/some-raw-branch -y ) >/dev/null 2>&1; then
+if ( PQ_REPOS_DIR= cmd_add "$PLANRAW" "" "" --repo "$CONTAINERROOT" --split --after tom/some-raw-branch <<<y ) >/dev/null 2>&1; then
   bad "a raw branch --after should be refused in container/no-primary mode"
 else
   ok
@@ -946,7 +952,7 @@ printf 'MARKER: ctr-b\nB.\n' > "$SDRESUME/02-b.md"
   printf '01-a.md\t\t%s\n' "$labela"
   printf '02-b.md\t\t%s\n' "$labelb"
 } > "$SDRESUME/graph.tsv"
-out=$(main add --split-dir "$SDRESUME" --repo "$REPO" -y 2>"$PQ_HOME/.err")
+out=$(main add --split-dir "$SDRESUME" --repo "$REPO" <<<y 2>"$PQ_HOME/.err")
 rc=$?
 [ "$rc" -eq 0 ] && ok || bad "resuming a no-primary split with an extraneous --repo should still succeed: $(cat "$PQ_HOME/.err")"
 case "$(cat "$PQ_HOME/.err")" in
@@ -965,7 +971,7 @@ reset_tasks
 NOTAREPO=$(mktemp -d)
 PLAINPLAN="$PQ_HOME/.notarepo-plan.md"
 printf '# plan\n\nJust one thing.\n' > "$PLAINPLAN"
-if ( cd "$NOTAREPO" && cmd_add "$PLAINPLAN" -y ) >/dev/null 2>"$PQ_HOME/.err"; then
+if ( cd "$NOTAREPO" && cmd_add "$PLAINPLAN" "" "" ) >/dev/null 2>"$PQ_HOME/.err"; then
   bad "a plain add from a non-repo directory should die"
 else
   ok

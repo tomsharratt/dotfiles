@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# test/pq-add-pick.sh - the interactive plan picker: recent_plans/latest_plan
+# test/pq-add-pick.sh - the interactive plan picker: recent_plans
 # ordering, plan_title, cell, age_since, pick_plan, pick_after, add_wizard,
 # and the wiring into cmd_add.
 #
@@ -24,8 +24,8 @@ export PQ_PLANS_DIR
 
 STUBBIN=$(mktemp -d)
 # Dispatches on --model, same shape as test/pq-split.sh's stub. Only the
-# wiring cases at the bottom ever reach this without an explicit --branch
-# (which skips the naming call entirely), so only one marker is needed.
+# wiring case at the bottom ever reaches this without a branch handed to
+# cmd_add (which skips the naming call entirely), so only one marker is needed.
 cat > "$STUBBIN/claude" <<'STUBEOF'
 #!/usr/bin/env bash
 model=""
@@ -106,7 +106,7 @@ mk_task() {                             # state prio slug repo branch -> task_di
   printf '%s' "$dir"
 }
 
-echo "== recent_plans / latest_plan: ordering by max(mtime, birth) ==" >&2
+echo "== recent_plans: ordering by max(mtime, birth) ==" >&2
 # stat's %m and %B are whole seconds, so fixtures must be spaced out for real,
 # not merely touch -t'd - touch cannot age a file anyway, since birth time is
 # untouched by it and max(mtime, birth) would just return birth unchanged.
@@ -117,12 +117,10 @@ mkplan c.md "Plan C"
 
 order() { recent_plans | awk -F'\t' '{ print $2 }' | xargs -n1 basename | tr '\n' ' '; }
 eq "$(order)" "c.md b.md a.md " "recent_plans should list c, b, a - newest created first"
-eq "$(basename "$(latest_plan)")" "c.md" "latest_plan should be c before the touch"
 
 sleep 1.1
 touch "$PQ_PLANS_DIR/a.md"
 eq "$(order)" "a.md c.md b.md " "touching a should move it back to the front, ahead of c and b"
-eq "$(basename "$(latest_plan)")" "a.md" "latest_plan should be a after the touch"
 
 echo "== plan_title ==" >&2
 printf '# Real Title\n\nBody.\n' > "$PQ_HOME/.t1.md"
@@ -425,24 +423,38 @@ skip_wizard() {                         # model -> the model add_wizard leaves b
 out=$(skip_wizard haiku </dev/null 2>/dev/null)
 eq "$out" "haiku" "--model is not held to the three, and its value survives the wizard untouched"
 
-echo "== wiring: bare 'main add' with no tty queues latest_plan() ==" >&2
+echo "== wiring: with no terminal, pq add stops and queues nothing ==" >&2
 reset_plans
 reset_tasks
 printf 'MARKER: wiring-fixture\n\nDo the wiring thing.\n' > "$PQ_PLANS_DIR/wiring.md"
-slug=$(main add --repo "$REPO" < /dev/null 2>"$PQ_HOME/.wire.err")
-rc=$?
-[ "$rc" -eq 0 ] && ok || bad "bare 'main add' with no tty should succeed: $(cat "$PQ_HOME/.wire.err")"
-t=$(find_task "$slug")
-eq "$(hdr "$t/plan.md" source)" "$PQ_PLANS_DIR/wiring.md" \
-  "with no tty and no plan given, source: should be latest_plan()'s path"
+if ( main add --repo "$REPO" < /dev/null ) >/dev/null 2>"$PQ_HOME/.wire.err"; then
+  bad "pq add with no terminal should stop"
+else
+  ok
+fi
+case "$(cat "$PQ_HOME/.wire.err")" in
+  *"run it at a terminal"*) ok ;;
+  *) bad "and say it needs a terminal (got: $(cat "$PQ_HOME/.wire.err"))" ;;
+esac
+eq "$(find "$PQ_HOME/queue" -mindepth 1 -maxdepth 1 | wc -l | tr -d ' ')" "0" "nothing is queued"
 
-echo "== wiring: -y also takes the newest without asking ==" >&2
-reset_tasks
-slug=$(main add --repo "$REPO" -y < /dev/null 2>"$PQ_HOME/.wire2.err")
+echo "== wiring: at a terminal, main add runs the picker, names the plan and asks the wizard ==" >&2
+# at_terminal stood in for, in the subshell only: pick row 1, confirm it, and
+# Enter at the model question. The stub names the plan with no outline, so
+# there is no split question, and an empty queue leaves no blocker to ask about.
+# shellcheck disable=SC2329  # at_terminal is called by main add, not here
+slug=$( ( at_terminal() { return 0; }; main add --repo "$REPO" ) <<<$'1\ny\n\n' 2>"$PQ_HOME/.wire2.err")
 rc=$?
-[ "$rc" -eq 0 ] && ok || bad "-y should succeed: $(cat "$PQ_HOME/.wire2.err")"
+[ "$rc" -eq 0 ] && ok || bad "main add through the wizard should succeed: $(cat "$PQ_HOME/.wire2.err")"
+eq "$slug" "wiring-fixture-task" "stdout is the slug Haiku's name gives"
 t=$(find_task "$slug")
-eq "$(hdr "$t/plan.md" source)" "$PQ_PLANS_DIR/wiring.md" "-y should also queue the newest plan"
+eq "$(hdr "$t/plan.md" source)" "$PQ_PLANS_DIR/wiring.md" "the picked plan is the one queued"
+eq "$(hdr "$t/plan.md" branch)" "tom/wiring-fixture-task" "named by Haiku"
+eq "$(hdr "$t/plan.md" model)" "$PQ_DEFAULT_MODEL" "Enter at the model question takes the default"
+case "$(cat "$PQ_HOME/.wire2.err")" in
+  *"pick a plan"*"use this plan?"*"which model?"*) ok ;;
+  *) bad "the picker and the wizard should each have asked, in order (got: $(cat "$PQ_HOME/.wire2.err"))" ;;
+esac
 
 echo "== wiring: a task queued with pick_after's blockers matches an equivalent --after ==" >&2
 reset_tasks
@@ -450,16 +462,16 @@ mk_task queue 005 blocker-cand "$REPO" tom/blocker-cand >/dev/null
 via_picker=$(run_pick_after "$REPO" <<<$'1\n' 2>/dev/null)
 eq "$via_picker" "blocker-cand" "pick_after should resolve to the candidate's own slug"
 
-out_x=$(cmd_add "$PQ_PLANS_DIR/wiring.md" --repo "$REPO" --branch tom/task-x --intent x --after blocker-cand -y 2>"$PQ_HOME/.x.err")
+out_x=$(cmd_add "$PQ_PLANS_DIR/wiring.md" tom/task-x x --repo "$REPO" --after blocker-cand 2>"$PQ_HOME/.x.err")
 t_x=$(find_task "$out_x")
-out_y=$(cmd_add "$PQ_PLANS_DIR/wiring.md" --repo "$REPO" --branch tom/task-y --intent y --after "$via_picker" -y 2>"$PQ_HOME/.y.err")
+out_y=$(cmd_add "$PQ_PLANS_DIR/wiring.md" tom/task-y y --repo "$REPO" --after "$via_picker" 2>"$PQ_HOME/.y.err")
 t_y=$(find_task "$out_y")
 eq "$(cat "$t_x/after")" "$(cat "$t_y/after")" \
   "queuing via --after blocker-cand and via --after <pick_after's own output> must produce identical after files"
 
 echo "== wiring: pq add takes no plan path - the wizard is the way in ==" >&2
 reset_tasks
-if ( main add "$PQ_PLANS_DIR/wiring.md" --repo "$REPO" -y ) >/dev/null 2>"$PQ_HOME/.explicit.err"; then
+if ( main add "$PQ_PLANS_DIR/wiring.md" --repo "$REPO" < /dev/null ) >/dev/null 2>"$PQ_HOME/.explicit.err"; then
   bad "pq add with a plan path should be refused"
 else
   ok

@@ -415,7 +415,7 @@ PLAN=$(mktemp -d); printf '# probe\n\nbody\n' > "$PLAN/plan.md"
 addq() {                                # branch-to-stand-on [extra args...] -> the task dir
   local stand=$1; shift
   git -C "$REPO" checkout -q "$stand"
-  ( cmd_add "$PLAN/plan.md" --repo "$REPO" --branch "tom/$1" --intent probe "${@:2}" >/dev/null 2>&1 )
+  ( cmd_add "$PLAN/plan.md" "tom/$1" probe --repo "$REPO" "${@:2}" >/dev/null 2>&1 )
   ls -d "$PQ_HOME"/queue/*-"$(branch_to_slug "tom/$1")" 2>/dev/null | head -1
 }
 
@@ -446,7 +446,7 @@ repo_base_reset
 
 # Detached HEAD has no branch to inherit.
 git -C "$REPO" checkout -q --detach master
-( cmd_add "$PLAN/plan.md" --repo "$REPO" --branch tom/inherit-6 --intent probe >/dev/null 2>&1 )
+( cmd_add "$PLAN/plan.md" tom/inherit-6 probe --repo "$REPO" >/dev/null 2>&1 )
 d=$(ls -d "$PQ_HOME"/queue/*-inherit-6 2>/dev/null | head -1)
 eq "$(hdr "$d/plan.md" base)" "" "a detached HEAD inherits nothing"
 git -C "$REPO" checkout -q master
