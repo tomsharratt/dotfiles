@@ -25,10 +25,14 @@ COMMENTS="$STUBBIN/.comments"
 printf '{"result":{"snapshot":{"panes":[]}}}' > "$PANES_JSON"
 : > "$HERDR_LOG"; : > "$CLAUDE_LOG"; printf 'ok' > "$MODE"; printf '0' > "$COMMENTS"
 # One line per call: the cwd, then argv, tab separated - and then whatever the
-# mode says. `sleep` is the reviewer still running; the test kills it.
+# mode says. `sleep` is the reviewer still running; the test kills it. The herdr
+# identity it was handed goes to a log of its own, so the argv log keeps its shape.
+CLAUDE_ENV="$STUBBIN/.claude-env"
 cat > "$STUBBIN/claude" <<EOF
 #!/bin/sh
 { printf '%s\t' "\$PWD"; for a in "\$@"; do printf '%s\t' "\$a"; done; printf '\n'; } >> "$CLAUDE_LOG"
+printf 'pane=%s tab=%s workspace=%s env=%s socket=%s\n' "\${HERDR_PANE_ID-unset}" "\${HERDR_TAB_ID-unset}" \
+  "\${HERDR_WORKSPACE_ID-unset}" "\${HERDR_ENV-unset}" "\${HERDR_SOCKET_PATH-unset}" >> "$CLAUDE_ENV"
 case "\$(cat "$MODE")" in
   sleep)     sleep 30; exit 0 ;;
   ok)        printf '{"is_error":false,"total_cost_usd":1.2,"duration_ms":5000,"permission_denials":[]}\n'; exit 0 ;;
@@ -118,7 +122,7 @@ reset_tasks() {
   mkdir -p "$PQ_HOME/queue" "$PQ_HOME/running" "$PQ_HOME/done" "$PQ_HOME/archive"
 }
 reset_tasks
-reset_logs() { : > "$HERDR_LOG"; : > "$CLAUDE_LOG"; rm -f "$STUBBIN/.prompt-fail"; }
+reset_logs() { : > "$HERDR_LOG"; : > "$CLAUDE_LOG"; : > "$CLAUDE_ENV"; rm -f "$STUBBIN/.prompt-fail"; }
 mode() { printf '%s' "$1" > "$MODE"; }
 pr_json() {                             # title state draft commits additions deletions
   jq -nc --arg t "$1" --arg s "$2" --argjson d "$3" --argjson c "$4" --argjson a "$5" --argjson r "$6" \
@@ -245,8 +249,13 @@ mode sleep; printf '3' > "$COMMENTS"
 # writer exits, so a background reviewer that inherited the tick's stdout would
 # make `out=$(pq tick)` wait for the whole review. This is how a monitor hung
 # for twenty minutes the first time the gate ran.
+#
+# Launched from inside a herdr pane, as `pq run` always is: the reviewer must not
+# inherit that pane's identity, or herdr's SessionStart hook hands the pane the
+# reviewer's session as its own.
 T0=$(date +%s)
-launch_out=$(review_task "$G" 0 2>&1)
+launch_out=$(export HERDR_PANE_ID=w9:p9 HERDR_TAB_ID=w9:t9 HERDR_WORKSPACE_ID=w9 \
+               HERDR_ENV=1 HERDR_SOCKET_PATH=/tmp/herdr-test.sock; review_task "$G" 0 2>&1)
 T1=$(date +%s)
 [ $(( T1 - T0 )) -lt 5 ] && ok || bad "review_task must not wait for the reviewer, even when its output is captured (took $(( T1 - T0 ))s)"
 has "$launch_out" "reviewing #42 with opus in the background" "and says it launched"
@@ -257,6 +266,13 @@ wait_calls 1
 eq "$(claude_calls)" "1" "one reviewer"
 line=$(head -1 "$CLAUDE_LOG")
 eq "$(cut -f1 <<<"$line")" "$WT" "it runs in the task's worktree"
+eq "$(head -1 "$CLAUDE_ENV")" "pane=unset tab=unset workspace=unset env=1 socket=/tmp/herdr-test.sock" \
+  "without the launching pane's identity, but still able to reach herdr for wt"
+# The namer and the splitter handed their panes a session the same way, so every
+# headless claude goes through headless_claude - a bare `claude -p` outside a
+# comment is one more pane about to be handed a session.
+bare=$(grep -nE '(^|[^_[:alnum:]])claude -p' "$HERE/../.local/bin/pq" | grep -vE '^[0-9]+:[[:space:]]*#')
+eq "$bare" "" "no claude -p in pq bypasses headless_claude"
 has "$line" "	-p	" "in print mode"
 has "$line" "	--model	opus	" "with the reviewer model"
 has "$line" "	--permission-mode	auto	" "in auto mode, like the implementer"

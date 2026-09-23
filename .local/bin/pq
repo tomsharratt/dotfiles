@@ -357,6 +357,24 @@ shielded() {                            # cmd...
   return "${code:-1}"
 }
 
+# ── headless claude ─────────────────────────────────────────────────────────
+# Every `claude -p` pq runs - the namer, the splitter, the reviewer - belongs to
+# no pane, but it inherits the pane identity of whatever pq was started from.
+# Herdr's Claude integration reports each session from a SessionStart hook,
+# against HERDR_PANE_ID, so the pane `pq add` or `pq run` was typed into was
+# handed the headless session as its own: herdr kept it on that pane with status
+# `unknown`, left it out of `herdr agent list` because pq is what runs in the
+# foreground there, and still held it a day after the session had exited.
+#
+# HERDR_PANE_ID is the first thing the hook checks, so without it nothing is
+# reported; the tab and workspace ids describe the same pane and go with it.
+# HERDR_ENV and HERDR_SOCKET_PATH stay - they say which herdr is running, which
+# is still true, and `wt` needs them for the `wt run` and `wt test` the reviewer
+# is told to use.
+headless_claude() {                     # claude args...
+  env -u HERDR_PANE_ID -u HERDR_TAB_ID -u HERDR_WORKSPACE_ID claude "$@"
+}
+
 # ── the cap ─────────────────────────────────────────────────────────────────
 # How many tasks may be running at once. It is STATE, not an argument: it lives in
 # a file and is re-read at the top of every tick, so `pq cap 1` in the morning and
@@ -733,7 +751,7 @@ Each entry in parts names the feature or change that pull request would carry - 
 The branch must differ from these, which are already taken: $avoid"
   [ -n "$label" ] && prompt="$prompt
 This part lands in the $label repository, so make the branch name say which one if the task's own words would not already distinguish it from the same work elsewhere."
-  raw=$(claude -p --model "$PQ_NAMER_MODEL" "$prompt" < "$1" 2>/dev/null) || return 0
+  raw=$(headless_claude -p --model "$PQ_NAMER_MODEL" "$prompt" < "$1" 2>/dev/null) || return 0
   # Be forgiving about a fenced or chatty reply: take the first {...} span.
   json=$(sed -n 's/.*\({.*}\).*/\1/p' <<<"$(tr '\n' ' ' <<<"$raw")" | head -1)
   [ -n "$json" ] || return 0
@@ -2535,7 +2553,7 @@ do_split() {
     done <<<"$candidates"
 
     msg "splitting $(basename "$plan") with $PQ_SPLITTER_MODEL - this takes a few minutes"
-    ( cd "$sd" && claude -p --model "$PQ_SPLITTER_MODEL" --effort "$PQ_SPLITTER_EFFORT" \
+    ( cd "$sd" && headless_claude -p --model "$PQ_SPLITTER_MODEL" --effort "$PQ_SPLITTER_EFFORT" \
         "${add_dir_args[@]}" --tools "Read,Grep,Glob,Write" \
         --permission-mode acceptEdits --output-format json "$(splitter_prompt "$candidates")" ) \
       < /dev/null > "$sd/splitter.json" 2> "$sd/splitter.err"
@@ -4933,7 +4951,7 @@ review_alive() {                        # pid (a process group id)
 # refused, because the task directory is outside the worktree it runs in - and a
 # reviewer that can see what the change was built to is a better reviewer.
 review_cmd() {                          # pr task_home
-  claude -p --model "$PQ_REVIEWER_MODEL" --effort "$PQ_REVIEW_EFFORT" \
+  headless_claude -p --model "$PQ_REVIEWER_MODEL" --effort "$PQ_REVIEW_EFFORT" \
     --permission-mode auto --allowedTools "$PQ_REVIEW_TOOLS" \
     --disallowedTools "Edit(/$HOME/**)" "Bash(gh pr ready:*)" "Bash(gh pr merge:*)" "Bash(gh pr close:*)" \
       "Bash(git checkout:*)" "Bash(git switch:*)" "Bash(git restore:*)" "Bash(git reset:*)" \
