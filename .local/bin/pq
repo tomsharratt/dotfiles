@@ -230,8 +230,11 @@ PQ_AGENT_START_MS="${PQ_AGENT_START_MS:-60000}"
 # self-review fallback.
 PQ_REVIEWER_MODEL="${PQ_REVIEWER_MODEL:-opus}"
 PQ_REVIEW_EFFORT="${PQ_REVIEW_EFFORT:-xhigh}"
-PQ_REVIEW_TIMEOUT="${PQ_REVIEW_TIMEOUT:-1500}"    # seconds a reviewer may run before it is killed
-[[ "$PQ_REVIEW_TIMEOUT" =~ ^[0-9]+$ ]] || PQ_REVIEW_TIMEOUT=1500
+# An hour. Reviews ran 747s, 822s, then 1083s against the 1500 this used to be,
+# and a reviewer killed at the ceiling throws the whole review away for the
+# self-review fallback - the one outcome the gate exists to avoid.
+PQ_REVIEW_TIMEOUT="${PQ_REVIEW_TIMEOUT:-3600}"    # seconds a reviewer may run before it is killed
+[[ "$PQ_REVIEW_TIMEOUT" =~ ^[0-9]+$ ]] || PQ_REVIEW_TIMEOUT=3600
 PQ_REVIEW_MAX_TRIES="${PQ_REVIEW_MAX_TRIES:-2}"   # launches (a failed probe counts too) before falling back to self-review
 [[ "$PQ_REVIEW_MAX_TRIES" =~ ^[0-9]+$ ]] || PQ_REVIEW_MAX_TRIES=2
 PQ_REVIEW_RETRY="${PQ_REVIEW_RETRY:-600}"         # seconds between tries
@@ -4808,7 +4811,7 @@ dispatch_task() {                       # task_dir  -> 0 launched, 1 failed
 # handing its slot away would start a fresh agent beside one about to be told to
 # fix things. `prompted` is not in flight - the agent owns its PR again and the
 # ordinary wrap-up grace applies. The hold is bounded by the gate's own bounds:
-# MAX_TRIES x (TIMEOUT + RETRY) at the very worst, about seventy minutes, then
+# MAX_TRIES x (TIMEOUT + RETRY) at the very worst, about two hours twenty, then
 # the fallback prompt. `PQ_WRAPUP_GRACE=0` therefore no longer means
 # release-on-PR for a gated task; it means release once the gate is through.
 #
@@ -4823,7 +4826,7 @@ dispatch_task() {                       # task_dir  -> 0 launched, 1 failed
 # but is reported the same way, loudly, on the first task it happens to.
 #
 # The reviewer is launched, not `shielded`: shielded waits, and a tick must never
-# block for twenty minutes. Everything needed to collect it is on disk - review.rc
+# block for up to an hour. Everything needed to collect it is on disk - review.rc
 # for the exit code, review.json for the output - so a `pq run` stopped with
 # Ctrl-C leaves the reviewer alone and a later tick, from any pq process, finishes
 # the job. Liveness is the PROCESS GROUP, not the pid: the pid on file is the

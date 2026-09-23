@@ -418,7 +418,7 @@ It is a state ladder on the task, one step per tick, so a tick never blocks on i
 The reviewer waits for the agent to go quiet first, and probes the pull request once before launching: a title beginning `STUCK:` is skipped outright (telling an agent that stopped for a reason to mark its work ready is the wrong instruction), and a single commit over `PQ_REVIEW_SPLIT_LINES` changed lines earns an extra clause in the follow-up asking for the branch to be restructured into small logical commits before it is marked ready.
 `pq ls` reads `review due`, `reviewing 7m`, `reviewed`, `resolving`, then falls back to `wrapping up`, and the tick summary counts `N reviewing`.
 
-The reviewer runs in the background rather than shielded, because a tick must never block for twenty minutes: everything needed to collect it is on disk, so a `pq run` stopped with Ctrl-C leaves the reviewer alone and a later tick, from any `pq` process, finishes the job.
+The reviewer runs in the background rather than shielded, because a tick must never block for up to an hour: everything needed to collect it is on disk, so a `pq run` stopped with Ctrl-C leaves the reviewer alone and a later tick, from any `pq` process, finishes the job.
 Liveness is the process group, not the pid, so a recycled pid is neither counted alive nor killed.
 A pull request that settles mid-review has its reviewer killed before the reap pass closes the workspace it runs in, and `pq rm` kills one too.
 
