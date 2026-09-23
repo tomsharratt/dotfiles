@@ -13,7 +13,7 @@
 # `pq`, and `pq` reaches it through one narrow seam (`wt new --no-agent --no-focus
 # --json`).
 #
-#   pq add [plan]        add a plan to the queue (no plan, at a terminal: pick one)
+#   pq add               pick a plan and add it to the queue (-y, or no tty: the newest)
 #   pq add --base B      fork from B and open the PR against it, not the default branch
 #   pq add --urgent      allocate from a reserved range, ahead of every real date
 #   pq add --after T     repeatable: don't dispatch until T's PR has merged
@@ -594,11 +594,11 @@ retitle() {                             # task_dir new_state [new_stamp]
 
 # ── after: blockers ─────────────────────────────────────────────────────────
 # A blocker is a resolved (label, repo, branch) triple, not a task reference -
-# `pq add B --after A` resolves A to its repo and branch at the moment you type
-# it. That is what makes the dependency survive `pq rm A`, survive A ageing out
-# of `done/`, and survive a slug being reused; it is also what makes a cross-repo
-# blocker work for free, and what lets a blocker name a branch that is not in
-# `pq` at all.
+# `pq add --after A` or `pq after B A` resolves A to its repo and branch at the
+# moment you type it. That is what makes the dependency survive `pq rm A`,
+# survive A ageing out of `done/`, and survive a slug being reused; it is also
+# what makes a cross-repo blocker work for free, and what lets a blocker name a
+# branch that is not in `pq` at all.
 
 # The branch a slug reduces to, same rule `cmd_add` uses for its own task names -
 # lowercased, non `[a-z0-9-]` squashed to `-`, runs collapsed, edges trimmed.
@@ -1214,12 +1214,18 @@ add_wizard() {
   [ "$after_explicit" = 1 ] || pick_after
 }
 
-cmd_add() {
+# The plan comes first and is never a flag: `pq add` itself always passes an
+# empty one, which means pick it (or take the newest - see the picker gate
+# below), and a plan is named only by pq's own callers - split_queue, one part
+# at a time. There is no `pq add plan.md`: the wizard is the way in, and a path
+# on the command line is refused as an unknown argument.
+cmd_add() {                             # plan ("" to pick) [flags...]
   # `model_explicit` is the *_explicit pattern again, and it is needed rather
   # than a `[ "$model" != "$PQ_DEFAULT_MODEL" ]` test: `--model sonnet` and no
   # flag at all leave `model` identical, and only one of the two should still
   # be asked about by add_wizard.
-  local plan="" branch="" model=$PQ_DEFAULT_MODEL model_explicit=0 effort=$PQ_DEFAULT_EFFORT
+  local plan=${1:-} branch="" model=$PQ_DEFAULT_MODEL model_explicit=0 effort=$PQ_DEFAULT_EFFORT
+  [ $# -gt 0 ] && shift
   local urgent=0 repo="" repo_explicit=0 as_json=0
   # `basebr` rather than `base`: the blocker-hint loop at the end of this
   # function already declares a `local base`, and `split_queue` reads THIS one
@@ -1270,9 +1276,9 @@ cmd_add() {
       --split-dir) split_dir=${2:-}; shift 2 ;;
       -y|--yes)    yes=1; shift ;;
       --json)      as_json=1; shift ;;
-      -h|--help)   die "usage: pq add [plan.md] [--branch B] [--base BRANCH] [--model M] [--effort E] [--urgent] [--repo PATH]... [--after task|branch]... [--design PATH]... [--intent TEXT] [--split | --split-dir DIR] [-y] [--json]" ;;
+      -h|--help)   die "usage: pq add [--branch B] [--base BRANCH] [--model M] [--effort E] [--urgent] [--repo PATH]... [--after task|branch]... [--design PATH]... [--intent TEXT] [--split | --split-dir DIR] [-y] [--json]" ;;
       -*)          die "unknown option '$1'" ;;
-      *)           plan=$1; shift ;;
+      *)           die "pq add takes no plan path - it asks which plan (or takes the newest with -y): '$1'" ;;
     esac
   done
 
@@ -1286,8 +1292,6 @@ cmd_add() {
 
   [ -n "$branch" ] && { [ "$split" = 1 ] || [ -n "$split_dir" ]; } && \
     die "--split queues N branches of its own - --branch has no meaning with it"
-  [ -n "$plan" ] && [ -n "$split_dir" ] && \
-    die "--split-dir carries its own source.md - don't also pass a plan file"
   [ "$split" = 1 ] && [ -n "$split_dir" ] && \
     die "--split and --split-dir are mutually exclusive - pick one"
 
@@ -1303,11 +1307,10 @@ cmd_add() {
     [ -d "$split_dir" ] || die "no such split directory: $split_dir"
   else
     # The interactive picker fires only when nothing else already answered
-    # "which plan": an explicit path still wins (so a plain `pq add plan.md`,
-    # and every recursive cmd_add call do_split makes, never reach it), `-y`
-    # already means "don't ask me" (and is now the only way to get today's
-    # zero-prompt behaviour at a terminal), and no tty is what keeps
-    # `a=$(pq add)` working in a script, a cron run, or an agent.
+    # "which plan": a plan handed in by the caller wins (every recursive
+    # cmd_add call split_queue makes, one per part, never reaches it), `-y`
+    # already means "don't ask me", and no tty is what keeps `a=$(pq add)`
+    # working in a script, a cron run, or an agent.
     if [ -z "$plan" ] && [ "$yes" != 1 ] && [ -t 0 ]; then
       local picked
       picked=$(pick_plan)
@@ -1643,10 +1646,10 @@ cmd_add() {
     # loop just said "already merged" from the live one.
   fi
 
-  # The slug on stdout is the handle chaining needs - it is what makes
-  # `b=$(pq add planB.md --after "$a")` possible at all, and pq's own
+  # The slug on stdout is the handle a caller needs - `a=$(pq add -y)`, or
+  # split_queue reading the --json form of each part it queues - and pq's own
   # convention is that stdout stays machine-readable while everything a human
-  # reads goes to stderr, which is why this is additive rather than a change.
+  # reads goes to stderr.
   if [ "$as_json" = 1 ]; then
     jq -nc --arg task "$slug" --arg state "$state" --arg branch "$branch" \
       --arg repo "$repo" --arg base "$(task_base "$dir")" \
@@ -6059,7 +6062,7 @@ cmd_run() {
 # non-zero, which would kill any test running under `set -e`.
 main() {
   case "${1:-}" in
-    add)        shift; cmd_add "$@" ;;
+    add)        shift; cmd_add "" "$@" ;;
     after)      shift; cmd_after "$@" ;;
     base)       shift; cmd_base "$@" ;;
     tick)       shift; cmd_tick "$@" ;;
@@ -6068,7 +6071,7 @@ main() {
     ls|list)    shift; cmd_ls "$@" ;;
     rm|remove)  shift; cmd_rm "$@" ;;
     evidence)   shift; cmd_evidence "$@" ;;
-    *) die "usage: pq {add [plan] [--base B] [--urgent] [--after task|branch]... [--design PATH]... [--split | --split-dir DIR] [-y] [--json] | after <task> [<task|branch>... | --clear] | base <task> [<branch> | --clear] | ls [--all] [--json] | tick [--cap N] [--dry-run] | run [--interval S] [--cap N] | cap [N] | rm <task> | evidence [task]}" ;;
+    *) die "usage: pq {add [--base B] [--urgent] [--after task|branch]... [--design PATH]... [--split | --split-dir DIR] [-y] [--json] | after <task> [<task|branch>... | --clear] | base <task> [<branch> | --clear] | ls [--all] [--json] | tick [--cap N] [--dry-run] | run [--interval S] [--cap N] | cap [N] | rm <task> | evidence [task]}" ;;
   esac
 }
 if [ "${BASH_SOURCE[0]}" = "$0" ]; then main "$@"; fi

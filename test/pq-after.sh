@@ -322,7 +322,7 @@ echo "== pq add: stdout is exactly the slug ==" >&2
 reset_tasks
 PLAN_FILE="$PQ_HOME/.test-plan.md"
 printf '# Test plan\n\nDo the thing.\n' > "$PLAN_FILE"
-add_out=$(main add "$PLAN_FILE" --branch tom/add-stdout-test --repo "$REPO" 2>"$PQ_HOME/.add.stderr")
+add_out=$(cmd_add "$PLAN_FILE" --branch tom/add-stdout-test --repo "$REPO" 2>"$PQ_HOME/.add.stderr")
 add_rc=$?
 [ "$add_rc" -eq 0 ] && ok || bad "pq add should succeed (rc=$add_rc): $(cat "$PQ_HOME/.add.stderr")"
 lines=$(printf '%s\n' "$add_out" | wc -l | tr -d ' ')
@@ -332,7 +332,7 @@ if find_task "$add_out" >/dev/null 2>&1; then ok; else bad "find_task should res
 
 # Chaining: b=$(pq add planB.md --after "$a") - the whole point of the stdout
 # contract.
-b_out=$(main add "$PLAN_FILE" --branch tom/add-chain-b --repo "$REPO" --after "$add_out" 2>"$PQ_HOME/.add.stderr")
+b_out=$(cmd_add "$PLAN_FILE" --branch tom/add-chain-b --repo "$REPO" --after "$add_out" 2>"$PQ_HOME/.add.stderr")
 b_rc=$?
 [ "$b_rc" -eq 0 ] && ok || bad "chained pq add should succeed: $(cat "$PQ_HOME/.add.stderr")"
 b_dir=$(find_task "$b_out" 2>/dev/null)
@@ -341,7 +341,7 @@ verdict=$(after_state "$b_dir" 2>/dev/null); verdict=${verdict%%$'\t'*}
 case "$verdict" in waiting\ *) ok ;; *) bad "B should be waiting on A right after being chained (got '$verdict')" ;; esac
 
 echo "== --json smoke test ==" >&2
-add_json=$(main add "$PLAN_FILE" --branch tom/add-json-test --repo "$REPO" --after "$add_out" \
+add_json=$(cmd_add "$PLAN_FILE" --branch tom/add-json-test --repo "$REPO" --after "$add_out" \
              --json 2>"$PQ_HOME/.add.stderr")
 if printf '%s' "$add_json" | jq -e '.after | length == 1 and .[0].label == "add-stdout-test"' >/dev/null 2>&1
 then ok; else bad "pq add --json should carry the resolved blocker (got '$add_json')"; fi
@@ -367,10 +367,10 @@ echo "== regression: cmd_add --after --json keeps the SAME cache for after_json 
 # fixed ordering bug looked like: the merge-check loop reported "already
 # merged" from a live cache, then --json's after_json read a cache already
 # deleted out from under it and called the same blocker "unknown".
-merged_out=$(main add "$PLAN_FILE" --branch tom/already-merged --repo "$REPO" 2>"$PQ_HOME/.add.stderr")
+merged_out=$(cmd_add "$PLAN_FILE" --branch tom/already-merged --repo "$REPO" 2>"$PQ_HOME/.add.stderr")
 merged_rc=$?
 [ "$merged_rc" -eq 0 ] && ok || bad "adding the already-merged task should succeed: $(cat "$PQ_HOME/.add.stderr")"
-merged_json=$(main add "$PLAN_FILE" --branch tom/depends-on-merged --repo "$REPO" \
+merged_json=$(cmd_add "$PLAN_FILE" --branch tom/depends-on-merged --repo "$REPO" \
                 --after "$merged_out" --json 2>"$PQ_HOME/.add.stderr")
 if printf '%s' "$merged_json" | jq -e '.after[0].state == "met"' >/dev/null 2>&1
 then ok; else bad "an already-merged blocker should read 'met' in the same pq add --json call (got '$merged_json')"; fi

@@ -58,7 +58,7 @@ printf '# Test plan\n\nDo the thing.\n' > "$PLAN"
 # allocates a stamp.
 add_task() {                             # branch [extra cmd_add args...] -> slug
   local branch=$1; shift
-  main add "$PLAN" --repo "$REPO" --branch "$branch" -y "$@" 2>/dev/null
+  cmd_add "$PLAN" --repo "$REPO" --branch "$branch" -y "$@" 2>/dev/null
 }
 
 queue_slugs() {
@@ -106,7 +106,7 @@ done
 
 echo "== two adds inside the same second get strictly ascending stamps ==" >&2
 reset_tasks
-# Driven through two real `main add` invocations, not two next_stamp calls:
+# Driven through two real `cmd_add` invocations, not two next_stamp calls:
 # next_stamp is stateless, so two back-to-back next_stamp calls in one process
 # would return the same value and this would pass vacuously. Monotonicity here
 # comes entirely from the first part's directory existing on disk by the time

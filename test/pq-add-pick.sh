@@ -450,21 +450,25 @@ mk_task queue 005 blocker-cand "$REPO" tom/blocker-cand >/dev/null
 via_picker=$(run_pick_after "$REPO" <<<$'1\n' 2>/dev/null)
 eq "$via_picker" "blocker-cand" "pick_after should resolve to the candidate's own slug"
 
-out_x=$(main add "$PQ_PLANS_DIR/wiring.md" --repo "$REPO" --branch tom/task-x --intent x --after blocker-cand -y 2>"$PQ_HOME/.x.err")
+out_x=$(cmd_add "$PQ_PLANS_DIR/wiring.md" --repo "$REPO" --branch tom/task-x --intent x --after blocker-cand -y 2>"$PQ_HOME/.x.err")
 t_x=$(find_task "$out_x")
-out_y=$(main add "$PQ_PLANS_DIR/wiring.md" --repo "$REPO" --branch tom/task-y --intent y --after "$via_picker" -y 2>"$PQ_HOME/.y.err")
+out_y=$(cmd_add "$PQ_PLANS_DIR/wiring.md" --repo "$REPO" --branch tom/task-y --intent y --after "$via_picker" -y 2>"$PQ_HOME/.y.err")
 t_y=$(find_task "$out_y")
 eq "$(cat "$t_x/after")" "$(cat "$t_y/after")" \
   "queuing via --after blocker-cand and via --after <pick_after's own output> must produce identical after files"
 
-echo "== wiring: an explicit plan path is completely unchanged ==" >&2
+echo "== wiring: pq add takes no plan path - the wizard is the way in ==" >&2
 reset_tasks
-slug=$(main add "$PQ_PLANS_DIR/wiring.md" --repo "$REPO" --branch tom/explicit-path --intent explicit -y \
-  2>"$PQ_HOME/.explicit.err")
-rc=$?
-[ "$rc" -eq 0 ] && ok || bad "an explicit plan path should still work exactly as before: $(cat "$PQ_HOME/.explicit.err")"
-t=$(find_task "$slug")
-eq "$(hdr "$t/plan.md" source)" "$PQ_PLANS_DIR/wiring.md" "an explicit plan path should never reach the picker"
+if ( main add "$PQ_PLANS_DIR/wiring.md" --repo "$REPO" -y ) >/dev/null 2>"$PQ_HOME/.explicit.err"; then
+  bad "pq add with a plan path should be refused"
+else
+  ok
+fi
+case "$(cat "$PQ_HOME/.explicit.err")" in
+  *"pq add takes no plan path"*) ok ;;
+  *) bad "the refusal should say why (got: $(cat "$PQ_HOME/.explicit.err"))" ;;
+esac
+eq "$(find "$PQ_HOME/queue" -mindepth 1 -maxdepth 1 | wc -l | tr -d ' ')" "0" "nothing is queued"
 
 printf '\n%d passed, %d failed\n' "$pass" "$fail" >&2
 [ "$fail" -eq 0 ]

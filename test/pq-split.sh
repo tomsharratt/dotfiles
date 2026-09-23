@@ -273,7 +273,7 @@ echo "== happy path: a four-part diamond, fresh --split ==" >&2
 reset_tasks
 PLAN="$PQ_HOME/.diamond-plan.md"
 printf 'FIXTURE: diamond\n\nA whole feature.\n' > "$PLAN"
-out=$(main add "$PLAN" --repo "$REPO" --split -y 2>"$PQ_HOME/.err")
+out=$(cmd_add "$PLAN" --repo "$REPO" --split -y 2>"$PQ_HOME/.err")
 rc=$?
 err=$(cat "$PQ_HOME/.err")
 [ "$rc" -eq 0 ] && ok || bad "happy path should succeed (rc=$rc): $err"
@@ -349,7 +349,7 @@ reset_tasks
 : > "$SPLIT_COUNTER"
 PLAN="$PQ_HOME/.solo-plan.md"
 printf 'FIXTURE: solo\n\nOne small thing.\n' > "$PLAN"
-declined_out=$(main add "$PLAN" --repo "$REPO" --split < /dev/null 2>"$PQ_HOME/.err")
+declined_out=$(cmd_add "$PLAN" --repo "$REPO" --split < /dev/null 2>"$PQ_HOME/.err")
 rc=$?
 [ "$rc" -eq 0 ] && ok || bad "declining should still exit 0: $(cat "$PQ_HOME/.err")"
 eq "$declined_out" "" "declining should print nothing to stdout"
@@ -378,7 +378,7 @@ reset_tasks
 : > "$SPLIT_COUNTER"
 PLAN2="$PQ_HOME/.solo-plan2.md"
 printf 'FIXTURE: solo\n\nOne small thing.\n' > "$PLAN2"
-main add "$PLAN2" --repo "$REPO" --split --urgent < /dev/null 2>"$PQ_HOME/.err" >/dev/null
+cmd_add "$PLAN2" --repo "$REPO" --split --urgent < /dev/null 2>"$PQ_HOME/.err" >/dev/null
 case "$(cat "$PQ_HOME/.err")" in
   *"--urgent"*) ok ;;
   *) bad "an explicitly-given --urgent should survive into the resume hint (got: $(cat "$PQ_HOME/.err"))" ;;
@@ -441,7 +441,7 @@ eq "$(queue_count)" "0" "a declined --json split queues nothing"
 echo "== --split with --branch is rejected ==" >&2
 reset_tasks
 before_splits=$(ls -d "$PQ_HOME/splits"/*/ 2>/dev/null | wc -l | tr -d ' ')
-if ( main add "$PLAN" --repo "$REPO" --split --branch tom/whatever -y ) >/dev/null 2>"$PQ_HOME/.err"; then
+if ( cmd_add "$PLAN" --repo "$REPO" --split --branch tom/whatever -y ) >/dev/null 2>"$PQ_HOME/.err"; then
   bad "--split with --branch should be rejected"
 else
   ok
@@ -705,7 +705,7 @@ echo "== multi-repo: explicit --repo (two or more) restricts the candidate set -
 reset_tasks
 PLANMR="$PQ_HOME/.multirepo-badlabel-plan.md"
 printf 'FIXTURE: multirepo-badlabel\n\nA plan.\n' > "$PLANMR"
-if ( main add "$PLANMR" --repo "$REPO" --repo "$REPO2" --split -y ) >/dev/null 2>&1; then
+if ( cmd_add "$PLANMR" --repo "$REPO" --repo "$REPO2" --split -y ) >/dev/null 2>&1; then
   bad "a label outside the explicit --repo set should be rejected"
 else
   ok
@@ -716,7 +716,7 @@ echo "== multi-repo: a SINGLE --repo does not restrict the set - the scan still 
 reset_tasks
 PLANMR2="$PQ_HOME/.multirepo-plan.md"
 printf 'FIXTURE: multirepo\n\nA plan.\n' > "$PLANMR2"
-out=$(PQ_REPOS_DIR="$SIBLINGROOT" main add "$PLANMR2" --repo "$REPO" --split -y 2>"$PQ_HOME/.err")
+out=$(PQ_REPOS_DIR="$SIBLINGROOT" cmd_add "$PLANMR2" --repo "$REPO" --split -y 2>"$PQ_HOME/.err")
 rc=$?
 [ "$rc" -eq 0 ] && ok || bad "a scanned sibling should still queue with a single --repo: $(cat "$PQ_HOME/.err")"
 t_a=$(find_task mr-a-thing); t_b=$(find_task mr-b-thing)
@@ -729,7 +729,7 @@ eq "$(hdr "$t_b/plan.md" repo)" "$(cd "$REPO2" && pwd -P)" "the scanned sibling 
 
 echo "== a non-split pq add with two --repo values is rejected ==" >&2
 reset_tasks
-if ( main add "/nonexistent-plan-file-xyz.md" --repo "$REPO" --repo "$REPO2" -y ) >/dev/null 2>&1; then
+if ( cmd_add "/nonexistent-plan-file-xyz.md" --repo "$REPO" --repo "$REPO2" -y ) >/dev/null 2>&1; then
   bad "a non-split add with two --repo values should be rejected"
 else
   ok
@@ -741,7 +741,7 @@ reset_tasks
 : > "$CALL_LOG"
 PLANMR3="$PQ_HOME/.multirepo-plan3.md"
 printf 'FIXTURE: multirepo\n\nA plan.\n' > "$PLANMR3"
-main add "$PLANMR3" --repo "$REPO" --repo "$REPO2" --split -y >/dev/null 2>&1
+cmd_add "$PLANMR3" --repo "$REPO" --repo "$REPO2" --split -y >/dev/null 2>&1
 opusargs=$(awk -F'\t' '$1 == "opus" { print $2; exit }' "$CALL_LOG")
 addcount=$(grep -o -- '--add-dir' <<<"$opusargs" | wc -l | tr -d ' ')
 eq "$addcount" "2" "one --add-dir per candidate (primary + REPO2)"
@@ -750,7 +750,7 @@ echo "== multi-repo: a candidate left dirty by the splitter is warned about, nam
 reset_tasks
 PLANMR4="$PQ_HOME/.multirepo-dirty-plan.md"
 printf 'FIXTURE: multirepo-dirty\n\nA plan.\n' > "$PLANMR4"
-main add "$PLANMR4" --repo "$REPO" --repo "$REPO2" --split -y >/dev/null 2>"$PQ_HOME/.err"
+cmd_add "$PLANMR4" --repo "$REPO" --repo "$REPO2" --split -y >/dev/null 2>"$PQ_HOME/.err"
 case "$(cat "$PQ_HOME/.err")" in
   *"$REPO2"*"dirty"*) ok ;;
   *) bad "leaving REPO2 dirty should warn naming REPO2 (got: $(cat "$PQ_HOME/.err"))" ;;
@@ -784,7 +784,7 @@ echo "== a split-level --after containing / is refused when 2+ --repo are given 
 reset_tasks
 PLANMR16="$PQ_HOME/.multirepo-rawafter-plan.md"
 printf 'FIXTURE: multirepo\n\nA plan.\n' > "$PLANMR16"
-if ( main add "$PLANMR16" --repo "$REPO" --repo "$REPO2" --split --after tom/some-raw-branch -y ) >/dev/null 2>&1; then
+if ( cmd_add "$PLANMR16" --repo "$REPO" --repo "$REPO2" --split --after tom/some-raw-branch -y ) >/dev/null 2>&1; then
   bad "a raw branch --after should be refused when --repo is given 2+ times"
 else
   ok
@@ -823,7 +823,7 @@ printf 'FIXTURE: container\n\nA plan.\n' > "$PLANC"
 # sibling-scan tests stay single-repo - repo_candidates_container reads that
 # same override, so it must be cleared here or the container scan would look
 # in the wrong place entirely and find nothing.
-out=$(PQ_REPOS_DIR= main add "$PLANC" --repo "$CONTAINERROOT" --split -y 2>"$PQ_HOME/.err")
+out=$(PQ_REPOS_DIR= cmd_add "$PLANC" --repo "$CONTAINERROOT" --split -y 2>"$PQ_HOME/.err")
 rc=$?
 [ "$rc" -eq 0 ] && ok || bad "container-mode split should succeed: $(cat "$PQ_HOME/.err")"
 t_a=$(find_task ctr-a-thing); t_b=$(find_task ctr-b-thing)
@@ -834,7 +834,7 @@ echo "== container mode: cwd itself (not --repo) being a non-repo container trig
 reset_tasks
 PLANCWD="$PQ_HOME/.container-cwd-plan.md"
 printf 'FIXTURE: container\n\nA plan.\n' > "$PLANCWD"
-out=$(cd "$CONTAINERROOT" && PQ_REPOS_DIR= main add "$PLANCWD" --split -y 2>"$PQ_HOME/.err")
+out=$(cd "$CONTAINERROOT" && PQ_REPOS_DIR= cmd_add "$PLANCWD" --split -y 2>"$PQ_HOME/.err")
 rc=$?
 [ "$rc" -eq 0 ] && ok || bad "running from cwd=container should discover its children: $(cat "$PQ_HOME/.err")"
 t_a=$(find_task ctr-a-thing)
@@ -891,7 +891,7 @@ mkdir -p "$EMPTYCONTAINER/not-a-repo"
 reset_tasks
 PLANEMPTY="$PQ_HOME/.container-empty-plan.md"
 printf 'FIXTURE: container\n\nA plan.\n' > "$PLANEMPTY"
-if ( PQ_REPOS_DIR= main add "$PLANEMPTY" --repo "$EMPTYCONTAINER" --split -y ) >/dev/null 2>"$PQ_HOME/.err"; then
+if ( PQ_REPOS_DIR= cmd_add "$PLANEMPTY" --repo "$EMPTYCONTAINER" --split -y ) >/dev/null 2>"$PQ_HOME/.err"; then
   bad "a container with no git-repo children should die"
 else
   ok
@@ -929,7 +929,7 @@ echo "== container mode: a raw-branch --after is refused even with NO explicit -
 reset_tasks
 PLANRAW="$PQ_HOME/.container-rawafter-plan.md"
 printf 'FIXTURE: container\n\nA plan.\n' > "$PLANRAW"
-if ( PQ_REPOS_DIR= main add "$PLANRAW" --repo "$CONTAINERROOT" --split --after tom/some-raw-branch -y ) >/dev/null 2>&1; then
+if ( PQ_REPOS_DIR= cmd_add "$PLANRAW" --repo "$CONTAINERROOT" --split --after tom/some-raw-branch -y ) >/dev/null 2>&1; then
   bad "a raw branch --after should be refused in container/no-primary mode"
 else
   ok
@@ -965,7 +965,7 @@ reset_tasks
 NOTAREPO=$(mktemp -d)
 PLAINPLAN="$PQ_HOME/.notarepo-plan.md"
 printf '# plan\n\nJust one thing.\n' > "$PLAINPLAN"
-if ( cd "$NOTAREPO" && main add "$PLAINPLAN" -y ) >/dev/null 2>"$PQ_HOME/.err"; then
+if ( cd "$NOTAREPO" && cmd_add "$PLAINPLAN" -y ) >/dev/null 2>"$PQ_HOME/.err"; then
   bad "a plain add from a non-repo directory should die"
 else
   ok

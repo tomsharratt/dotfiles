@@ -137,7 +137,7 @@ Dispatch runs `wt new` in that repo, which picks up its profile, and everything 
 Branch *lookups* are keyed on the repo as well as the name, but a task's slug is a single global namespace, so two live tasks can never share a branch leaf even across two different projects - `tom/fix-timezone` cannot be queued in both at once.
 
 ```
-pq add [plan]            add a plan to the queue (no plan, at a terminal: pick one)
+pq add                   pick a plan and add it to the queue (-y, or no tty: the newest)
 pq add --urgent          allocate from a reserved range, ahead of every real date
 pq add --after T         repeatable, at add time: don't dispatch until T's PR has merged
 pq add --design PATH     repeatable: a design file the implementer builds to (auto-detected from the plan too)
@@ -160,7 +160,7 @@ The fourteen-digit prefix on a task directory is a UTC timestamp and nothing els
 
 #### Picking a plan
 
-A bare `pq add` at a terminal shows the ten most recently touched plans in `~/.claude/plans`, each with its age and its title - the first `# H1` in the file, since Claude Code names the file itself from your opening prompt and that name is rarely what the plan is actually about.
+`pq add` at a terminal shows the ten most recently touched plans in `~/.claude/plans`, each with its age and its title - the first `# H1` in the file, since Claude Code names the file itself from your opening prompt and that name is rarely what the plan is actually about.
 "Most recently touched" means whichever is newer, mtime or birth time, so a plan edited this morning outranks one merely created today, and a plan restored by `cp -p`, `rsync -a`, or a git checkout doesn't fall to the bottom on a stale mtime.
 
 Ten is a page, not a limit.
@@ -178,8 +178,7 @@ Only what is typed at the prompt is held to those three - `--model` itself still
 
 Passing a flag the wizard would otherwise ask about skips just that one question and leaves the rest standing - `pq add --split` skips the split question, `pq add --model opus` skips the model question, `pq add --after some-task` skips the blocker question, and any combination of them skips exactly the questions it has already answered.
 
-`-y` and no tty (a script, a cron run, an agent) skip the picker altogether and take the newest plan without asking anything - exactly what `pq add` has always done.
-A plan path given explicitly skips the picker too, but uses exactly that plan rather than the newest one - also unchanged from before.
+`-y` and no tty (a script, a cron run, an agent) skip the picker altogether and take the newest plan without asking anything.
 
 #### Delivering a reviewable pull request
 
@@ -239,7 +238,7 @@ A lingering directory from before this scheme won't - that is what the one-time 
 #### Blockers
 
 Some work is several pull requests where the second cannot start until the first has shipped - a client change waiting on the endpoint it calls, say.
-`pq add B --after A` (or `pq after B A` once both are queued) says exactly that: B is not eligible for dispatch until A's PR has merged into A's repo's default branch.
+The wizard's blocker question, `pq add --after A`, or `pq after B A` once both are queued, says exactly that: B is not eligible for dispatch until A's PR has merged into A's repo's default branch.
 
 Blocked is derived, not stored - a blocked task sits in `queue/` like any other and fill just skips it, the same way the cap is soft arithmetic rather than a drain state.
 A task's blockers live in a third file, `after`, alongside `plan.md` and `state.env`: one blocker per line, `label<TAB>repo<TAB>branch`.
@@ -249,13 +248,7 @@ That is also what makes a cross-repo blocker work for free, and lets a blocker n
 Merge state comes from the forge, never from git ancestry: a squash-merged branch's tip is not an ancestor of its default branch, so `git branch --merged` misses every real merge.
 `pq` asks `gh` instead, and only trusts a `MERGED` pull request whose base is genuinely the repo's default branch - merged into some other branch does not count.
 
-`pq add` prints the new task's slug on stdout - everything else it prints is for a human, on stderr - which is what makes chaining a one-liner:
-
-```
-a=$(pq add planA.md)
-b=$(pq add planB.md --after "$a")
-c=$(pq add planC.md --after "$b")
-```
+`pq add` prints the new task's slug on stdout - everything else it prints is for a human, on stderr.
 
 `pq after <task>` answers "why has this not started": per blocker, both the state of the task that owns the branch and the state of its pull request, since either one can be the reason and the fix differs.
 A blocker that has already merged is fine to add - `pq` says so rather than refusing.
@@ -319,7 +312,7 @@ Either way nothing is lost - a task caught mid-dispatch keeps its claim without 
 A big change is one pull request: the implementer commits it as a series of small, self-contained steps, and the commits are how it is reviewed.
 Cutting it into several pull requests on top of that only buys a waterfall - each piece waits on the merge of the one before it, and so does its review - so `pq` never proposes dividing a plan just because it is big.
 Some plans do lay out several pull requests of their own, though: a "PR 1" and a "PR 2" the plan names, or work in more than one repository, which one pull request cannot span.
-`pq add plan.md --split` is for those: one Opus session reads the plan and writes each of its pull requests up as a standalone plan of its own, plus a dependency graph - then queues every part through the ordinary `pq add` path, with `--after` already wired from the graph.
+`pq add --split` is for those: one Opus session reads the plan and writes each of its pull requests up as a standalone plan of its own, plus a dependency graph - then queues every part through the ordinary `pq add` path, with `--after` already wired from the graph.
 It follows the plan's own boundaries and never draws its own: no pull request is divided further or merged with another, and a plan that lays out one pull request in one repository comes back as a single part.
 The order the plan gives its pull requests in is not a dependency - only real ones are wired (an endpoint, a schema, a helper one part introduces and another uses, or two parts that would edit the same code), so parts that do not depend on each other run side by side.
 
@@ -328,7 +321,7 @@ The Haiku call that names every task also returns an outline: the pull requests 
 When the outline has more than one entry the wizard lists it and asks whether to queue one task per pull request, with Enter meaning yes; a plan with a one-entry outline is not asked at all.
 The outline is shown to you, not fed to the splitter, which reads the plan's pull requests off the plan itself and still shows its table for confirmation before anything is queued, so a split that comes out differently from the outline is visible before it costs anything.
 `--split` is still the way in when Haiku has missed a plan that lays out several.
-A non-interactive add (`-y`, no tty, an explicit plan path) never auto-splits, even a plan that asks for it; it prints the same outline as a warning and queues the plan as one task, saying how to redo it with `--split`.
+A non-interactive add (`-y` or no tty) never auto-splits, even a plan that asks for it; it prints the same outline as a warning and queues the plan as one task, saying how to redo it with `--split`.
 
 The load-bearing constraint is that parts wait for merges, never for branches - no part is ever built on top of a sibling's branch.
 Each part starts from the default branch with its declared dependencies already merged, and every part is written for an agent that sees only that one file: it never mentions another part, its filename, or its branch.

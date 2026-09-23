@@ -129,7 +129,7 @@ mkplan() {                              # file marker [extra lines...]
 
 echo "== --design copies the files into design/ and writes the header ==" >&2
 PLAN="$PQ_HOME/.p1.md"; mkplan "$PLAN" plain "Body."
-slug=$(main add "$PLAN" --repo "$REPO" --branch tom/d1 --intent x --design "$DC" --design "$DES/shot.png" -y 2>"$PQ_HOME/.err")
+slug=$(cmd_add "$PLAN" --repo "$REPO" --branch tom/d1 --intent x --design "$DC" --design "$DES/shot.png" -y 2>"$PQ_HOME/.err")
 rc=$?
 [ "$rc" -eq 0 ] && ok || bad "add with two designs should succeed: $(cat "$PQ_HOME/.err")"
 t=$(find_task "$slug")
@@ -142,14 +142,14 @@ cmp -s "$DC" "$t/design/Onboarding Refresh.dc.html" && ok || bad "the copy must 
 eq "$(readlink "$PQ_HOME/tasks/$(basename "$t")")" "$t" "add makes the stable tasks/ link"
 
 echo "== a task with no design writes no design: header at all ==" >&2
-slug=$(main add "$PLAN" --repo "$REPO" --branch tom/d0 --intent x -y 2>/dev/null)
+slug=$(cmd_add "$PLAN" --repo "$REPO" --branch tom/d0 --intent x -y 2>/dev/null)
 t=$(find_task "$slug")
 grep -q '^design:' "$t/plan.md" && bad "no design set must mean no header, not an empty one" || ok
 [ -d "$t/design" ] && bad "no design set must mean no design/ directory" || ok
 
 echo "== a missing --design path dies before anything is queued ==" >&2
 before=$(queue_count)
-( main add "$PLAN" --repo "$REPO" --branch tom/d2 --intent x --design /nonexistent/nope.png -y ) >/dev/null 2>"$PQ_HOME/.err" \
+( cmd_add "$PLAN" --repo "$REPO" --branch tom/d2 --intent x --design /nonexistent/nope.png -y ) >/dev/null 2>"$PQ_HOME/.err" \
   && bad "a missing design path must fail the add" || ok
 has "$(cat "$PQ_HOME/.err")" "no such design file: /nonexistent/nope.png" "and say which path"
 eq "$(queue_count)" "$before" "nothing may be queued when a design is missing"
@@ -161,7 +161,7 @@ FAKEHOME=$(mktemp -d)
 printf 'PNG\n' > "$FAKEHOME/mock.png"
 PLAN2="$PQ_HOME/.p2.md"
 mkplan "$PLAN2" plain "Design file: $DC" "The mock is at ~/mock.png, roughly." "Not a design: $DES/app/views/show.html.erb"
-slug=$(HOME=$FAKEHOME main add "$PLAN2" --repo "$REPO" --branch tom/d3 --intent x -y 2>"$PQ_HOME/.err")
+slug=$(HOME=$FAKEHOME cmd_add "$PLAN2" --repo "$REPO" --branch tom/d3 --intent x -y 2>"$PQ_HOME/.err")
 rc=$?
 [ "$rc" -eq 0 ] && ok || bad "auto-detect add should succeed: $(cat "$PQ_HOME/.err")"
 t=$(find_task "$slug")
@@ -175,7 +175,7 @@ hasnt "$(cat "$PQ_HOME/.err")" "not on disk" "nothing here was dangling"
 echo "== auto-detection: a url is never read as a path ==" >&2
 PLAN3="$PQ_HOME/.p3.md"
 mkplan "$PLAN3" plain "Design source: https://claude.ai/design/p/1de6ab63?file=Audio+Player.dc.html and nothing else."
-slug=$(main add "$PLAN3" --repo "$REPO" --branch tom/d4 --intent x -y 2>"$PQ_HOME/.err")
+slug=$(cmd_add "$PLAN3" --repo "$REPO" --branch tom/d4 --intent x -y 2>"$PQ_HOME/.err")
 t=$(find_task "$slug")
 eq "$(hdr "$t/plan.md" design)" "" "a claude.ai url is not a design path"
 hasnt "$(cat "$PQ_HOME/.err")" "not on disk" "and is not warned about as a dangling one either"
@@ -185,7 +185,7 @@ has "$(cat "$PQ_HOME/.err")" "no design file was found on disk or given" "a desi
 echo "== auto-detection: a dangling path warns by name and does not block the add ==" >&2
 PLAN4="$PQ_HOME/.p4.md"
 mkplan "$PLAN4" plain "Design file: /nonexistent/Missing Board.dc.html"
-slug=$(main add "$PLAN4" --repo "$REPO" --branch tom/d5 --intent x -y 2>"$PQ_HOME/.err")
+slug=$(cmd_add "$PLAN4" --repo "$REPO" --branch tom/d5 --intent x -y 2>"$PQ_HOME/.err")
 rc=$?
 [ "$rc" -eq 0 ] && ok || bad "a dangling design mention must not fail the add"
 has "$(cat "$PQ_HOME/.err")" "not on disk: /nonexistent/Missing Board.dc.html" "the dangling path is named"
@@ -300,16 +300,16 @@ named=$(name_plan "$PN")
 eq "$(cut -f1 <<<"$named")" "" "a prefix with no words is no name at all"
 eq "$(cut -f2 <<<"$named")" "No words." "and the intent still comes through"
 reset_tasks
-slug=$(main add "$PB" --repo "$REPO" -y 2>"$PQ_HOME/.err")
+slug=$(cmd_add "$PB" --repo "$REPO" -y 2>"$PQ_HOME/.err")
 t=$(find_task "$slug")
 eq "$(hdr "$t/plan.md" branch)" "tom/fix-login-swallow" "the queued task carries the prefixed branch"
 reset_tasks
-( main add "$PN" --repo "$REPO" -y ) >/dev/null 2>"$PQ_HOME/.err" && bad "a plan Haiku gave no words for must not queue" || ok
+( cmd_add "$PN" --repo "$REPO" -y ) >/dev/null 2>"$PQ_HOME/.err" && bad "a plan Haiku gave no words for must not queue" || ok
 has "$(cat "$PQ_HOME/.err")" "could not derive a branch name from the plan" "and asks for --branch"
 
 echo "== -y prints the outline as a warning, points at --split, and never splits ==" >&2
 reset_tasks
-slug=$(main add "$P3" --repo "$REPO" -y 2>"$PQ_HOME/.err")
+slug=$(cmd_add "$P3" --repo "$REPO" -y 2>"$PQ_HOME/.err")
 rc=$?
 [ "$rc" -eq 0 ] && ok || bad "a -y add of an outlined plan should succeed: $(cat "$PQ_HOME/.err")"
 err=$(cat "$PQ_HOME/.err")
@@ -326,7 +326,7 @@ eq "$(hdr "$t/plan.md" intent)" "Three things, one plan." "the intent comes from
 echo "== a one-entry outline is not worth a warning ==" >&2
 reset_tasks
 P1="$PQ_HOME/.one.md"; mkplan "$P1" one
-main add "$P1" --repo "$REPO" -y >/dev/null 2>"$PQ_HOME/.err"
+cmd_add "$P1" --repo "$REPO" -y >/dev/null 2>"$PQ_HOME/.err"
 hasnt "$(cat "$PQ_HOME/.err")" "lays out" "one pull request is what every plan should be"
 hasnt "$(cat "$PQ_HOME/.err")" "--split" "so nothing is suggested"
 
@@ -340,9 +340,9 @@ hasnt "$hp" "naturally" "the old judged outline is gone"
 
 echo "== --json carries the design set ==" >&2
 reset_tasks
-out=$(main add "$PLAN" --repo "$REPO" --branch tom/dj --intent x --design "$DES/shot.png" --design "$DC" -y --json 2>/dev/null)
+out=$(cmd_add "$PLAN" --repo "$REPO" --branch tom/dj --intent x --design "$DES/shot.png" --design "$DC" -y --json 2>/dev/null)
 eq "$(jq -c '.design' <<<"$out")" '["shot.png","Onboarding Refresh.dc.html"]' "--json lists the design basenames"
-out=$(main add "$PLAN" --repo "$REPO" --branch tom/dj0 --intent x -y --json 2>/dev/null)
+out=$(cmd_add "$PLAN" --repo "$REPO" --branch tom/dj0 --intent x -y --json 2>/dev/null)
 eq "$(jq -c '.design' <<<"$out")" '[]' "and an empty array when there is none"
 out=$(main ls --json 2>/dev/null)
 eq "$(jq -r '.[] | select(.task == "dj") | .design | length' <<<"$out")" "2" "pq ls --json carries it too"
@@ -361,7 +361,7 @@ echo "== split: a design follows the parts that name it ==" >&2
 reset_tasks
 PS="$PQ_HOME/.split-plan.md"
 mkplan "$PS" split "Design file: $DC"
-out=$(main add "$PS" --repo "$REPO" --split -y 2>"$PQ_HOME/.err")
+out=$(cmd_add "$PS" --repo "$REPO" --split -y 2>"$PQ_HOME/.err")
 rc=$?
 [ "$rc" -eq 0 ] && ok || bad "a split with a design should succeed: $(cat "$PQ_HOME/.err")"
 eq "$(queue_count)" "2" "two parts queued"
@@ -376,7 +376,7 @@ SD=$(ls -d "$PQ_HOME/splits"/*/ | head -1); SD=${SD%/}
 
 echo "== split: a design no part names goes to every part, with a warning ==" >&2
 reset_tasks
-out=$(main add "$PS" --repo "$REPO" --split --design "$DES/shot.png" -y 2>"$PQ_HOME/.err")
+out=$(cmd_add "$PS" --repo "$REPO" --split --design "$DES/shot.png" -y 2>"$PQ_HOME/.err")
 rc=$?
 [ "$rc" -eq 0 ] && ok || bad "a split with an uncited design should still succeed: $(cat "$PQ_HOME/.err")"
 has "$(cat "$PQ_HOME/.err")" "no part names the design file shot.png - attaching it to every part" "the miss is warned about by name"
