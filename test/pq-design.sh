@@ -52,6 +52,12 @@ case "$model" in
         printf '{"branch":"tom/one-part","intent":"One thing.","parts":["The one thing"]}\n' ;;
       *"MARKER: plain"*)
         printf '{"branch":"tom/plain-plan","intent":"No outline at all."}\n' ;;
+      *"MARKER: bare"*)
+        printf '{"branch":"fix-login-swallow","intent":"Bare."}\n' ;;
+      *"MARKER: category"*)
+        printf '{"branch":"feature/settings-index","intent":"Category."}\n' ;;
+      *"MARKER: nobranch"*)
+        printf '{"branch":"tom/","intent":"No words."}\n' ;;
       *"MARKER: part-a"*)
         printf '{"branch":"tom/part-a","intent":"Part A.","parts":["A"]}\n' ;;
       *"MARKER: part-b"*)
@@ -278,6 +284,28 @@ PP="$PQ_HOME/.plain.md"; mkplan "$PP" plain
 named=$(name_plan "$PP")
 eq "$(wc -l <<<"$named" | tr -d ' ')" "1" "a reply with no parts is still one line"
 eq "$(outline_of "$named")" "" "and has no outline"
+
+echo "== name_plan: the branch is always tom/<words>, whatever Haiku sent back ==" >&2
+PB="$PQ_HOME/.bare.md"; mkplan "$PB" bare
+IFS=$'\t' read -r b _ <<<"$(name_plan "$PB")"
+eq "$b" "tom/fix-login-swallow" "a bare name gets the prefix"
+PC="$PQ_HOME/.category.md"; mkplan "$PC" category
+IFS=$'\t' read -r b _ <<<"$(name_plan "$PC")"
+eq "$b" "tom/settings-index" "an invented category is replaced by it"
+IFS=$'\t' read -r b _ <<<"$(name_plan "$P3")"
+eq "$b" "tom/three-parts" "a name that already has it is left alone"
+PN="$PQ_HOME/.nobranch.md"; mkplan "$PN" nobranch
+# `cut`, as cmd_add reads it: `read` would strip the empty field's leading tab.
+named=$(name_plan "$PN")
+eq "$(cut -f1 <<<"$named")" "" "a prefix with no words is no name at all"
+eq "$(cut -f2 <<<"$named")" "No words." "and the intent still comes through"
+reset_tasks
+slug=$(main add "$PB" --repo "$REPO" -y 2>"$PQ_HOME/.err")
+t=$(find_task "$slug")
+eq "$(hdr "$t/plan.md" branch)" "tom/fix-login-swallow" "the queued task carries the prefixed branch"
+reset_tasks
+( main add "$PN" --repo "$REPO" -y ) >/dev/null 2>"$PQ_HOME/.err" && bad "a plan Haiku gave no words for must not queue" || ok
+has "$(cat "$PQ_HOME/.err")" "could not derive a branch name from the plan" "and asks for --branch"
 
 echo "== -y prints the outline as a warning, points at --split, and never splits ==" >&2
 reset_tasks

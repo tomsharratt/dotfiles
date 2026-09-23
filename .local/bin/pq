@@ -761,7 +761,14 @@ This part lands in the $label repository, so make the branch name say which one 
   # Be forgiving about a fenced or chatty reply: take the first {...} span.
   json=$(sed -n 's/.*\({.*}\).*/\1/p' <<<"$(tr '\n' ' ' <<<"$raw")" | head -1)
   [ -n "$json" ] || return 0
-  jq -er '[.branch, .intent] | @tsv' 2>/dev/null <<<"$json" || return 0
+  # The branch is always tom/<words>, whatever came back. Haiku drops the
+  # prefix it is asked for often enough to matter - 27 of the first 103 tasks
+  # went out bare - and now and then invents a category of its own, fix/ or
+  # feature/. So only the words after the last slash are taken from the reply,
+  # and the prefix is pq's. A reply with no words at all stays empty, and the
+  # caller asks for --branch.
+  jq -er '[(.branch // "" | sub("^.*/"; "") | if . == "" then "" else "tom/" + . end), .intent] | @tsv' \
+    2>/dev/null <<<"$json" || return 0
   # The outline. A tab or newline inside a title would break the line-oriented
   # contract above, so both are squeezed to spaces, and an empty title is dropped.
   jq -r '.parts[]? | strings' 2>/dev/null <<<"$json" | tr '\t' ' ' | sed '/^[[:space:]]*$/d'
