@@ -295,6 +295,7 @@ hdr() {                                 # plan.md key
 # Same shape as wt's state files, so the two tools' state reads the same way.
 st() {                                  # task_dir key
   [ -f "$1/state.env" ] || return 0
+  # shellcheck source=/dev/null  # a task's runtime facts, not a script to follow
   ( set -a; . "$1/state.env" 2>/dev/null; set +a; eval "printf '%s' \"\${$2:-}\"" ) 2>/dev/null
 }
 # Upsert KEY=VALUE, preserving the other keys. Each dispatch step records itself the
@@ -414,7 +415,7 @@ cmd_cap() {
     [ -d "$d" ] || continue
     [ -n "$(slot_state "${d%/}")" ] && nwrap=$((nwrap + 1))
   done
-  active=$(( $(ls -d "$PQ_HOME/running"/*/ 2>/dev/null | wc -l | tr -d ' ') + nwrap ))
+  active=$(( $(dir_count "$PQ_HOME/running") + nwrap ))
   local also=""
   [ "$nwrap" -gt 0 ] && also=" ($nwrap of them wrapping up a PR)"
   # A wall outranks the arithmetic here as much as it does in fill: room the next
@@ -507,7 +508,7 @@ all_tasks() {                           # [scope: live|all]
   # unquoted `$states` word-splits on that inherited IFS, and a tab-only IFS
   # has no space in it - `for s in $states` collapses to one bogus iteration
   # and every task vanishes. `"${states[@]}"` never depends on IFS at all.
-  local scope=${1:-live} s d states=(running queue done)
+  local scope=${1:-live} s d states=(running queue "done")
   [ "$scope" = all ] && states+=(archive)
   for s in "${states[@]}"; do
     for d in "$PQ_HOME/$s"/*/; do
@@ -517,6 +518,13 @@ all_tasks() {                           # [scope: live|all]
   done
 }
 
+# How many task directories one state holds. A glob rather than `ls | wc -l`:
+# the same count, with nothing parsed out of ls.
+dir_count() {                           # dir -> n
+  local n=0 x
+  for x in "$1"/*/; do [ -d "$x" ] && n=$((n + 1)); done
+  printf '%s' "$n"
+}
 
 # Fill's own view of the queue: stamp order, sorted NUMERICALLY rather than
 # trusting glob order. Glob order and numeric order agree by construction now
@@ -1564,7 +1572,7 @@ cmd_add() {                             # plan branch intent security ("" "" "" 
   # naming round trip between the two points records a stamp for when the
   # task actually landed, not for when the command started.
   local stamp; stamp=$(next_stamp "$urgent")
-  local dir="$PQ_HOME/$state/$(task_name "$stamp" "$slug")"
+  local dir; dir="$PQ_HOME/$state/$(task_name "$stamp" "$slug")"
   [ -e "$dir" ] && die "a task already exists at $state/$(basename "$dir")"
   local taken_in; taken_in=$(slug_taken_in "$slug") && die "a task named '$slug' already exists in $taken_in/"
 
@@ -1658,7 +1666,8 @@ repo_candidates() {                     # primary_repo -> label<TAB>path, primar
   root="${PQ_REPOS_DIR:-$(dirname "$primary")}"
 
   printf '%s\t%s\n' "$(basename "$primary")" "$primary"
-  local seen_paths=$'\n'"$primary"$'\n' seen_labels=$'\n'"$(basename "$primary")"$'\n'
+  local seen_paths=$'\n'"$primary"$'\n' seen_labels
+  seen_labels=$'\n'"$(basename "$primary")"$'\n'
 
   # Each entry resolves to its MAIN checkout via the same `git worktree list
   # --porcelain` idiom cmd_add already uses on the primary (line ~751), so a
@@ -2912,6 +2921,7 @@ parse_reset() {                         # hint text -> epoch seconds
     *)   dpart=""; tpart=$s ;;
   esac
   tpart=$(tr -d ' ' <<<"$tpart" | tr '[:lower:]' '[:upper:]')
+  # shellcheck disable=SC2001  # a backreference, which no parameter expansion does
   case "$tpart" in *:*) ;; *) tpart=$(sed 's/\([0-9]\{1,2\}\)\([AP]M\)/\1:00\2/' <<<"$tpart") ;; esac
   case "$tpart" in *AM|*PM) ;; *) return 1 ;; esac
   nowe=$(date '+%s')
@@ -3315,7 +3325,7 @@ pr_load() {                             # repo branch...
                  (if .isDraft then "draft" else "" end), .baseRefName,
                  (.mergeCommit.oid // "")] | @tsv' <<<"$raw"
     ) > "$PR_CACHE.$n" &
-    pids[$n]=$!; n=$((n + 1))
+    pids[n]=$!; n=$((n + 1))
   done
   [ "$n" -gt 0 ] || return 0
   wait "${pids[@]}" 2>/dev/null
@@ -3868,10 +3878,10 @@ age_since() {                           # epoch_seconds -> 12m / 3h / 5d
 }
 
 age_of() {                              # iso8601
-  local then
-  then=$(epoch_of "${1:-}")
-  [ -n "$then" ] || { printf -- '-'; return; }
-  age_since "$then"
+  local at
+  at=$(epoch_of "${1:-}")
+  [ -n "$at" ] || { printf -- '-'; return; }
+  age_since "$at"
 }
 
 # What check_stall recorded about a pane, as a cell: `quota 8:30pm`, `walled 2h`,
@@ -4014,7 +4024,7 @@ cmd_ls() {
   local tasks; tasks=$(all_tasks "$([ "$all" = 1 ] && printf all || printf live)")
   if [ -z "$tasks" ]; then
     [ "$as_json" = 1 ] && echo '[]'
-    local narch0; narch0=$(ls -d "$PQ_HOME/archive"/*/ 2>/dev/null | wc -l | tr -d ' ')
+    local narch0; narch0=$(dir_count "$PQ_HOME/archive")
     if [ "$narch0" -gt 0 ] && [ "$all" != 1 ]; then
       msg "queue is empty - add one with: pq add ($narch0 archived, --all to see)"
     else
@@ -4148,9 +4158,9 @@ cmd_ls() {
   else
     render_table "$tbl"
     local nq nr narch
-    nq=$(ls -d "$PQ_HOME/queue"/*/ 2>/dev/null | wc -l | tr -d ' ')
-    nr=$(ls -d "$PQ_HOME/running"/*/ 2>/dev/null | wc -l | tr -d ' ')
-    narch=$(ls -d "$PQ_HOME/archive"/*/ 2>/dev/null | wc -l | tr -d ' ')
+    nq=$(dir_count "$PQ_HOME/queue")
+    nr=$(dir_count "$PQ_HOME/running")
+    narch=$(dir_count "$PQ_HOME/archive")
     printf '\n' >&2
     # The wrap-up count only earns its words when there is one, but when there
     # is, it is the line that explains a queue sitting still at a cap that looks
@@ -6029,7 +6039,7 @@ tick_body() {                           # cap dry
           # So does the security reviewer's ladder, for a plan that asked.
           st_set "$d" PQ_REVIEW pending
           [ "$(hdr "$d/plan.md" security)" = yes ] && st_set "$d" PQ_SECURITY pending
-          retitle "$d" done >/dev/null
+          retitle "$d" "done" >/dev/null
           msg "finished $slug - #$num $what"
         fi
         continue
@@ -6103,7 +6113,7 @@ tick_body() {                           # cap dry
   # the same pass, using the PR row `pr_targets running` already loaded for it
   # above - and before the blocker pass, though the two are independent (done
   # tasks vs. queued tasks, neither reads the other's cache).
-  local n_torn=0 would_torn=0 reap_note= rc
+  local n_torn=0 would_torn=0 reap_note="" rc
   if reap_ok; then
     for d in "$PQ_HOME/done"/*/; do
       [ -d "$d" ] || continue
@@ -6233,8 +6243,8 @@ tick_body() {                           # cap dry
   # Only running/ is recounted - fill just moved tasks into it. The wrap-up half
   # is reused rather than recomputed: nothing after fill can change it, and a
   # second active_slots pass would re-walk done/ for the same answer.
-  n_run=$(ls -d "$PQ_HOME/running"/*/ 2>/dev/null | wc -l | tr -d ' ')
-  local queued; queued=$(ls -d "$PQ_HOME/queue"/*/ 2>/dev/null | wc -l | tr -d ' ')
+  n_run=$(dir_count "$PQ_HOME/running")
+  local queued; queued=$(dir_count "$PQ_HOME/queue")
   # Name the two halves separately. A cap of 3 reading "3 running" while three
   # more agents were still wrapping up in done/ is precisely what made six live
   # agents look like a healthy tick for as long as this bug lasted.
@@ -6339,7 +6349,7 @@ cmd_run() {
   # been. slot_state, not slot_held - the loop is over, and nobody's clock should
   # start on the way out.
   local n_run n_wrap d
-  n_run=$(ls -d "$PQ_HOME/running"/*/ 2>/dev/null | wc -l | tr -d ' ')
+  n_run=$(dir_count "$PQ_HOME/running")
   n_wrap=0
   for d in "$PQ_HOME/done"/*/; do
     [ -d "$d" ] || continue
