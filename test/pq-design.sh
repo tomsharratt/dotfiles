@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# test/pq-design.sh - designs travel with the task, and Haiku's outline suggests
-# a split: `--design`, auto-detection from the plan's text, the `design:` header
+# test/pq-design.sh - designs travel with the task, and a plan that lays out
+# several pull requests is offered as one task each: `--design`, auto-detection
+# from the plan's text, the `design:` header
 # and design/ directory, the wizard's two new questions, propagation through a
 # split, and name_plan's multi-line reply.
 #
@@ -22,23 +23,26 @@ PQ_REPOS_DIR=$(mktemp -d)
 export PQ_REPOS_DIR
 
 STUBBIN=$(mktemp -d)
-# `haiku` reads the plan on stdin and answers off its marker line. Three
+# `haiku` reads the plan on stdin, keeps the prompt it was given in
+# .haiku-prompt next to itself, and answers off its marker line. Three
 # shapes of reply: a full outline (three parts), a one-entry outline, and the
 # pre-outline shape with no `parts` at all, which every existing caller still
 # has to read. `opus` writes a two-part split whose first part names the
 # design file and whose second does not.
 cat > "$STUBBIN/claude" <<'STUBEOF'
 #!/usr/bin/env bash
-model=""
+model="" prompt=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --model) model=$2; shift 2 ;;
-    *) shift ;;
+    -p) shift ;;
+    *) prompt=$1; shift ;;
   esac
 done
 case "$model" in
   haiku)
     content=$(cat)
+    printf '%s' "$prompt" > "$(dirname "$0")/.haiku-prompt"
     case "$content" in
       *"MARKER: three"*)
         printf '{"branch":"tom/three-parts","intent":"Three things, one plan.","parts":["Add the checklist step collection to Onboarding","Rebuild the Getting Started page around the new components","Add the Resources block and the sign-up link"]}\n' ;;
@@ -226,39 +230,41 @@ hasnt "$(cat "$PQ_HOME/.err")" "path to it" "--design given explicitly skips the
   && bad "a typed path that does not exist must die" || ok
 has "$(cat "$PQ_HOME/.err")" "no such design file" "and say so"
 
-echo "== add_wizard: the outline is shown, in order, and flips the default at the threshold ==" >&2
+echo "== add_wizard: a plan that lays out several pull requests is offered as one task each ==" >&2
 THREE=$(printf 'Add the checklist step collection to Onboarding\nRebuild the Getting Started page around the new components\nAdd the Resources block and the sign-up link')
 out=$(run_wizard 0 0 1 "$THREE" <<<"" 2>"$PQ_HOME/.err")
 err=$(cat "$PQ_HOME/.err")
-has "$err" "Haiku reads this plan as 3 separately reviewable pull requests:" "the outline is introduced with its count"
+has "$err" "this plan lays out 3 pull requests:" "the outline is introduced with its count"
 has "$err" "1. Add the checklist step collection to Onboarding" "title 1 is numbered first"
 has "$err" "2. Rebuild the Getting Started page around the new components" "title 2 second"
 has "$err" "3. Add the Resources block and the sign-up link" "title 3 third"
-case "$err" in *"1. Add the checklist"*"2. Rebuild"*"3. Add the Resources"*) ok ;; *) bad "the titles must print in build order" ;; esac
-has "$err" "[Y/n]" "at the threshold (3) the default is yes"
+case "$err" in *"1. Add the checklist"*"2. Rebuild"*"3. Add the Resources"*) ok ;; *) bad "the titles must print in the plan's order" ;; esac
+has "$err" "queue one task per pull request? [Y/n]" "the default is yes"
 eq "$out" "split=1 design=[]" "so Enter splits"
 out=$(run_wizard 0 0 1 "$THREE" <<<"n" 2>/dev/null)
 eq "$out" "split=0 design=[]" "n still declines"
 
+# Two is as much a plan's own say-so as three: there is no size threshold left.
 TWO=$(printf 'First half\nSecond half')
 out=$(run_wizard 0 0 1 "$TWO" <<<"" 2>"$PQ_HOME/.err")
 err=$(cat "$PQ_HOME/.err")
-has "$err" "Haiku reads this plan as 2 separately reviewable pull requests:" "a two-entry outline is still shown"
-has "$err" "[y/N]" "below the threshold the default is no"
-eq "$out" "split=0 design=[]" "so Enter does not split"
-out=$(run_wizard 0 0 1 "$TWO" <<<"y" 2>/dev/null)
-eq "$out" "split=1 design=[]" "y still splits"
-out=$(PQ_SPLIT_SUGGEST=2 run_wizard 0 0 1 "$TWO" <<<"" 2>"$PQ_HOME/.err")
-has "$(cat "$PQ_HOME/.err")" "[Y/n]" "PQ_SPLIT_SUGGEST moves the threshold"
-eq "$out" "split=1 design=[]" "...and Enter follows it"
+has "$err" "this plan lays out 2 pull requests:" "a two-entry outline is shown"
+has "$err" "[Y/n]" "and defaults to yes too"
+eq "$out" "split=1 design=[]" "so Enter splits"
+out=$(run_wizard 0 0 1 "$TWO" <<<"N" 2>/dev/null)
+eq "$out" "split=0 design=[]" "N declines"
 
-out=$(run_wizard 0 0 1 "The one thing" <<<"" 2>"$PQ_HOME/.err")
+# A plan of one pull request - however big - has nothing to split along, so
+# the question is not asked at all. The design question is left to read the
+# next line, which is what a stray split question would have eaten.
+out=$(run_wizard 0 1 0 "The one thing" <<<"$DES/shot.png" 2>"$PQ_HOME/.err")
 err=$(cat "$PQ_HOME/.err")
-hasnt "$err" "Haiku reads" "a one-entry outline is not shown"
-has "$err" "split into a stack of parts? [y/N]" "the plain question is asked as it always was"
-eq "$out" "split=0 design=[]" "and Enter means no"
-out=$(run_wizard 0 0 1 "" <<<"" 2>"$PQ_HOME/.err")
-hasnt "$(cat "$PQ_HOME/.err")" "Haiku reads" "no outline at all is the plain question too"
+hasnt "$err" "lays out" "a one-entry outline is not shown"
+hasnt "$err" "pull request?" "and is not asked about"
+eq "$out" "split=0 design=[$DES/shot.png"$'\n'"]" "so the next question reads the first line"
+out=$(run_wizard 0 0 1 "" </dev/null 2>"$PQ_HOME/.err")
+eq "$(cat "$PQ_HOME/.err")" "" "no outline at all asks nothing either"
+eq "$out" "split=0 design=[]" "and splits nothing"
 
 echo "== name_plan: the outline rides on line 2 onwards, and line 1 still reads alone ==" >&2
 P3="$PQ_HOME/.three.md"; mkplan "$P3" three
@@ -273,15 +279,15 @@ named=$(name_plan "$PP")
 eq "$(wc -l <<<"$named" | tr -d ' ')" "1" "a reply with no parts is still one line"
 eq "$(outline_of "$named")" "" "and has no outline"
 
-echo "== -y prints the outline as a warning, says consider --split, and never splits ==" >&2
+echo "== -y prints the outline as a warning, points at --split, and never splits ==" >&2
 reset_tasks
 slug=$(main add "$P3" --repo "$REPO" -y 2>"$PQ_HOME/.err")
 rc=$?
 [ "$rc" -eq 0 ] && ok || bad "a -y add of an outlined plan should succeed: $(cat "$PQ_HOME/.err")"
 err=$(cat "$PQ_HOME/.err")
-has "$err" "Haiku reads this plan as 3 separately reviewable pull requests:" "the outline is printed"
+has "$err" "this plan lays out 3 pull requests:" "the outline is printed"
 has "$err" "2. Rebuild the Getting Started page" "with its titles"
-has "$err" "consider --split" "and the suggestion"
+has "$err" "queued as one task all the same - pq rm it and add it again with --split" "and the way to one task each"
 eq "$slug" "three-parts" "one task, named off line 1"
 eq "$(queue_count)" "1" "never auto-split"
 [ -d "$PQ_HOME/splits" ] && bad "no split directory may be created by a suggestion" || ok
@@ -293,8 +299,16 @@ echo "== a one-entry outline is not worth a warning ==" >&2
 reset_tasks
 P1="$PQ_HOME/.one.md"; mkplan "$P1" one
 main add "$P1" --repo "$REPO" -y >/dev/null 2>"$PQ_HOME/.err"
-hasnt "$(cat "$PQ_HOME/.err")" "Haiku reads" "one pull request is what every plan should be"
-hasnt "$(cat "$PQ_HOME/.err")" "consider --split" "so nothing is suggested"
+hasnt "$(cat "$PQ_HOME/.err")" "lays out" "one pull request is what every plan should be"
+hasnt "$(cat "$PQ_HOME/.err")" "--split" "so nothing is suggested"
+
+echo "== name_plan asks Haiku for the plan's own pull requests, not a division by size ==" >&2
+name_plan "$P1" >/dev/null
+hp=$(cat "$STUBBIN/.haiku-prompt")
+has "$hp" "parts is a single entry unless the plan itself says this work ships as more than one pull request" "one entry unless the plan says otherwise"
+has "$hp" "or changes code in more than one repository" "a repository each"
+has "$hp" "Never divide a plan by its own sections, steps, stages, files or layers" "never by size"
+hasnt "$hp" "naturally" "the old judged outline is gone"
 
 echo "== --json carries the design set ==" >&2
 reset_tasks

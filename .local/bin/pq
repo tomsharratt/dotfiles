@@ -18,7 +18,7 @@
 #   pq add --urgent      allocate from a reserved range, ahead of every real date
 #   pq add --after T     repeatable: don't dispatch until T's PR has merged
 #   pq add --design P    repeatable: a design file the implementer builds to (auto-detected from the plan too)
-#   pq add --split       split a plan into a stack of standalone parts, wired with --after
+#   pq add --split       queue a plan that lays out several pull requests as one task each, wired with --after
 #   pq add --split-dir D queue an already-split directory, skipping the split step
 #   pq evidence [task]   publish a task's screenshots to the pq-evidence branch; prints the markdown to paste
 #   pq after <task>      list a task's blockers and what each is waiting on
@@ -204,12 +204,6 @@ PQ_PERM_RE="${PQ_PERM_RE:-Do you want to |Yes, and don.t ask again|Allow once}"
 PQ_QUOTA_RETRY="${PQ_QUOTA_RETRY:-600}"           # seconds between "continue" attempts
 PQ_QUOTA_MAX_TRIES="${PQ_QUOTA_MAX_TRIES:-40}"    # ~7h at that interval, then stop knocking
 PQ_TAIL_LINES="${PQ_TAIL_LINES:-30}"
-
-# How many pull requests Haiku has to read a plan as before `pq add`'s split
-# question defaults to yes - see add_wizard. Below it the outline is still
-# shown, but Enter means no, as it always did.
-PQ_SPLIT_SUGGEST="${PQ_SPLIT_SUGGEST:-3}"
-[[ "$PQ_SPLIT_SUGGEST" =~ ^[0-9]+$ ]] && [ "$PQ_SPLIT_SUGGEST" -ge 1 ] || PQ_SPLIT_SUGGEST=3
 
 # The one branch every task's screenshots are published to (`pq evidence`), in
 # the task's own repo. Never deleted: a merged pull request's description keeps
@@ -669,7 +663,7 @@ resolve_after() {                       # owner_repo value -> "label\trepo\tbran
 # each task's own `after` file, looking for a path that leads back to
 # (owner_repo, owner_branch) - including the trivial self-reference, one step
 # in. Two tasks each waiting on the other would stall silently forever, and the
-# odds only grow once a big plan is auto-split into a stack of them.
+# odds only grow once one plan's pull requests are queued as a set of them.
 after_cycle() {                         # owner_repo owner_branch repo branch [visited task_dirs...]
   local owner_repo=$1 owner_branch=$2 repo=$3 branch=$4 t r2 b2 v
   [ "$repo" = "$owner_repo" ] && [ "$branch" = "$owner_branch" ] && return 0
@@ -736,16 +730,28 @@ latest_plan() { recent_plans | head -1 | cut -f2-; }
 # like the avoid list, and omitted entirely for a single-repo split.
 #
 # Line 1 is `branch<TAB>intent`. Every line after it is one entry of the OUTLINE:
-# the pull requests the plan would naturally be delivered as, in build order, one
-# title per line - a single entry when the plan is one coherent change. `cmd_add`
-# shows it before asking whether to split (see add_wizard), and it is advisory:
-# the Opus splitter finds its own seams. Callers that only want the name read
-# the first line - `IFS=$'\t' read` on a herestring stops there - so the outline
-# costs them nothing and is what keeps this one Haiku call per add.
+# the pull requests the plan itself lays out, in its order, one title per line -
+# a single entry for any plan that does not. Read off the plan, never judged
+# from its size: a big change is one pull request of small commits (see
+# dispatch_prompt), and dividing it further only turns work that could run side
+# by side into a waterfall of reviews, each part waiting on the merge before it.
+# So only a plan that SAYS it ships as several pull requests - a "PR 1" and a
+# "PR 2", or changes in more than one repository, which cannot share one - reads
+# as more than one entry. The wording was checked against ten real plans and
+# one written to span three repositories, four runs each: the real plan with a
+# PR 1, 2 and 3 and the three-repository one always came back as three, and
+# the big single-PR plans, including one of three PR plans written to separate
+# files, always as one - where the old "would naturally be delivered as" had
+# read one of them as five. `cmd_add` shows a multi-entry outline before asking
+# whether to queue it as one task per pull request (see add_wizard). Callers
+# that only want the name read the first line - `IFS=$'\t' read` on a
+# herestring stops there - so the outline costs them nothing and is what keeps
+# this one Haiku call per add.
 name_plan() {                           # plan_file [avoid: comma-separated branches already taken] [repo_label]
   local raw json avoid=${2:-} label=${3:-} prompt
   prompt='Read this plan and reply with ONLY a JSON object, no code fence, no commentary:
-{"branch":"tom/<3-5 dash-separated lowercase words naming the task>","intent":"<2-3 sentences, one line, saying what this sets out to achieve in the author'"'"'s terms - not a description of the diff>","parts":["<one title per pull request this plan would naturally be delivered as, in build order - a single entry when the plan is one coherent change>"]}
+{"branch":"tom/<3-5 dash-separated lowercase words naming the task>","intent":"<2-3 sentences, one line, saying what this sets out to achieve in the author'"'"'s terms - not a description of the diff>","parts":["<a title for the pull request this plan will open - or, only when it lays out several, one title per pull request in the order it gives them>"]}
+parts is a single entry unless the plan itself says this work ships as more than one pull request - a "PR 1" and a "PR 2", say - or changes code in more than one repository, which takes a pull request per repository since one cannot span two. Never divide a plan by its own sections, steps, stages, files or layers: a plan that never says they ship separately is one entry however large it is, and so is a plan that is itself one of several pull requests planned elsewhere.
 Each entry in parts names the feature or change that pull request would carry - "Add the checklist step collection to Onboarding", "Rebuild the Getting Started page around the new components" - never a list of files.'
   [ -n "$avoid" ] && prompt="$prompt
 The branch must differ from these, which are already taken: $avoid"
@@ -1134,31 +1140,28 @@ design_list() {                         # task_dir
 # callers that predate the newer ones (test/pq-add-pick.sh's wrapper declares
 # only the original four), which under `set -u` would otherwise abort.
 #
-# The split question shows Haiku's outline first when it has more than one
-# entry, so you can see how the plan is read before answering - and Enter means
-# yes once it reaches PQ_SPLIT_SUGGEST entries. The outline is shown to you, not
-# fed to the splitter, which finds its own seams and still shows its table for
-# confirmation before anything is queued.
+# The split question is asked only of a plan whose outline has more than one
+# entry - one that lays out several pull requests itself (see name_plan) - and
+# lists them first, with Enter meaning yes: one task is one pull request, so
+# a plan that means to open three is queued as three. Any other plan is not
+# asked at all, however big it is; there is nothing to split it along. The
+# outline is shown to you, not fed to the splitter, which reads the plan's
+# pull requests off source.md itself and still shows its table for
+# confirmation before anything is queued. `--split` is still there for a plan
+# that lays out several when Haiku has missed it.
 add_wizard() {
   if [ "$split" != 1 ] && [ -z "$split_dir" ]; then
-    local ans n=0 t i=0 default=n
+    local ans n=0 t i=0
     [ -n "${outline:-}" ] && n=$(grep -c . <<<"$outline")
     if [ "$n" -gt 1 ]; then
-      msg "Haiku reads this plan as $n separately reviewable pull requests:"
+      msg "this plan lays out $n pull requests:"
       while IFS= read -r t; do
         [ -n "$t" ] || continue
         i=$((i + 1)); printf 'pq:   %d. %s\n' "$i" "$t" >&2
       done <<<"$outline"
-      [ "$n" -ge "$PQ_SPLIT_SUGGEST" ] && default=y
-    fi
-    if [ "$default" = y ]; then
-      printf 'pq: split it into a stack of parts? [Y/n] ' >&2
+      printf 'pq: queue one task per pull request? [Y/n] ' >&2
       read -r ans || ans=n
       [[ "${ans:-}" =~ ^[Nn] ]] || split=1
-    else
-      printf 'pq: split into a stack of parts? [y/N] ' >&2
-      read -r ans || ans=n
-      [[ "${ans:-}" =~ ^[Yy]$ ]] && split=1
     fi
   fi
   # Which model runs it. The three offered are the ones worth choosing between
@@ -1242,7 +1245,7 @@ cmd_add() {
   # not ask. `design_hinted` is whether the plan reads as built from a design at
   # all - what decides whether an empty set earns a question or a warning.
   local design_vals="" design_explicit=0 design_hinted=0
-  # Haiku's outline of the plan - the pull requests it would naturally be - read
+  # Haiku's outline of the plan - the pull requests it lays out itself - read
   # by add_wizard through dynamic scope, so it must be declared here.
   local outline=""
   while [ $# -gt 0 ]; do
@@ -1388,7 +1391,7 @@ cmd_add() {
   fi
 
   # Naming, before the wizard rather than after the split gate where it used to
-  # sit, so Haiku's outline is in hand when the split question is asked. One
+  # sit, so Haiku's outline is in hand when the split question would be asked. One
   # call per add either way: the later call is gone, and the outline rides along
   # in the same reply. Skipped where it always was - a part queued by do_split
   # supplies both --branch and --intent, and paying Haiku again per part would
@@ -1414,20 +1417,22 @@ cmd_add() {
   [ "$interactive" = 1 ] && add_wizard
 
   # What the wizard would have said, for an add that never reached it. Never an
-  # auto-split - nothing unattended should turn one task into six - but the
-  # outline is worth seeing in the log, and so is a design the plan leans on
-  # with no file to show for it.
+  # auto-split - nothing unattended should turn one task into six, even when the
+  # plan asks for six, since the splitter is an Opus session and its table is
+  # meant to be looked at - but a plan that lays out several pull requests is
+  # worth saying so in the log, and so is a design the plan leans on with no
+  # file to show for it.
   if [ "$interactive" != 1 ]; then
     local n_out=0
     [ -n "$outline" ] && n_out=$(grep -c . <<<"$outline")
     if [ "$n_out" -gt 1 ] && [ "$split" != 1 ] && [ -z "$split_dir" ]; then
-      warn "Haiku reads this plan as $n_out separately reviewable pull requests:"
+      warn "this plan lays out $n_out pull requests:"
       local t i=0
       while IFS= read -r t; do
         [ -n "$t" ] || continue
         i=$((i + 1)); printf '\033[38;2;246;193;119mpq:   %d. %s\033[0m\n' "$i" "$t" >&2
       done <<<"$outline"
-      warn "consider --split"
+      warn "queued as one task all the same - pq rm it and add it again with --split for one task per pull request"
     fi
     if [ "$design_hinted" = 1 ] && [ -z "$design_vals" ]; then
       warn "the plan was built from a design, but no design file was found on disk or given - the implementer will build from prose; pass --design PATH"
@@ -1454,14 +1459,14 @@ cmd_add() {
 
   # The --branch/--split guard above ran before the wizard could have set
   # split=1 by answering its own question - re-check the same rule now that
-  # the wizard has had its say, or "split into a stack of parts? y" would
+  # the wizard has had its say, or "queue one task per pull request? y" would
   # silently drop an explicit --branch instead of refusing it.
   [ -n "$branch" ] && [ "$split" = 1 ] && \
     die "--split queues N branches of its own - --branch has no meaning with it"
 
   # Same reasoning, same fix: a repeatable --repo given alongside a plan the
   # picker chose interactively must not be rejected just because the wizard
-  # hadn't yet answered "split into a stack of parts?" when the first check
+  # hadn't yet answered "queue one task per pull request?" when the first check
   # ran - $repo_n itself does not change, only $split does.
   [ "$repo_n" -gt 1 ] && [ "$split" != 1 ] && [ -z "$split_dir" ] && \
     die "--repo is repeatable only with --split or --split-dir - a plain add takes exactly one"
@@ -1749,9 +1754,13 @@ repo_candidates_container() {           # dir -> label<TAB>path, sorted by label
 }
 
 # ── splitting a plan ─────────────────────────────────────────────────────────
-# `pq add --split` runs one Opus session that reads a whole-feature plan and
-# writes one standalone plan per seam plus a dependency graph, then queues
-# every part through the ordinary `cmd_add` path with its blockers wired -
+# `pq add --split` is for a plan that lays out several pull requests of its own:
+# a "PR 1" and a "PR 2", or work in more than one repository. It runs one Opus
+# session that reads the plan and writes one standalone plan per pull request
+# the plan lays out - never a division the plan does not make itself, since a
+# big change is one pull request of small commits, and cutting it further only
+# queues its parts behind each other's merges - plus a dependency graph, then
+# queues every part through the ordinary `cmd_add` path with its blockers wired -
 # same header, same `branch_taken` guard, same staging dance, same `after`
 # file a hand-typed add would get. The load-bearing constraint: parts wait for
 # MERGES, never for branches - no part is ever built on a sibling's branch.
@@ -1802,7 +1811,7 @@ The source plan is built from these design files: $design_hdr. A part that imple
   fi
 
   cat <<EOF
-Read ./source.md - it is a plan for a whole feature. These repositories are checked out and readable, but never writable - read whatever you need from any of them to find the real seams in the plan:
+Read ./source.md - it is a plan that lays out the pull requests its work ships as. These repositories are checked out and readable, but never writable - read whatever you need from any of them to write each of those pull requests up as a plan of its own:
 
 $repo_block
 
@@ -1816,12 +1825,12 @@ Field discipline matters here: a root part (no dependencies) still needs an EMPT
 
 $example
 
-How to choose the split:
-- Each part is a pull request a human would enjoy reviewing: one coherent change, complete in itself.
-- Each part must leave its own repository's default branch working and shippable once merged. No part may need a later part to compile, pass tests, or behave correctly. A feature flag defaulting off is fine; a half-migrated schema is not.
-- A part belongs to exactly ONE repository, because a part is one pull request. Work that genuinely spans two repositories is two parts.
-- Use as FEW parts as possible while that stays true, WITHIN each repository - two to six per repository is the usual answer, never more than twelve in total. If the plan is already one coherent shippable change, write a single part.
-- Declare a dependency only where one really exists: an interface, schema, migration, or helper another part introduces, or two parts that would edit the same code and collide. This holds across repositories too - a client part that needs an endpoint, field, or flag a server part introduces depends on that server part. Parts with no real dependency must have none declared - that is what lets them run in parallel.
+How to choose the parts - they are the plan's own pull requests, not a division of yours:
+- One part per pull request source.md lays out, in its order: a "PR 1" and a "PR 2" are two parts. Never divide one of the plan's pull requests further, however large, and never merge two - a large pull request is reviewed as a series of small commits, and cutting it into more pull requests only makes each piece wait on another's merge.
+- A part belongs to exactly ONE repository, because a part is one pull request. One of the plan's pull requests that spans repositories is one part per repository, and so is a plan that works in several repositories without naming its pull requests.
+- If source.md does not lay out more than one pull request and all of its work is in one repository, write a single part.
+- Each part must leave its own repository's default branch working and shippable once merged. No part may need a later part to compile, pass tests, or behave correctly. A feature flag defaulting off is fine; a half-migrated schema is not. If a pull request the plan lays out cannot stand alone like that, keep the plan's boundaries anyway and note the problem in that part's Context section.
+- The order the plan gives its pull requests in is NOT a dependency, and neither is its numbering. Declare a dependency only where one really exists: an interface, schema, migration, or helper another part introduces, or two parts that would edit the same code and collide. This holds across repositories too - a client part that needs an endpoint, field, or flag a server part introduces depends on that server part. Parts with no real dependency must have none declared - that is what lets them run in parallel instead of one after another.
 - Between the parts, cover ALL of source.md: do not drop scope, do not add scope, do not leave anything to "a follow-up".
 
 How to write each part - it will be executed by an agent that sees ONLY that one file: it has never read source.md and cannot see any other part.

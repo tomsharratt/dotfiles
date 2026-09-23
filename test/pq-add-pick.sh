@@ -364,9 +364,16 @@ run_wizard() {                          # split after_explicit [model_explicit] 
 out=$(run_wizard 1 1 </dev/null)
 eq "$out" "split=1 model=sonnet after_vals=[]" "all already decided: no prompt should even try to read stdin"
 
-echo "== add_wizard: answering y to the split question sets split=1 ==" >&2
-out=$(run_wizard 0 1 <<<$'y\n')
+echo "== add_wizard: the split question is asked only of a plan that lays out several pull requests ==" >&2
+# `outline` reaches add_wizard through dynamic scope, like every other local
+# cmd_add hands it - set here, in the caller, the same way.
+out=$(outline=$'First half\nSecond half' run_wizard 0 1 <<<$'y\n' 2>/dev/null)
 eq "$out" "split=1 model=sonnet after_vals=[]" "y at the split prompt should set split=1; after_explicit=1 skips the blocker prompt"
+out=$(outline=$'First half\nSecond half' run_wizard 0 1 <<<$'n\n' 2>/dev/null)
+eq "$out" "split=0 model=sonnet after_vals=[]" "n at the split prompt should leave split=0"
+out=$(outline="The one thing" run_wizard 0 1 </dev/null 2>"$PQ_HOME/.wiz.err")
+eq "$out" "split=0 model=sonnet after_vals=[]" "a one-entry outline leaves split=0"
+eq "$(cat "$PQ_HOME/.wiz.err")" "" "and asks nothing - no prompt is printed at all"
 
 echo "== add_wizard: split already 1 skips that question; the blocker prompt still runs ==" >&2
 mk_task queue 010 task-a "$REPO" tom/task-a >/dev/null

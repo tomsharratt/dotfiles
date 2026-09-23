@@ -142,7 +142,7 @@ pq add --urgent          allocate from a reserved range, ahead of every real dat
 pq add --after T         repeatable, at add time: don't dispatch until T's PR has merged
 pq add --design PATH     repeatable: a design file the implementer builds to (auto-detected from the plan too)
 pq add --repo PATH       repeatable, only with --split/--split-dir: name the repos a split may use
-pq add --split           split a plan into a stack of standalone parts, wired with --after
+pq add --split           queue a plan that lays out several pull requests as one task each, wired with --after
 pq add --split-dir D     queue an already-split directory, skipping the split step
 pq after <task>          list a task's blockers and what each is waiting on
 pq after <task> T...     add blockers to a task still in queue/
@@ -171,7 +171,7 @@ The keys are offered only when there is more than one page, and paging past eith
 Row numbers are absolute: row 11 is the eleventh-newest plan whichever page you are looking at, so a number always means the same plan and any listed row can be picked from any page.
 Pick a number - Enter takes the top row of the page you are on, which is the most recent plan on page one - and it previews the plan before asking `use this plan? [y/N]`; answering `n` returns to the number prompt, on the page you were reading, rather than aborting the whole command.
 That `n` is "no", not "next page" - the two prompts read the key differently, and each one's hint says which is in force.
-Once you confirm, it asks the three things that actually shape how a task runs: whether to split it into a stack of small PRs, which model should run it, and which of the tasks already queued or running it should wait on.
+Once you confirm, it asks the things that actually shape how a task runs: which model should run it and which of the tasks already queued or running it should wait on - and, first, for a plan that lays out several pull requests of its own, whether to queue one task per pull request.
 The model question offers `sonnet`, `opus` and `fable`, and Enter takes `PQ_DEFAULT_MODEL` (`sonnet` unless you have overridden it); an initial and any case will do.
 Only what is typed at the prompt is held to those three - `--model` itself still takes any id `claude --model` accepts.
 `--effort` stays a flag, with no question of its own.
@@ -238,7 +238,7 @@ A lingering directory from before this scheme won't - that is what the one-time 
 
 #### Blockers
 
-Large work wants to be split into several small plans, each a reviewable PR, where the second usually cannot start until the first has shipped.
+Some work is several pull requests where the second cannot start until the first has shipped - a client change waiting on the endpoint it calls, say.
 `pq add B --after A` (or `pq after B A` once both are queued) says exactly that: B is not eligible for dispatch until A's PR has merged into A's repo's default branch.
 
 Blocked is derived, not stored - a blocked task sits in `queue/` like any other and fill just skips it, the same way the cap is soft arithmetic rather than a drain state.
@@ -314,17 +314,21 @@ That needs a little care, because a terminal signals the whole foreground proces
 A second Ctrl-C abandons the work in flight, killing that child too, so "force" does not leave a `wt new` running with nobody to record what it produced.
 Either way nothing is lost - a task caught mid-dispatch keeps its claim without a launch record, which the next reconcile recognises and resumes.
 
-#### Splitting a large plan
+#### Plans that lay out several pull requests
 
-A plan-mode session naturally produces a plan for a whole feature, but a whole feature is almost never one pull request worth reviewing.
-`pq add plan.md --split` runs one Opus session that reads the plan, decides where the real seams are, and writes one standalone plan per part plus a dependency graph - then queues every part through the ordinary `pq add` path, with `--after` already wired from the graph.
+A big change is one pull request: the implementer commits it as a series of small, self-contained steps, and the commits are how it is reviewed.
+Cutting it into several pull requests on top of that only buys a waterfall - each piece waits on the merge of the one before it, and so does its review - so `pq` never proposes dividing a plan just because it is big.
+Some plans do lay out several pull requests of their own, though: a "PR 1" and a "PR 2" the plan names, or work in more than one repository, which one pull request cannot span.
+`pq add plan.md --split` is for those: one Opus session reads the plan and writes each of its pull requests up as a standalone plan of its own, plus a dependency graph - then queues every part through the ordinary `pq add` path, with `--after` already wired from the graph.
+It follows the plan's own boundaries and never draws its own: no pull request is divided further or merged with another, and a plan that lays out one pull request in one repository comes back as a single part.
+The order the plan gives its pull requests in is not a dependency - only real ones are wired (an endpoint, a schema, a helper one part introduces and another uses, or two parts that would edit the same code), so parts that do not depend on each other run side by side.
 
-You do not have to decide that by yourself.
-The Haiku call that names every task also returns an outline: the pull requests the plan would naturally be delivered as, in build order, one title each - a single entry when the plan is one coherent change.
-When the outline has more than one entry the wizard's split question shows it first, so you can see how the plan is read before answering, and once it reaches `PQ_SPLIT_SUGGEST` entries (default 3) Enter means yes.
-The outline is advisory: it is shown to you, not fed to the splitter, which finds its own seams and still shows its table for confirmation before anything is queued, so a split that comes out differently from the outline is visible before it costs anything.
-A non-interactive add (`-y`, no tty, an explicit plan path) never auto-splits; it prints the same outline as a warning, followed by `consider --split`.
-The result is a stack of small, individually reviewable PRs where nothing downstream starts until you have merged what it depends on, and a plan that turns out to be wrong is wrong for one PR rather than for a whole night.
+You do not have to notice that by yourself.
+The Haiku call that names every task also returns an outline: the pull requests the plan itself lays out, in its order, one title each - and a single entry for any plan that does not, however large it is.
+When the outline has more than one entry the wizard lists it and asks whether to queue one task per pull request, with Enter meaning yes; a plan with a one-entry outline is not asked at all.
+The outline is shown to you, not fed to the splitter, which reads the plan's pull requests off the plan itself and still shows its table for confirmation before anything is queued, so a split that comes out differently from the outline is visible before it costs anything.
+`--split` is still the way in when Haiku has missed a plan that lays out several.
+A non-interactive add (`-y`, no tty, an explicit plan path) never auto-splits, even a plan that asks for it; it prints the same outline as a warning and queues the plan as one task, saying how to redo it with `--split`.
 
 The load-bearing constraint is that parts wait for merges, never for branches - no part is ever built on top of a sibling's branch.
 Each part starts from the default branch with its declared dependencies already merged, and every part is written for an agent that sees only that one file: it never mentions another part, its filename, or its branch.

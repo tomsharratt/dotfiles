@@ -977,5 +977,22 @@ esac
 eq "$(queue_count)" "0" "plain add from non-repo dir: nothing queued"
 rm -rf "$NOTAREPO"
 
+echo "== splitter_prompt: the parts are the plan's own pull requests, and their order is no dependency ==" >&2
+# A split used to find its own seams, which cut one big change into a stack of
+# pull requests each waiting on the one before it. A big change is one pull
+# request of small commits now, so the splitter may only follow the plan.
+sp=$(splitter_prompt "$(printf '%s\t%s' "$(basename "$REPO")" "$REPO")")
+for want in \
+  "One part per pull request source.md lays out" \
+  "Never divide one of the plan's pull requests further, however large, and never merge two" \
+  "If source.md does not lay out more than one pull request and all of its work is in one repository, write a single part." \
+  "The order the plan gives its pull requests in is NOT a dependency, and neither is its numbering." \
+  "One of the plan's pull requests that spans repositories is one part per repository"; do
+  case "$sp" in *"$want"*) ok ;; *) bad "the splitter prompt should say: $want" ;; esac
+done
+for gone in "seams" "as FEW parts as possible" "two to six"; do
+  case "$sp" in *"$gone"*) bad "the splitter prompt should no longer say: $gone" ;; *) ok ;; esac
+done
+
 printf '\n%d passed, %d failed\n' "$pass" "$fail" >&2
 [ "$fail" -eq 0 ]
