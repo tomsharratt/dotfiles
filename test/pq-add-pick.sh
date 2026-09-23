@@ -462,9 +462,9 @@ mk_task queue 005 blocker-cand "$REPO" tom/blocker-cand >/dev/null
 via_picker=$(run_pick_after "$REPO" <<<$'1\n' 2>/dev/null)
 eq "$via_picker" "blocker-cand" "pick_after should resolve to the candidate's own slug"
 
-out_x=$(cmd_add "$PQ_PLANS_DIR/wiring.md" tom/task-x x --repo "$REPO" --after blocker-cand 2>"$PQ_HOME/.x.err")
+out_x=$(cmd_add "$PQ_PLANS_DIR/wiring.md" tom/task-x x "" --repo "$REPO" --after blocker-cand 2>"$PQ_HOME/.x.err")
 t_x=$(find_task "$out_x")
-out_y=$(cmd_add "$PQ_PLANS_DIR/wiring.md" tom/task-y y --repo "$REPO" --after "$via_picker" 2>"$PQ_HOME/.y.err")
+out_y=$(cmd_add "$PQ_PLANS_DIR/wiring.md" tom/task-y y "" --repo "$REPO" --after "$via_picker" 2>"$PQ_HOME/.y.err")
 t_y=$(find_task "$out_y")
 eq "$(cat "$t_x/after")" "$(cat "$t_y/after")" \
   "queuing via --after blocker-cand and via --after <pick_after's own output> must produce identical after files"

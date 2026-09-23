@@ -58,7 +58,7 @@ printf '# Test plan\n\nDo the thing.\n' > "$PLAN"
 # allocates a stamp.
 add_task() {                             # branch [extra cmd_add args...] -> slug
   local branch=$1; shift
-  cmd_add "$PLAN" "$branch" "" --repo "$REPO" "$@" 2>/dev/null
+  cmd_add "$PLAN" "$branch" "" "" --repo "$REPO" "$@" 2>/dev/null
 }
 
 queue_slugs() {

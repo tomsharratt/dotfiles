@@ -322,7 +322,7 @@ echo "== pq add: stdout is exactly the slug ==" >&2
 reset_tasks
 PLAN_FILE="$PQ_HOME/.test-plan.md"
 printf '# Test plan\n\nDo the thing.\n' > "$PLAN_FILE"
-add_out=$(cmd_add "$PLAN_FILE" tom/add-stdout-test "" --repo "$REPO" 2>"$PQ_HOME/.add.stderr")
+add_out=$(cmd_add "$PLAN_FILE" tom/add-stdout-test "" "" --repo "$REPO" 2>"$PQ_HOME/.add.stderr")
 add_rc=$?
 [ "$add_rc" -eq 0 ] && ok || bad "pq add should succeed (rc=$add_rc): $(cat "$PQ_HOME/.add.stderr")"
 lines=$(printf '%s\n' "$add_out" | wc -l | tr -d ' ')
@@ -332,7 +332,7 @@ if find_task "$add_out" >/dev/null 2>&1; then ok; else bad "find_task should res
 
 # Chaining through the printed slug, the way split_queue wires each part's
 # --after from the slugs of the parts queued before it.
-b_out=$(cmd_add "$PLAN_FILE" tom/add-chain-b "" --repo "$REPO" --after "$add_out" 2>"$PQ_HOME/.add.stderr")
+b_out=$(cmd_add "$PLAN_FILE" tom/add-chain-b "" "" --repo "$REPO" --after "$add_out" 2>"$PQ_HOME/.add.stderr")
 b_rc=$?
 [ "$b_rc" -eq 0 ] && ok || bad "chained pq add should succeed: $(cat "$PQ_HOME/.add.stderr")"
 b_dir=$(find_task "$b_out" 2>/dev/null)
@@ -341,7 +341,7 @@ verdict=$(after_state "$b_dir" 2>/dev/null); verdict=${verdict%%$'\t'*}
 case "$verdict" in waiting\ *) ok ;; *) bad "B should be waiting on A right after being chained (got '$verdict')" ;; esac
 
 echo "== an --after blocker is recorded, and pq ls --json sees the task blocked ==" >&2
-add_json=$(cmd_add "$PLAN_FILE" tom/add-json-test "" --repo "$REPO" --after "$add_out" 2>"$PQ_HOME/.add.stderr")
+add_json=$(cmd_add "$PLAN_FILE" tom/add-json-test "" "" --repo "$REPO" --after "$add_out" 2>"$PQ_HOME/.add.stderr")
 eq "$(cut -f1 "$(find_task "$add_json")/after")" "add-stdout-test" "the blocker is recorded under its own label"
 
 ls_json=$(main ls --json 2>/dev/null)
@@ -364,10 +364,10 @@ echo "== cmd_add --after reports an already-merged blocker and leaves no PR cach
 # canned gh stub above) rather than a hand-primed cache. cmd_add runs in a
 # command substitution here, as it does for every part split_queue queues, so
 # its $$ - and the cache it names after it - is this script's.
-merged_out=$(cmd_add "$PLAN_FILE" tom/already-merged "" --repo "$REPO" 2>"$PQ_HOME/.add.stderr")
+merged_out=$(cmd_add "$PLAN_FILE" tom/already-merged "" "" --repo "$REPO" 2>"$PQ_HOME/.add.stderr")
 merged_rc=$?
 [ "$merged_rc" -eq 0 ] && ok || bad "adding the already-merged task should succeed: $(cat "$PQ_HOME/.add.stderr")"
-( cmd_add "$PLAN_FILE" tom/depends-on-merged "" --repo "$REPO" --after "$merged_out" ) \
+( cmd_add "$PLAN_FILE" tom/depends-on-merged "" "" --repo "$REPO" --after "$merged_out" ) \
   >/dev/null 2>"$PQ_HOME/.add.stderr"
 case "$(cat "$PQ_HOME/.add.stderr")" in
   *"after $merged_out: already in"*) ok ;;

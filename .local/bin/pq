@@ -89,8 +89,9 @@
 # a side-by-side comparison against the design files the task carries
 # (`pq add --design`, or detected from the plan's text), and a DRAFT pull request
 # with a review guide. Then the REVIEW GATE runs one independent `/code-review`
-# against the draft in the background and prompts the implementer to resolve
-# what it posted and mark the pull request ready - see the `review gate` section.
+# against the draft in the background - and a `/security-review` beside it when
+# the plan asks for one - and prompts the implementer to resolve what they found
+# and mark the pull request ready - see the `review gate` section.
 #
 # Once a done task has settled AND been torn down - not on the verdict alone,
 # which would strand its worktree - `pq tick` files it away to `archive/`, keeping only the
@@ -111,7 +112,8 @@
 #
 #   <task>/plan.md     the settings header + Claude's plan, immutable once added
 #                     (`base:` is optional and absent on most tasks - see `task_base`;
-#                      `design:` likewise, a comma-separated list of the files in design/)
+#                      `design:` likewise, a comma-separated list of the files in design/;
+#                      `security: yes` likewise, when the plan asks for a security review - see name_plan)
 #          after       blockers: one per line, TSV  label <TAB> repo <TAB> branch
 #          state.env   KEY=VALUE runtime facts, written as dispatch progresses
 #          contract.md how the plan is to be delivered - written once, at dispatch, from
@@ -121,6 +123,8 @@
 #          evidence/   the implementer's screenshots, published by `pq evidence`
 #          review.json the review gate's own `claude -p` output, plus review.err and
 #          review.rc   its stderr and exit code - see the `review gate` section
+#          security.*  the same three for the security reviewer, when the plan asked for one,
+#                      and security.md, the report it wrote, which pq posts on the pull request
 #
 #   <split>/source.md     the plan being split, copied in
 #          repos          the repo inventory the splitter was shown: TSV  label <TAB> path, primary first - what --split-dir checks against
@@ -130,7 +134,7 @@
 #          NN-*.md        the parts themselves, written by the splitter
 #          splitter.json  the splitter session's own JSON output - cost, duration, permission denials
 #          splitter.err   the splitter session's stderr, read on failure
-#          .named.tsv     part <TAB> branch <TAB> slug <TAB> intent, written once naming succeeds
+#          .named.tsv     part <TAB> branch <TAB> slug <TAB> intent <TAB> security (yes or empty), written once naming succeeds
 #
 # `after` is neither of the other two: `plan.md` is immutable by contract so an
 # agent re-reading its own plan never sees it change, and `state.env` is runtime
@@ -219,9 +223,12 @@ PQ_AGENT_START_MS="${PQ_AGENT_START_MS:-60000}"
 # The review gate - see the `review gate` section. Every pull request a task opens
 # gets one independent `/code-review` run by pq itself, in the background, and the
 # implementer is then told to resolve what it posted and mark the draft ready.
-# There is no off switch: PQ_REVIEW_MAX_TRIES=0 is the honest degraded mode, where
-# the reviewer is never launched and the implementer is sent straight to the
-# self-review fallback.
+# A plan that asks for a security review gets a `/security-review` beside it, run
+# on these same knobs - the model, effort, timeout, tries and retry below - since
+# it is the same job for a different eye, and a second set would be knobs nobody
+# turns. There is no off switch: PQ_REVIEW_MAX_TRIES=0 is the honest degraded
+# mode, where no reviewer is ever launched and the implementer is sent straight
+# to the self-review fallback.
 PQ_REVIEWER_MODEL="${PQ_REVIEWER_MODEL:-opus}"
 PQ_REVIEW_EFFORT="${PQ_REVIEW_EFFORT:-xhigh}"
 # An hour. Reviews ran 747s, 822s, then 1083s against the 1500 this used to be,
@@ -510,6 +517,7 @@ all_tasks() {                           # [scope: live|all]
   done
 }
 
+
 # Fill's own view of the queue: stamp order, sorted NUMERICALLY rather than
 # trusting glob order. Glob order and numeric order agree by construction now
 # (task_name's fixed width, see above), but this sort is the guard that keeps
@@ -713,8 +721,16 @@ recent_plans() {                        # -> epoch<TAB>path, newest first
 # the intent at the top of its description - and neither can be derived from the
 # filename, which is auto-generated ("floofy-hugging-dragonfly.md").
 #
-# Prints "branch<TAB>intent", or nothing if the model could not be reached or gave
-# something unusable; the caller then stops rather than inventing one.
+# Prints "branch<TAB>intent<TAB>security", or nothing if the model could not be
+# reached or gave something unusable; the caller then stops rather than inventing
+# one. `security` is `yes` when the plan asks for a security review of its work,
+# and empty otherwise - it is what opens the security reviewer's ladder beside the
+# code reviewer's (see the `review gate` section). One more field in the same
+# reply rather than a call of its own, and checked the same way the outline was:
+# ten real plans, four runs each, came back right forty times out of forty -
+# including one that calls for it only as a mandatory aside to a CSRF decision,
+# two that say it is not warranted, and pq's own plan, which names it only as
+# follow-up work.
 #
 # The optional second argument is a comma-separated avoid list: branches already
 # spoken for by a sibling part in the same split, appended as one more sentence
@@ -727,7 +743,7 @@ recent_plans() {                        # -> epoch<TAB>path, newest first
 # otherwise both want the same branch. Appended as one more sentence, exactly
 # like the avoid list, and omitted entirely for a single-repo split.
 #
-# Line 1 is `branch<TAB>intent`. Every line after it is one entry of the OUTLINE:
+# Line 1 is `branch<TAB>intent<TAB>security`. Every line after it is one entry of the OUTLINE:
 # the pull requests the plan itself lays out, in its order, one title per line -
 # a single entry for any plan that does not. Read off the plan, never judged
 # from its size: a big change is one pull request of small commits (see
@@ -748,9 +764,10 @@ recent_plans() {                        # -> epoch<TAB>path, newest first
 name_plan() {                           # plan_file [avoid: comma-separated branches already taken] [repo_label]
   local raw json avoid=${2:-} label=${3:-} prompt
   prompt='Read this plan and reply with ONLY a JSON object, no code fence, no commentary:
-{"branch":"tom/<3-5 dash-separated lowercase words naming the task>","intent":"<2-3 sentences, one line, saying what this sets out to achieve in the author'"'"'s terms - not a description of the diff>","parts":["<a title for the pull request this plan will open - or, only when it lays out several, one title per pull request in the order it gives them>"]}
+{"branch":"tom/<3-5 dash-separated lowercase words naming the task>","intent":"<2-3 sentences, one line, saying what this sets out to achieve in the author'"'"'s terms - not a description of the diff>","security":<true or false>,"parts":["<a title for the pull request this plan will open - or, only when it lays out several, one title per pull request in the order it gives them>"]}
 parts is a single entry unless the plan itself says this work ships as more than one pull request - a "PR 1" and a "PR 2", say - or changes code in more than one repository, which takes a pull request per repository since one cannot span two. Never divide a plan by its own sections, steps, stages, files or layers: a plan that never says they ship separately is one entry however large it is, and so is a plan that is itself one of several pull requests planned elsewhere.
-Each entry in parts names the feature or change that pull request would carry - "Add the checklist step collection to Onboarding", "Rebuild the Getting Started page around the new components" - never a list of files.'
+Each entry in parts names the feature or change that pull request would carry - "Add the checklist step collection to Onboarding", "Rebuild the Getting Started page around the new components" - never a list of files.
+security is true only when the plan asks for a security review of this change - a /security-review - to be run, including one it calls warranted or mandatory. It is false when the plan says one is not warranted or not needed, when it mentions one only as future or follow-up work, and when it never asks for one.'
   [ -n "$avoid" ] && prompt="$prompt
 The branch must differ from these, which are already taken: $avoid"
   [ -n "$label" ] && prompt="$prompt
@@ -766,7 +783,17 @@ This part lands in the $label repository, so make the branch name say which one 
   # becomes a dash rather than cutting the name down, since on a multi-repo
   # split an ios/ or android/ may be the only thing telling two parts apart.
   # A reply with no words at all stays empty, and the caller stops.
-  jq -er '[(.branch // "" | sub("^tom/"; "") | gsub("/"; "-") | if . == "" then "" else "tom/" + . end), .intent] | @tsv' \
+  #
+  # The security verdict is `yes` or empty, and a yes stands only when the plan's
+  # text names a security review at all: Haiku's reading decides between "run
+  # /security-review" and "/security-review is not warranted", which no pattern
+  # can, but a yes for a plan that never mentions one is a guess, and it would
+  # cost an hour of the reviewer model for nothing.
+  local mentioned=false
+  grep -qiE 'security[- ]review' "$1" 2>/dev/null && mentioned=true
+  jq -er --argjson mentioned "$mentioned" \
+    '[(.branch // "" | sub("^tom/"; "") | gsub("/"; "-") | if . == "" then "" else "tom/" + . end), .intent,
+      (if $mentioned and .security == true then "yes" else "" end)] | @tsv' \
     2>/dev/null <<<"$json" || return 0
   # The outline. A tab or newline inside a title would break the line-oriented
   # contract above, so both are squeezed to spaces, and an empty title is dropped.
@@ -1219,20 +1246,25 @@ add_wizard() {
 }
 
 # The plan and the name the task goes by come first, and are never flags.
-# `pq add` itself passes all three empty: the plan is picked at the wizard and
+# `pq add` itself passes all four empty: the plan is picked at the wizard and
 # Haiku names it. Only pq's own caller fills them in - split_queue, one part at
 # a time, with a part it wrote and a name it already chose - and a branch given
-# means the intent was given too, so it is taken as it came, even empty. None
-# of it is on the command line: the wizard is the way in, and a plan path,
-# --branch or --intent typed there is refused.
-cmd_add() {                             # plan branch intent ("" "" "" to pick and name) [flags...]
-  [ $# -ge 3 ] || die "internal error: cmd_add takes a plan, a branch and an intent before its flags"
+# means the intent and the security verdict were given too, so they are taken
+# as they came, even empty. None of it is on the command line: the wizard is the
+# way in, and a plan path, --branch or --intent typed there is refused.
+#
+# The security verdict is `yes` or empty, nothing else: a caller written for the
+# three positionals this used to take would hand its first flag over as the
+# fourth, and that must fail here rather than quietly shift every flag after it.
+cmd_add() {                             # plan branch intent security ("" "" "" "" to pick and name) [flags...]
+  [ $# -ge 4 ] || die "internal error: cmd_add takes a plan, a branch, an intent and a security verdict before its flags"
+  case "$4" in ""|yes) ;; *) die "internal error: cmd_add's security verdict is yes or empty, not '$4'" ;; esac
   # `model_explicit` is the *_explicit pattern again, and it is needed rather
   # than a `[ "$model" != "$PQ_DEFAULT_MODEL" ]` test: `--model sonnet` and no
   # flag at all leave `model` identical, and only one of the two should still
   # be asked about by add_wizard.
-  local plan=$1 branch=$2 intent=$3 model=$PQ_DEFAULT_MODEL model_explicit=0 effort=$PQ_DEFAULT_EFFORT
-  shift 3
+  local plan=$1 branch=$2 intent=$3 security=$4 model=$PQ_DEFAULT_MODEL model_explicit=0 effort=$PQ_DEFAULT_EFFORT
+  shift 4
   local urgent=0 repo="" repo_explicit=0
   # `basebr` rather than `base`: the blocker-hint loop at the end of this
   # function already declares a `local base`, and `split_queue` reads THIS one
@@ -1470,13 +1502,15 @@ cmd_add() {                             # plan branch intent ("" "" "" to pick a
 
   # The name. Haiku was asked above, before the wizard, when it was going to be
   # asked at all; here its answer is taken apart. A part arrives named, intent
-  # and all - an empty intent from its own naming call included - so only an
-  # unnamed task reads Haiku's reply. Either way the branch is checked before
-  # anything is written.
+  # and verdict and all - an empty intent from its own naming call included - so
+  # only an unnamed task reads Haiku's reply. Either way the branch is checked
+  # before anything is written. `cut`, never `read`: a tab is IFS whitespace, so
+  # an empty intent would let the verdict slide into its place.
   local why
   if [ -z "$branch" ] && [ -n "$named" ]; then
     branch=$(cut -f1 <<<"$named")
     intent=$(cut -f2 <<<"$named")
+    security=$(cut -f3 <<<"$named")
   fi
   [ -n "$branch" ] || die "could not name the plan - Haiku gave no usable branch; try pq add again"
   git check-ref-format "refs/heads/$branch" || die "invalid branch name: '$branch'"
@@ -1556,6 +1590,9 @@ cmd_add() {                             # plan branch intent ("" "" "" to pick a
     # Same absent-means-none pattern as `base:` - written only when there is
     # a design set, so every task without one keeps the header it always had.
     [ -n "$design_hdr" ] && printf 'design:   %s\n' "$design_hdr"
+    # And again: only a plan that asks for a security review carries the key,
+    # and it is what reconcile reads to open the security reviewer's ladder.
+    [ "$security" = yes ] && printf 'security: yes\n'
     printf 'model:    %s\n'   "$model"
     printf 'effort:   %s\n'   "$effort"
     printf 'intent:   %s\n'   "${intent:-}"
@@ -1586,6 +1623,7 @@ cmd_add() {                             # plan branch intent ("" "" "" to pick a
   [ -n "$base_note" ] && msg "$base_note"
   [ -n "$intent" ] && msg "intent: $intent"
   [ -n "$design_hdr" ] && msg "design: $design_hdr"
+  [ "$security" = yes ] && msg "review: code and security - the plan asks for a /security-review"
   msg "added:  $state/$(basename "$dir")  ($model, effort $effort)"
 
   if [ -n "$after_lines" ]; then
@@ -1787,6 +1825,7 @@ How to write each part - it will be executed by an agent that sees ONLY that one
 - Never mention another part, its filename, or its number, and never say "the previous plan". Where a part relies on earlier work, state it as a fact about the code it will find - e.g. "the mentions table already has a notified_at column" - never as a reference to another plan or file.
 - Every part starts from its own repository's default branch with its declared dependencies already merged. Never tell a part to branch from, rebase onto, or cherry-pick another part's branch.
 - Same shape as the plan you read: a Context section, the specific files to change, the existing functions and patterns to reuse, and a verification section. Real paths, confirmed to exist.
+- If source.md asks for a security review (a /security-review) of its work, ask for one in every part whose changes that review is about, with what it should focus on - and in no other part.
 - Do not start a part's file with '---' - no YAML front matter.
 $design_sentence
 EOF
@@ -2069,12 +2108,17 @@ split_levels() {                        # sd -> prints level<TAB>part<TAB>repo(p
 }
 
 # Name every part, in topological (level) order, collecting part<TAB>branch
-# <TAB>slug<TAB>intent into $sd/.named.tsv. Serial and slow on purpose - one
-# Haiku round trip per part, plus `branch_taken`'s bounded `ls-remote` per
-# branch, adds roughly 15-30s for a six-part split. That is the intended
-# cost: the `ls-remote` is what catches a branch pushed from another machine,
-# and skipping it to save the round trips would only move that failure to
-# `wt new` at 2am, where it silently adopts the existing branch instead.
+# <TAB>slug<TAB>intent<TAB>security into $sd/.named.tsv. Each part gets its own
+# security verdict, off its own text, since a plan that asks for a security
+# review of its server work may not want one of the client part that follows -
+# which is why splitter_prompt has the ask carried into the parts it is about.
+#
+# Serial and slow on purpose - one Haiku round trip per part, plus
+# `branch_taken`'s bounded `ls-remote` per branch, adds roughly 15-30s for a
+# six-part split. That is the intended cost: the `ls-remote` is what catches a
+# branch pushed from another machine, and skipping it to save the round trips
+# would only move that failure to `wt new` at 2am, where it silently adopts the
+# existing branch instead.
 #
 # A collision - with git, with a live task, or with a sibling already named
 # in this pass - gets one retry with an avoid list; a second is a hard error
@@ -2084,7 +2128,7 @@ split_name_parts() {                    # sd leveled_tsv multi
   local sd=$1 leveled=$2 multi=$3
   local named_file="$sd/.named.tsv"
   : > "$named_file"
-  local level part repopath label deps named branch intent slug reason avoid try
+  local level part repopath label deps named branch intent security slug reason avoid try
   while IFS=$'\t' read -r level part repopath label deps; do
     [ -n "$part" ] || continue
     avoid=""
@@ -2095,7 +2139,10 @@ split_name_parts() {                    # sd leveled_tsv multi
         named=$(name_plan "$sd/$part" "$avoid")
       fi
       [ -n "$named" ] || die "$part: could not derive a branch name and intent - naming failed"
-      IFS=$'\t' read -r branch intent <<<"$named"
+      # `cut`, not `read`: a tab is IFS whitespace, so an empty intent would
+      # let the verdict slide into its place - see cmd_add.
+      named=$(head -1 <<<"$named")
+      branch=$(cut -f1 <<<"$named"); intent=$(cut -f2 <<<"$named"); security=$(cut -f3 <<<"$named")
       [ -n "$branch" ] || die "$part: could not derive a branch name - naming failed"
       git check-ref-format "refs/heads/$branch" || die "$part: invalid branch name '$branch'"
       slug=$(branch_to_slug "$branch")
@@ -2103,7 +2150,7 @@ split_name_parts() {                    # sd leveled_tsv multi
 
       reason=$(split_name_collision "$branch" "$slug" "$named_file" "$repopath")
       if [ -z "$reason" ]; then
-        printf '%s\t%s\t%s\t%s\n' "$part" "$branch" "$slug" "$intent" >> "$named_file"
+        printf '%s\t%s\t%s\t%s\t%s\n' "$part" "$branch" "$slug" "$intent" "$security" >> "$named_file"
         break
       fi
       if [ "$try" = 2 ]; then
@@ -2189,7 +2236,7 @@ split_queue() {                         # sd leveled_tsv named_file
   # branch (it would fail that part's own base validation, mid-split, after
   # earlier parts had already queued).
   local n_based=0 baseflag=""
-  local n=0 total level part repopath label deps row branch intent afterflags dep depslug task out rc av
+  local n=0 total level part repopath label deps row branch intent security afterflags dep depslug task out rc av
 
   # $leveled already has exactly one line per part - no need to touch
   # graph.tsv again for a count already sitting in an argument this function
@@ -2215,7 +2262,9 @@ split_queue() {                         # sd leveled_tsv named_file
     [ -n "$part" ] || continue
     n=$((n + 1))
     row=$(awk -F'\t' -v p="$part" '$1 == p { print; exit }' "$named_file")
-    IFS=$'\t' read -r _ branch _ intent <<<"$row"
+    # `cut` for the same reason as split_name_parts, and forgiving of a row with
+    # no fifth field, which reads as no security review.
+    branch=$(cut -f2 <<<"$row"); intent=$(cut -f4 <<<"$row"); security=$(cut -f5 <<<"$row")
 
     # An array, unlike the flag strings below: a design path can contain
     # spaces, and unquoted word-splitting would cut it in two. Expanded with
@@ -2287,7 +2336,7 @@ $basebr
     # Each part's OWN repo, resolved by split_levels - never the shared
     # `$repo`, which is only ever the primary (or, in a no-primary container
     # split, not a repo at all).
-    out=$(cmd_add "$sd/$part" "$branch" "$intent" --repo "$repopath" \
+    out=$(cmd_add "$sd/$part" "$branch" "$intent" "$security" --repo "$repopath" \
             --model "$model" --effort "$effort" \
             $urgentflag $baseflag $afterflags ${design_args[@]+"${design_args[@]}"})
     rc=$?
@@ -3917,7 +3966,7 @@ agent_cell() {                          # task_dir state
       if [ -n "$blocked" ]; then printf '%s' "$blocked"; return; fi
       if [ "$(pane_state "$(st "$d" PQ_PANE)")" = blocked ]; then printf 'blocked'; return; fi
       # The review gate, ahead of the slot report: `review due`, `reviewing 7m`,
-      # `reviewed`, `review failed`, `resolving`, `review lapsed` all say more
+      # `security review 3m`, `reviewed`, `review failed`, `resolving`, `review lapsed` all say more
       # than `wrapping up` about WHY the slot is held, and `review lapsed` is a
       # decision for you. Block words keep precedence above, since a blocked
       # agent wants an answer whatever the gate is doing.
@@ -4066,6 +4115,7 @@ cmd_ls() {
         --arg merged "$merged" --arg closed "$closed" \
         --arg reaped "$reaped" --arg held "$held" \
         --arg review "$(st "$d" PQ_REVIEW)" --arg review_result "$(st "$d" PQ_REVIEW_RESULT)" \
+        --arg security "$(st "$d" PQ_SECURITY)" --arg security_result "$(st "$d" PQ_SECURITY_RESULT)" \
         --arg design "$(hdr "$d/plan.md" design)" \
         --argjson holding_slot "$holding" \
         --argjson after "$(after_json "$d")" --argjson blocked "$blocked" '
@@ -4080,6 +4130,7 @@ cmd_ls() {
           merged: ($merged|str), closed: ($closed|str),
           reaped: ($reaped|str), held: ($held|str),
           review: ($review|str), review_result: ($review_result|str),
+          security: ($security|str), security_result: ($security_result|str),
           design: (if $design == "" then [] else ($design | split(", ")) end) }' >> "$tbl"
     else
       local row="$slug"
@@ -4285,8 +4336,9 @@ cmd_rm() {
   printf 'pq: remove task "%s" (%s)? [y/N] ' "$slug" "$st" >&2; read -r ans || ans=n
   [[ "${ans:-}" =~ ^[Yy]$ ]] || { msg "cancelled"; return 0; }
   # A reviewer still running would go on writing into a directory that is about
-  # to vanish, and then post comments on a pull request pq has forgotten.
-  [ "$(st "$d" PQ_REVIEW)" = running ] && review_kill "$d"
+  # to vanish, and then post comments on a pull request pq has forgotten - and
+  # the security reviewer can still be running once the gate is at `posted`.
+  review_kill "$d"
   rm -rf "$d" || die "could not remove $d"
   rm -f "$PQ_HOME/tasks/$(basename "$d")"
   msg "removed $slug"
@@ -4460,10 +4512,10 @@ Never wait for input - there is nobody watching."
 # markdown rule asks, and written once: dispatch_task only calls this when no
 # contract.md exists, so a re-entered dispatch never rewrites a running agent's.
 contract_write() {                      # task_dir
-  local d=$1 repo branch base intent design url wt slug tmp home
+  local d=$1 repo branch base intent design security url wt slug tmp home
   repo=$(hdr "$d/plan.md" repo);   branch=$(hdr "$d/plan.md" branch)
   base=$(hdr "$d/plan.md" base);   intent=$(hdr "$d/plan.md" intent)
-  design=$(hdr "$d/plan.md" design)
+  design=$(hdr "$d/plan.md" design); security=$(hdr "$d/plan.md" security)
   url=$(st "$d" PQ_URL); wt=$(st "$d" PQ_WORKTREE); slug=$(slug_of "$d")
   # Every path the agent is given is the STABLE one (task_home): the real
   # directory moves to done/ the moment the pull request is reconciled, while
@@ -4544,6 +4596,15 @@ Add two sections to it:
 
 Leave it a draft.
 pq runs an independent review of every pull request and will tell you when to resolve its findings and mark the pull request ready.
+EOF
+    # A plan that asks for a security review says "run /security-review" in so
+    # many words, and an implementer following it to the letter would try to -
+    # so the one that runs it is named here, as the code review is above.
+    [ "$security" = yes ] && cat <<EOF
+The plan asks for a security review, and pq runs that too: an independent \`/security-review\` of the pull request, whose report comes to you with the code review's findings.
+Do not run one yourself.
+EOF
+    cat <<EOF
 If you get stuck, or the plan turns out not to fit the code: commit what you have, push, open a draft pull request whose title begins with \`STUCK:\` and whose description explains what blocked you, then stop.
 Never wait for input - there is nobody watching.
 EOF
@@ -4790,8 +4851,11 @@ dispatch_task() {                       # task_dir  -> 0 launched, 1 failed
 # fix things. `prompted` is not in flight - the agent owns its PR again and the
 # ordinary wrap-up grace applies. The hold is bounded by the gate's own bounds:
 # MAX_TRIES x (TIMEOUT + RETRY) at the very worst, about two hours twenty, then
-# the fallback prompt. `PQ_WRAPUP_GRACE=0` therefore no longer means
-# release-on-PR for a gated task; it means release once the gate is through.
+# the fallback prompt. A security reviewer runs to the same bound beside it, but
+# can only start once the gate's probe has passed, so probes that fail first add
+# up to MAX_TRIES x RETRY on top - two hours forty at the very worst.
+# `PQ_WRAPUP_GRACE=0` therefore no longer means release-on-PR for a gated task;
+# it means release once the gate is through.
 #
 # "Settled" is everything else, an unset key included, so a task from before the
 # gate reads exactly as it did - `blocker_state`'s stalled verdict rests on it.
@@ -4810,6 +4874,41 @@ dispatch_task() {                       # task_dir  -> 0 launched, 1 failed
 # the job. Liveness is the PROCESS GROUP, not the pid: the pid on file is the
 # group leader, and a recycled pid is almost never a group leader too, so a
 # stranger is neither counted alive nor killed.
+#
+# THE SECURITY REVIEWER. A plan can ask for a security review too - plans say
+# "run /security-review" in so many words, and say what it should focus on - and
+# name_plan reads that into a `security: yes` header at add time. Such a task gets
+# a second reviewer beside the first: `claude -p "/security-review"`, in the same
+# worktree, on the same knobs and the same read-only rules. The implementer could
+# no more run it than /code-review, and its contract tells it not to try. The
+# skill takes no target and posts nothing - it reviews `git diff origin/HEAD...`
+# of wherever it runs and replies with a markdown report - so pq delivers: the
+# report is saved as security.md, posted on the pull request as one comment to be
+# read beside the inline ones, and pointed at in the implementer's follow-up.
+#
+# Its own ladder, on PQ_SECURITY, with the code reviewer's keys and files
+# (PQ_REVIEW_*, review.*) left exactly as they were, so a task mid-review when
+# this arrived reads as it did:
+#
+#   (unset)   not asked for - every task from before, and most since
+#   pending   reconcile stamped it beside the gate. Launches once the gate is
+#             `running` or `posted` - the gate's probe has passed, so the pull
+#             request is neither STUCK nor settled, and it is not probed again -
+#             on the same readiness as the code reviewer, so both go out on the
+#             same tick; retried on the same backoff
+#   running   a background process group, collected from security.rc
+#   done      finished. PQ_SECURITY_RESULT is `ok`, or `failed` / `timeout`, for
+#             which the follow-up asks for a security self-review instead, and
+#             PQ_SECURITY_POSTED says whether the report reached the PR
+#   skipped   stopped with the gate - the PR was STUCK or settled
+#
+# The two meet at one point: the gate's `posted` step sends nothing while the
+# security reviewer is pending or running, so the implementer is told once,
+# about both, and the slot stays held until then. So a pending|running
+# PQ_SECURITY only ever sits beside a gate that is in flight, and every way the
+# gate ends early ends it too - except an agent that has gone, where a security
+# review under way is let finish first: its report lands on the pull request,
+# and resolving it is yours then.
 
 review_inflight() {                     # task_dir -> 0 while the gate holds the slot
   case "$(st "$1" PQ_REVIEW)" in pending|running|posted) return 0 ;; esac
@@ -4823,6 +4922,12 @@ review_alive() {                        # pid (a process group id)
   [ -n "${1:-}" ] || return 1
   pgrep -g "$1" >/dev/null 2>&1
 }
+
+# The git verbs no reviewer may run: the ones that discard the implementer's
+# uncommitted work or write over its branch. Shared by review_cmd and
+# security_cmd - see the deny rules below for why each is there.
+REVIEWER_GIT_DENY=("Bash(git checkout:*)" "Bash(git switch:*)" "Bash(git restore:*)" "Bash(git reset:*)"
+                   "Bash(git stash:*)" "Bash(git clean:*)" "Bash(git commit:*)" "Bash(git push:*)")
 
 # The reviewer itself, one swappable function. `-p` with the skill typed as the
 # user's own prompt: the model may not invoke /code-review, but the user may,
@@ -4914,8 +5019,7 @@ review_cmd() {                          # pr task_home
   headless_claude -p --model "$PQ_REVIEWER_MODEL" --effort "$PQ_REVIEW_EFFORT" \
     --permission-mode auto --allowedTools "$PQ_REVIEW_TOOLS" \
     --disallowedTools "Edit(/$HOME/**)" "Bash(gh pr ready:*)" "Bash(gh pr merge:*)" "Bash(gh pr close:*)" \
-      "Bash(git checkout:*)" "Bash(git switch:*)" "Bash(git restore:*)" "Bash(git reset:*)" \
-      "Bash(git stash:*)" "Bash(git clean:*)" "Bash(git commit:*)" "Bash(git push:*)" \
+      "${REVIEWER_GIT_DENY[@]}" \
     --append-system-prompt "$(review_brief "$1")" \
     --add-dir "$2" \
     --output-format json "/code-review $PQ_REVIEW_EFFORT --comment $1"
@@ -4930,6 +5034,45 @@ review_cmd() {                          # pr task_home
 # `wt run` and `wt test` find this worktree's own from the directory they run in.
 review_brief() {                        # pr
   printf '%s' "You are reviewing pull request #$1 from inside the worktree of the agent that wrote it, which is still working there. Your only output is the review you post on the pull request. Change nothing else: no file edits, no commits, no checkouts, no pushes, and do not mark the pull request ready, merge it or close it - its author does that once it has answered your review. Write the review payload, and any other scratch file, as a new file inside a directory made with \`mktemp -d\`, never inside the worktree. This worktree has its own databases, ports and environment: run project commands through \`wt run <cmd>\`, and anything that runs in the test environment, such as specs, through \`wt test <cmd>\` - only the specs a finding needs. A bare \`bundle exec\` or \`bin/rails\` uses the shared databases of the whole machine instead."
+}
+
+# The security reviewer, one swappable function like review_cmd and read-only
+# by the same deny rules - with `gh` denied outright rather than in part, since
+# posting is pq's job here (see security_post). No --allowedTools: auto mode
+# judges the reads, and the skill's own frontmatter allows the `git diff`, `git
+# log` and `git show` it opens with. The skill takes no level and no target, so
+# `--effort` is the only way PQ_REVIEW_EFFORT reaches it, and the brief the only
+# way the pull request's base does.
+#
+# Run against scratch repositories before it shipped, exactly as below. A change
+# with a SQL injection and two cross-tenant reads came back with all three, at
+# confidence 9 and 10, in 167s for $1.12; a clean one came back with none; and
+# one forked from an integration branch that carried a command injection of its
+# own was shown the whole integration branch by the skill, went by the brief's
+# `git diff origin/<base>...HEAD` instead, and left the base's injection out of
+# scope. None was denied anything, and none touched its worktree.
+security_cmd() {                        # pr task_home base
+  headless_claude -p --model "$PQ_REVIEWER_MODEL" --effort "$PQ_REVIEW_EFFORT" \
+    --permission-mode auto \
+    --disallowedTools "Edit(/$HOME/**)" "Bash(gh:*)" "${REVIEWER_GIT_DENY[@]}" \
+    --append-system-prompt "$(security_brief "$1" "$2" "$3")" \
+    --add-dir "$2" \
+    --output-format json "/security-review"
+}
+
+# What the security reviewer is told beside the skill. The base is named because
+# the skill diffs against origin/HEAD - the repository default, whatever the pull
+# request is aimed at - so a task on an integration branch would otherwise be
+# reviewed as the whole integration branch. It is named for a default-branch
+# task too, so a worktree whose origin/HEAD was never set up still has the right
+# command. The plan is pointed at because it says why it asked and what to look
+# at, and the `wt` clause is review_brief's: the spike's reviewers ran code to
+# check a finding, and in a Rails worktree that means a database. One line, and
+# quote-free by the same convention as dispatch_prompt.
+security_brief() {                      # pr task_home base
+  local basec=""
+  [ -n "${3:-}" ] && basec=" The pull request is against $3, so the change under review is exactly \`git diff origin/$3...HEAD\`: where the diff shown to you differs from that, review what that command shows and nothing else."
+  printf '%s' "You are running a security review of pull request #$1 from inside the worktree of the agent that wrote it, which is still working there.$basec The plan the change was built from is $2/plan.md, and it says why it asked for this review and what to focus on. Your only output is your final reply, the markdown report: pq posts it on the pull request and hands it to the author. Change nothing: no file edits, no commits, no checkouts, no pushes, and no gh. Write any scratch file as a new file inside a directory made with \`mktemp -d\`, never inside the worktree. This worktree has its own databases, ports and environment: run project commands through \`wt run <cmd>\`, and anything that runs in the test environment, such as specs, through \`wt test <cmd>\`. A bare \`bundle exec\` or \`bin/rails\` uses the shared databases of the whole machine instead."
 }
 
 # One `gh` call, right before launching: is this a STUCK pull request, and is it
@@ -4950,14 +5093,24 @@ review_comments() {                     # repo pr -> count, or nothing
   (cd "$1" 2>/dev/null && gh api "repos/{owner}/{repo}/pulls/$2/comments" --jq 'length' 2>/dev/null) | tr -dc '0-9'
 }
 
-review_launch() {                       # task_dir pr cwd
-  local d=$1 pr=$2 cwd=$3 pid
-  rm -f "$d/review.rc" "$d/review.json" "$d/review.err" "$d"/review.*.tmp
+# What a reviewer's ladder is keyed on in state.env: PQ_REVIEW for the code
+# reviewer (whose ladder is the gate itself), PQ_SECURITY for the security one,
+# each with its _PID, _AT, _TRIES, _RESULT and _RETRY_AT beside it. The STEM
+# names its files: review.json, review.err, review.rc - or security.*.
+reviewer_key() {                        # stem -> state.env key
+  case "$1" in review) printf 'PQ_REVIEW' ;; security) printf 'PQ_SECURITY' ;; esac
+}
+
+reviewer_launch() {                     # task_dir stem cwd cmd...
+  local d=$1 stem=$2 cwd=$3 key pid
+  shift 3
+  key=$(reviewer_key "$stem")
+  rm -f "$d/$stem.rc" "$d/$stem.json" "$d/$stem.err" "$d/$stem.md" "$d/$stem".*.tmp
   # Job control puts the subshell in a process group of its own, as `shielded`
   # does - but nobody waits on this one. HUP and INT are ignored so the reviewer
   # survives the pq that launched it going away; TERM is not, because that is
-  # how review_kill stops it. Every result file is written to a .tmp and moved,
-  # and review.rc last, so its presence means the rest is complete.
+  # how reviewer_kill stops it. Every result file is written to a .tmp and moved,
+  # and the .rc last, so its presence means the rest is complete.
   #
   # The SUBSHELL's own three descriptors are detached too, not just the
   # reviewer's inside it. stdin, or a background group reading the terminal
@@ -4971,29 +5124,37 @@ review_launch() {                       # task_dir pr cwd
     trap '' HUP INT
     rc=1
     if cd "$cwd" 2>/dev/null; then
-      review_cmd "$pr" "$(task_home "$d")" > "$d/review.json.tmp" 2> "$d/review.err.tmp"; rc=$?
+      "$@" > "$d/$stem.json.tmp" 2> "$d/$stem.err.tmp"; rc=$?
     else
-      : > "$d/review.json.tmp"
-      printf 'no such directory: %s\n' "$cwd" > "$d/review.err.tmp"
+      : > "$d/$stem.json.tmp"
+      printf 'no such directory: %s\n' "$cwd" > "$d/$stem.err.tmp"
     fi
-    mv -f "$d/review.json.tmp" "$d/review.json" 2>/dev/null
-    mv -f "$d/review.err.tmp"  "$d/review.err"  2>/dev/null
-    printf '%s' "$rc" > "$d/review.rc.tmp" && mv -f "$d/review.rc.tmp" "$d/review.rc"
+    mv -f "$d/$stem.json.tmp" "$d/$stem.json" 2>/dev/null
+    mv -f "$d/$stem.err.tmp"  "$d/$stem.err"  2>/dev/null
+    printf '%s' "$rc" > "$d/$stem.rc.tmp" && mv -f "$d/$stem.rc.tmp" "$d/$stem.rc"
   ) < /dev/null > /dev/null 2>&1 &
   pid=$!
   set +m
   disown "$pid" 2>/dev/null || true
-  st_set "$d" PQ_REVIEW_PID "$pid"
-  st_set "$d" PQ_REVIEW_AT "$(epoch)"
-  st_set "$d" PQ_REVIEW running
+  st_set "$d" "${key}_PID" "$pid"
+  st_set "$d" "${key}_AT" "$(epoch)"
+  st_set "$d" "$key" running
 }
 
-review_kill() {                         # task_dir
-  local d=$1 pid; pid=$(st "$d" PQ_REVIEW_PID)
+reviewer_kill() {                       # task_dir stem
+  local d=$1 stem=$2 pid; pid=$(st "$d" "$(reviewer_key "$stem")_PID")
   if [ -n "$pid" ] && review_alive "$pid"; then
     kill -TERM -- "-$pid" 2>/dev/null || pkill -TERM -g "$pid" 2>/dev/null || true
   fi
-  rm -f "$d"/review.*.tmp
+  rm -f "$d/$stem".*.tmp
+  return 0
+}
+
+# Every reviewer the task still has running, which is what a settled pull
+# request and `pq rm` both want - neither cares which one it was.
+review_kill() {                         # task_dir
+  [ "$(st "$1" PQ_REVIEW)" = running ]   && reviewer_kill "$1" review
+  [ "$(st "$1" PQ_SECURITY)" = running ] && reviewer_kill "$1" security
   return 0
 }
 
@@ -5030,29 +5191,95 @@ review_collect() {                      # task_dir -> ok | failed | denied
 }
 
 # A try that did not produce a review: back to `pending` on a backoff while
-# there are tries left, else `posted` with the failure as its result, which is
-# what routes the follow-up to the self-review text. `PQ_REVIEW_TRIES` counts
+# there are tries left, else the reviewer's finished state - `posted` for the
+# code reviewer, `done` for the security one - with the failure as its result,
+# which is what routes the follow-up to the self-review text. The tries count
 # launches and probes alike, and the caller has already counted this one.
-review_try_failed() {                   # task_dir result why
-  local d=$1 result=$2 why=$3 slug tries
-  slug=$(slug_of "$d"); tries=$(st "$d" PQ_REVIEW_TRIES); tries=${tries:-0}
-  st_set "$d" PQ_REVIEW_RESULT "$result"
+reviewer_try_failed() {                 # task_dir stem result why
+  local d=$1 stem=$2 result=$3 why=$4 key noun final slug tries
+  key=$(reviewer_key "$stem")
+  case "$stem" in review) noun=review; final=posted ;; *) noun="security review"; final="done" ;; esac
+  slug=$(slug_of "$d"); tries=$(st "$d" "${key}_TRIES"); tries=${tries:-0}
+  st_set "$d" "${key}_RESULT" "$result"
   if [ "$tries" -lt "$PQ_REVIEW_MAX_TRIES" ]; then
-    st_set "$d" PQ_REVIEW pending
-    st_set "$d" PQ_REVIEW_RETRY_AT "$(( $(epoch) + PQ_REVIEW_RETRY ))"
-    warn "$slug: review attempt $tries failed - $why; retrying in $(( PQ_REVIEW_RETRY / 60 ))m"
+    st_set "$d" "$key" pending
+    st_set "$d" "${key}_RETRY_AT" "$(( $(epoch) + PQ_REVIEW_RETRY ))"
+    warn "$slug: $noun attempt $tries failed - $why; retrying in $(( PQ_REVIEW_RETRY / 60 ))m"
   else
-    st_set "$d" PQ_REVIEW posted
-    warn "$slug: review failed after $tries attempt(s) - $why; the implementer will be asked to self-review instead"
+    st_set "$d" "$key" "$final"
+    warn "$slug: $noun failed after $tries attempt(s) - $why; the implementer will be asked to self-review instead"
   fi
+}
+
+# What a finished security reviewer amounts to: `ok` when it exited cleanly with
+# a report, `failed` otherwise. It never posts, so unlike review_collect there
+# is no `denied` - a denial is only ever warned about.
+security_collect() {                    # task_dir -> ok | failed
+  local d=$1 rc is_error report denied
+  rc=$(cat "$d/security.rc" 2>/dev/null)
+  is_error=$(jq -r 'if type == "object" then ((.is_error // false) | tostring) else "malformed" end' \
+               "$d/security.json" 2>/dev/null) || is_error=malformed
+  report=$(jq -r 'if type == "object" then (.result // "" | tostring) else "" end' "$d/security.json" 2>/dev/null)
+  denied=$(jq -r '[.permission_denials[]?] | length' "$d/security.json" 2>/dev/null) || denied=0
+  if [ "$rc" = 0 ] && [ "$is_error" = false ] && [ -n "$(tr -d '[:space:]' <<<"$report")" ]; then
+    [ "${denied:-0}" = 0 ] || warn "$(slug_of "$d"): the security reviewer reached for things it was denied ($denied denials) - see $d/security.json"
+    printf 'ok'; return
+  fi
+  printf 'failed'
+}
+
+# The report goes on the pull request as one comment, so it is read beside the
+# inline code review rather than by the implementer alone. pq posts it because
+# the skill posts nothing, and one `gh` call pq makes is more certain than asking
+# a model to make it. A comment that does not land is not a failed review: the
+# report is on disk, and the follow-up asks the implementer to post it instead.
+security_post() {                       # task_dir repo pr -> 0 posted
+  local d=$1 repo=$2 pr=$3 body="$1/.security-comment.$$" rc
+  # shellcheck disable=SC2016  # the backticks are markdown, not a substitution
+  { printf '_An independent `/security-review` of this pull request, run by pq because its plan asked for one._\n\n'
+    cat "$d/security.md"; } > "$body" 2>/dev/null || { rm -f "$body"; return 1; }
+  (cd "$repo" 2>/dev/null && gh pr comment "$pr" --body-file "$body") >/dev/null 2>&1; rc=$?
+  rm -f "$body"
+  return "$rc"
+}
+
+# Stopped with the gate, and killed first if it is running.
+security_skip() {                       # task_dir why
+  case "$(st "$1" PQ_SECURITY)" in pending|running) ;; *) return 0 ;; esac
+  [ "$(st "$1" PQ_SECURITY)" = running ] && reviewer_kill "$1" security
+  st_set "$1" PQ_SECURITY skipped; st_set "$1" PQ_SECURITY_WHY "$2"
 }
 
 # The follow-up the implementer is sent. Quote-free by the same convention as
 # dispatch_prompt. The restructure clause is added only when the probe found one
 # commit over PQ_REVIEW_SPLIT_LINES changed lines: the commits are how the PR
 # gets read, and one blob is the shape this whole change exists to stop.
-review_prompt() {                       # pr result split lines base
+#
+# The security clause is added only for a task whose security reviewer ran to
+# `done`, so a task that never asked for one gets, byte for byte, the prompt it
+# always got. It sits between the code review's text and the restructure clause,
+# and reads the same after either of the code review's two openings.
+review_prompt() {                       # pr result split lines base [security_result security_posted report]
   local pr=$1 result=$2 split=${3:-} lines=${4:-} base=${5:-} splitc="" why text
+  local sec=${6:-} sposted=${7:-} report=${8:-} secc="" swhy
+  case "$sec" in
+    "") ;;
+    ok)
+      if [ "$sposted" = 1 ]; then
+        secc="The security review the plan asked for has run as well, and its report is posted on the pull request and saved in $report. "
+      else
+        secc="The security review the plan asked for has run as well, and its report is in $report - pq could not post it on the pull request, so post it there yourself with gh pr comment $pr --body-file $report. "
+      fi
+      secc="${secc}Resolve every finding it raises: fix it and push, or answer it in a comment on the pull request with why it is not exploitable. " ;;
+    *)
+      case "$sec" in
+        timeout) swhy="the security reviewer ran out of time" ;;
+        *)       swhy="the security reviewer exited with an error" ;;
+      esac
+      secc="The security review the plan asked for did not happen - $swhy. \
+Review your own diff for the security risks the plan names, fix and push, and say in a comment on \
+the pull request what you checked. " ;;
+  esac
   [ "$split" = 1 ] && splitc="The pull request is a single commit of $lines changed lines. \
 Before marking it ready, restructure the branch into small logical commits, each coherent \
 on its own with a message saying why, and push with --force-with-lease. "
@@ -5064,7 +5291,7 @@ Never wait for input - there is nobody watching."
       text="pq has finished an independent review of pull request #$pr and posted its findings \
 as inline review comments. Read every one (gh api repos/{owner}/{repo}/pulls/$pr/comments) and \
 resolve each: fix it and push, or reply on that thread with the reasoning for leaving it. \
-Leave no comment unanswered. ${splitc}${tail}" ;;
+Leave no comment unanswered. ${secc}${splitc}${tail}" ;;
     *)
       case "$result" in
         timeout) why="the reviewer ran out of time" ;;
@@ -5073,15 +5300,21 @@ Leave no comment unanswered. ${splitc}${tail}" ;;
       esac
       text="pq could not get an independent review of pull request #$pr - $why. \
 Review your own diff as a stranger would (git diff origin/${base:-HEAD}...HEAD) for bugs, \
-missing tests and what the plan did not anticipate; fix and push. ${splitc}${tail}" ;;
+missing tests and what the plan did not anticipate; fix and push. ${secc}${splitc}${tail}" ;;
   esac
   printf '%s' "$text"
 }
 
 # One task, one step. Every write is gated on `dry` at its own site, as reap_task
 # does, because which `would ...` applies depends on state computed first.
+#
+# One step for the GATE, that is: the code reviewer's ladder never moves twice in
+# one call. The security reviewer takes its own step in the same call - after the
+# gate's while the gate is pending or running, so the two launch on the same
+# tick, and before it at `posted`, so a security review that finishes last has
+# its follow-up sent on the tick it finishes.
 review_task() {                         # task_dir dry
-  local d=$1 dry=$2 state slug repo branch pr num prstate draft pstate tries nowsec settled=0
+  local d=$1 dry=$2 state slug repo branch pr num prstate draft pstate nowsec settled=0
   state=$(st "$d" PQ_REVIEW)
   case "$state" in pending|running|posted|prompted) ;; *) return 0 ;; esac
   slug=$(slug_of "$d"); repo=$(hdr "$d/plan.md" repo); branch=$(hdr "$d/plan.md" branch)
@@ -5091,99 +5324,32 @@ review_task() {                         # task_dir dry
   pr=$(st "$d" PQ_PR); [ -n "$pr" ] || pr=${num:-}
   case "${prstate:-}" in MERGED|CLOSED) settled=1 ;; esac
   pstate=$(pane_state "$(st "$d" PQ_PANE)")
-  tries=$(st "$d" PQ_REVIEW_TRIES); tries=${tries:-0}
 
   # A settled row outranks everything in every state but `prompted`, which has
   # its own reading of a merge below: the verdict is in, reap is next in this
   # very tick, and a reviewer still running would be working in a workspace
-  # about to be closed under it.
+  # about to be closed under it - either reviewer.
   if [ "$settled" = 1 ] && [ "$state" != prompted ]; then
     [ "$dry" = 1 ] && { msg "would skip $slug's review - #$pr has settled"; return 0; }
-    [ "$state" = running ] && review_kill "$d"
+    review_kill "$d"
     st_set "$d" PQ_REVIEW skipped; st_set "$d" PQ_REVIEW_WHY settled
+    security_skip "$d" settled
     msg "$slug: review skipped - #$pr has settled"
     return 0
   fi
 
   case "$state" in
-    pending)
-      [ -n "$pr" ] || return 0
-      # Not while the agent is still going or blocked; not behind a wall pq has
-      # dismissed, which reads idle to herdr and only PQ_BLOCKED says otherwise;
-      # not while herdr is silent; not inside a retry backoff.
-      [ -n "$(st "$d" PQ_BLOCKED)" ] && return 0
-      case "$pstate" in working|blocked|"") return 0 ;; esac
-      local at; at=$(st "$d" PQ_REVIEW_RETRY_AT)
-      [ -n "$at" ] && [ "$nowsec" -lt "$at" ] && return 0
-      if [ "$PQ_REVIEW_MAX_TRIES" = 0 ]; then
-        [ "$dry" = 1 ] && { msg "would send $slug straight to self-review (PQ_REVIEW_MAX_TRIES=0)"; return 0; }
-        st_set "$d" PQ_REVIEW posted; st_set "$d" PQ_REVIEW_RESULT failed
-        return 0
-      fi
-      [ "$dry" = 1 ] && { msg "would probe #$pr and launch a review of $slug"; return 0; }
-      local probe title pstate2 ncommits changed
-      if ! probe=$(review_probe "$repo" "$pr"); then
-        st_set "$d" PQ_REVIEW_TRIES "$((tries + 1))"
-        review_try_failed "$d" failed "could not read #$pr with gh"
-        return 0
-      fi
-      IFS=$'\t' read -r title pstate2 _ ncommits changed <<<"$probe"
-      if grep -qiE "$PQ_STUCK_RE" <<<"$title"; then
-        st_set "$d" PQ_REVIEW skipped; st_set "$d" PQ_REVIEW_WHY stuck
-        msg "$slug: #$pr is a STUCK pull request - not reviewing it; it wants you"
-        return 0
-      fi
-      case "$pstate2" in
-        MERGED|CLOSED)
-          st_set "$d" PQ_REVIEW skipped; st_set "$d" PQ_REVIEW_WHY settled
-          msg "$slug: review skipped - #$pr has settled"
-          return 0 ;;
-      esac
-      if [ "${ncommits:-0}" = 1 ] && [ "${changed:-0}" -gt "$PQ_REVIEW_SPLIT_LINES" ]; then
-        st_set "$d" PQ_REVIEW_SPLIT 1; st_set "$d" PQ_REVIEW_LINES "$changed"
-      fi
-      local cwd; cwd=$(st "$d" PQ_WORKTREE)
-      [ -n "$cwd" ] && [ -d "$cwd" ] || cwd=$repo
-      st_set "$d" PQ_REVIEW_TRIES "$((tries + 1))"
-      st_set "$d" PQ_REVIEW_COMMENTS "$(review_comments "$repo" "$pr")"
-      review_launch "$d" "$pr" "$cwd"
-      msg "$slug: reviewing #$pr with $PQ_REVIEWER_MODEL in the background"
-      ;;
-    running)
-      local pid; pid=$(st "$d" PQ_REVIEW_PID)
-      if [ -f "$d/review.rc" ]; then
-        local result; result=$(review_collect "$d")
-        case "$result" in
-          ok)
-            [ "$dry" = 1 ] && { msg "would record $slug's review as posted"; return 0; }
-            st_set "$d" PQ_REVIEW posted; st_set "$d" PQ_REVIEW_RESULT ok
-            msg "$slug: review of #$pr posted$(fmt_cost "$(jq -r '.total_cost_usd // empty' "$d/review.json" 2>/dev/null)" \
-                                                        "$(jq -r '.duration_ms // empty' "$d/review.json" 2>/dev/null)")" ;;
-          denied)
-            [ "$dry" = 1 ] && { msg "would record $slug's review as denied"; return 0; }
-            st_set "$d" PQ_REVIEW posted; st_set "$d" PQ_REVIEW_RESULT denied
-            warn "$slug: the reviewer was denied permission to post through gh - check PQ_REVIEW_TOOLS; falling back to self-review" ;;
-          *)
-            [ "$dry" = 1 ] && { msg "would count $slug's failed review as a try"; return 0; }
-            review_try_failed "$d" failed "the reviewer exited $(cat "$d/review.rc" 2>/dev/null) - see $d/review.err" ;;
-        esac
-        return 0
-      fi
-      if ! review_alive "$pid"; then
-        [ "$dry" = 1 ] && { msg "would count $slug's vanished reviewer as a failed try"; return 0; }
-        review_try_failed "$d" failed "the reviewer process is gone without leaving an exit code"
-        return 0
-      fi
-      local since; since=$(st "$d" PQ_REVIEW_AT); since=${since:-$nowsec}
-      if [ $(( nowsec - since )) -ge "$PQ_REVIEW_TIMEOUT" ]; then
-        [ "$dry" = 1 ] && { msg "would kill $slug's reviewer - over PQ_REVIEW_TIMEOUT"; return 0; }
-        review_kill "$d"
-        review_try_failed "$d" timeout "ran past ${PQ_REVIEW_TIMEOUT}s"
-      fi
+    pending|running)
+      review_step "$d" "$dry" "$pr" "$pstate"
+      security_step "$d" "$dry" "$pr" "$pstate"
       ;;
     posted)
+      security_step "$d" "$dry" "$pr" "$pstate"
       case "$pstate" in
         noagent|missing)
+          # A security review still to finish is let finish: its report lands
+          # on the pull request, which is where you will be resolving it now.
+          case "$(st "$d" PQ_SECURITY)" in pending|running) return 0 ;; esac
           [ "$dry" = 1 ] && { msg "would mark $slug's review lapsed - its agent is gone"; return 0; }
           st_set "$d" PQ_REVIEW lapsed; st_set "$d" PQ_REVIEW_WHY noagent
           warn "$slug: review posted on #$pr, but its agent is gone - resolve the comments yourself and mark it ready"
@@ -5192,10 +5358,15 @@ review_task() {                         # task_dir dry
         *) return 0 ;;                  # working, blocked, or herdr silent
       esac
       [ -n "$(st "$d" PQ_BLOCKED)" ] && return 0
+      # One follow-up, about both reviews - so not while the security reviewer
+      # the plan asked for is yet to launch, or still running.
+      case "$(st "$d" PQ_SECURITY)" in pending|running) return 0 ;; esac
       [ "$dry" = 1 ] && { msg "would prompt $slug to resolve the review of #$pr"; return 0; }
-      local text result base code rc
+      local text result base code rc sec=""
       result=$(st "$d" PQ_REVIEW_RESULT); base=$(task_base "$d")
-      text=$(review_prompt "$pr" "${result:-failed}" "$(st "$d" PQ_REVIEW_SPLIT)" "$(st "$d" PQ_REVIEW_LINES)" "$base")
+      [ "$(st "$d" PQ_SECURITY)" = "done" ] && sec=$(st "$d" PQ_SECURITY_RESULT)
+      text=$(review_prompt "$pr" "${result:-failed}" "$(st "$d" PQ_REVIEW_SPLIT)" "$(st "$d" PQ_REVIEW_LINES)" "$base" \
+               "$sec" "$(st "$d" PQ_SECURITY_POSTED)" "$(task_home "$d")/security.md")
       code=$(agent_prompt "$(st "$d" PQ_PANE)" "$text"); rc=$?
       case "$rc" in
         0)
@@ -5255,14 +5426,192 @@ review_task() {                         # task_dir dry
   return 0
 }
 
+# The code reviewer's step while the gate is pending or running - the gate's
+# own ladder, as it was before the security reviewer joined it.
+review_step() {                         # task_dir dry pr pstate
+  local d=$1 dry=$2 pr=$3 pstate=$4 state slug repo tries nowsec
+  state=$(st "$d" PQ_REVIEW)
+  slug=$(slug_of "$d"); repo=$(hdr "$d/plan.md" repo)
+  nowsec=$(epoch)
+  tries=$(st "$d" PQ_REVIEW_TRIES); tries=${tries:-0}
+  case "$state" in
+    pending)
+      [ -n "$pr" ] || return 0
+      # Not while the agent is still going or blocked; not behind a wall pq has
+      # dismissed, which reads idle to herdr and only PQ_BLOCKED says otherwise;
+      # not while herdr is silent; not inside a retry backoff.
+      [ -n "$(st "$d" PQ_BLOCKED)" ] && return 0
+      case "$pstate" in working|blocked|"") return 0 ;; esac
+      local at; at=$(st "$d" PQ_REVIEW_RETRY_AT)
+      [ -n "$at" ] && [ "$nowsec" -lt "$at" ] && return 0
+      if [ "$PQ_REVIEW_MAX_TRIES" = 0 ]; then
+        [ "$dry" = 1 ] && { msg "would send $slug straight to self-review (PQ_REVIEW_MAX_TRIES=0)"; return 0; }
+        st_set "$d" PQ_REVIEW posted; st_set "$d" PQ_REVIEW_RESULT failed
+        return 0
+      fi
+      [ "$dry" = 1 ] && { msg "would probe #$pr and launch a review of $slug"; return 0; }
+      local probe title pstate2 ncommits changed
+      if ! probe=$(review_probe "$repo" "$pr"); then
+        st_set "$d" PQ_REVIEW_TRIES "$((tries + 1))"
+        reviewer_try_failed "$d" review failed "could not read #$pr with gh"
+        return 0
+      fi
+      IFS=$'\t' read -r title pstate2 _ ncommits changed <<<"$probe"
+      if grep -qiE "$PQ_STUCK_RE" <<<"$title"; then
+        st_set "$d" PQ_REVIEW skipped; st_set "$d" PQ_REVIEW_WHY stuck
+        security_skip "$d" stuck
+        msg "$slug: #$pr is a STUCK pull request - not reviewing it; it wants you"
+        return 0
+      fi
+      case "$pstate2" in
+        MERGED|CLOSED)
+          st_set "$d" PQ_REVIEW skipped; st_set "$d" PQ_REVIEW_WHY settled
+          security_skip "$d" settled
+          msg "$slug: review skipped - #$pr has settled"
+          return 0 ;;
+      esac
+      if [ "${ncommits:-0}" = 1 ] && [ "${changed:-0}" -gt "$PQ_REVIEW_SPLIT_LINES" ]; then
+        st_set "$d" PQ_REVIEW_SPLIT 1; st_set "$d" PQ_REVIEW_LINES "$changed"
+      fi
+      local cwd; cwd=$(st "$d" PQ_WORKTREE)
+      [ -n "$cwd" ] && [ -d "$cwd" ] || cwd=$repo
+      st_set "$d" PQ_REVIEW_TRIES "$((tries + 1))"
+      st_set "$d" PQ_REVIEW_COMMENTS "$(review_comments "$repo" "$pr")"
+      reviewer_launch "$d" review "$cwd" review_cmd "$pr" "$(task_home "$d")"
+      msg "$slug: reviewing #$pr with $PQ_REVIEWER_MODEL in the background"
+      ;;
+    running)
+      local pid; pid=$(st "$d" PQ_REVIEW_PID)
+      if [ -f "$d/review.rc" ]; then
+        local result; result=$(review_collect "$d")
+        case "$result" in
+          ok)
+            [ "$dry" = 1 ] && { msg "would record $slug's review as posted"; return 0; }
+            st_set "$d" PQ_REVIEW posted; st_set "$d" PQ_REVIEW_RESULT ok
+            msg "$slug: review of #$pr posted$(fmt_cost "$(jq -r '.total_cost_usd // empty' "$d/review.json" 2>/dev/null)" \
+                                                        "$(jq -r '.duration_ms // empty' "$d/review.json" 2>/dev/null)")" ;;
+          denied)
+            [ "$dry" = 1 ] && { msg "would record $slug's review as denied"; return 0; }
+            st_set "$d" PQ_REVIEW posted; st_set "$d" PQ_REVIEW_RESULT denied
+            warn "$slug: the reviewer was denied permission to post through gh - check PQ_REVIEW_TOOLS; falling back to self-review" ;;
+          *)
+            [ "$dry" = 1 ] && { msg "would count $slug's failed review as a try"; return 0; }
+            reviewer_try_failed "$d" review failed "the reviewer exited $(cat "$d/review.rc" 2>/dev/null) - see $d/review.err" ;;
+        esac
+        return 0
+      fi
+      if ! review_alive "$pid"; then
+        [ "$dry" = 1 ] && { msg "would count $slug's vanished reviewer as a failed try"; return 0; }
+        reviewer_try_failed "$d" review failed "the reviewer process is gone without leaving an exit code"
+        return 0
+      fi
+      local since; since=$(st "$d" PQ_REVIEW_AT); since=${since:-$nowsec}
+      if [ $(( nowsec - since )) -ge "$PQ_REVIEW_TIMEOUT" ]; then
+        [ "$dry" = 1 ] && { msg "would kill $slug's reviewer - over PQ_REVIEW_TIMEOUT"; return 0; }
+        reviewer_kill "$d" review
+        reviewer_try_failed "$d" review timeout "ran past ${PQ_REVIEW_TIMEOUT}s"
+      fi
+      ;;
+  esac
+  return 0
+}
+
+# The security reviewer's step, beside the gate's (see the section's head for
+# its ladder). No probe of its own: it launches only once the gate has probed
+# and launched, which is everything it needs to know about the pull request.
+security_step() {                       # task_dir dry pr pstate
+  local d=$1 dry=$2 pr=$3 pstate=$4 sec slug nowsec tries
+  sec=$(st "$d" PQ_SECURITY)
+  case "$sec" in pending|running) ;; *) return 0 ;; esac
+  slug=$(slug_of "$d"); nowsec=$(epoch)
+  case "$sec" in
+    pending)
+      case "$(st "$d" PQ_REVIEW)" in running|posted) ;; *) return 0 ;; esac
+      [ -n "$(st "$d" PQ_BLOCKED)" ] && return 0
+      case "$pstate" in working|blocked|"") return 0 ;; esac
+      local at; at=$(st "$d" PQ_SECURITY_RETRY_AT)
+      [ -n "$at" ] && [ "$nowsec" -lt "$at" ] && return 0
+      if [ "$PQ_REVIEW_MAX_TRIES" = 0 ]; then
+        [ "$dry" = 1 ] && { msg "would send $slug straight to a security self-review (PQ_REVIEW_MAX_TRIES=0)"; return 0; }
+        st_set "$d" PQ_SECURITY "done"; st_set "$d" PQ_SECURITY_RESULT failed
+        return 0
+      fi
+      # The skill reads the change off the worktree's own HEAD, so unlike the
+      # code reviewer - which reads the pull request through gh, and can fall
+      # back to the main checkout - it has nowhere else it could run.
+      local cwd; cwd=$(st "$d" PQ_WORKTREE)
+      if [ -z "$cwd" ] || [ ! -d "$cwd" ]; then
+        [ "$dry" = 1 ] && { msg "would give up $slug's security review - its worktree is gone"; return 0; }
+        st_set "$d" PQ_SECURITY "done"; st_set "$d" PQ_SECURITY_RESULT failed
+        warn "$slug: no worktree to run the security review in (${cwd:-none recorded}) - the implementer will be asked to self-review instead"
+        return 0
+      fi
+      [ "$dry" = 1 ] && { msg "would launch a security review of $slug"; return 0; }
+      tries=$(st "$d" PQ_SECURITY_TRIES); tries=${tries:-0}
+      st_set "$d" PQ_SECURITY_TRIES "$((tries + 1))"
+      reviewer_launch "$d" security "$cwd" security_cmd "$pr" "$(task_home "$d")" "$(task_base "$d")"
+      msg "$slug: security-reviewing #$pr with $PQ_REVIEWER_MODEL in the background"
+      ;;
+    running)
+      if [ -f "$d/security.rc" ]; then
+        case "$(security_collect "$d")" in
+          ok)
+            [ "$dry" = 1 ] && { msg "would record $slug's security review as done"; return 0; }
+            jq -j '.result' "$d/security.json" > "$d/security.md" 2>/dev/null
+            st_set "$d" PQ_SECURITY "done"; st_set "$d" PQ_SECURITY_RESULT ok
+            local cost; cost=$(fmt_cost "$(jq -r '.total_cost_usd // empty' "$d/security.json" 2>/dev/null)" \
+                                        "$(jq -r '.duration_ms // empty' "$d/security.json" 2>/dev/null)")
+            if security_post "$d" "$(hdr "$d/plan.md" repo)" "$pr"; then
+              st_set "$d" PQ_SECURITY_POSTED 1
+              msg "$slug: security review of #$pr posted$cost"
+            else
+              st_set "$d" PQ_SECURITY_POSTED ""
+              warn "$slug: security review of #$pr finished$cost, but could not be posted on it - the implementer will be asked to"
+            fi ;;
+          *)
+            [ "$dry" = 1 ] && { msg "would count $slug's failed security review as a try"; return 0; }
+            local rc why; rc=$(cat "$d/security.rc" 2>/dev/null)
+            if [ "$rc" = 0 ]; then why="the security reviewer finished without a report - see $d/security.json"
+            else why="the security reviewer exited $rc - see $d/security.err"; fi
+            reviewer_try_failed "$d" security failed "$why" ;;
+        esac
+        return 0
+      fi
+      local pid; pid=$(st "$d" PQ_SECURITY_PID)
+      if ! review_alive "$pid"; then
+        [ "$dry" = 1 ] && { msg "would count $slug's vanished security reviewer as a failed try"; return 0; }
+        reviewer_try_failed "$d" security failed "the security reviewer process is gone without leaving an exit code"
+        return 0
+      fi
+      local since; since=$(st "$d" PQ_SECURITY_AT); since=${since:-$nowsec}
+      if [ $(( nowsec - since )) -ge "$PQ_REVIEW_TIMEOUT" ]; then
+        [ "$dry" = 1 ] && { msg "would kill $slug's security reviewer - over PQ_REVIEW_TIMEOUT"; return 0; }
+        reviewer_kill "$d" security
+        reviewer_try_failed "$d" security timeout "ran past ${PQ_REVIEW_TIMEOUT}s"
+      fi
+      ;;
+  esac
+  return 0
+}
+
 # What `pq ls` says about the gate, or nothing when it has nothing to say.
 # ASCII only, like every cell.
+#
+# A gate at `posted` that is waiting on the security reviewer says so: `reviewed`
+# would read as about to move on, when the follow-up is held for the other review.
 review_cell() {                         # task_dir
-  local d=$1
+  local d=$1 sec; sec=$(st "$d" PQ_SECURITY)
   case "$(st "$d" PQ_REVIEW)" in
     pending)  printf 'review due' ;;
     running)  printf 'reviewing %s' "$(age_since "$(st "$d" PQ_REVIEW_AT)")" ;;
-    posted)   case "$(st "$d" PQ_REVIEW_RESULT)" in ok) printf 'reviewed' ;; *) printf 'review failed' ;; esac ;;
+    posted)
+      case "$sec" in
+        pending) printf 'security review due'; return ;;
+        running) printf 'security review %s' "$(age_since "$(st "$d" PQ_SECURITY_AT)")"; return ;;
+      esac
+      if [ "$(st "$d" PQ_REVIEW_RESULT)" != ok ]; then printf 'review failed'
+      elif [ "$sec" = "done" ] && [ "$(st "$d" PQ_SECURITY_RESULT)" != ok ]; then printf 'security review failed'
+      else printf 'reviewed'; fi ;;
     prompted) printf 'resolving' ;;
     lapsed)   printf 'review lapsed' ;;
   esac
@@ -5677,7 +6026,9 @@ tick_body() {                           # cap dry
           st_set "$d" PQ_PR "$num"; st_set "$d" PQ_FINISHED "$(now)"
           # The review gate opens here, once, in the same cluster - see the
           # `review gate` section for what happens to it from the next pass on.
+          # So does the security reviewer's ladder, for a plan that asked.
           st_set "$d" PQ_REVIEW pending
+          [ "$(hdr "$d/plan.md" security)" = yes ] && st_set "$d" PQ_SECURITY pending
           retitle "$d" done >/dev/null
           msg "finished $slug - #$num $what"
         fi
@@ -6003,7 +6354,7 @@ cmd_run() {
 # non-zero, which would kill any test running under `set -e`.
 main() {
   case "${1:-}" in
-    add)        shift; cmd_add "" "" "" "$@" ;;
+    add)        shift; cmd_add "" "" "" "" "$@" ;;
     after)      shift; cmd_after "$@" ;;
     base)       shift; cmd_base "$@" ;;
     tick)       shift; cmd_tick "$@" ;;

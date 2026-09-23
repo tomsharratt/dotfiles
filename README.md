@@ -410,7 +410,7 @@ The point is that a second pair of eyes has been over the diff, and the first pa
 
 It is a state ladder on the task, one step per tick, so a tick never blocks on it: `pending` once reconcile has seen the pull request, `running` while the reviewer is a background process of its own, `posted` when it has finished, `prompted` once the follow-up is with the implementer, and `ready` when the pull request stops being a draft.
 The reviewer waits for the agent to go quiet first, and probes the pull request once before launching: a title beginning `STUCK:` is skipped outright (telling an agent that stopped for a reason to mark its work ready is the wrong instruction), and a single commit over `PQ_REVIEW_SPLIT_LINES` changed lines earns an extra clause in the follow-up asking for the branch to be restructured into small logical commits before it is marked ready.
-`pq ls` reads `review due`, `reviewing 7m`, `reviewed`, `resolving`, then falls back to `wrapping up`, and the tick summary counts `N reviewing`.
+`pq ls` reads `review due`, `reviewing 7m`, `reviewed`, `resolving`, then falls back to `wrapping up`, and the tick summary counts `N reviewing` - see "The security review" below for the words it adds.
 
 The reviewer runs in the background rather than shielded, because a tick must never block for up to an hour: everything needed to collect it is on disk, so a `pq run` stopped with Ctrl-C leaves the reviewer alone and a later tick, from any `pq` process, finishes the job.
 Liveness is the process group, not the pid, so a recycled pid is neither counted alive nor killed.
@@ -419,10 +419,36 @@ A pull request that settles mid-review has its reviewer killed before the reap p
 Failure is loud, once, and falls back rather than blocking.
 A reviewer that errors or runs past `PQ_REVIEW_TIMEOUT` is retried after `PQ_REVIEW_RETRY`, up to `PQ_REVIEW_MAX_TRIES` launches, and then given up on; the implementer is then told the review did not happen and to review its own diff as a stranger would, fix, push, and mark the pull request ready anyway, and `pq ls` reads `review failed` until it does.
 A reviewer that was refused `gh` and posted nothing is `denied` and never retried, since it cannot succeed until `PQ_REVIEW_TOOLS` changes - and it is reported the same way, on the first task it happens to.
-There is no off switch; `PQ_REVIEW_MAX_TRIES=0` is the honest degraded mode, which skips the reviewer and sends every task straight to the self-review fallback.
+There is no off switch; `PQ_REVIEW_MAX_TRIES=0` is the honest degraded mode, which skips every reviewer and sends every task straight to the self-review fallback.
 
 A gate that nobody is going to close is `lapsed`: the agent has exited, or has sat idle past the wrap-up grace with the draft still open.
 That is warned about once, counts into "needs you", and reads `review lapsed` in `pq ls` - the comments are there, and resolving them is yours.
+
+#### The security review
+
+Some plans ask for a security review as well - "run `/security-review` as well as `/code-review`", with what it should look at - and those get one, run by `pq` the same way.
+The same Haiku call that names a task at add time reads whether its plan asks for one, and a plan that does gets a `security: yes` header (absent, like `base:` and `design:`, when it does not) and says `review: code and security` as it is queued.
+It has to be read rather than matched: plans name the skill as often to waive it as to ask for it - "`/security-review` is not warranted" - so a pattern cannot tell the two apart, and a yes stands only when the plan's text mentions a security review at all.
+The wording was checked against ten real plans, four runs each, and came back right all forty times, including one that asks for it inside an aside about CSRF and `pq`'s own plan, which names it only as follow-up work.
+A split carries the ask into the parts it is about, and each part gets a verdict of its own.
+
+The implementer's contract says `pq` runs the review, and not to run one itself.
+Once the draft is open, `pq` runs `claude -p "/security-review"` in the task's worktree beside the code reviewer, launched on the same tick, on the same `PQ_REVIEWER_MODEL`, `PQ_REVIEW_EFFORT`, `PQ_REVIEW_TIMEOUT`, `PQ_REVIEW_MAX_TRIES` and `PQ_REVIEW_RETRY`, and under the same read-only deny rules, with `gh` denied outright.
+The skill takes no target and posts nothing: it reviews `git diff origin/HEAD...` of wherever it runs and replies with a markdown report.
+So its brief names the diff to go by - `git diff origin/<base>...HEAD`, since `origin/HEAD` is the default branch whatever the pull request is aimed at - and points it at the plan, which says why it asked and what to look at.
+Then `pq` delivers the report itself: it is saved as `<task>/security.md` and posted on the pull request as one comment, next to the code review's inline ones.
+
+The two reviews meet at one point: the follow-up waits until both have finished, so the implementer is told once, about both - answer every inline comment and every finding in the security report, by fixing it or saying why it stands - and the slot stays held until then.
+`pq ls` reads `security review 4m` while the gate waits on it, and `security review failed` if it did not happen.
+A security review that fails is retried and then given up on exactly like the code review, and the follow-up then asks the implementer to check its own diff for the risks the plan names.
+A report that could not be posted is not a failed review: the follow-up asks the implementer to post it from `security.md`.
+The security reviewer never probes the pull request itself - it launches only once the code reviewer's probe has passed - so a `STUCK:` title or a settled pull request stops both, and one that settles mid-review has both killed.
+The one exception is an agent that has gone: a security review already under way is let finish, so its report still reaches the pull request, and then the gate lapses as it would have.
+
+It was verified before it shipped, in scratch repositories, with the exact command `pq` runs.
+A change with a SQL injection and two cross-tenant reads came back with all three, at confidence 9 or 10, in under three minutes for about a dollar.
+A clean change came back with none.
+A change forked from an integration branch that carried a command injection of its own was shown the whole integration branch by the skill, went by the brief's diff instead, and left the base's injection out of scope.
 
 #### Tearing a task down
 
