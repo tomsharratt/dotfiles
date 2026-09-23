@@ -54,8 +54,10 @@ case "$model" in
         printf '{"branch":"tom/plain-plan","intent":"No outline at all."}\n' ;;
       *"MARKER: bare"*)
         printf '{"branch":"fix-login-swallow","intent":"Bare."}\n' ;;
-      *"MARKER: category"*)
-        printf '{"branch":"feature/settings-index","intent":"Category."}\n' ;;
+      *"MARKER: slashed"*)
+        printf '{"branch":"ios/tip-fee","intent":"Slashed."}\n' ;;
+      *"MARKER: tomslashed"*)
+        printf '{"branch":"tom/android/tip-fee","intent":"Slashed under tom."}\n' ;;
       *"MARKER: nobranch"*)
         printf '{"branch":"tom/","intent":"No words."}\n' ;;
       *"MARKER: part-a"*)
@@ -289,9 +291,14 @@ echo "== name_plan: the branch is always tom/<words>, whatever Haiku sent back =
 PB="$PQ_HOME/.bare.md"; mkplan "$PB" bare
 IFS=$'\t' read -r b _ <<<"$(name_plan "$PB")"
 eq "$b" "tom/fix-login-swallow" "a bare name gets the prefix"
-PC="$PQ_HOME/.category.md"; mkplan "$PC" category
-IFS=$'\t' read -r b _ <<<"$(name_plan "$PC")"
-eq "$b" "tom/settings-index" "an invented category is replaced by it"
+# A slash inside the words keeps them all, as a dash: on a multi-repo split
+# the repo in the name may be all that tells two parts apart.
+PS="$PQ_HOME/.slashed.md"; mkplan "$PS" slashed
+IFS=$'\t' read -r b _ <<<"$(name_plan "$PS")"
+eq "$b" "tom/ios-tip-fee" "a slash without the prefix keeps every word"
+PT="$PQ_HOME/.tomslashed.md"; mkplan "$PT" tomslashed
+IFS=$'\t' read -r b _ <<<"$(name_plan "$PT")"
+eq "$b" "tom/android-tip-fee" "and so does one under it"
 IFS=$'\t' read -r b _ <<<"$(name_plan "$P3")"
 eq "$b" "tom/three-parts" "a name that already has it is left alone"
 PN="$PQ_HOME/.nobranch.md"; mkplan "$PN" nobranch
