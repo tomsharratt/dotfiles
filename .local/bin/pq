@@ -3266,7 +3266,7 @@ check_stall() {                         # task_dir
 # a night.
 #
 # A reviewer that hit the wall is the same evidence, and freezes the same way
-# (see review_wall_until) - until it relaunches, which is the next knock on the
+# (see review_wall_until) - until its retry is due, which is the next knock on the
 # wall that pq has. It is named as "<slug>'s review", since the first field is
 # only ever shown, and a bare slug would say the task's own agent is walled.
 walled_slot() {                         # -> who<TAB>resets_at | "", who being a slug or "<slug>'s review"
@@ -5379,10 +5379,20 @@ reviewer_session_lost() {               # task_dir stem
 # the ladder itself - `pending`, with a wall recorded - so every way a ladder ends
 # (skipped, settled, lapsed, removed) ends this too, and a freeze built on it
 # (see walled_slot) cannot outlive the wait it stands for.
+#
+# And only until its retry is due, which is the other half of that. The wall is
+# cleared by the relaunch, and a relaunch waits for its agent to be idle - which
+# it need not be once the reset comes round: on a permission prompt, typed into by
+# hand, behind a wall of its own that pq has given up on. None of that is the
+# account's wall. Read off the ladder alone, the freeze held the whole queue on a
+# reset hours gone, for as long as the agent stayed busy, and `pq ls` went on
+# naming the reset; past its retry the reviewer is simply due.
 review_wall_until() {                       # task_dir -> resets_at, maybe empty; 0 while waiting
-  local k
+  local k at
   for k in PQ_REVIEW PQ_SECURITY; do
     [ "$(st "$1" "$k")" = pending ] && [ "$(st "$1" "${k}_WALL")" = 1 ] || continue
+    at=$(st "$1" "${k}_RETRY_AT")
+    [ -n "$at" ] && [ "$(epoch)" -lt "$at" ] 2>/dev/null || continue
     printf '%s' "$(st "$1" "${k}_RESETS_AT")"
     return 0
   done

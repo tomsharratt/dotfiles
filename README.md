@@ -429,6 +429,8 @@ The reviewer then waits out the wall the way a walled pane does: it goes back to
 At the reset it resumes its own session, with every flag again and a plain "carry on" rather than the skill, which would start the review over - so the work done before the wall is not paid for twice.
 A session that has gone since is started afresh, at once, with no try spent.
 While it waits, `pq ls` reads `review quota 7pm`, the slot stays held, and the queue is frozen on it exactly as on a walled pane, since the wall is the account's; the freeze is read off the reviewer's own ladder, so it lets go the moment the ladder ends, however it ends.
+It also lets go once the retry is due, even when the reviewer cannot relaunch yet because its agent is on a permission prompt, being typed into, or behind a wall of its own that pq has given up on: the reviewer's wall is behind it by then, and it reads `review due` until its agent is idle again.
+An agent on a wall of its own that pq is still knocking on keeps the queue frozen, as any walled pane does.
 
 A gate that nobody is going to close is `lapsed`: the agent has exited, or has sat idle past the wrap-up grace with the draft still open.
 That is warned about once, counts into "needs you", and reads `review lapsed` in `pq ls` - the comments are there, and resolving them is yours.

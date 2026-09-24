@@ -182,10 +182,11 @@ mk_gated() {                            # prio slug pane [security] -> task_dir
   task_link "$dir"
   printf '%s' "$dir"
 }
-set_idle() {                            # pane -> herdr reads it as an idle claude
-  jq -nc --arg p "$1" '{result:{snapshot:{panes:[{pane_id:$p,agent:"claude",agent_status:"idle"}]}}}' > "$PANES_JSON"
-  PIDX=$(printf '%s\tclaude\tidle' "$1"); PIDX_OK=1
+set_pane() {                            # pane status -> herdr reads it as a claude in that status
+  jq -nc --arg p "$1" --arg s "$2" '{result:{snapshot:{panes:[{pane_id:$p,agent:"claude",agent_status:$s}]}}}' > "$PANES_JSON"
+  PIDX=$(printf '%s\tclaude\t%s' "$1" "$2"); PIDX_OK=1
 }
+set_idle() { set_pane "$1" idle; }
 wait_for() { local i; for i in $(seq 1 50); do "$@" && return 0; sleep 0.1; done; return 1; }
 last_call() { grep "$1" "$CLAUDE_LOG" | tail -1; }
 prompts()   { grep -c "^agent	prompt	" "$HERDR_LOG" 2>/dev/null || true; }
@@ -363,6 +364,50 @@ review_task "$G" 0 >/dev/null 2>&1
 eq "$(st "$G" PQ_REVIEW)" "skipped" "skipped with the settle"
 eq "$(walled_slot)" "" "and nothing is left freezing the queue"
 eq "$(review_cell "$G")" "" "nor saying quota"
+
+echo "== the freeze ends at the reset, even while the reviewer cannot relaunch yet ==" >&2
+# The reviewer relaunches only onto an idle agent, and its agent need not be one
+# once the reset comes round: on a permission prompt, typed into by hand, or behind
+# a wall of its own that pq gave up on. None of that is the account's wall, so the
+# queue must not stay frozen on a reset hours gone - which it did, for as long as
+# the agent stayed busy.
+reset_tasks; mode walled
+G=$(mk_gated 095 busy w1:p1); set_idle w1:p1
+wall_at $(( $(real) + 3600 ))
+review_task "$G" 0 >/dev/null 2>&1; wait_for test -f "$G/review.rc"
+review_task "$G" 0 >/dev/null 2>&1
+[ -n "$(walled_slot)" ] && ok || bad "walled, and freezing, before the reset"
+set_pane w1:p1 blocked; mode ok
+FAKE_NOW=$(( $(st "$G" PQ_REVIEW_RETRY_AT) + 6 * 3600 ))
+review_task "$G" 0 >/dev/null 2>&1
+eq "$(st "$G" PQ_REVIEW)" "pending" "the reviewer still waits for its agent"
+eq "$(grep -c . "$CLAUDE_LOG")" "1" "and is not relaunched onto a busy one"
+eq "$(walled_slot)" "" "but the queue does not wait with it"
+eq "$(review_cell "$G")" "review due" "and pq ls names no reset that has gone"
+hasnt "$(main cap 3 2>&1)" "walled" "nor does pq cap"
+rm -f "$PQ_HOME/cap"
+st_set "$G" PQ_BLOCKED quota; st_set "$G" PQ_GAVEUP 1
+eq "$(walled_slot)" "" "nor does an agent walled for good, which pq has already stopped freezing on"
+st_set "$G" PQ_BLOCKED ""; st_set "$G" PQ_GAVEUP ""
+set_idle w1:p1
+review_task "$G" 0 >/dev/null 2>&1
+eq "$(st "$G" PQ_REVIEW)" "running" "once its agent is idle again, it resumes"
+has "$(last_call "this review")" "	--resume	b1747627-d4f1-4d8c-958f-feb69fe51607	" "the session that walled"
+# The security reviewer's wall, beside a gate that has posted, lets go the same way.
+reset_tasks; mode ok; smode walled
+G=$(mk_gated 096 secbusy w1:p1 yes); set_idle w1:p1
+wall_at $(( $(real) + 3600 ))
+review_task "$G" 0 >/dev/null 2>&1
+wait_for test -f "$G/review.rc"; wait_for test -f "$G/security.rc"
+review_task "$G" 0 >/dev/null 2>&1
+eq "$(st "$G" PQ_REVIEW)/$(st "$G" PQ_SECURITY)" "posted/pending" "the security reviewer is on the wall"
+[ -n "$(walled_slot)" ] && ok || bad "and freezing, before the reset"
+set_pane w1:p1 working
+FAKE_NOW=$(( $(st "$G" PQ_SECURITY_RETRY_AT) + 60 ))
+review_task "$G" 0 >/dev/null 2>&1
+eq "$(st "$G" PQ_SECURITY)" "pending" "waiting on its agent"
+eq "$(walled_slot)" "" "not freezing the queue"
+eq "$(review_cell "$G")" "security review due" "and read as due"
 
 echo "== the security reviewer: its wall is never posted, and the follow-up waits ==" >&2
 reset_tasks; mode ok; smode walled
