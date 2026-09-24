@@ -421,6 +421,15 @@ A reviewer that errors or runs past `PQ_REVIEW_TIMEOUT` is retried after `PQ_REV
 A reviewer that was refused `gh` and posted nothing is `denied` and never retried, since it cannot succeed until `PQ_REVIEW_TOOLS` changes - and it is reported the same way, on the first task it happens to.
 There is no off switch; `PQ_REVIEW_MAX_TRIES=0` is the honest degraded mode, which skips every reviewer and sends every task straight to the self-review fallback.
 
+A reviewer that hits the usage limit has not failed, and is not treated as if it had.
+In `claude -p` the wall is not an error: the first reviewer to hit it had spent fifteen minutes and $5.52 on a review, then exited 0, with `is_error: false` and nothing in its reply but "You've hit your session limit · resets 7pm (America/Toronto)" - and the gate read that as a review that had posted, and told the implementer to resolve comments that did not exist.
+So a reply that is one line and reads as the wall (`PQ_QUOTA_RE`, as on a pane) is caught before anything else is read off a finished reviewer, code or security, whatever its exit code says; a reply that is not JSON has the last line of its stderr put to the same test.
+One line, because a real review is never that short, while a review of rate-limiting code can say "hit your API limit" somewhere in a longer one.
+The reviewer then waits out the wall the way a walled pane does: it goes back to `pending` with its retry a minute past the reset its line names, or every `PQ_QUOTA_RETRY` when it names none, and spends none of its `PQ_REVIEW_MAX_TRIES` - walls are counted apart, up to `PQ_QUOTA_MAX_TRIES`, after which the follow-up asks for a self-review and says why.
+At the reset it resumes its own session, with every flag again and a plain "carry on" rather than the skill, which would start the review over - so the work done before the wall is not paid for twice.
+A session that has gone since is started afresh, at once, with no try spent.
+While it waits, `pq ls` reads `review quota 7pm`, the slot stays held, and the queue is frozen on it exactly as on a walled pane, since the wall is the account's; the freeze is read off the reviewer's own ladder, so it lets go the moment the ladder ends, however it ends.
+
 A gate that nobody is going to close is `lapsed`: the agent has exited, or has sat idle past the wrap-up grace with the draft still open.
 That is warned about once, counts into "needs you", and reads `review lapsed` in `pq ls` - the comments are there, and resolving them is yours.
 

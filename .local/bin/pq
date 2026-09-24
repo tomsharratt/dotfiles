@@ -3264,11 +3264,20 @@ check_stall() {                         # task_dir
 # agent dispatched behind it walls on its first request, is detected, and the freeze
 # comes back. That is the right way round: a misread pane should cost a worktree, not
 # a night.
-walled_slot() {                         # -> slug<TAB>resets_at | ""
-  local d
+#
+# A reviewer that hit the wall is the same evidence, and freezes the same way
+# (see review_wall_until) - until it relaunches, which is the next knock on the
+# wall that pq has. It is named as "<slug>'s review", since the first field is
+# only ever shown, and a bare slug would say the task's own agent is walled.
+walled_slot() {                         # -> who<TAB>resets_at | "", who being a slug or "<slug>'s review"
+  local d resets
   for d in "$PQ_HOME/running"/*/ "$PQ_HOME/done"/*/; do
     [ -d "$d" ] || continue
     d=${d%/}
+    if resets=$(review_wall_until "$d"); then
+      printf "%s's review\t%s" "$(slug_of "$d")" "$resets"
+      return 0
+    fi
     [ "$(st "$d" PQ_BLOCKED)" = quota ] || continue
     [ "$(st "$d" PQ_GAVEUP)" = 1 ] && continue
     case "$(pane_state "$(st "$d" PQ_PANE)")" in noagent|missing) continue ;; esac
@@ -4863,12 +4872,19 @@ dispatch_task() {                       # task_dir  -> 0 launched, 1 failed
 # MAX_TRIES x (TIMEOUT + RETRY) at the very worst, about two hours twenty, then
 # the fallback prompt. A security reviewer runs to the same bound beside it, but
 # can only start once the gate's probe has passed, so probes that fail first add
-# up to MAX_TRIES x RETRY on top - two hours forty at the very worst.
+# up to MAX_TRIES x RETRY on top - two hours forty at the very worst. A reviewer
+# that hits the usage limit is the one exception, and holds the slot for as long
+# as the wall does (see reviewer_walled): nothing else could use it meanwhile,
+# since the wall is the account's, and the queue is frozen on it anyway.
 # `PQ_WRAPUP_GRACE=0` therefore no longer means release-on-PR for a gated task;
 # it means release once the gate is through.
 #
 # "Settled" is everything else, an unset key included, so a task from before the
 # gate reads exactly as it did - `blocker_state`'s stalled verdict rests on it.
+#
+# The usage limit is not a failure, and is caught before anything else is read
+# off a finished reviewer: see reviewer_walled, which holds either reviewer until
+# the reset and resumes its session, spending none of its tries.
 #
 # Failure is loud, once, and falls back rather than blocking: a reviewer that
 # errors is retried on a backoff and then given up on, and the implementer is
@@ -5025,14 +5041,25 @@ REVIEWER_GIT_DENY=("Bash(git checkout:*)" "Bash(git switch:*)" "Bash(git restore
 # real review reached for the design file to check the change against it and was
 # refused, because the task directory is outside the worktree it runs in - and a
 # reviewer that can see what the change was built to is a better reviewer.
-review_cmd() {                          # pr task_home
+#
+# With a session, the same reviewer picks up where the usage limit stopped it
+# (see reviewer_walled): every flag again, since none of them is kept with the
+# session, and a plain continue for the prompt - typing the skill again would
+# expand it afresh and start the review over.
+review_cmd() {                          # pr task_home [session]
+  local resume=() prompt="/code-review $PQ_REVIEW_EFFORT --comment $1"
+  if [ -n "${3:-}" ]; then
+    resume=(--resume "$3")
+    prompt="The usage limit that stopped you has reset. Carry on with this review exactly where you left off, and post it on the pull request as the review asked."
+  fi
   headless_claude -p --model "$PQ_REVIEWER_MODEL" --effort "$PQ_REVIEW_EFFORT" \
+    ${resume[@]+"${resume[@]}"} \
     --permission-mode auto --allowedTools "$PQ_REVIEW_TOOLS" \
     --disallowedTools "Edit(/$HOME/**)" "Bash(gh pr ready:*)" "Bash(gh pr merge:*)" "Bash(gh pr close:*)" \
       "${REVIEWER_GIT_DENY[@]}" \
     --append-system-prompt "$(review_brief "$1")" \
     --add-dir "$2" \
-    --output-format json "/code-review $PQ_REVIEW_EFFORT --comment $1"
+    --output-format json "$prompt"
 }
 
 # What the reviewer is told beside the skill: what it may touch, where its
@@ -5061,13 +5088,19 @@ review_brief() {                        # pr
 # own was shown the whole integration branch by the skill, went by the brief's
 # `git diff origin/<base>...HEAD` instead, and left the base's injection out of
 # scope. None was denied anything, and none touched its worktree.
-security_cmd() {                        # pr task_home base
+security_cmd() {                        # pr task_home base [session]
+  local resume=() prompt="/security-review"
+  if [ -n "${4:-}" ]; then
+    resume=(--resume "$4")
+    prompt="The usage limit that stopped you has reset. Carry on with this security review exactly where you left off, and reply with the markdown report as the review asked."
+  fi
   headless_claude -p --model "$PQ_REVIEWER_MODEL" --effort "$PQ_REVIEW_EFFORT" \
+    ${resume[@]+"${resume[@]}"} \
     --permission-mode auto \
     --disallowedTools "Edit(/$HOME/**)" "Bash(gh:*)" "${REVIEWER_GIT_DENY[@]}" \
     --append-system-prompt "$(security_brief "$1" "$2" "$3")" \
     --add-dir "$2" \
-    --output-format json "/security-review"
+    --output-format json "$prompt"
 }
 
 # What the security reviewer is told beside the skill. The base is named because
@@ -5148,6 +5181,7 @@ reviewer_launch() {                     # task_dir stem cwd cmd...
   disown "$pid" 2>/dev/null || true
   st_set "$d" "${key}_PID" "$pid"
   st_set "$d" "${key}_AT" "$(epoch)"
+  [ -z "$(st "$d" "${key}_WALL")" ] || { st_set "$d" "${key}_WALL" ""; st_set "$d" "${key}_RESETS_AT" ""; }
   st_set "$d" "$key" running
 }
 
@@ -5211,6 +5245,8 @@ reviewer_try_failed() {                 # task_dir stem result why
   case "$stem" in review) noun=review; final=posted ;; *) noun="security review"; final="done" ;; esac
   slug=$(slug_of "$d"); tries=$(st "$d" "${key}_TRIES"); tries=${tries:-0}
   st_set "$d" "${key}_RESULT" "$result"
+  # A session that failed is not one to resume: whatever went wrong is in it.
+  [ -z "$(st "$d" "${key}_SESSION")" ] || st_set "$d" "${key}_SESSION" ""
   if [ "$tries" -lt "$PQ_REVIEW_MAX_TRIES" ]; then
     st_set "$d" "$key" pending
     st_set "$d" "${key}_RETRY_AT" "$(( $(epoch) + PQ_REVIEW_RETRY ))"
@@ -5236,6 +5272,121 @@ security_collect() {                    # task_dir -> ok | failed
     printf 'ok'; return
   fi
   printf 'failed'
+}
+
+# THE USAGE LIMIT. A reviewer is a headless session on the same account as every
+# agent pq runs, and it can hit the same wall - and in `-p` the wall is not an
+# error. The first one seen ran for fifteen minutes and $5.52 of a review, then
+# exited 0 with `is_error: false`, `subtype: success` and, for its whole reply,
+# the one line "You've hit your session limit · resets 7pm (America/Toronto)".
+# review_collect read that as a review that had posted, and the implementer was
+# told to resolve inline comments that did not exist. security_collect would have
+# posted the line on the pull request as the security review.
+#
+# So the wall is looked for first, whatever the exit code says: a reply that is
+# ONE line and reads as the wall (PQ_QUOTA_RE, as on a pane). One line, because a
+# real review is never that short, while one of rate-limiting code may well say
+# "hit your API limit" somewhere in a longer reply. A reply that is not JSON at
+# all has the same test put to the last line of its stderr.
+reviewer_wall_text() {                  # task_dir stem -> the wall's line, when that is all it said
+  local d=$1 stem=$2 text
+  text=$(jq -r 'if type == "object" then (.result // "" | tostring) else empty end' "$d/$stem.json" 2>/dev/null \
+           | sed '/^[[:space:]]*$/d')
+  [ -n "$text" ] || text=$(sed '/^[[:space:]]*$/d' "$d/$stem.err" 2>/dev/null | tail -n 1)
+  [ -n "$text" ] && [ "$(grep -c . <<<"$text")" = 1 ] || return 1
+  grep -qiE "$PQ_QUOTA_RE" <<<"$text" || return 1
+  printf '%s' "$text"
+}
+
+# A wall is not the reviewer's failure, so it spends none of PQ_REVIEW_MAX_TRIES:
+# the try counted at launch is handed back, and walls are counted apart - up to
+# PQ_QUOTA_MAX_TRIES, the same bound the knock on a walled pane has, after which
+# the result is final as `quota` and the follow-up asks for a self-review.
+#
+# Until then the ladder goes back to `pending`, with the retry a minute past the
+# reset its line names - read by reset_hint and parse_reset, as off a pane - or
+# every PQ_QUOTA_RETRY when it names none. The session is kept, and the relaunch
+# resumes it (see review_cmd), so fifteen minutes of review are not paid for twice.
+#
+# A bare clock time is the next time the clock reads it, read against NOW - so a
+# wall collected a while after its reset had come round would read as tomorrow's.
+# The wall was printed when the reviewer finished, which the .rc file's mtime
+# records, and a time that was still ahead of it then is today's, and past.
+reviewer_walled() {                     # task_dir stem wall_text
+  local d=$1 stem=$2 text=$3 key noun final slug tries walls sid hint e at nowsec due plan
+  key=$(reviewer_key "$stem")
+  case "$stem" in review) noun=reviewer; final=posted ;; *) noun="security reviewer"; final="done" ;; esac
+  slug=$(slug_of "$d"); nowsec=$(epoch)
+  tries=$(st "$d" "${key}_TRIES"); tries=${tries:-0}
+  [ "$tries" -gt 0 ] && st_set "$d" "${key}_TRIES" "$(( tries - 1 ))"
+  walls=$(st "$d" "${key}_WALLS"); walls=$(( ${walls:-0} + 1 ))
+  st_set "$d" "${key}_WALLS" "$walls"
+  sid=$(jq -r 'if type == "object" then (.session_id // empty) else empty end' "$d/$stem.json" 2>/dev/null)
+  [ -n "$sid" ] && st_set "$d" "${key}_SESSION" "$sid"
+  if [ "$walls" -gt "$PQ_QUOTA_MAX_TRIES" ]; then
+    st_set "$d" "${key}_RESULT" quota; st_set "$d" "$key" "$final"
+    warn "$slug: the $noun is still walled after $PQ_QUOTA_MAX_TRIES tries - the implementer will be asked to self-review instead"
+    return 0
+  fi
+  hint=$(reset_hint "$text")
+  e=$(parse_reset "$hint" 2>/dev/null) || e=""
+  if [ -n "$e" ]; then
+    case "$hint" in
+      *,*) ;;
+      *) at=$(stat -f %m "$d/$stem.rc" 2>/dev/null) || at=$nowsec
+         [ $(( e - 86400 )) -ge $(( at - 300 )) ] && e=$(( e - 86400 )) ;;
+    esac
+  fi
+  if [ -n "$e" ] && [ $(( e + 60 )) -gt "$nowsec" ]; then
+    due=$(( e + 60 ))                   # a minute past it, so clock skew cannot land early
+    st_set "$d" "${key}_RESETS_AT" "$e"
+    plan="resuming it at $(clock_of "$due")"
+  elif [ -n "$e" ]; then
+    due=$nowsec
+    st_set "$d" "${key}_RESETS_AT" ""
+    plan="its reset has already come round, so resuming it now"
+  else
+    due=$(( nowsec + PQ_QUOTA_RETRY ))
+    st_set "$d" "${key}_RESETS_AT" ""
+    plan="no reset time in its reply, so trying again every $(( PQ_QUOTA_RETRY / 60 ))m"
+  fi
+  st_set "$d" "${key}_WALL" 1
+  st_set "$d" "${key}_RETRY_AT" "$due"
+  st_set "$d" "$key" pending
+  warn "$slug: the $noun hit the usage limit - $plan"
+}
+
+# A session that has gone - pruned, or never written - cannot be resumed, and
+# `--resume` says so on stderr and exits 1 having done nothing. That is no try
+# at all: the review starts afresh at once rather than spending half its tries
+# on an id that will never work.
+reviewer_session_gone() {               # task_dir stem -> 0 when a resume found nothing to resume
+  [ -n "$(st "$1" "$(reviewer_key "$2")_SESSION")" ] || return 1
+  grep -q 'No conversation found with session ID' "$1/$2.err" 2>/dev/null
+}
+reviewer_session_lost() {               # task_dir stem
+  local d=$1 stem=$2 key noun tries
+  key=$(reviewer_key "$stem")
+  case "$stem" in review) noun=reviewer ;; *) noun="security reviewer" ;; esac
+  tries=$(st "$d" "${key}_TRIES"); tries=${tries:-0}
+  [ "$tries" -gt 0 ] && st_set "$d" "${key}_TRIES" "$(( tries - 1 ))"
+  st_set "$d" "${key}_SESSION" ""; st_set "$d" "${key}_RETRY_AT" ""
+  st_set "$d" "$key" pending
+  warn "$(slug_of "$d"): the session of the walled $noun is gone - starting it afresh"
+}
+
+# Is a reviewer of this task waiting out the usage limit, and until when? Read off
+# the ladder itself - `pending`, with a wall recorded - so every way a ladder ends
+# (skipped, settled, lapsed, removed) ends this too, and a freeze built on it
+# (see walled_slot) cannot outlive the wait it stands for.
+review_wall_until() {                       # task_dir -> resets_at, maybe empty; 0 while waiting
+  local k
+  for k in PQ_REVIEW PQ_SECURITY; do
+    [ "$(st "$1" "$k")" = pending ] && [ "$(st "$1" "${k}_WALL")" = 1 ] || continue
+    printf '%s' "$(st "$1" "${k}_RESETS_AT")"
+    return 0
+  done
+  return 1
 }
 
 # The report goes on the pull request as one comment, so it is read beside the
@@ -5284,6 +5435,7 @@ review_prompt() {                       # pr result split lines base [security_r
     *)
       case "$sec" in
         timeout) swhy="the security reviewer ran out of time" ;;
+        quota)   swhy="the security reviewer kept hitting the usage limit" ;;
         *)       swhy="the security reviewer exited with an error" ;;
       esac
       secc="The security review the plan asked for did not happen - $swhy. \
@@ -5305,6 +5457,7 @@ Leave no comment unanswered. ${secc}${splitc}${tail}" ;;
     *)
       case "$result" in
         timeout) why="the reviewer ran out of time" ;;
+        quota)   why="the reviewer kept hitting the usage limit" ;;
         denied)  why="the reviewer was denied permission to post" ;;
         *)       why="the reviewer exited with an error" ;;
       esac
@@ -5487,12 +5640,25 @@ review_step() {                         # task_dir dry pr pstate
       [ -n "$cwd" ] && [ -d "$cwd" ] || cwd=$repo
       st_set "$d" PQ_REVIEW_TRIES "$((tries + 1))"
       st_set "$d" PQ_REVIEW_COMMENTS "$(review_comments "$repo" "$pr")"
-      reviewer_launch "$d" review "$cwd" review_cmd "$pr" "$(task_home "$d")"
-      msg "$slug: reviewing #$pr with $PQ_REVIEWER_MODEL in the background"
+      local sid; sid=$(st "$d" PQ_REVIEW_SESSION)
+      reviewer_launch "$d" review "$cwd" review_cmd "$pr" "$(task_home "$d")" "$sid"
+      if [ -n "$sid" ]; then msg "$slug: resuming the review of #$pr after the usage limit"
+      else msg "$slug: reviewing #$pr with $PQ_REVIEWER_MODEL in the background"; fi
       ;;
     running)
       local pid; pid=$(st "$d" PQ_REVIEW_PID)
       if [ -f "$d/review.rc" ]; then
+        local wall
+        if wall=$(reviewer_wall_text "$d" review); then
+          [ "$dry" = 1 ] && { msg "would hold $slug's review for the usage limit"; return 0; }
+          reviewer_walled "$d" review "$wall"
+          return 0
+        fi
+        if reviewer_session_gone "$d" review; then
+          [ "$dry" = 1 ] && { msg "would start $slug's walled review afresh - its session is gone"; return 0; }
+          reviewer_session_lost "$d" review
+          return 0
+        fi
         local result; result=$(review_collect "$d")
         case "$result" in
           ok)
@@ -5559,11 +5725,24 @@ security_step() {                       # task_dir dry pr pstate
       [ "$dry" = 1 ] && { msg "would launch a security review of $slug"; return 0; }
       tries=$(st "$d" PQ_SECURITY_TRIES); tries=${tries:-0}
       st_set "$d" PQ_SECURITY_TRIES "$((tries + 1))"
-      reviewer_launch "$d" security "$cwd" security_cmd "$pr" "$(task_home "$d")" "$(task_base "$d")"
-      msg "$slug: security-reviewing #$pr with $PQ_REVIEWER_MODEL in the background"
+      local sid; sid=$(st "$d" PQ_SECURITY_SESSION)
+      reviewer_launch "$d" security "$cwd" security_cmd "$pr" "$(task_home "$d")" "$(task_base "$d")" "$sid"
+      if [ -n "$sid" ]; then msg "$slug: resuming the security review of #$pr after the usage limit"
+      else msg "$slug: security-reviewing #$pr with $PQ_REVIEWER_MODEL in the background"; fi
       ;;
     running)
       if [ -f "$d/security.rc" ]; then
+        local wall
+        if wall=$(reviewer_wall_text "$d" security); then
+          [ "$dry" = 1 ] && { msg "would hold $slug's security review for the usage limit"; return 0; }
+          reviewer_walled "$d" security "$wall"
+          return 0
+        fi
+        if reviewer_session_gone "$d" security; then
+          [ "$dry" = 1 ] && { msg "would start $slug's walled security review afresh - its session is gone"; return 0; }
+          reviewer_session_lost "$d" security
+          return 0
+        fi
         case "$(security_collect "$d")" in
           ok)
             [ "$dry" = 1 ] && { msg "would record $slug's security review as done"; return 0; }
@@ -5610,7 +5789,14 @@ security_step() {                       # task_dir dry pr pstate
 # A gate at `posted` that is waiting on the security reviewer says so: `reviewed`
 # would read as about to move on, when the follow-up is held for the other review.
 review_cell() {                         # task_dir
-  local d=$1 sec; sec=$(st "$d" PQ_SECURITY)
+  local d=$1 sec resets at; sec=$(st "$d" PQ_SECURITY)
+  # A reviewer waiting out the usage limit reads as a walled pane does in
+  # block_cell: `review quota 7pm`, or bare when its reply named no time.
+  if resets=$(review_wall_until "$d"); then
+    at=$(clock_of "$resets")
+    printf 'review quota%s' "${at:+ $at}"
+    return
+  fi
   case "$(st "$d" PQ_REVIEW)" in
     pending)  printf 'review due' ;;
     running)  printf 'reviewing %s' "$(age_since "$(st "$d" PQ_REVIEW_AT)")" ;;
