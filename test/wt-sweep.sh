@@ -26,6 +26,13 @@ XDG_STATE_HOME=$(mktemp -d)
 XDG_CONFIG_HOME=$(mktemp -d)
 export XDG_STATE_HOME XDG_CONFIG_HOME
 mkdir -p "$XDG_STATE_HOME/wt"
+# HOME too, and before the profile is sourced. wt_sweep also sweeps
+# $HOME/.puma-dev, and a real sweep below runs against two made-up live slugs -
+# so with the real HOME it deleted the route of every actual worktree, and each
+# one's .test url died at the next puma-dev restart.
+HOME=$(mktemp -d)
+export HOME
+mkdir -p "$HOME/.puma-dev"
 
 STUBBIN=$(mktemp -d)
 DB_LIST="$STUBBIN/.databases"
@@ -58,7 +65,7 @@ ok()  { pass=$((pass + 1)); }
 bad() { fail=$((fail + 1)); printf 'FAIL: %s\n' "$1" >&2; }
 eq() { [ "$1" = "$2" ] && ok || bad "$3 (got '$1', want '$2')"; }
 
-cleanup() { rm -rf "$XDG_STATE_HOME" "$XDG_CONFIG_HOME" "$STUBBIN"; }
+cleanup() { rm -rf "$XDG_STATE_HOME" "$XDG_CONFIG_HOME" "$STUBBIN" "$HOME"; }
 trap cleanup EXIT
 
 # The real branch whose database this was found on, and its slug.
@@ -134,9 +141,15 @@ eq "$(grep -c '^database ' <<<"$preview")" 3 \
 
 echo "== a real sweep drops exactly what the preview listed ==" >&2
 export WT_LIVE_SLUGS=$(printf '%s\n%s\n' "$LONG_SLUG" "$SHORT_SLUG")
+# The canonical app's route sits below WT_PORT_BASE, so no sweep may take it.
+printf '%s' 3000 > "$HOME/.puma-dev/supercast"
+printf '%s' 3101 > "$HOME/.puma-dev/$LONG_SLUG"
+printf '%s' 3105 > "$HOME/.puma-dev/tom-long-gone-branch"
 : > "$DROP_LOG"
 wt_sweep >/dev/null 2>&1
 eq "$(cat "$DROP_LOG")" "$orphan_db" "only the orphan is dropped"
+eq "$(cd "$HOME/.puma-dev" && printf '%s ' *)" "supercast $LONG_SLUG " \
+  "and only the orphan's puma-dev route is swept"
 
 echo "== _wt_test_db names a DIFFERENT database, at every slug length ==" >&2
 # The bug this naming exists to prevent: _wt_db truncates to 63 bytes, so simply
