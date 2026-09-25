@@ -4824,7 +4824,7 @@ EOF
     if [ -n "$url" ]; then
       cat <<EOF
 The app is served at $url from the \`dev\` tab in this workspace.
-If nothing answers there, look at that tab and restart the server with \`wt dev ${wt:-$repo}\`.
+If nothing answers there, or once you have added a gem, changed an initializer or anything else a running server will not pick up, run \`wt restart\` to restart it in that tab - never \`wt dev\`, which would run the whole stack in your own shell.
 Log in with the project's development credentials: the ones its seed data (\`db/seeds.rb\`) or its docs name, and \`wt open ${wt:-$repo}\` opens the login page the project's profile points at, with the seed admin pre-filled.
 Before changing any screen the plan names, capture it as it is today.
 Walk every user-facing path the change touches, in the browser.

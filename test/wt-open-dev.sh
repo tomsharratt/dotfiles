@@ -88,11 +88,16 @@ EOF
 # string, which is what proves the XDG carry-over reaches the new shell.
 TABS="$FIX/tabs.json"; TABCREATE_LOG="$FIX/tab-create"; SENT="$FIX/sent"
 printf '[]' > "$TABS"; : > "$TABCREATE_LOG"; : > "$SENT"
+WSS="$FIX/workspaces.json"; PANES="$FIX/panes.json"; CLOSED="$FIX/closed"
+printf '[]' > "$WSS"; printf '[]' > "$PANES"; : > "$CLOSED"
 cat > "$HOME/.local/bin/herdr" <<EOF
 #!/usr/bin/env bash
 case "\$1 \$2" in
   "api snapshot")
-    printf '{"result":{"snapshot":{"tabs":%s}}}' "\$(cat "$TABS")" ;;
+    printf '{"result":{"snapshot":{"tabs":%s,"workspaces":%s,"panes":%s}}}' "\$(cat "$TABS")" "\$(cat "$WSS")" "\$(cat "$PANES")" ;;
+  "tab close")
+    printf '%s\n' "\$3" >> "$CLOSED"
+    jq -c --arg t "\$3" 'map(select(.tab_id != \$t))' "$TABS" > "$TABS.tmp" && mv "$TABS.tmp" "$TABS" ;;
   "tab create")
     printf '%s\n' "\$*" >> "$TABCREATE_LOG"
     printf '{"result":{"root_pane":{"pane_id":"w1:pDev"}}}' ;;
@@ -237,6 +242,34 @@ out=$(run_open); rc=$?
 eq "$rc" "0" "a dev server that never comes up must not fail wt open"
 case "$out" in *"after 2s"*) ok ;; *) bad "it should say it gave up waiting (got: $out)" ;; esac
 eq "$(cat "$OPEN_LOG")" "https://task-one.test" "the url opens regardless - that is what was asked for"
+
+echo "== wt restart: the dev tab is closed, and a fresh one started and waited for ==" >&2
+# After a new gem or an initializer, a running stack has to be restarted, and
+# agents used to find their own ways: kill -USR2 on some puma, or `wt dev` in their
+# own shell with no terminal at all.
+reset 1; write_state 3101 w1; write_profile 1
+printf '[{"tab_id":"w1:t1","workspace_id":"w1","label":"1"},{"tab_id":"w1:tDev","workspace_id":"w1","label":"dev"}]' > "$TABS"
+jq -n --arg p "$WTP" '[{workspace_id: "w1", worktree: {checkout_path: $p}}]' > "$WSS"
+printf '[{"pane_id":"w1:pAgent","tab_id":"w1:t1"},{"pane_id":"w1:pDevOld","tab_id":"w1:tDev"}]' > "$PANES"
+: > "$CLOSED"
+out=$( cd "$WTP/.." && cd "$WTP" && WT_DEV_WAIT=2 "$WT" restart 2>&1 ); rc=$?
+eq "$rc" "0" "wt restart succeeds"
+eq "$(cat "$CLOSED")" "w1:tDev" "it closes the dev tab and nothing else - not the agent's"
+eq "$(tabs_made)" "1" "and makes a fresh one"
+case "$(cat "$TABCREATE_LOG")" in *"--workspace w1"*"--label dev"*) ok ;; *) bad "in the same workspace, labelled dev (got: $(cat "$TABCREATE_LOG"))" ;; esac
+case "$(cat "$SENT")" in *"dev"*"$WTP"*) ok ;; *) bad "running wt dev on this worktree (got: $(cat "$SENT"))" ;; esac
+case "$out" in *"dev server up"*) ok ;; *) bad "and waits for it to come up (got: $out)" ;; esac
+
+echo "== ...from a subdirectory too, and never in a workspace holding something else ==" >&2
+reset 1; write_state 3101 w1; write_profile 1
+mkdir -p "$WTP/app/models"
+printf '[{"tab_id":"w1:tDev","workspace_id":"w1","label":"dev"}]' > "$TABS"
+jq -n '[{workspace_id: "w1", worktree: {checkout_path: "/somewhere/else"}}]' > "$WSS"
+printf '[]' > "$PANES"; : > "$CLOSED"
+( cd "$WTP/app/models" && WT_DEV_WAIT=2 "$WT" restart ) >/dev/null 2>&1
+case "$(cat "$CLOSED")" in *w1:*) bad "w1 holds another checkout now - none of its tabs may be closed" ;; *) ok ;; esac
+case "$(cat "$TABCREATE_LOG")" in *"--workspace wFALLBACK"*) ok ;; *) bad "it finds the worktree's workspace by path instead (got: $(cat "$TABCREATE_LOG"))" ;; esac
+printf '[]' > "$WSS"
 
 printf '\n%d passed, %d failed\n' "$pass" "$fail" >&2
 [ "$fail" -eq 0 ]

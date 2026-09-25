@@ -263,6 +263,19 @@ wt_env() {
     export DATABASE_URL="postgres:///$(_wt_db)"
   fi
   export REDIS_URL="redis://localhost:6379/${WT_REDIS:-0}"
+  # The domain is the dev server's alone. The test suite has its own - application.yml's
+  # `test: domain: lvh.me`, which the specs build their hosts and urls from - and figaro
+  # skips a key already in ENV, so exporting the worktree's here beat it: the test
+  # session cookie was scoped to <slug>.test, rack-test dropped it on a request to
+  # x.lvh.me, and every spec carrying a session across requests failed, beside the
+  # Spotify payload specs that build `https://app.#{ENV['domain']}/...`. Those were
+  # the seven "known environment-only failures" every session under `wt test`
+  # re-proved. Unset rather than merely not exported: a `wt run` shell or a dev pane
+  # already has both, and inheriting them is the same failure.
+  if [ "${RAILS_ENV:-}" = test ]; then
+    unset LOCAL_DOMAIN domain
+    return 0
+  fi
   export LOCAL_DOMAIN="$WT_DOMAIN"
   # Scope the session cookie to THIS worktree's host. figaro loads config/application.yml,
   # which sets ENV["domain"]="supercast.test"; the session_store treats a LOCAL_DOMAIN host as
@@ -282,6 +295,20 @@ wt_open_url() {
   printf 'https://app.%s/login?user[email]=%s' "$WT_DOMAIN" "$email"
 }
 
+# The Procfile a worktree's dev server runs: Procfile.dev, derived fresh each boot
+# (so it can't drift) and written outside the repo (so it never dirties the
+# worktree), with three changes. The web port is this worktree's, not 3000.
+# stripe_connect is dropped: several `stripe listen` sessions would all receive and
+# double-process the same webhooks. And the css watcher is `tailwindcss:watch[always]`:
+# plain `tailwindcss:watch` exits after one build when its stdin is not a terminal,
+# and foreman then takes the whole stack down with it - which is what a `wt dev`
+# started from anywhere but a pane did, an agent's own Bash tool included. This keeps
+# the supercast repo itself untouched.
+_wt_procfile() {                        # procfile port
+  sed -e "s/3000/$2/g" -e 's/tailwindcss:watch[[:space:]]*$/"tailwindcss:watch[always]"/' "$1" \
+    | grep -v '^stripe_connect:'
+}
+
 wt_dev() {
   local db pf; db=$(_wt_db); pf="${TMPDIR:-/tmp}/wt-${WT_SLUG}.Procfile"
   # Isolated db / redis / url / port - identical to what `wt run` hands the console.
@@ -294,12 +321,8 @@ wt_dev() {
     { [ -z "$oldpid" ] || ! kill -0 "$oldpid" 2>/dev/null; } && rm -f "$pidfile"
   fi
   # Procfile.dev pins the web port to 3000, so it can't be shared. Generate a
-  # per-worktree copy that binds this worktree's port instead - derived fresh
-  # from the tracked Procfile.dev each boot (so it can't drift), written outside
-  # the repo (so it never dirties the worktree). stripe_connect is dropped:
-  # several `stripe listen` sessions would all receive and double-process the
-  # same webhooks. This keeps the supercast repo itself untouched.
-  sed "s/3000/$WT_PORT/g" "$WT_PATH/Procfile.dev" | grep -v '^stripe_connect:' > "$pf"
+  # per-worktree copy that binds this worktree's port instead - see _wt_procfile.
+  _wt_procfile "$WT_PATH/Procfile.dev" "$WT_PORT" > "$pf"
   msg "dev  ->  https://$WT_DOMAIN (:$PORT)  db=$db  redis/${WT_REDIS:-0}"
   # -d: foreman defaults its working dir to the Procfile's dir; point it at the
   # worktree since the generated Procfile lives outside the repo. Not exec'd, so

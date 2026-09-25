@@ -17,6 +17,8 @@
 #                        (ignored when the branch already exists locally or on origin)
 #        --json          print the worktree's facts (path, panes, port, url) to stdout
 #   wt dev  <path>       run the worktree's dev server (the dev pane's command)
+#   wt restart [path]    restart the worktree's dev server in its dev tab - after a
+#                        new gem, an initializer, anything a running stack misses
 #   wt run  [cmd...]     run a command with the worktree's isolated env loaded
 #                        (e.g. `wt run bin/rails console`); no cmd -> a shell
 #   wt open [name]       open the worktree's dev url in the browser
@@ -687,13 +689,14 @@ unpushed_list() {                       # path summary
 # Only the tabs wt made (`dev`, `setup`), never the agent's own, and never the tab
 # this very command is running in - that one would take `wt rm` down with it.
 STOP_WAIT=15
-stop_tabs() {                           # ws
-  local ws=${1:-} snap tabs t pane info pgid shell pgroups="" shells="" g p i alive
+stop_tabs() {                           # ws [labels, default "dev setup"]
+  local ws=${1:-} labels=${2:-dev setup} snap tabs t pane info pgid shell pgroups="" shells="" g p i alive
   [ -n "$ws" ] && [ "$ws" != null ] && in_herdr || return 0
   snap=$("$HERDR" api snapshot 2>/dev/null) || return 0
-  tabs=$(jq -r --arg w "$ws" --arg me "${HERDR_PANE_ID:-}" '
+  tabs=$(jq -r --arg w "$ws" --arg me "${HERDR_PANE_ID:-}" --arg labels "$labels" '
     .result.snapshot as $s
-    | $s.tabs[]? | select(.workspace_id == $w and (.label == "dev" or .label == "setup"))
+    | ($labels | split(" ")) as $ls
+    | $s.tabs[]? | select(.workspace_id == $w and (.label as $l | $ls | index($l)))
     | .tab_id as $t
     | select([$s.panes[]? | select(.tab_id == $t) | .pane_id] | index($me) | not)
     | $t' <<<"$snap" 2>/dev/null)
@@ -1338,6 +1341,33 @@ dev_autostart() {
   warn "nothing on :$WT_PORT after ${limit}s - opening anyway; the 'dev' tab has the detail"
 }
 
+# Restart a worktree's dev server, in its dev tab, for whatever a running stack does
+# not pick up: a new gem, an initializer, the Procfile. That used to be done by hand,
+# and agents found their own ways - `kill -USR2` on whichever puma they could find
+# (sent to foreman instead, it took the whole stack down), or `wt dev` from their own
+# Bash tool, which runs the stack with no terminal and no tab for anyone to see. It
+# is stop_tabs on the dev tab, then dev_autostart: a fresh `dev` tab, waited for
+# until the port answers. Only a verified workspace is touched (see ws_is_for).
+cmd_restart() {
+  need_herdr
+  local path repo repo_name name ws
+  path=$(git -C "${1:-$PWD}" rev-parse --show-toplevel 2>/dev/null) || die "not inside a git worktree: ${1:-$PWD}"
+  repo=$(main_worktree "$path"); repo_name=$(basename "$repo"); name=$(cur_branch "$path")
+  load_profile "$repo" "$repo_name"
+  declare -F wt_dev >/dev/null || die "no dev server configured for $repo_name (add wt_dev to its profile)"
+  load_state_for_path "$path" "$repo_name" "$name" \
+    || die "no saved state for this worktree - run 'wt provision $path' first"
+  WT_PATH=$path WT_REPO=$repo WT_REPO_NAME=$repo_name
+  [ -n "${WT_PORT:-}" ] || die "$repo_name worktrees have no dev server port - nothing to restart"
+  ws=${WT_WORKSPACE:-}
+  ws_is_for "$ws" "$path" || ws=$(herdr_ws_for "$repo" "$path" "$name")
+  [ -n "$ws" ] && [ "$ws" != null ] || die "no herdr workspace holds $path"
+  WT_WORKSPACE=$ws
+  msg "stopping the dev server in $ws"
+  stop_tabs "$ws" dev
+  dev_autostart
+}
+
 cmd_open() {
   local name=${1:-} repo repo_name url path
   repo=$(main_worktree "$PWD"); [ -n "$repo" ] || die "not inside a git worktree"
@@ -1558,6 +1588,7 @@ main() {
   case "${1:-}" in
     new)        shift; cmd_new "$@" ;;
     dev)        shift; cmd_dev "$@" ;;
+    restart)    shift; cmd_restart "$@" ;;
     run)        shift; cmd_run "$@" ;;
     test)       shift; cmd_test "$@" ;;
     open)       shift; cmd_open "$@" ;;
@@ -1565,7 +1596,7 @@ main() {
     rm)         shift; cmd_rm "$@" ;;
     ls|list)    shift; cmd_ls "$@" ;;
     gc)         shift; cmd_gc "$@" ;;
-    *) die "usage: wt {new [--no-agent] [--no-focus] [--base REF] [--json] [name] | dev <path> | run [cmd...] | test [cmd...] | open [name] | provision <path> | rm [-y] [name] | ls | gc [--settled] [--sweep] [-y]}" ;;
+    *) die "usage: wt {new [--no-agent] [--no-focus] [--base REF] [--json] [name] | dev <path> | restart [path] | run [cmd...] | test [cmd...] | open [name] | provision <path> | rm [-y] [name] | ls | gc [--settled] [--sweep] [-y]}" ;;
   esac
 }
 if [ "${BASH_SOURCE[0]}" = "$0" ]; then main "$@"; fi

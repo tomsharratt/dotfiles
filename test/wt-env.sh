@@ -89,14 +89,48 @@ for env in development production "" testing Test; do
     "RAILS_ENV='$env' must resolve to the dev database"
 done
 
-echo "== nothing else wt_env exports is affected by RAILS_ENV ==" >&2
+echo "== PORT and REDIS_URL are the same in either environment ==" >&2
 for env in "" test; do
   eq "$(envvar "$env" PORT)" "3104" "PORT is unchanged (RAILS_ENV='$env')"
   eq "$(envvar "$env" REDIS_URL)" "redis://localhost:6379/3" \
     "REDIS_URL is unchanged (RAILS_ENV='$env') - the test redis index is NOT isolated"
-  eq "$(envvar "$env" LOCAL_DOMAIN)" "$WT_DOMAIN" "LOCAL_DOMAIN is unchanged (RAILS_ENV='$env')"
-  eq "$(envvar "$env" domain)" "$WT_DOMAIN" "domain is unchanged (RAILS_ENV='$env')"
 done
+
+echo "== the worktree's domain is the dev server's, and never the test suite's ==" >&2
+# The seven failures every session re-proved under `wt test` were this. figaro
+# skips a key already in ENV, so an exported `domain` beats application.yml's
+# `test: domain: lvh.me`; session_store then scopes the test cookie to
+# <slug>.test, rack-test drops it on a request to x.lvh.me, and every spec that
+# carries a session across requests fails - along with the Spotify payload specs
+# that build `https://app.#{ENV['domain']}/...`. The suite expects its own domain.
+eq "$(envvar "" LOCAL_DOMAIN)" "$WT_DOMAIN" "the dev server still gets the worktree's LOCAL_DOMAIN"
+eq "$(envvar "" domain)" "$WT_DOMAIN" "and its domain"
+for key in LOCAL_DOMAIN domain; do
+  eq "$(envvar test "$key")" "" "\`wt test\` exports no $key"
+  # ...and takes one away that the calling shell already had: a `wt run` shell, or
+  # a dev pane, has both exported, and inheriting them is the same failure.
+  eq "$( ( export LOCAL_DOMAIN=x.test domain=x.test; envvar test "$key" ) )" "" \
+    "nor lets the caller's $key through"
+done
+
+echo "== the dev server's Procfile: this port, no stripe, and a css watcher that stays up ==" >&2
+# supercast's own Procfile.dev, as it stands.
+PF=$(mktemp)
+cat > "$PF" <<'EOF'
+web: RUBY_YJIT_ENABLE=1 FEEDS_SERVICE_URL=https://feeds.dev-tunnel.supercast.tech rails s -p 3000 -b 0.0.0.0
+worker: RUBY_YJIT_ENABLE=1 FEEDS_SERVICE_URL=https://feeds.dev-tunnel.supercast.tech bundle exec sidekiq
+stripe_connect: stripe listen -c http://localhost:3000/webhooks/stripe/connect/events
+css: rails tailwindcss:watch
+js: yarn build --watch
+EOF
+out=$(_wt_procfile "$PF" 3104)
+case "$out" in *"rails s -p 3104 -b 0.0.0.0"*) ok ;; *) bad "the web process binds the worktree's port (got '$out')" ;; esac
+case "$out" in *stripe*) bad "stripe_connect is dropped - every worktree would process the same webhooks" ;; *) ok ;; esac
+# Plain `tailwindcss:watch` exits after one build when stdin is not a terminal,
+# and foreman takes the stack down with it.
+eq "$(grep '^css:' <<<"$out")" 'css: rails "tailwindcss:watch[always]"' "the css watcher is told to stay up without a terminal"
+eq "$(grep '^js:' <<<"$out")" "js: yarn build --watch" "the rest is as it was"
+rm -f "$PF"
 
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]
