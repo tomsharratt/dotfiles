@@ -67,6 +67,8 @@ set -uo pipefail
 
 HERDR="$HOME/.local/bin/herdr"
 SELF="$HOME/.local/bin/wt"
+# Where herdr creates the worktrees it makes: one directory per repo under here.
+WORKTREE_ROOT="$HOME/.herdr/worktrees"
 STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/wt"
 PROFILE_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/wt/profiles"
 mkdir -p "$STATE_DIR"
@@ -568,11 +570,15 @@ gc_run() {
     GC_RECLAIMED=$((GC_RECLAIMED + 1))
     msg "orphan ${WT_REPO_NAME:-?}/${WT_NAME:-?} - worktree gone, reclaiming its resources"
     load_profile "${WT_REPO:-}" "${WT_REPO_NAME:-}"
+    local own_ws=""
+    in_herdr && ws_is_for "${WT_WORKSPACE:-}" "${WT_PATH:-}" && own_ws=$WT_WORKSPACE
+    # The worktree is gone, but a dev server left running in its workspace is not,
+    # and it would write the directory back after rm_leftover below.
+    stop_tabs "$own_ws"
     declare -F wt_teardown >/dev/null && run_profile_fn wt_teardown || true
-    if in_herdr && [ -n "${WT_WORKSPACE:-}" ] && [ "${WT_WORKSPACE:-}" != null ] \
-       && ws_is_for "$WT_WORKSPACE" "${WT_PATH:-}"; then
-      "$HERDR" worktree remove --workspace "$WT_WORKSPACE" --force --json >/dev/null 2>&1 \
-        || "$HERDR" workspace close "$WT_WORKSPACE" >/dev/null 2>&1 || true
+    if [ -n "$own_ws" ]; then
+      "$HERDR" worktree remove --workspace "$own_ws" --force --json >/dev/null 2>&1 \
+        || "$HERDR" workspace close "$own_ws" >/dev/null 2>&1 || true
     fi
     [ -n "${WT_REPO:-}" ] && git -C "$WT_REPO" worktree prune 2>/dev/null || true
     rm_leftover "${WT_PATH:-}"
@@ -587,6 +593,24 @@ gc_run() {
   # url of its own, because only a profile's wt_provision writes one and that
   # runs in a different shell. See test/wt-new-url.sh.
   wt_reset
+  gc_husks
+}
+
+# Directories under WORKTREE_ROOT that are not worktrees and never will be again:
+# what is left when something writes into a worktree's path after it has gone.
+# Nothing else finds them - gc_run walks state files, and a husk's state file went
+# with its worktree. A husk has no `.git` at all; one that still carries a .git file,
+# broken or not, may hold work and is left for a person, and the repo directories
+# under the root are never touched themselves.
+gc_husks() {
+  local d
+  for d in "$WORKTREE_ROOT"/*/*/; do
+    [ -d "$d" ] || continue
+    d=${d%/}
+    [ -e "$d/.git" ] && continue
+    rm_leftover "$d"
+  done
+  return 0
 }
 
 # Remove a worktree directory git has already let go of. `git worktree remove` leaves
@@ -648,6 +672,58 @@ pr_head_is() {                          # repo branch sha
 unpushed_list() {                       # path summary
   git -C "$1" status --porcelain 2>/dev/null | head -20
   case "$2" in *unpushed*) git -C "$1" log --oneline HEAD --not --remotes 2>/dev/null | head -20 ;; esac
+}
+
+# Stop what wt's own tabs in the workspace are running - the dev server, or a
+# provisioning still under way - and wait for it to be gone. Removing a worktree
+# under a running dev server is how the husks under WORKTREE_ROOT were made:
+# reap_one removed the directory and closed the workspace only afterwards, so puma
+# was still up in between and wrote tmp/cache/bootsnap straight back, a second or
+# two before each teardown finished, into a directory nothing would ever look at
+# again. Closing a tab hangs its pane up, which stops foreman and all it started;
+# what is left after STOP_WAIT seconds is killed, since a teardown is no time to
+# be patient with a process holding the worktree open.
+#
+# Only the tabs wt made (`dev`, `setup`), never the agent's own, and never the tab
+# this very command is running in - that one would take `wt rm` down with it.
+STOP_WAIT=15
+stop_tabs() {                           # ws
+  local ws=${1:-} snap tabs t pane info pgid shell pgroups="" shells="" g p i alive
+  [ -n "$ws" ] && [ "$ws" != null ] && in_herdr || return 0
+  snap=$("$HERDR" api snapshot 2>/dev/null) || return 0
+  tabs=$(jq -r --arg w "$ws" --arg me "${HERDR_PANE_ID:-}" '
+    .result.snapshot as $s
+    | $s.tabs[]? | select(.workspace_id == $w and (.label == "dev" or .label == "setup"))
+    | .tab_id as $t
+    | select([$s.panes[]? | select(.tab_id == $t) | .pane_id] | index($me) | not)
+    | $t' <<<"$snap" 2>/dev/null)
+  [ -n "$tabs" ] || return 0
+  while IFS= read -r t; do
+    [ -n "$t" ] || continue
+    while IFS= read -r pane; do
+      [ -n "$pane" ] || continue
+      info=$("$HERDR" pane process-info --pane "$pane" 2>/dev/null)
+      pgid=$(jq -r '.result.process_info.foreground_process_group_id // empty' <<<"$info" 2>/dev/null)
+      shell=$(jq -r '.result.process_info.shell_pid // empty' <<<"$info" 2>/dev/null)
+      [ -n "$pgid" ] && pgroups="$pgroups $pgid"
+      [ -n "$shell" ] && shells="$shells $shell"
+    done <<<"$(jq -r --arg t "$t" '.result.snapshot.panes[]? | select(.tab_id == $t) | .pane_id' <<<"$snap" 2>/dev/null)"
+    "$HERDR" tab close "$t" >/dev/null 2>&1
+  done <<<"$tabs"
+  # shellcheck disable=SC2086  # the lists are whitespace-joined pids on purpose
+  for i in $(seq 1 $(( STOP_WAIT * 10 ))); do
+    alive=""
+    for g in $pgroups; do pgrep -g "$g" >/dev/null 2>&1 && alive=1; done
+    for p in $shells; do kill -0 "$p" 2>/dev/null && alive=1; done
+    [ -n "$alive" ] || return 0
+    sleep 0.1
+  done
+  warn "the dev tab's processes outlived ${STOP_WAIT}s - killing them"
+  # shellcheck disable=SC2086
+  for g in $pgroups; do kill -KILL -- "-$g" 2>/dev/null; done
+  # shellcheck disable=SC2086
+  for p in $shells; do kill -KILL "$p" 2>/dev/null; done
+  return 0
 }
 
 # Whether the Herdr workspace WS still holds the worktree at PATH. An id on file was
@@ -731,6 +807,10 @@ reap_one() {                            # repo repo_name branch path del_branch(
   [ -n "${WT_SLUG:-}" ] || WT_SLUG=$(slugify "$name")
   WT_PATH=$path WT_REPO=$repo WT_REPO_NAME=$rn
   [ -n "${WT_DOMAIN:-}" ] || WT_DOMAIN="$WT_SLUG.test"
+
+  # 0. Stop the dev server before anything it uses goes: its database first, then
+  #    the directory it would otherwise write back into (see stop_tabs).
+  stop_tabs "$ws"
 
   # 1. Free external resources while we are certain to still be alive.
   if declare -F wt_teardown >/dev/null; then

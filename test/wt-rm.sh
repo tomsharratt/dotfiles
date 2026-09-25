@@ -50,6 +50,11 @@ chmod +x "$STUBBIN/herdr"
 # shellcheck source=/dev/null
 source "$HERE/../.local/bin/wt"
 
+# Where gc looks for husks, pointed at a throwaway root for the whole file: gc_run
+# removes any directory there with no .git in it, and with the real root it
+# removed the real ones - under ~/.herdr/worktrees - the first time it ran here.
+WORKTREE_ROOT=$(mktemp -d)
+
 # Reassigned AFTER the source, not put on PATH: wt resolves herdr as an absolute
 # path (HERDR="$HOME/.local/bin/herdr"), so a PATH stub is never consulted. Getting
 # this wrong makes the workspace assertions below silently vacuous - which is the
@@ -67,7 +72,7 @@ ok()  { pass=$((pass + 1)); }
 bad() { fail=$((fail + 1)); printf 'FAIL: %s\n' "$1" >&2; }
 eq() { [ "$1" = "$2" ] && ok || bad "$3 (got '$1', want '$2')"; }
 
-cleanup() { rm -rf "$XDG_STATE_HOME" "$XDG_CONFIG_HOME" "$STUBBIN" "${REPO:-}" "${WTROOT:-}"; }
+cleanup() { rm -rf "$XDG_STATE_HOME" "$XDG_CONFIG_HOME" "$STUBBIN" "${REPO:-}" "${WTROOT:-}" "${WORKTREE_ROOT:-}"; }
 trap cleanup EXIT
 
 # ── one real, throwaway git repo with two linked worktrees ──────────────────
@@ -248,6 +253,66 @@ EOF
 gc_run >/dev/null 2>&1
 case "$(cat "$HERDR_LOG")" in *"--workspace w41"*) ok ;; *) bad "but closes it while it still holds the orphan's checkout (log: $(cat "$HERDR_LOG"))" ;; esac
 snapshot
+
+# ── teardown leaves nothing behind ──────────────────────────────────────────
+# reap_one removed the worktree before it closed the workspace, so the dev server
+# was still running while its directory went, and wrote tmp/cache/bootsnap straight
+# back: ~/.herdr/worktrees/supercast held four directories of nothing but tmp/,
+# each dated a second or two before its task was reaped. The dev tab here is a real
+# process group doing what puma does to tmp/, and closing its tab kills it, as
+# herdr's does.
+echo "== the dev tab is stopped before the worktree goes, so nothing writes it back ==" >&2
+git -C "$REPO" worktree add -q -b tom/booted "$WTROOT/booted" master
+git -C "$REPO" update-ref refs/remotes/origin/tom/booted refs/heads/tom/booted
+cat > "$XDG_STATE_HOME/wt/$RN--tom-booted.env" <<EOF
+WT_NAME=tom/booted
+WT_SLUG=tom-booted
+WT_PATH=$WTROOT/booted
+WT_REPO=$REPO
+WT_REPO_NAME=$RN
+WT_WORKSPACE=w50
+EOF
+set -m
+( while :; do mkdir -p "$WTROOT/booted/tmp/cache/bootsnap" 2>/dev/null; sleep 0.05; done ) &
+DEVPID=$!
+set +m
+printf '%s' "$DEVPID" > "$STUBBIN/.dev-pgid"
+jq -n --arg p "$WTROOT/booted" '{result: {snapshot: {
+  workspaces: [{workspace_id: "w50", worktree: {checkout_path: $p}}],
+  tabs: [{tab_id: "w50:t1", workspace_id: "w50", label: "1"}, {tab_id: "w50:t2", workspace_id: "w50", label: "dev"}],
+  panes: [{pane_id: "w50:p1", tab_id: "w50:t1", workspace_id: "w50"}, {pane_id: "w50:p2", tab_id: "w50:t2", workspace_id: "w50"}]}}}' > "$SNAPSHOT"
+cat > "$STUBBIN/herdr" <<EOF
+#!/bin/sh
+printf '%s\n' "\$*" >> "$HERDR_LOG"
+case "\$1 \$2" in
+  "api snapshot") cat "$SNAPSHOT" ;;
+  "pane process-info")
+    [ "\$4" = w50:p2 ] && printf '{"result":{"process_info":{"pane_id":"w50:p2","shell_pid":%s,"foreground_process_group_id":%s}}}\n' "\$(cat "$STUBBIN/.dev-pgid")" "\$(cat "$STUBBIN/.dev-pgid")" ;;
+  "tab close") [ "\$3" = w50:t2 ] && kill -TERM -- "-\$(cat "$STUBBIN/.dev-pgid")" 2>/dev/null ;;
+esac
+exit 0
+EOF
+: > "$HERDR_LOG"
+sidx_load
+reap_one "$REPO" "$RN" tom/booted "$WTROOT/booted" y >/dev/null 2>&1
+sleep 0.5
+kill -0 "$DEVPID" 2>/dev/null && { bad "the dev tab's processes must be stopped"; kill -TERM -- "-$DEVPID" 2>/dev/null; } || ok
+[ -e "$WTROOT/booted" ] && bad "nothing may write the worktree back once it is gone (left: $(ls -A "$WTROOT/booted" 2>/dev/null))" || ok
+grep -q '^tab close w50:t2' "$HERDR_LOG" && ok || bad "the dev tab is closed by id (log: $(cat "$HERDR_LOG"))"
+grep -q '^tab close w50:t1' "$HERDR_LOG" && bad "the agent's own tab is not wt's to close here" || ok
+snapshot
+
+echo "== wt gc removes what is left under the worktree root and is not a worktree ==" >&2
+ROOT=$WORKTREE_ROOT
+mkdir -p "$ROOT/$RN/husk/tmp/cache/bootsnap" "$ROOT/$RN/broken"
+printf 'gitdir: /nowhere\n' > "$ROOT/$RN/broken/.git"
+git -C "$REPO" worktree add -q -b tom/rooted "$ROOT/$RN/rooted" master
+out=$(gc_run 2>&1)
+[ -e "$ROOT/$RN/husk" ] && bad "a directory with no git in it at all is a husk, and goes" || ok
+case "$out" in *"removed leftover directory $ROOT/$RN/husk"*) ok ;; *) bad "and says so (got '$out')" ;; esac
+[ -d "$ROOT/$RN/broken" ] && ok || bad "one that still carries a .git is not wt's to delete, broken or not"
+[ -d "$ROOT/$RN/rooted" ] && ok || bad "and a live worktree is never touched"
+[ -d "$ROOT/$RN" ] && ok || bad "nor the repo's own directory under the root"
 
 # ── work that exists nowhere else ───────────────────────────────────────────
 # `wt rm --yes` is `git worktree remove --force` plus `git branch -D`, and pq runs

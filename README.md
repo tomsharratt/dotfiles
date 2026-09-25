@@ -573,6 +573,11 @@ Nothing in `archive/` is ever deleted or swept up again by a later tick - it is 
 
 Herdr has no worktree-removal hook, so removing a worktree through Herdr's own UI (rather than `wt rm`) would otherwise leak its database, port, and redis db.
 `wt gc` reconciles this: it checks each recorded worktree and, for any whose directory no longer exists, runs the profile's teardown and frees the reservation.
+It also removes what is left under Herdr's worktree root (`~/.herdr/worktrees/<repo>/`) that is not a worktree at all - a directory with no `.git` in it, which is what a process writing into a removed worktree's path leaves behind.
+One that still carries a `.git` file, broken or not, may hold work, and is left for you.
+
+Those husks came from the teardown itself: it removed the worktree before it closed the workspace, so the dev server was still running in between and wrote `tmp/cache/bootsnap` straight back, a second or two before each teardown finished.
+`wt rm` and `wt gc` now close `wt`'s own `dev` and `setup` tabs first and wait for what they were running to exit, killing whatever is still there after fifteen seconds, before the database or the directory goes - never the agent's tab, and never the tab `wt rm` itself is running in.
 `wt new` runs it automatically, so orphans are always reclaimed on the next task - run `wt gc` yourself any time to clean up immediately.
 
 `wt gc --settled` goes further and reclaims worktrees whose pull request has stopped moving - merged or closed - the case the orphan pass structurally cannot see, since a finished worktree is still a perfectly valid git worktree.
