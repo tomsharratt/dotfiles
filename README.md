@@ -394,12 +394,28 @@ Only until the first knock, though, because a knock is precisely what demoted it
 Re-reading that line afterwards would not even give back a stale time: a bare clock time is read as the next time the clock comes round to it, so `resets 4:20pm` read at 4:30 is tomorrow, and a ten-minute cycle would quietly become a day-long one.
 The same rollover is why a second look never accepts a reset further out than `pq` would keep knocking for anyway - a hint that has rolled sits a clear day away, well past a bound that a five-hour window's reset is nowhere near.
 
-The wall is the only thing `pq` ever answers.
+The wall is the only dialog `pq` ever answers.
 A permission prompt is recorded as `permission` and deliberately left alone - that is the trade for running everything in auto mode - so `pq ls` separates the agents waiting on the clock from the ones waiting on you.
 One appearing where a wall was is taken as recovery, because a session asking for something is a session running again, and the alternative is a knock sending Escape at the prompt - refusing it - every ten minutes.
 After forty unanswered knocks a task is marked `walled` and left, rather than knocking all night - and at that point it stops freezing dispatch, which is the only bound on how long a freeze can last.
 It wants one, because detection is a regex over a terminal and so can be wrong: any pane showing the words is a candidate, including one showing a diff of `pq` itself, and one that goes idle rather than resuming can never prove it recovered.
 Releasing the freeze there costs a single worktree if the wall was real - the next agent walls, is detected, and the freeze comes back - which is the right way round, since a misread pane should cost a worktree rather than a night.
+
+#### An agent that goes quiet
+
+The wall is not the only way an unattended agent stops.
+One sat idle for 56 minutes and then 52 more with no pull request and nothing on screen asking for anything, until Tom asked "has this stalled?"; another sat 18 minutes on "Login expired · Please run /login" until he typed "continue", which was all it took.
+Both are an idle agent whose screen has stopped, and each tick reads that screen anyway, so the same read covers them, for every pane that is neither walled nor on a prompt.
+
+A stretch is Herdr calling the pane idle **and** its tail unchanged since the tick that first saw it idle - nothing is judged off one glimpse.
+An error near the bottom of the pane - `API Error`, or a login that expired, on a line of its own the way Claude Code prints them rather than mid-line in a diff or a command - is the last thing the session said rather than something scrolled past, and it is knocked on with "Continue with what you were doing" once the stretch has lasted a tick, then every five minutes, six times at most; a turn that ends without the error at the bottom is the recovery, and resets the count.
+An agent in `running/` that stays idle for fifteen minutes with no pull request is nudged back to its contract instead: deliver it, or open a `STUCK:` draft saying what blocked it.
+That happens three times at most, and the pane moving never buys it more - a nudged agent always moves a little and then stops again - since only its pull request ends the count.
+An agent resting idle in `done/` is finished, not quiet, and is never nudged.
+Past either bound it is handed to you: `pq ls` reads `error` or `quiet` while the pane is idle, counted into "needs you", and the tick warns once.
+
+Both knocks go through `herdr agent prompt`, which refuses a pane that is on a dialog, so neither can answer one.
+Neither freezes the queue the way the wall does: a regex over a terminal can be wrong, and a real account-wide failure - a login that will not refresh - shows itself at the next dispatch's agent start, which costs a worktree rather than a night.
 
 #### The review gate
 

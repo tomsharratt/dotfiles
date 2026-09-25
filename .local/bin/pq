@@ -3153,6 +3153,9 @@ check_stall() {                         # task_dir
       # Only when there is something to clear: this is the overwhelmingly common
       # branch, and each clear is six rewrites of state.env for no change at all.
       [ -n "$was" ] && clear_block "$d"
+      # No wall and no prompt - but an agent can stop without either, and that
+      # is the next thing to look at, on the same read of the pane.
+      check_quiet "$d" "$pane" "$text" "$hash" "$nowsec"
       return 0
     fi
     # The wall is on screen, but only a screen that has stopped moving is stuck.
@@ -3253,6 +3256,114 @@ check_stall() {                         # task_dir
   st_set "$d" PQ_RESETS_AT ""
   unstick "$pane" "Continue with what you were doing."
   msg "$slug: knocking after the session limit (attempt $tries)"
+}
+
+# ── an agent that has gone quiet ─────────────────────────────────────────────
+# The wall is not the only way an unattended agent stops. tap-to-reveal sat idle
+# for 56 minutes and then 52 more before Tom asked "has this stalled?", with no
+# pull request and nothing on screen asking for anything. tiptap sat 18 minutes on
+# "Login expired · Please run /login" until he typed "continue" - which was all it
+# took. Both are an idle agent whose screen has stopped, which check_stall already
+# reads every tick, so this runs on the same read, for every pane that is neither
+# walled nor on a prompt.
+#
+# The stretch is the evidence: herdr calling the pane idle, AND its tail unchanged
+# since the tick that first saw it idle (PQ_QUIET_SINCE, PQ_QUIET_HASH). Nothing is
+# judged off one glimpse. Two things end a stretch early:
+#
+#   an error    a line matching PQ_ERROR_RE near the bottom of the pane - the last
+#               thing the session printed, not something scrolled past - is knocked
+#               on with "continue" once the stretch has lasted a tick, then every
+#               ERROR_RETRY, up to ERROR_KNOCKS times. A finished turn with no error
+#               at the bottom is the recovery, and resets the count
+#   quiet       an agent in running/ - dispatched, no pull request yet - idle and
+#               still for QUIET_AFTER is nudged back to its contract: deliver, or say
+#               it is stuck. Up to QUIET_NUDGES times, and the count is never reset by
+#               the pane moving - a nudged agent always moves a little and then stops
+#               again - only by the task leaving running/
+#
+# Past either bound it is handed to you, once: `pq ls` reads `error` or `quiet` on an
+# idle pane, counted into "needs you". The nudge is running/ only, since a done/
+# agent resting idle is simply finished; an error is knocked on in either.
+#
+# Both go through `herdr agent prompt`, which refuses a pane sitting on a dialog, so
+# a knock can never answer one. And neither freezes the queue, unlike the wall: a
+# regex over a terminal can be wrong, and a real account-wide failure - a login that
+# will not refresh - shows itself at the next dispatch's agent_start, which costs one
+# worktree rather than a night.
+# Anchored to where Claude Code prints them - a line of their own, after the
+# transcript's `⎿` - because the words themselves turn up mid-line in plenty of
+# panes: a diff of error-handling code, a command that greps for them. The first
+# live read of every agent pane matched exactly one, and it was a command line.
+PQ_ERROR_RE='^[[:space:]]*(⎿[[:space:]]*)?(API Error|Login expired)'
+ERROR_RETRY=300
+ERROR_KNOCKS=6
+QUIET_AFTER=900
+QUIET_NUDGES=3
+ERROR_LINES=12
+
+quiet_prompt() {                        # task_home minutes
+  printf '%s' "You have been idle for $2 minutes without opening a pull request. \
+If the work is done, deliver it as $1/contract.md says: publish the evidence and open the draft pull request. \
+If you are stuck, or the plan does not fit the code, commit what you have, push, and open a draft pull request \
+whose title begins with STUCK: saying what blocked you. Never wait for input - there is nobody watching."
+}
+
+check_quiet() {                         # task_dir pane text hash now
+  local d=$1 pane=$2 text=$3 hash=$4 nowsec=$5 slug since seen
+  case "$(pane_state "$pane")" in
+    idle|done) ;;
+    *) [ -z "$(st "$d" PQ_QUIET_SINCE)" ] || st_set "$d" PQ_QUIET_SINCE ""
+       return 0 ;;
+  esac
+  seen=$(st "$d" PQ_QUIET_HASH); since=$(st "$d" PQ_QUIET_SINCE)
+  if [ -z "$since" ] || [ "$seen" != "$hash" ]; then
+    st_set "$d" PQ_QUIET_HASH "$hash"; st_set "$d" PQ_QUIET_SINCE "$nowsec"
+    return 0
+  fi
+  slug=$(slug_of "$d")
+  local err knocks at code
+  err=$(tail -n "$ERROR_LINES" <<<"$text" | grep -E "$PQ_ERROR_RE" | tail -1 | sed 's/^[^A-Za-z]*//')
+  if [ -n "$err" ]; then
+    knocks=$(st "$d" PQ_ERR_KNOCKS); knocks=${knocks:-0}
+    if [ "$knocks" -ge "$ERROR_KNOCKS" ]; then
+      [ "$(st "$d" PQ_QUIET)" = error ] || { st_set "$d" PQ_QUIET error
+        warn "$slug: still stopped on \"$err\" after $knocks knocks - look at it"; }
+      return 0
+    fi
+    at=$(st "$d" PQ_ERR_AT)
+    [ -n "$at" ] && [ $(( nowsec - at )) -lt "$ERROR_RETRY" ] && return 0
+    code=$(agent_prompt "$pane" "Continue with what you were doing.") || {
+      warn "$slug: stopped on \"$err\" - could not knock ($code)"; return 0; }
+    knocks=$(( knocks + 1 ))
+    st_set "$d" PQ_ERR_KNOCKS "$knocks"; st_set "$d" PQ_ERR_AT "$nowsec"; st_set "$d" PQ_QUIET_SINCE ""
+    msg "$slug: stopped on \"$err\" - knocked (attempt $knocks)"
+    return 0
+  fi
+  # A turn that ended without an error at the bottom is the recovery.
+  [ -z "$(st "$d" PQ_ERR_KNOCKS)" ] || { st_set "$d" PQ_ERR_KNOCKS ""; st_set "$d" PQ_ERR_AT ""; }
+  [ "$(st "$d" PQ_QUIET)" = error ] && st_set "$d" PQ_QUIET ""
+
+  [ "$(state_of "$d")" = running ] && [ -n "$(st "$d" PQ_LAUNCHED)" ] || return 0
+  [ $(( nowsec - since )) -ge "$QUIET_AFTER" ] || return 0
+  local nudges; nudges=$(st "$d" PQ_NUDGES); nudges=${nudges:-0}
+  if [ "$nudges" -ge "$QUIET_NUDGES" ]; then
+    [ "$(st "$d" PQ_QUIET)" = quiet ] || { st_set "$d" PQ_QUIET quiet
+      warn "$slug: idle with no pull request after $nudges nudges - look at it"; }
+    return 0
+  fi
+  code=$(agent_prompt "$pane" "$(quiet_prompt "$(task_home "$d")" $(( (nowsec - since) / 60 )))") || {
+    warn "$slug: gone quiet with no pull request - could not nudge it ($code)"; return 0; }
+  nudges=$(( nudges + 1 ))
+  st_set "$d" PQ_NUDGES "$nudges"; st_set "$d" PQ_QUIET_SINCE ""
+  msg "$slug: idle $(( (nowsec - since) / 60 ))m with no pull request - nudged it (nudge $nudges of $QUIET_NUDGES)"
+}
+
+# What check_quiet handed over, as a cell: only while the pane is idle, since an
+# agent you have since set going again is simply working.
+quiet_cell() {                          # task_dir pane_state
+  case "$2" in idle|done) ;; *) return 0 ;; esac
+  case "$(st "$1" PQ_QUIET)" in error|quiet) printf '%s' "$(st "$1" PQ_QUIET)" ;; esac
 }
 
 # Is anybody behind the wall right now, and when does their window reopen? The first
@@ -4044,6 +4155,8 @@ agent_cell() {                          # task_dir state
       blocked=$(block_cell "$d")
       if [ -n "$blocked" ]; then printf '%s' "$blocked"; return; fi
       if [ "$(pane_state "$(st "$d" PQ_PANE)")" = blocked ]; then printf 'blocked'; return; fi
+      blocked=$(quiet_cell "$d" "$(pane_state "$(st "$d" PQ_PANE)")")
+      if [ -n "$blocked" ]; then printf '%s' "$blocked"; return; fi
       # The review gate, ahead of the slot report: `review due`, `reviewing 7m`,
       # `security review 3m`, `reviewed`, `review failed`, `resolving`, `review lapsed` all say more
       # than `wrapping up` about WHY the slot is held, and `review lapsed` is a
@@ -4079,6 +4192,9 @@ agent_cell() {                          # task_dir state
     noagent) printf 'exited';  return ;;      # a shell is sitting where Claude was
     unknown) printf 'unknown'; return ;;
   esac
+  # Idle is healthy until check_quiet has given up on it - see there.
+  blocked=$(quiet_cell "$d" "$status")
+  [ -n "$blocked" ] && { printf '%s' "$blocked"; return; }
   printf '%s' "$status"
 }
 
@@ -4154,7 +4270,7 @@ cmd_ls() {
     repo=$(hdr "$d/plan.md" repo)
     agent=$(agent_cell "$d" "$st")
     case "$agent" in
-      permission|gone|exited|blocked|unknown) needs=$((needs + 1)) ;;
+      permission|gone|exited|blocked|unknown|quiet|error) needs=$((needs + 1)) ;;
       dead\ *|stalled\ *|held\ *|base\ *)             needs=$((needs + 1)) ;;
       review\ lapsed|ci\ failed|conflict|new\ review)  needs=$((needs + 1)) ;;
     esac
