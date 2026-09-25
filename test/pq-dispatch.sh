@@ -172,6 +172,19 @@ has "$(cat "$C")" "Make the thing better." "the intent line is carried in"
 hasnt "$(cat "$C")" "## Design fidelity" "no design section without a design"
 hasnt "$(cat "$C")" "forked from" "no base clause without a base"
 grep -q -- '—' "$C" && bad "no em dashes" || ok
+# The width is set with emulate: resize quietly clamps it to what the window
+# allows, and two sessions lost time to a 390px screenshot that was not.
+has "$(cat "$C")" 'chrome-devtools-axi emulate --viewport "390x844x1"' "the narrow width is set with emulate"
+has "$(cat "$C")" 'emulate --viewport "1440x900x1"' "and so is the wide one"
+hasnt "$(cat "$C")" "chrome-devtools-axi resize" "never resize"
+# pq's review is the one the pull request gets: supercast's CLAUDE.md asks for a
+# /code-review before every pull request, and #6831 was reviewed three times.
+has "$(cat "$C")" "do not run \`/code-review\` yourself" "the implementer runs no review of its own"
+has "$(cat "$C")" "stands in for the one the repository's conventions ask for" "and is told why its conventions do not apply here"
+has "$(cat "$C")" "Open exactly one pull request for this task" "one task, one pull request"
+has "$(cat "$C")" "only the pull request on \`tom/first\`" "since only the one on its branch is reviewed"
+has "$(cat "$C")" "under a \`## pq\` heading" "a pq defect is reported in the pull request"
+has "$(cat "$C")" "never in your memory" "and not saved to memory, where it outlives the fix"
 printf 'MARKER-KEEP\n' >> "$C"
 st_set "$D" PQ_LAUNCHED ""
 set_panes "$(printf 'w1:p1\tclaude\tidle')"

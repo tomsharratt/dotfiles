@@ -199,8 +199,12 @@ It asks for four things.
 **Commits are the unit of review**: one coherent, self-contained step per commit, in the order a reader should meet them, each message saying what and why; a mechanical change is its own commit and says so; a non-mechanical commit over about 300 lines is split; never one squashed commit at the end.
 History may be rewritten only while the pull request is a draft.
 **Verification in the browser**: the app is served at the worktree's own url from its `dev` tab, and the implementer walks every path the change touches, captures each screen before and after with `chrome-devtools-axi`, and is told to fix anything that looks off even when the plan did not name it.
+The width is set with `emulate --viewport "390x844x1"` (or `1440x900x1`), never `resize`, which quietly clamps the width to the window's and so produced "390px" screenshots that were not.
 **Design fidelity**, when the task carries design files: open each in the browser, screenshot the target artboard at its native width, build to it, then screenshot the implementation at the same width and state and compare side by side - layout, spacing, sizes, colour, type, radius, icons, copy, and every state the artboard shows - until nothing differs or a difference is deliberate and recorded.
 **A draft pull request with a guide**: `pq evidence` publishes the screenshots, the pull request opens as a draft with the intent line first, a `## Review guide` (the commits in reading order, where the risk is, what is mechanical) and a `## Visual evidence` section - plus, for a design task, a `## Design fidelity` table and the deliberate deviations.
+Exactly one pull request, from the task's own branch, since that is the only one `pq` reviews and watches; and no `/code-review` of the implementer's own, since `pq`'s independent one stands in for whatever the repository's conventions ask for.
+
+Anything about `pq` itself that got in the implementer's way goes in the pull request, under a `## pq` heading, and never in its memory - a note saved there outlives the fix, and one telling agents to `rm -rf` a stray task directory outlived the fix that made it unnecessary by a week.
 
 The pull request stays a draft until the review gate below has run and the implementer has answered it.
 An agent that gets stuck, or finds the plan does not fit, commits what it has and opens a draft whose title begins with `STUCK:` - the gate leaves those alone, and `pq ls` reads the chain behind one as stalled.
@@ -420,8 +424,8 @@ Neither freezes the queue the way the wall does: a regex over a terminal can be 
 #### The review gate
 
 Every pull request a task opens gets one independent review before the implementer may call it ready - run by `pq`, not asked of the agent.
-The agent cannot run `/code-review` itself: the skill is reserved for a human typing it, and every agent that was once asked to answered that it could not.
-But in `claude -p` the prompt *is* the human, so `pq` runs `claude -p "/code-review <level> --comment N"` itself, in the task's worktree, with the task's own directory opened to it so it can read the plan and the design files, and the skill posts its findings as inline review comments on the pull request.
+The agent could run `/code-review` itself, and a repository's conventions often ask it to - supercast's CLAUDE.md wants one before every pull request, and one task was reviewed three times - but a review by the session that wrote the change is not independent.
+So its contract says `pq`'s review stands in for the repository's and that it runs none of its own, and `pq` runs `claude -p "/code-review <level> --comment N"` itself, in the task's worktree, with the task's own directory opened to it so it can read the plan and the design files, and the skill posts its findings as inline review comments on the pull request.
 `PQ_REVIEWER_MODEL` (default `opus`) and `PQ_REVIEW_EFFORT` (default `xhigh`) are what it runs at, the second passed both as the session's `--effort` and as the skill's own level argument.
 The order of that prompt is load-bearing, and was wrong for the gate's first few runs.
 The skill reads the first non-flag token as the level and everything after it as the target, so sending the pull request first (`/code-review N <level> --comment`) meant the level was ignored - silently falling back to `codeReviewLastEffort` in `~/.claude.json`, the level last typed at an interactive prompt, which is what "Reusing xhigh effort (the level you typed last)" at the top of those transcripts was reporting - and the target became the string `N <level>` rather than the pull request number.

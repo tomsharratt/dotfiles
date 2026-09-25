@@ -4664,13 +4664,14 @@ cmd_evidence() {
 # at add - so an improvement to the contract reaches every task still queued, while
 # a running agent never sees its own contract change underneath it.
 #
-# It still names no review step, for the reason recorded when the clause came out:
-# this prompt may only name capabilities the model can invoke ITSELF, and Claude
-# Code's `/code-review` is reserved for a human typing it (disable-model-invocation),
-# so every agent asked for one answered that it could not. The review gate exists
-# now and is pq's own - see the `review gate` section: pq runs the reviewer in the
-# background once the agent has opened its draft, and prompts the agent afterwards,
-# so nothing here needs to ask.
+# It names no review step, and the reason has changed. It used to be that agents
+# could not invoke `/code-review` - the skill was reserved for a human typing it -
+# and that is no longer so: implementers ran it 23 times across 16 sessions, on top
+# of pq's own, because a repository's conventions ask for one before every pull
+# request (supercast's CLAUDE.md does), and #6831 was reviewed three times. The
+# review is pq's - see the `review gate` section - and the contract says so: pq's
+# independent review stands in for the repository's, and the implementer runs
+# none of its own.
 #
 # Quote-free by convention now rather than by rule. This used to be wrapped in single
 # quotes and typed into the pane's shell, which is why a quote anywhere in it was
@@ -4758,7 +4759,8 @@ If nothing answers there, look at that tab and restart the server with \`wt dev 
 Log in with the project's development credentials: the ones its seed data (\`db/seeds.rb\`) or its docs name, and \`wt open ${wt:-$repo}\` opens the login page the project's profile points at, with the seed admin pre-filled.
 Before changing any screen the plan names, capture it as it is today.
 Walk every user-facing path the change touches, in the browser.
-\`chrome-devtools-axi\` is on PATH: \`chrome-devtools-axi open <url>\`, \`chrome-devtools-axi resize <width> <height>\`, \`chrome-devtools-axi screenshot <file>\`.
+\`chrome-devtools-axi\` is on PATH: \`chrome-devtools-axi open <url>\`, \`chrome-devtools-axi emulate --viewport "1440x900x1"\` (or \`chrome-devtools-axi emulate --viewport "390x844x1"\`) to set the width, and \`chrome-devtools-axi screenshot <file>\`.
+Set the width with \`emulate\`, never \`resize\`: \`resize\` quietly clamps the width to what the window allows, so a 390px screenshot comes out wider without saying so.
 Export \`CHROME_DEVTOOLS_AXI_CHROME_ARGS=--ignore-certificate-errors\` first, so the \`.test\` domain's certificate does not stop it.
 Be picky: anything that looks off gets fixed, even when the plan did not name it.
 Save screenshots into \`$home/evidence/\`, named \`NN-<screen>-before.png\` and \`NN-<screen>-after.png\`, at 1440px wide and, for any responsive surface, at 390px too.
@@ -4775,7 +4777,7 @@ EOF
 
 The plan was built from these design files, which are in \`$home/design/\`: $design.
 The plan names the artboards that matter.
-Open each file with \`chrome-devtools-axi open file://$home/design/<file>\`, screenshot the target artboard at its native width, and build to it.
+Open each file with \`chrome-devtools-axi open file://$home/design/<file>\`, set the artboard's native width with \`emulate --viewport\`, screenshot it, and build to it.
 Then screenshot your implementation at the same width and in the same state, and compare the two side by side: layout, spacing, sizes, colour, type, radius, icons, copy, and every state the artboard shows (hover, empty, error, blocked).
 Fix every difference and compare again, until nothing differs or a difference is deliberate - an existing component convention, accessibility, responsiveness - and recorded in the pull request.
 Save the pairs into \`$home/evidence/\` as \`NN-<screen>-design.png\` and \`NN-<screen>-impl.png\`.
@@ -4783,6 +4785,9 @@ EOF
     cat <<EOF
 
 ## The pull request
+
+Open exactly one pull request for this task, from \`$branch\`: pq reviews and watches only the pull request on \`$branch\`, so work sent up in a second one is never reviewed.
+If the plan seems to need two, do it all in this one and say so in the description.
 
 Run \`pq evidence $slug\`.
 It publishes everything in \`$home/evidence/\` and prints one markdown image line per file, to paste into the description.
@@ -4793,7 +4798,8 @@ Add two sections to it:
 - \`## Visual evidence\`: the before/after pairs${design:+ and the design/impl pairs} with a one-line caption each${design:+, then a \`## Design fidelity\` table - element, design, implemented, note - followed by the deliberate deviations}.
 
 Leave it a draft.
-pq runs an independent review of every pull request and will tell you when to resolve its findings and mark the pull request ready.
+pq runs an independent \`/code-review\` of every pull request and will tell you when to resolve its findings and mark the pull request ready.
+That review stands in for the one the repository's conventions ask for, so do not run \`/code-review\` yourself, before the pull request or after it: a review by the session that wrote the change is not independent, and one more on top of pq's only costs time.
 EOF
     # A plan that asks for a security review says "run /security-review" in so
     # many words, and an implementer following it to the letter would try to -
@@ -4804,6 +4810,7 @@ Do not run one yourself.
 EOF
     cat <<EOF
 If you get stuck, or the plan turns out not to fit the code: commit what you have, push, open a draft pull request whose title begins with \`STUCK:\` and whose description explains what blocked you, then stop.
+If something about pq itself gets in your way - this contract, its paths, \`pq evidence\`, its review - say so in the pull request description, under a \`## pq\` heading, and never in your memory: a note saved there outlives the fix and misleads every session after it.
 Never wait for input - there is nobody watching.
 EOF
   } > "$tmp" || { rm -f "$tmp"; return 1; }
@@ -5017,9 +5024,10 @@ dispatch_task() {                       # task_dir  -> 0 launched, 1 failed
 # ── review gate ─────────────────────────────────────────────────────────────
 # Every pull request a task opens gets one independent review before the
 # implementer may call it ready - run BY pq, not asked of the agent. The agent
-# cannot run `/code-review` itself (the skill is reserved for a human typing it,
-# see dispatch_prompt), and its contract has it open the pull request as a DRAFT
-# and wait. This section is what happens next: once the agent has gone quiet,
+# could run `/code-review` itself, and a repository's conventions often ask it to,
+# but a review by the session that wrote the change is not independent - so its
+# contract says pq's review stands in for that one, and has it open the pull
+# request as a DRAFT and wait. This section is what happens next: once the agent has gone quiet,
 # pq runs `claude -p "/code-review N --comment"` in the background, in the
 # worktree, which posts inline review comments on the pull request; when that
 # finishes, pq prompts the implementer to resolve every comment and mark the
@@ -5090,8 +5098,8 @@ dispatch_task() {                       # task_dir  -> 0 launched, 1 failed
 # "run /security-review" in so many words, and say what it should focus on - and
 # name_plan reads that into a `security: yes` header at add time. Such a task gets
 # a second reviewer beside the first: `claude -p "/security-review"`, in the same
-# worktree, on the same knobs and the same read-only rules. The implementer could
-# no more run it than /code-review, and its contract tells it not to try. The
+# worktree, on the same knobs and the same read-only rules. The implementer's
+# contract tells it not to run one itself, as it does for /code-review. The
 # skill takes no target and posts nothing - it reviews `git diff origin/HEAD...`
 # of wherever it runs and replies with a markdown report - so pq delivers: the
 # report is saved as security.md, posted on the pull request as one comment to be
@@ -5141,9 +5149,8 @@ REVIEWER_GIT_DENY=("Bash(git checkout:*)" "Bash(git switch:*)" "Bash(git restore
                    "Bash(git stash:*)" "Bash(git clean:*)" "Bash(git commit:*)" "Bash(git push:*)")
 
 # The reviewer itself, one swappable function. `-p` with the skill typed as the
-# user's own prompt: the model may not invoke /code-review, but the user may,
-# and in `-p` the prompt IS the user - verified against a real pull request,
-# which came back with eleven inline comments.
+# user's own prompt, which is how its level and its target reach it - verified
+# against a real pull request, which came back with eleven inline comments.
 #
 # PQ_REVIEW_EFFORT is passed twice, as the session's `--effort` and as the
 # skill's own level argument. ARGUMENT ORDER IS LOAD-BEARING for the second one:
