@@ -4915,10 +4915,11 @@ dispatch_task() {                       # task_dir  -> 0 launched, 1 failed
 #   running   the reviewer is a background process group of its own; its exit
 #             code lands in review.rc and is collected on a later tick. Bounded
 #             by PQ_REVIEW_TIMEOUT, then killed
-#   posted    the reviewer finished. PQ_REVIEW_RESULT says how - `ok`, or
-#             `failed` / `timeout` / `denied`, for which the follow-up asks for a
-#             self-review instead. Waits for the agent to be promptable, then
-#             delivers
+#   posted    the reviewer finished. PQ_REVIEW_RESULT says how - `ok`, with
+#             PQ_REVIEW_POSTED the inline comments that landed, or `failed` /
+#             `timeout` / `denied` / `empty` (a clean exit that posted nothing),
+#             for which the follow-up asks for a self-review instead. Waits for
+#             the agent to be promptable, then delivers
 #   prompted  the follow-up is with the implementer. Ends when the PR stops
 #             being a draft
 #   ready     it did - the gate is over
@@ -5190,12 +5191,25 @@ review_probe() {                        # repo pr -> title<TAB>state<TAB>draft|o
            (.commits | length | tostring), ((.additions + .deletions) | tostring)] | @tsv' <<<"$raw" 2>/dev/null
 }
 
-# How many inline review comments the pull request carries. Read once at launch
-# and once at collection, because the difference is the only honest answer to
-# "did the review post anything": the reviewer's JSON says what it was denied,
-# not what it managed. Empty when gh cannot say.
+# How many inline review threads the pull request carries - top-level comments,
+# not the replies an implementer posts under them. Read once at launch and once
+# at collection, because the difference is the only honest answer to "did the
+# review post anything": the reviewer's JSON says what it was denied, not what it
+# managed, and a reply of "found 14 issues, all posted" is the model's word for it.
+# The skill's --comment mode posts one inline comment per finding and nothing
+# else, whichever route it takes (the MCP tool, `gh api` per finding, or one
+# review carrying them all), so this is what moves when a review lands.
+#
+# Every page, counted across them: the API pages at 30, so a count that stopped
+# there read 30 before and 30 after on any pull request already that busy, and
+# `--jq length` under --paginate prints one length per page. Empty when gh cannot
+# say, which is not the same answer as 0.
 review_comments() {                     # repo pr -> count, or nothing
-  (cd "$1" 2>/dev/null && gh api "repos/{owner}/{repo}/pulls/$2/comments" --jq 'length' 2>/dev/null) | tr -dc '0-9'
+  local ids
+  ids=$(cd "$1" 2>/dev/null && gh api --paginate "repos/{owner}/{repo}/pulls/$2/comments" \
+          --jq '.[] | select(.in_reply_to_id == null) | .id' 2>/dev/null) || return 0
+  grep -c . <<<"$ids"
+  return 0
 }
 
 # What a reviewer's ladder is keyed on in state.env: PQ_REVIEW for the code
@@ -5264,16 +5278,37 @@ review_kill() {                         # task_dir
   return 0
 }
 
-# What a finished reviewer amounts to. `denied` means the review could not post:
-# a `gh` command was refused AND the pull request has no more inline comments
-# than it had at launch - the one failure a retry cannot fix, since it will be
-# refused the same way until PQ_REVIEW_TOOLS changes. A `gh` refusal with
-# comments landing anyway is a reviewer that got its job done and was then
-# stopped from, say, editing one of its own comments - worth a warning, still
-# a review. The spike that verified the command saw exactly that: 25 denials
-# (gem sources read outside the worktree, `ruby`, `bundle`, one `gh api -X
-# PATCH`) and eleven comments posted.
-review_collect() {                      # task_dir -> ok | failed | denied
+# What a finished reviewer amounts to, judged by what landed on the pull request
+# rather than by its exit code: the first reviewer that hit the usage limit exited
+# 0 having posted nothing, and the implementer was told to resolve comments that
+# did not exist. So a clean exit is `ok N` only when N new inline comments did
+# land, and `empty` - a failed try, retried like any other - when none did.
+#
+# That rule has one cost, stated rather than hidden: a review that genuinely finds
+# nothing posts nothing too, so it is retried and then answered by the self-review
+# fallback, which is where a clean pull request would have ended up anyway. None of
+# the reviews run so far was one - the skill's own floor asks for about seven
+# findings at xhigh - and the reviewer's reply is kept as review.md for that
+# fallback to point at, which also covers findings it printed because GitHub
+# refused them inline (a file outside the diff, a line outside a hunk).
+#
+# `denied` means the review could not post: a `gh` command was refused and
+# nothing landed - the one failure a retry cannot fix, since it will be refused
+# the same way until PQ_REVIEW_TOOLS changes. A `gh` refusal with comments
+# landing anyway is a reviewer that got its job done and was then stopped from,
+# say, editing one of its own comments - worth a warning, still a review. The
+# spike that verified the command saw exactly that: 25 denials (gem sources read
+# outside the worktree, `ruby`, `bundle`, one `gh api -X PATCH`) and eleven
+# comments posted.
+#
+# When gh cannot say how many there are now, the review is taken at its word as
+# a bare `ok`: that is gh failing, not the reviewer, and the implementer's own
+# read of the comments is the next thing to happen either way. A count at launch
+# that gh could not give leaves only "are there any at all" to go on.
+#
+# Prints the verdict and nothing else; the caller records it, since this runs in
+# a command substitution under --dry-run too.
+review_collect() {                      # task_dir -> "ok N" | ok | empty | failed | denied
   local d=$1 rc is_error gh_denied other before after
   rc=$(cat "$d/review.rc" 2>/dev/null)
   is_error=$(jq -r 'if type == "object" then ((.is_error // false) | tostring) else "malformed" end' \
@@ -5283,15 +5318,18 @@ review_collect() {                      # task_dir -> ok | failed | denied
                 "$d/review.json" 2>/dev/null) || gh_denied=0
   other=$(jq -r '[.permission_denials[]?] | length' "$d/review.json" 2>/dev/null) || other=0
   if [ "$rc" = 0 ] && [ "$is_error" = false ]; then
-    if [ "${gh_denied:-0}" != 0 ]; then
-      before=$(st "$d" PQ_REVIEW_COMMENTS)
-      after=$(review_comments "$(hdr "$d/plan.md" repo)" "$(st "$d" PQ_PR)")
-      if [ -n "$before" ] && [ -n "$after" ] && [ "$after" -le "$before" ]; then
-        printf 'denied'; return
-      fi
+    before=$(st "$d" PQ_REVIEW_COMMENTS)
+    after=$(review_comments "$(hdr "$d/plan.md" repo)" "$(st "$d" PQ_PR)")
+    if [ -z "$after" ] || { [ -z "$before" ] && [ "$after" -gt 0 ]; }; then
+      [ "${other:-0}" = 0 ] || warn "$(slug_of "$d"): the reviewer reached for things it was denied ($other denials, $gh_denied of them gh) - see $d/review.json"
+      printf 'ok'; return
+    fi
+    if [ "$after" -le "${before:-0}" ]; then
+      [ "${gh_denied:-0}" != 0 ] && { printf 'denied'; return; }
+      printf 'empty'; return
     fi
     [ "${other:-0}" = 0 ] || warn "$(slug_of "$d"): the reviewer reached for things it was denied ($other denials, $gh_denied of them gh) - see $d/review.json"
-    printf 'ok'; return
+    printf 'ok %s' "$(( after - ${before:-0} ))"; return
   fi
   printf 'failed'
 }
@@ -5492,9 +5530,14 @@ security_skip() {                       # task_dir why
 # `done`, so a task that never asked for one gets, byte for byte, the prompt it
 # always got. It sits between the code review's text and the restructure clause,
 # and reads the same after either of the code review's two openings.
-review_prompt() {                       # pr result split lines base [security_result security_posted report]
+#
+# The code review's count is said when it is known, so the implementer knows how
+# many threads to answer; the reviewer's own reply is pointed at from the
+# fallback when it posted nothing, since it may list findings it could only print.
+review_prompt() {                       # pr result split lines base [security_result security_posted report] [landed reply]
   local pr=$1 result=$2 split=${3:-} lines=${4:-} base=${5:-} splitc="" why text
   local sec=${6:-} sposted=${7:-} report=${8:-} secc="" swhy
+  local landed=${9:-} reply=${10:-} replyc=""
   case "$sec" in
     "") ;;
     ok)
@@ -5522,8 +5565,14 @@ If you opened it because you were stuck, do not mark it ready; answer what you c
 Never wait for input - there is nobody watching."
   case "$result" in
     ok)
-      text="pq has finished an independent review of pull request #$pr and posted its findings \
-as inline review comments. Read every one (gh api repos/{owner}/{repo}/pulls/$pr/comments) and \
+      local posted="its findings as inline review comments"
+      case "$landed" in
+        "") ;;
+        1)  posted="its findings as 1 inline review comment" ;;
+        *)  posted="its findings as $landed inline review comments" ;;
+      esac
+      text="pq has finished an independent review of pull request #$pr and posted $posted. \
+Read every one (gh api repos/{owner}/{repo}/pulls/$pr/comments) and \
 resolve each: fix it and push, or reply on that thread with the reasoning for leaving it. \
 Leave no comment unanswered. ${secc}${splitc}${tail}" ;;
     *)
@@ -5531,10 +5580,12 @@ Leave no comment unanswered. ${secc}${splitc}${tail}" ;;
         timeout) why="the reviewer ran out of time" ;;
         quota)   why="the reviewer kept hitting the usage limit" ;;
         denied)  why="the reviewer was denied permission to post" ;;
+        empty)   why="the reviewer finished without posting anything on it" ;;
         *)       why="the reviewer exited with an error" ;;
       esac
+      [ -n "$reply" ] && replyc="Its reply is saved in $reply and may name findings it could not post inline - resolve those as well. "
       text="pq could not get an independent review of pull request #$pr - $why. \
-Review your own diff as a stranger would (git diff origin/${base:-HEAD}...HEAD) for bugs, \
+${replyc}Review your own diff as a stranger would (git diff origin/${base:-HEAD}...HEAD) for bugs, \
 missing tests and what the plan did not anticipate; fix and push. ${secc}${splitc}${tail}" ;;
   esac
   printf '%s' "$text"
@@ -5600,8 +5651,11 @@ review_task() {                         # task_dir dry
       local text result base code rc sec=""
       result=$(st "$d" PQ_REVIEW_RESULT); base=$(task_base "$d")
       [ "$(st "$d" PQ_SECURITY)" = "done" ] && sec=$(st "$d" PQ_SECURITY_RESULT)
+      local reply=""
+      [ "${result:-failed}" != ok ] && [ -s "$d/review.md" ] && reply="$(task_home "$d")/review.md"
       text=$(review_prompt "$pr" "${result:-failed}" "$(st "$d" PQ_REVIEW_SPLIT)" "$(st "$d" PQ_REVIEW_LINES)" "$base" \
-               "$sec" "$(st "$d" PQ_SECURITY_POSTED)" "$(task_home "$d")/security.md")
+               "$sec" "$(st "$d" PQ_SECURITY_POSTED)" "$(task_home "$d")/security.md" \
+               "$(st "$d" PQ_REVIEW_POSTED)" "$reply")
       code=$(agent_prompt "$(st "$d" PQ_PANE)" "$text"); rc=$?
       case "$rc" in
         0)
@@ -5711,8 +5765,10 @@ review_step() {                         # task_dir dry pr pstate
       local cwd; cwd=$(st "$d" PQ_WORKTREE)
       [ -n "$cwd" ] && [ -d "$cwd" ] || cwd=$repo
       st_set "$d" PQ_REVIEW_TRIES "$((tries + 1))"
-      st_set "$d" PQ_REVIEW_COMMENTS "$(review_comments "$repo" "$pr")"
+      # The count a resumed session is judged against is the one from before it
+      # first ran: whatever it posted ahead of the wall is its work too.
       local sid; sid=$(st "$d" PQ_REVIEW_SESSION)
+      [ -n "$sid" ] || st_set "$d" PQ_REVIEW_COMMENTS "$(review_comments "$repo" "$pr")"
       reviewer_launch "$d" review "$cwd" review_cmd "$pr" "$(task_home "$d")" "$sid"
       if [ -n "$sid" ]; then msg "$slug: resuming the review of #$pr after the usage limit"
       else msg "$slug: reviewing #$pr with $PQ_REVIEWER_MODEL in the background"; fi
@@ -5731,13 +5787,22 @@ review_step() {                         # task_dir dry pr pstate
           reviewer_session_lost "$d" review
           return 0
         fi
-        local result; result=$(review_collect "$d")
+        local verdict result landed; verdict=$(review_collect "$d")
+        result=${verdict%% *}; landed=""
+        [ "$result" = "$verdict" ] || landed=${verdict#* }
         case "$result" in
           ok)
             [ "$dry" = 1 ] && { msg "would record $slug's review as posted"; return 0; }
-            st_set "$d" PQ_REVIEW posted; st_set "$d" PQ_REVIEW_RESULT ok
-            msg "$slug: review of #$pr posted$(fmt_cost "$(jq -r '.total_cost_usd // empty' "$d/review.json" 2>/dev/null)" \
+            st_set "$d" PQ_REVIEW posted; st_set "$d" PQ_REVIEW_RESULT ok; st_set "$d" PQ_REVIEW_POSTED "$landed"
+            msg "$slug: review of #$pr posted${landed:+ - $landed inline comment$([ "$landed" = 1 ] || printf s)}$(fmt_cost "$(jq -r '.total_cost_usd // empty' "$d/review.json" 2>/dev/null)" \
                                                         "$(jq -r '.duration_ms // empty' "$d/review.json" 2>/dev/null)")" ;;
+          empty)
+            [ "$dry" = 1 ] && { msg "would count $slug's review as a failed try - it posted nothing"; return 0; }
+            # Its reply may still carry findings GitHub refused inline; the
+            # fallback prompt points at it (review_prompt).
+            jq -j 'if type == "object" then (.result // "" | tostring) else "" end' "$d/review.json" > "$d/review.md" 2>/dev/null
+            [ -n "$(tr -d '[:space:]' < "$d/review.md" 2>/dev/null)" ] || rm -f "$d/review.md"
+            reviewer_try_failed "$d" review empty "the reviewer exited cleanly but posted no inline comments on #$pr - see $d/review.json" ;;
           denied)
             [ "$dry" = 1 ] && { msg "would record $slug's review as denied"; return 0; }
             st_set "$d" PQ_REVIEW posted; st_set "$d" PQ_REVIEW_RESULT denied

@@ -63,9 +63,11 @@ case "\$m" in
   wallerr)   printf 'not json\n'; printf 'Error: request failed\n%s\n' "\$(cat "$WALL_LINE")" >&2; exit 1 ;;
   fail)      printf '{"is_error":true}\n'; exit 1 ;;
   sleep)     sleep 30; exit 0 ;;
-  ratelimit) jq -nc '{is_error:false,session_id:"s-2",result:"Two findings.\nThe new middleware returns 429 once clients hit your API limit, but never sets Retry-After."}'; exit 0 ;;
+  ratelimit) [ "\$kind" = code ] && echo \$(( \$(cat "$COMMENTS") + 2 )) > "$COMMENTS"
+             jq -nc '{is_error:false,session_id:"s-2",result:"Two findings.\nThe new middleware returns 429 once clients hit your API limit, but never sets Retry-After."}'; exit 0 ;;
 esac
 if [ "\$kind" = code ]; then
+  echo \$(( \$(cat "$COMMENTS") + 2 )) > "$COMMENTS"      # a review that lands posts inline comments
   printf '{"is_error":false,"total_cost_usd":1.2,"duration_ms":5000,"session_id":"s-code","permission_denials":[]}\n'; exit 0
 fi
 jq -nc '{is_error:false,total_cost_usd:0.9,duration_ms:90000,session_id:"s-sec",permission_denials:[],result:"# Security review\n\nNo vulnerabilities found."}'
@@ -75,7 +77,7 @@ cat > "$STUBBIN/gh" <<EOF
 case "\$*" in
   *"pr comment"*) printf '%s\n' "\$*" >> "$GH_LOG"; exit 0 ;;
   *"pr view"*)    [ -f "$PRJSON" ] && cat "$PRJSON" && exit 0; exit 1 ;;
-  *"/comments"*)  cat "$COMMENTS"; exit 0 ;;
+  *"/comments"*)  awk -v n="\$(cat "$COMMENTS")" 'BEGIN { for (i = 1; i <= n; i++) print i }'; exit 0 ;;
 esac
 exit 1
 EOF

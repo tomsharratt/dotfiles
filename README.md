@@ -425,6 +425,12 @@ A pull request that settles mid-review has its reviewer killed before the reap p
 Failure is loud, once, and falls back rather than blocking.
 A reviewer that errors or runs past `PQ_REVIEW_TIMEOUT` is retried after `PQ_REVIEW_RETRY`, up to `PQ_REVIEW_MAX_TRIES` launches, and then given up on; the implementer is then told the review did not happen and to review its own diff as a stranger would, fix, push, and mark the pull request ready anyway, and `pq ls` reads `review failed` until it does.
 A reviewer that was refused `gh` and posted nothing is `denied` and never retried, since it cannot succeed until `PQ_REVIEW_TOOLS` changes - and it is reported the same way, on the first task it happens to.
+
+A clean exit is not taken as a review, either: what decides is whether anything landed.
+`pq` counts the pull request's top-level inline comments when the reviewer launches and again when it finishes, every page of them (the API pages at 30, which the count used to stop at), and a reviewer that exited cleanly with nothing new is `empty` - a failed try like any other.
+When the review did land, the follow-up says how many comments to answer.
+The one cost is a review that genuinely finds nothing, which posts nothing too: it is retried and then answered by the self-review fallback, where a clean pull request would have ended up anyway, and none of the reviews run so far was one.
+The reviewer's reply is kept as `<task>/review.md` for that fallback to point at, since it may list findings GitHub refused inline - a file outside the diff, a line outside a hunk.
 There is no off switch; `PQ_REVIEW_MAX_TRIES=0` is the honest degraded mode, which skips every reviewer and sends every task straight to the self-review fallback.
 
 A reviewer that hits the usage limit has not failed, and is not treated as if it had.

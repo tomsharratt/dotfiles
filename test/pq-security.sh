@@ -86,6 +86,7 @@ case "\$m" in
   fail)  printf '{"is_error":true}\n'; exit 1 ;;
 esac
 if [ "\$kind" = code ]; then
+  echo \$(( \$(cat "$COMMENTS") + 2 )) > "$COMMENTS"      # a review that lands posts inline comments
   printf '{"is_error":false,"total_cost_usd":1.2,"duration_ms":5000,"permission_denials":[]}\n'; exit 0
 fi
 case "\$m" in
@@ -105,7 +106,7 @@ case "\$*" in
     for a in "\$@"; do [ "\$prev" = --body-file ] && f=\$a; prev=\$a; done
     cat "\$f" > "$STUBBIN/.comment-body"; exit 0 ;;
   *"pr view"*)   [ -f "$PRJSON" ] && cat "$PRJSON" && exit 0; exit 1 ;;
-  *"/comments"*) cat "$COMMENTS"; exit 0 ;;
+  *"/comments"*) awk -v n="\$(cat "$COMMENTS")" 'BEGIN { for (i = 1; i <= n; i++) print i }'; exit 0 ;;
 esac
 exit 1
 EOF

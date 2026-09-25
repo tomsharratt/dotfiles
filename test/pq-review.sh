@@ -33,21 +33,31 @@ cat > "$STUBBIN/claude" <<EOF
 { printf '%s\t' "\$PWD"; for a in "\$@"; do printf '%s\t' "\$a"; done; printf '\n'; } >> "$CLAUDE_LOG"
 printf 'pane=%s tab=%s workspace=%s env=%s socket=%s\n' "\${HERDR_PANE_ID-unset}" "\${HERDR_TAB_ID-unset}" \
   "\${HERDR_WORKSPACE_ID-unset}" "\${HERDR_ENV-unset}" "\${HERDR_SOCKET_PATH-unset}" >> "$CLAUDE_ENV"
+# A review that lands posts inline comments, as the real one does - two here -
+# so the count pq reads at collection has moved; \`empty\` exits just as cleanly
+# and posts nothing, printing its findings instead.
+posted() { echo \$(( \$(cat "$COMMENTS") + 2 )) > "$COMMENTS"; }
 case "\$(cat "$MODE")" in
   sleep)     sleep 30; exit 0 ;;
-  ok)        printf '{"is_error":false,"total_cost_usd":1.2,"duration_ms":5000,"permission_denials":[]}\n'; exit 0 ;;
+  ok)        posted; printf '{"is_error":false,"total_cost_usd":1.2,"duration_ms":5000,"permission_denials":[]}\n'; exit 0 ;;
+  empty)     printf '{"is_error":false,"result":"Found 2 issues, both outside the diff, so printed here: a and b.","permission_denials":[]}\n'; exit 0 ;;
   fail)      printf '{"is_error":true}\n'; exit 1 ;;
   malformed) printf 'not json at all\n'; exit 0 ;;
   denied)    printf '{"is_error":false,"permission_denials":[{"tool_name":"Bash","tool_input":{"command":"gh api repos/x/y/pulls/42/comments -f body=hi"}}]}\n'; exit 0 ;;
-  otherdeny) printf '{"is_error":false,"permission_denials":[{"tool_name":"Bash","tool_input":{"command":"bundle info activesupport"}}]}\n'; exit 0 ;;
+  otherdeny) posted; printf '{"is_error":false,"permission_denials":[{"tool_name":"Bash","tool_input":{"command":"bundle info activesupport"}}]}\n'; exit 0 ;;
 esac
 exit 1
 EOF
+# The comments endpoint answers one id per top-level comment, as pq's --jq asks;
+# every call is logged, so the shape of that call can be checked too.
+GH_LOG="$STUBBIN/.gh-calls"
 cat > "$STUBBIN/gh" <<EOF
 #!/bin/sh
+printf '%s\n' "\$*" >> "$GH_LOG"
 case "\$*" in
   *"pr view"*)  [ -f "$PRJSON" ] && cat "$PRJSON" && exit 0; exit 1 ;;
-  *"/comments"*) cat "$COMMENTS"; exit 0 ;;
+  *"/comments"*) [ -f "$STUBBIN/.gh-down" ] && exit 1
+                 awk -v n="\$(cat "$COMMENTS")" 'BEGIN { for (i = 1; i <= n; i++) print i }'; exit 0 ;;
 esac
 exit 1
 EOF
@@ -336,7 +346,8 @@ wait_rc "$G" && ok || bad "the ok stub should have written review.rc"
 review_task "$G" 0 >"$PQ_HOME/.out" 2>&1
 eq "$(st "$G" PQ_REVIEW)" "posted" "collected as posted"
 eq "$(st "$G" PQ_REVIEW_RESULT)" "ok" "with an ok result"
-has "$(cat "$PQ_HOME/.out")" "review of #42 posted (\$1.20, 0m5s)" "cost and duration are reported"
+has "$(cat "$PQ_HOME/.out")" "review of #42 posted - 2 inline comments (\$1.20, 0m5s)" "what landed, cost and duration are reported"
+eq "$(st "$G" PQ_REVIEW_POSTED)" "2" "the two comments that landed are recorded"
 eq "$(review_cell "$G")" "reviewed" "the cell says reviewed"
 review_inflight "$G" && ok || bad "posted is still in flight - the follow-up has not gone"
 st_set "$G" PQ_WRAPUP_SINCE "$(ago 100)"
@@ -347,7 +358,7 @@ eq "$(st "$G" PQ_REVIEW)" "prompted" "delivered"
 eq "$(st "$G" PQ_WRAPUP_SINCE)" "" "the wrap-up clock is cleared - this tick's snapshot predates the prompt"
 P=$(prompt_text)
 has "$P" "pull request #42" "the prompt names the PR"
-has "$P" "inline review comments" "and says the findings are inline comments"
+has "$P" "posted its findings as 2 inline review comments" "and says how many inline comments landed"
 has "$P" "gh api repos/{owner}/{repo}/pulls/42/comments" "and how to read them"
 has "$P" "gh pr ready 42" "and how to mark it ready"
 has "$P" "Never wait for input" "and that nobody is watching"
@@ -551,6 +562,58 @@ review_task "$N3" 0 >"$PQ_HOME/.out" 2>&1
 eq "$(st "$N3" PQ_REVIEW_RESULT)" "ok" "a bundle denial is not a posting failure"
 has "$(cat "$PQ_HOME/.out")" "1 denials, 0 of them gh" "but is reported"
 mode ok
+
+echo "== a clean exit that posted nothing is a failed try, not a review ==" >&2
+# The first reviewer to hit the usage limit exited 0 having posted nothing, and
+# the implementer was told to resolve comments that did not exist. Any silent
+# non-review has that shape, so what landed is what decides.
+reset_tasks; reset_caches; reset_logs; mode empty; printf '4' > "$COMMENTS"
+E=$(mk_gated 053 silent w6:p1)
+set_panes "$(printf 'w6:p1\tclaude\tidle')"
+review_task "$E" 0 >/dev/null 2>&1; wait_rc "$E"
+review_task "$E" 0 >"$PQ_HOME/.out" 2>&1
+eq "$(st "$E" PQ_REVIEW)" "pending" "nothing landed: back to pending for another try"
+eq "$(st "$E" PQ_REVIEW_RESULT)" "empty" "recorded as empty"
+has "$(cat "$PQ_HOME/.out")" "posted no inline comments on #42" "and said"
+has "$(cat "$E/review.md")" "printed here" "its reply is kept, in case it printed what it could not post"
+FAKE_NOW=$(( FAKE_NOW + PQ_REVIEW_RETRY + 1 ))
+review_task "$E" 0 >/dev/null 2>&1; wait_calls 2; wait_rc "$E"
+review_task "$E" 0 >"$PQ_HOME/.out" 2>&1
+eq "$(st "$E" PQ_REVIEW)" "posted" "the second empty try ends the ladder"
+eq "$(st "$E" PQ_REVIEW_RESULT)" "empty" "still as empty"
+eq "$(review_cell "$E")" "review failed" "and pq ls says the review did not happen"
+reset_logs
+review_task "$E" 0 >/dev/null 2>&1
+P=$(prompt_text)
+has "$P" "could not get an independent review of pull request #42" "the follow-up is the fallback"
+has "$P" "the reviewer finished without posting anything on it" "with the reason"
+has "$P" "$PQ_HOME/tasks/$(basename "$E")/review.md" "pointing at the reply, through the stable path"
+hasnt "$P" "inline review comments" "and no talk of comments to read"
+mode ok
+
+echo "== gh unable to count at collection takes the review at its word ==" >&2
+reset_tasks; reset_caches; reset_logs; mode ok; printf '0' > "$COMMENTS"
+U=$(mk_gated 054 uncounted w6:p1)
+review_task "$U" 0 >/dev/null 2>&1; wait_rc "$U"
+touch "$STUBBIN/.gh-down"
+review_task "$U" 0 >"$PQ_HOME/.out" 2>&1
+rm -f "$STUBBIN/.gh-down"
+eq "$(st "$U" PQ_REVIEW_RESULT)" "ok" "gh failing is not the reviewer failing"
+eq "$(st "$U" PQ_REVIEW_POSTED)" "" "and no count is invented"
+reset_logs; review_task "$U" 0 >/dev/null 2>&1
+has "$(prompt_text)" "posted its findings as inline review comments" "the follow-up names no number it does not have"
+
+echo "== the count reads every page, and only the threads a review opens ==" >&2
+grep -q -- '--paginate' "$GH_LOG" && ok || bad "the count must page past GitHub's 30 (log: $(cat "$GH_LOG"))"
+grep -q 'in_reply_to_id == null' "$GH_LOG" && ok || bad "and count top-level comments, not the replies under them"
+
+echo "== a resumed review keeps the count from before it first ran ==" >&2
+reset_tasks; reset_caches; reset_logs; mode ok; printf '9' > "$COMMENTS"
+S2=$(mk_gated 055 resumed w6:p1)
+st_set "$S2" PQ_REVIEW_SESSION s-walled; st_set "$S2" PQ_REVIEW_COMMENTS 5
+set_panes "$(printf 'w6:p1\tclaude\tidle')"
+review_task "$S2" 0 >/dev/null 2>&1
+eq "$(st "$S2" PQ_REVIEW_COMMENTS)" "5" "what it posted before the wall still counts as its own"
 
 echo "== a stale pid is a failed try ==" >&2
 reset_tasks; reset_caches; reset_logs; mode sleep
