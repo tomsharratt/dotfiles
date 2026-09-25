@@ -77,7 +77,8 @@ wt open [name]       open the worktree's dev url in the browser, starting the
 wt provision <path>  re-run provisioning for a worktree (idempotent)
 wt rm  [-y] [name]   tear a worktree down (drop db, free port, remove worktree);
                      one holding work that is not pushed is refused under -y
-wt ls                list worktrees with their allocated port / redis / url / db
+wt ls                list worktrees with their port, age, agent, pull request and
+                     url, fitted to the terminal (the url goes first, never cut)
 wt gc                reclaim resources from worktrees removed outside wt rm
 ```
 
@@ -97,9 +98,18 @@ Use `wt test` for anything running under `RAILS_ENV=test`, and plain `wt run` fo
 The dev server needs `domain` and `LOCAL_DOMAIN` set to the worktree's own host, but the suite has its own (`application.yml`'s `test: domain: lvh.me`), and figaro will not override a key already in the environment - so exporting the worktree's under `wt test` scoped the test session cookie to `<slug>.test`, rack-test dropped it on every request to `x.lvh.me`, and seven specs failed there and nowhere else.
 Agents re-proved those same seven in session after session; under `wt test` they now pass, and a `wt test` inherited from a shell that already has the two set unsets them.
 
-Two things it does not fix.
-A bare `bundle exec rspec` that bypasses `wt` entirely still lands on the shared `supercast-web_test`; making *that* safe would need `database.yml` to name a variable only worktrees set.
-And the test **redis** index is still shared, because `config/initializers/redis.rb` hardcodes db 15 in test with no override - so Redis-backed specs can still race a concurrent run even though the databases no longer do.
+A bare `bundle exec rspec` gets the same, without going through `wt` at all.
+Of 160 spec runs in the implementer transcripts, 36 were bare and another 32 set `DATABASE_URL` by hand; the bare ones landed on the shared `supercast-web_test`.
+Provisioning now writes a `.rspec` into the worktree, which supercast gitignores, and RSpec reads that file through ERB before it loads anything - so the ruby in it sets the same environment first.
+A `DATABASE_URL` set on purpose is kept; an unset one, or the worktree's dev database inherited from a `wt run` shell, is replaced.
+The file is rewritten on every dev boot, so a worktree made before it existed gets one on its next `wt restart`.
+A `.rspec` without wt's marker line is someone else's and is left alone, and none is written where git would not ignore it, since a dirty worktree is one `wt rm` refuses.
+
+One thing is still shared: the test **redis** index.
+`config/initializers/redis.rb` builds `Redis.new(db: 15)` in test, and in redis-rb an explicit `db:` beats `REDIS_URL`.
+`spec/rails_helper.rb` then runs `flushdb` before every example, which `REDIS_NAMESPACE` cannot scope: redis-namespace passes `flushdb` through to the whole database.
+So a spec using `$redis` can have its keys flushed by a concurrent run in another worktree.
+Fixing that needs a supercast change - its test redis database taken from the environment - and a second redis index per worktree from wt, more than redis's default 16 databases hold beside `WT_REDIS_MAX=14`.
 
 `wt new` layers things on top of "prepare a worktree", and two of them can be dropped so the command can be driven by a script rather than by `prefix+t`:
 

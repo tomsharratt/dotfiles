@@ -132,5 +132,57 @@ eq "$(grep '^css:' <<<"$out")" 'css: rails "tailwindcss:watch[always]"' "the css
 eq "$(grep '^js:' <<<"$out")" "js: yarn build --watch" "the rest is as it was"
 rm -f "$PF"
 
+echo "== a bare \`bundle exec rspec\` gets what \`wt test\` gives it, through .rspec ==" >&2
+# A worktree like supercast's: .rspec gitignored, and pushed, so nothing is unpushed.
+WT_PATH=$(mktemp -d)
+REMOTE=$(mktemp -d)
+git init -q -b master "$WT_PATH"
+printf '.rspec\n' > "$WT_PATH/.gitignore"
+git -C "$WT_PATH" add .gitignore
+git -C "$WT_PATH" -c user.email=t@t -c user.name=t commit -q -m init
+git init -q --bare "$REMOTE"
+git -C "$WT_PATH" remote add origin "$REMOTE"
+git -C "$WT_PATH" push -q origin master 2>/dev/null
+_wt_rspec
+[ -f "$WT_PATH/.rspec" ] && ok || bad "provisioning writes the worktree's .rspec"
+# The guard pq's reap relies on: a worktree with anything wt_rspec wrote showing
+# as uncommitted would be refused by `wt rm` and held by pq forever.
+eq "$(unpushed_work "$WT_PATH" "$WT_PATH" master)" "" "the .rspec leaves nothing unpushed for \`wt rm\` to refuse"
+
+# The file through ERB and rspec-core's own comment filter, as rspec reads it.
+# Prints the environment it leaves, then whatever it would pass rspec as options.
+rspec_env() {                           # env assignments... -> db|redis|domain?|local?|options
+  env -u DATABASE_URL -u REDIS_URL -u domain -u LOCAL_DOMAIN "$@" ruby -rerb -e '
+    s = ERB.new(File.read(ARGV[0]), trim_mode: "-").result(binding)
+    opts = s.split(/\n+/).reject { |l| l =~ /\A\s*#/ }.join(" ").strip
+    puts [ENV["DATABASE_URL"], ENV["REDIS_URL"], ENV.key?("domain"), ENV.key?("LOCAL_DOMAIN"), opts].join("|")
+  ' "$WT_PATH/.rspec"
+}
+eq "$(rspec_env)" "postgres://localhost/$TEST_DB|redis://localhost:6379/3|false|false|" \
+  "with nothing set, the worktree's own test database and redis index, and no options"
+eq "$(rspec_env DATABASE_URL="postgres:///$DEV_DB" domain=x.test LOCAL_DOMAIN=x.test)" \
+  "postgres://localhost/$TEST_DB|redis://localhost:6379/3|false|false|" \
+  "a \`wt run\` shell's dev database and domain are replaced, not inherited"
+eq "$(rspec_env DATABASE_URL=postgres://localhost/mine_test REDIS_URL=redis://localhost:6379/9)" \
+  "postgres://localhost/mine_test|redis://localhost:6379/9|false|false|" \
+  "a DATABASE_URL and REDIS_URL set on purpose are kept"
+eq "$(rspec_env DATABASE_URL="$(envvar test DATABASE_URL)")" \
+  "postgres://localhost/$TEST_DB|redis://localhost:6379/3|false|false|" \
+  "and \`wt test\`'s own is unchanged"
+
+WT_REDIS=5 _wt_rspec
+case "$(cat "$WT_PATH/.rspec")" in *"6379/5"*) ok ;; *) bad "wt's own .rspec is rewritten on the next boot" ;; esac
+printf -- '--format documentation\n' > "$WT_PATH/.rspec"
+_wt_rspec
+eq "$(cat "$WT_PATH/.rspec")" "--format documentation" "a .rspec without wt's marker is someone else's, and left alone"
+rm -rf "$WT_PATH" "$REMOTE"
+
+# Where .rspec is not ignored, writing it would dirty the worktree: nothing is written.
+WT_PATH=$(mktemp -d)
+git init -q -b master "$WT_PATH"
+_wt_rspec
+[ -e "$WT_PATH/.rspec" ] && bad "a .rspec git does not ignore must not be written" || ok
+rm -rf "$WT_PATH"
+
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]

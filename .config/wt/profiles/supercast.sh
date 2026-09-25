@@ -184,6 +184,8 @@ wt_provision() {
            bin/rails db:schema:load >/dev/null ); then
     warn "loading the schema into $tdb failed - fix before testing"; return 1
   fi
+  #    And point a bare `bundle exec rspec` at it too - see _wt_rspec.
+  _wt_rspec
 
   # 6. Build the assets a full-page render needs. app/assets/builds/ is gitignored
   #    and empty in a fresh worktree, so every request or feature spec rendering
@@ -285,6 +287,41 @@ wt_env() {
   export domain="$WT_DOMAIN"
 }
 
+# The same test environment for a bare `bundle exec rspec`, which never goes through
+# wt_env: without it a spec run in a worktree falls through to the one machine-wide
+# supercast-web_test - 36 of 160 spec runs in the implementer transcripts did that.
+# RSpec reads the project's .rspec through ERB before it loads anything, so ruby there
+# can set the environment first. supercast gitignores .rspec, so the file never dirties
+# the worktree - which matters beyond tidiness, since a dirty worktree is one `wt rm`
+# refuses and pq's reap holds. Written only where git ignores it, and never over a
+# .rspec of someone else's: one without the marker line is left alone.
+#
+# A DATABASE_URL set on purpose is kept - agents point concurrent runs at test
+# databases of their own. Only an unset one, or this worktree's dev database inherited
+# from a `wt run` shell, is replaced. The rest mirrors wt_env's test branch.
+#
+# Rewritten on every dev boot, like the Procfile, so it cannot drift from this profile
+# and a worktree made before it existed picks it up on its next `wt restart`.
+_WT_RSPEC_MARK="# Written by wt's supercast profile, and rewritten on every dev boot - delete this line to keep your own."
+_wt_rspec() {
+  local f="$WT_PATH/.rspec"
+  git -C "$WT_PATH" check-ignore -q .rspec 2>/dev/null || return 0
+  [ -e "$f" ] && [ "$(head -1 "$f")" != "$_WT_RSPEC_MARK" ] && return 0
+  cat > "$f" <<EOF
+$_WT_RSPEC_MARK
+# A bare "bundle exec rspec" here gets what "wt test" gives it: this worktree's own
+# test database, not the supercast-web_test every other worktree shares.
+<%
+  if [nil, "", "postgres:///$(_wt_db)"].include?(ENV["DATABASE_URL"])
+    ENV["DATABASE_URL"] = "postgres://localhost/$(_wt_test_db)"
+  end
+  ENV["REDIS_URL"] ||= "redis://localhost:6379/${WT_REDIS:-0}"
+  ENV.delete("LOCAL_DOMAIN")
+  ENV.delete("domain")
+-%>
+EOF
+}
+
 # Browser entry point for `wt open`: the app login with an email pre-filled, so a
 # fresh worktree drops you onto a session in one click. Served off the app.
 # subdomain - puma-dev routes any *.<slug>.test host through this worktree's entry,
@@ -313,6 +350,7 @@ wt_dev() {
   local db pf; db=$(_wt_db); pf="${TMPDIR:-/tmp}/wt-${WT_SLUG}.Procfile"
   # Isolated db / redis / url / port - identical to what `wt run` hands the console.
   wt_env
+  _wt_rspec
   # Clear a stale server pidfile (only if its process is dead) so a restart after a
   # hard kill isn't blocked by "A server is already running".
   local pidfile="$WT_PATH/tmp/pids/server.pid" oldpid
