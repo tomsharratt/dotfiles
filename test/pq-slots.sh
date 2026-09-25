@@ -9,6 +9,10 @@
 # done/. The release therefore has to be a timer (an agent that has genuinely
 # finished sits `idle` forever), and the boundary cases below are the difference
 # between over-dispatching and stalling the queue outright.
+#
+# SC2034: the knobs and caches set here are read by the pq sourced below.
+# SC2015: `ok` never fails, so `[ ... ] && ok || bad` is an if/else.
+# shellcheck disable=SC2034,SC2015
 set -uo pipefail
 
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
@@ -117,7 +121,8 @@ tick() {                                # cap dry -> stdout+stderr in $OUT
 # for hdr()/state_of(), plus a pane id for pane_state to be steered against.
 mk_task() {                             # state prio slug branch pane -> task_dir
   local state=$1 prio=$2 slug=$3 branch=$4 pane=$5
-  local dir="$PQ_HOME/$state/$(printf '%014d' $(( 20260101000000 + 10#$prio )))-$slug"
+  local dir
+  dir="$PQ_HOME/$state/$(printf '%014d' $(( 20260101000000 + 10#$prio )))-$slug"
   mkdir -p "$dir"
   {
     printf -- '---\n'

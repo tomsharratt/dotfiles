@@ -1,3 +1,4 @@
+# shellcheck shell=bash  # sourced by wt, never run
 # wt profile for supercast - a Rails app served by puma-dev at *.test, run via a
 # foreman Procfile (web / worker / css / js / stripe). Each worktree runs fully
 # isolated: its own postgres database (a copy of the dev db), its own redis db
@@ -10,7 +11,9 @@
 #   - Procfile.dev binds ${PORT:-3000}                      -> per-worktree port
 #   - config/application.rb has config.hosts.clear          -> any *.test host is allowed
 
+# shellcheck disable=SC2034  # WT_RESOURCES and WT_REDIS_MAX are read by the wt sourcing this
 WT_RESOURCES="port redis"   # allocate an isolated port + redis db index (from wt's 3101 - 3000 stays with the canonical checkout)
+# shellcheck disable=SC2034
 WT_REDIS_MAX=14             # reserve db 15 for the spec suite (config/initializers/redis.rb)
 
 # The dev db has a hyphen; a bareword pg db name can't, so the slug's dashes
@@ -260,10 +263,11 @@ wt_env() {
   # allowed hosts and is rejected. postgres://localhost/x is allowed outright,
   # which is why no DATABASE_CLEANER_ALLOW_REMOTE_DATABASE_URL is needed.
   if [ "${RAILS_ENV:-}" = test ]; then
-    export DATABASE_URL="postgres://localhost/$(_wt_test_db)"
+    DATABASE_URL="postgres://localhost/$(_wt_test_db)"
   else
-    export DATABASE_URL="postgres:///$(_wt_db)"
+    DATABASE_URL="postgres:///$(_wt_db)"
   fi
+  export DATABASE_URL
   export REDIS_URL="redis://localhost:6379/${WT_REDIS:-0}"
   # The domain is the dev server's alone. The test suite has its own - application.yml's
   # `test: domain: lvh.me`, which the specs build their hosts and urls from - and figaro

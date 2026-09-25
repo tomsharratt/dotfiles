@@ -201,6 +201,7 @@ wt_reset() {
 # calling wt_reset: profiles record their own keys here through wt_state_set.
 state_get() {                           # state_file key
   [ -f "$1" ] || return 0
+  # shellcheck disable=SC1090  # a worktree's recorded facts, not a script to follow
   ( unset "$2"; set -a; . "$1" 2>/dev/null; set +a; eval "printf '%s' \"\${$2:-}\"" ) 2>/dev/null
 }
 
@@ -226,6 +227,7 @@ state_index() {
   local f
   for f in "$STATE_DIR"/*.env; do
     [ -e "$f" ] || return 0
+    # shellcheck disable=SC1090  # a worktree's recorded facts, not a script to follow
     ( unset WT_PATH; set -a; . "$f" 2>/dev/null; set +a
       [ -n "${WT_PATH:-}" ] && printf '%s\t%s\n' "$(realpath_p "$WT_PATH")" "$f" ) || true
   done
@@ -345,6 +347,7 @@ prepare_state() {                       # name path repo repo_name [workspace_id
   # reallocating; the url and db matter because they are a profile's to write, in
   # the separate shell that runs wt_provision, so nothing legitimately sets them
   # here and whatever survives would be emitted by --json as if it were ours.
+  # shellcheck disable=SC2034  # WT_DB is exported (load_state's set -a), so clearing it reaches the profile
   WT_PORT="" WT_REDIS="" WT_SLUG="" WT_URL="" WT_DB=""
   sidx_load
   sf=$(sf_for_path "$path")
@@ -426,7 +429,7 @@ pr_load() {                             # repo repo_name branch...
         --json number,state 2>/dev/null ) \
       | jq -r --arg b "$b" '.[] | [$b, (.number | tostring), .state] | @tsv' 2>/dev/null \
       > "$PR_CACHE.$n" &
-    pids[$n]=$!
+    pids[n]=$!
     n=$((n + 1))
   done
   [ "$n" -gt 0 ] || return 0
@@ -459,6 +462,7 @@ PR_DETAIL_FIELDS='headRefName,state,isDraft,reviewDecision,mergeStateStatus,stat
 # reports UNKNOWN while it is still computing mergeability) yields no word at all, leaving
 # the row to read a plain "open" - claiming "ready" on a state we have not confirmed is
 # the one wrong answer here.
+# shellcheck disable=SC2016  # a jq program: its $ are jq's
 PR_DETAIL_JQ='
   def checks:
     [ .statusCheckRollup[]? | (.conclusion // .state // .status // "") | ascii_upcase ] as $c
@@ -497,7 +501,7 @@ pr_detail_load() {                      # repo repo_name branch...   (pr_load mu
     ( cd "$repo" 2>/dev/null && gh pr list --head "$b" --state open --limit 1 \
         --json "$PR_DETAIL_FIELDS" 2>/dev/null ) \
       | jq -r "$PR_DETAIL_JQ" 2>/dev/null > "$PR_DETAIL_CACHE.$n" &
-    pids[$n]=$!
+    pids[n]=$!
     n=$((n + 1))
   done
   [ "$n" -gt 0 ] || return 0
@@ -869,8 +873,8 @@ gc_settled() {                          # yes(1|0)
     [ -n "$repo" ] || continue
     rn=$(basename "$repo")
     wts=$(repo_worktrees "$repo"); [ -n "$wts" ] || continue
-    branches=$(cut -f2 <<<"$wts" | tr '\n' ' ')
-    pr_load "$repo" "$rn" $branches
+    read -r -a branches <<<"$(cut -f2 <<<"$wts" | tr '\n' ' ')"
+    pr_load "$repo" "$rn" "${branches[@]}"
     if [ "${PR_OK:-0}" != 1 ]; then
       warn "$rn: could not read PR state (gh missing, offline, or no GitHub remote) - skipped"
       continue
@@ -977,7 +981,11 @@ cmd_gc() {
   done
   sidx_load
   gc_run
-  [ "${GC_RECLAIMED:-0}" -gt 0 ] && msg "reclaimed ${GC_RECLAIMED} orphan(s)" || msg "no orphans - all worktrees accounted for"
+  if [ "${GC_RECLAIMED:-0}" -gt 0 ]; then
+    msg "reclaimed ${GC_RECLAIMED} orphan(s)"
+  else
+    msg "no orphans - all worktrees accounted for"
+  fi
   [ "$settled" = 1 ] && gc_settled "$yes"
   [ "$sweep" = 1 ] && gc_sweep "$yes"
   return 0
@@ -1567,9 +1575,9 @@ cmd_ls() {
     [ -n "$repo" ] || continue
     rn=$(basename "$repo")
     wts=$(repo_worktrees "$repo"); [ -n "$wts" ] || continue
-    branches=$(cut -f2 <<<"$wts" | tr '\n' ' ')
-    pr_load "$repo" "$rn" $branches
-    pr_detail_load "$repo" "$rn" $branches
+    read -r -a branches <<<"$(cut -f2 <<<"$wts" | tr '\n' ' ')"
+    pr_load "$repo" "$rn" "${branches[@]}"
+    pr_detail_load "$repo" "$rn" "${branches[@]}"
     while IFS=$'\t' read -r path branch; do
       [ -n "$path" ] || continue
       rows=$((rows + 1))

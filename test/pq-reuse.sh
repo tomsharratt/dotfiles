@@ -13,6 +13,10 @@
 #
 # Everything goes through the real pr_load -> gh -> jq pipeline: `gh` answers
 # from $PRS/<branch with / as ->.json, the rows the forge would return.
+#
+# SC2034: the caches and pane index set here are read by the pq sourced below.
+# SC2015: `ok` never fails, so `[ ... ] && ok || bad` is an if/else.
+# shellcheck disable=SC2034,SC2015
 set -uo pipefail
 
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
@@ -84,7 +88,8 @@ reset_tasks() {
   : > "$WT_LOG"
 }
 mk_task() {                              # state prio slug branch -> task_dir
-  local dir="$PQ_HOME/$1/$(printf '%014d' $(( 20260101000000 + 10#$2 )))-$3"
+  local dir
+  dir="$PQ_HOME/$1/$(printf '%014d' $(( 20260101000000 + 10#$2 )))-$3"
   mkdir -p "$dir"
   printf -- '---\nrepo:     %s\nbranch:   %s\nmodel:    sonnet\neffort:   xhigh\nintent:   t\nadded:    2026-01-01T00:00:00Z\n---\n\nplan\n' \
     "$REPO" "$4" > "$dir/plan.md"
@@ -122,7 +127,7 @@ echo "== reap never tears down on an old pull request's merge ==" >&2
 # The whole cost of the bug: the old merge settled the task, and reap removed a
 # worktree whose agent was still working in it.
 reset_tasks
-d=$(mk_task done 11 reaped-early tom/reaped-early)
+d=$(mk_task "done" 11 reaped-early tom/reaped-early)
 st_set "$d" PQ_CLAIMED 2026-09-20T10:00:00Z; st_set "$d" PQ_WORKTREE "$WTDIR"; st_set "$d" PQ_PANE w1:p1
 prs tom/reaped-early "$(pr_json 132 OPEN 2026-09-20T12:00:00Z)" "$(pr_json 101 MERGED 2026-08-01T00:00:00Z)"
 pr_load_all "$(pr_targets running)"
@@ -135,7 +140,7 @@ eq "$(st "$d" PQ_MERGED)" "" "and no merge is recorded"
 echo "== a blocker owned by a task still in the queue is not met by an old merge ==" >&2
 # The queued owner has not been claimed, so no pull request can be its work yet.
 reset_tasks
-own=$(mk_task queue 12 owner tom/owner)
+mk_task queue 12 owner tom/owner >/dev/null
 w=$(mk_task queue 13 waiter tom/waiter)
 printf 'owner\t%s\ttom/owner\n' "$REPO" > "$w/after"
 prs tom/owner "$(pr_json 102 MERGED 2026-08-01T00:00:00Z)"
@@ -179,11 +184,11 @@ rm -f "$STUBBIN/.offline"
 echo "== ...and counts a finished task's branch, even with the forge silent ==" >&2
 reset_tasks
 touch "$STUBBIN/.offline"
-a=$(mk_task archive 16 old-work tom/old-work)
+mk_task archive 16 old-work tom/old-work >/dev/null
 why=$(branch_taken tom/old-work "$REPO"); rc=$?
 eq "$rc" 0 "an archived task's branch is taken"
 case "$why" in *"old-work"*) ok ;; *) bad "the reason names the task (got '$why')" ;; esac
-mk_task done 17 recent tom/recent >/dev/null
+mk_task "done" 17 recent tom/recent >/dev/null
 branch_taken tom/recent "$REPO" >/dev/null && ok || bad "and so is a done task's"
 rm -f "$STUBBIN/.offline"
 

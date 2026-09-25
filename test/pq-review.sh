@@ -8,6 +8,10 @@
 # records how it was called and behaves per a mode file (sleeps, succeeds, fails,
 # is denied), and a `gh` stub serving the one probe and the one comment count the
 # gate asks for.
+#
+# SC2034: the knobs and caches set here are read by the pq sourced below.
+# SC2015: `ok` never fails, so `[ ... ] && ok || bad` is an if/else.
+# shellcheck disable=SC2034,SC2015
 set -uo pipefail
 
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
@@ -149,7 +153,8 @@ tick() {                                # cap dry -> stdout+stderr in $OUT
 
 mk_task() {                             # state prio slug branch pane -> task_dir
   local state=$1 prio=$2 slug=$3 branch=$4 pane=$5
-  local dir="$PQ_HOME/$state/$(printf '%014d' $(( 20260101000000 + 10#$prio )))-$slug"
+  local dir
+  dir="$PQ_HOME/$state/$(printf '%014d' $(( 20260101000000 + 10#$prio )))-$slug"
   mkdir -p "$dir"
   {
     printf -- '---\n'
@@ -167,7 +172,7 @@ mk_task() {                             # state prio slug branch pane -> task_di
 }
 # A done task with an open draft PR #42, its review gate pending.
 mk_gated() {                            # prio slug pane -> task_dir
-  local d; d=$(mk_task done "$1" "$2" "tom/$2" "$3")
+  local d; d=$(mk_task "done" "$1" "$2" "tom/$2" "$3")
   st_set "$d" PQ_LAUNCHED "$(now)"; st_set "$d" PQ_PR 42; st_set "$d" PQ_FINISHED "$(now)"
   st_set "$d" PQ_REVIEW pending
   cache_row "$REPO" "tom/$2" 42 OPEN draft master
@@ -186,14 +191,14 @@ claude_calls() { grep -c . "$CLAUDE_LOG" 2>/dev/null || true; }
 # The reviewer is launched in the background and review_task returns at once,
 # so the stub's log line lands a moment later - poll for it rather than race it.
 wait_calls() {                          # n
-  local i; for i in $(seq 1 50); do [ "$(claude_calls)" -ge "$1" ] && return 0; sleep 0.1; done
+  local _; for _ in $(seq 1 50); do [ "$(claude_calls)" -ge "$1" ] && return 0; sleep 0.1; done
   return 1
 }
 prompt_text() { grep "^agent	prompt	" "$HERDR_LOG" | tail -1 | cut -f4; }
 # Wait for the stub to have finished writing review.rc - it is a real background
 # process, so a bounded poll rather than a fixed sleep.
 wait_rc() {                             # task_dir
-  local i; for i in $(seq 1 50); do [ -f "$1/review.rc" ] && return 0; sleep 0.1; done
+  local _; for _ in $(seq 1 50); do [ -f "$1/review.rc" ] && return 0; sleep 0.1; done
   return 1
 }
 
@@ -218,14 +223,14 @@ review_inflight "$D" && ok || bad "pending is in flight"
 eq "$(claude_calls)" "0" "the agent was still working, so nothing launched on that tick"
 
 echo "== a task from before the gate is never touched ==" >&2
-L=$(mk_task done 002 legacy tom/legacy w2:p1)
+L=$(mk_task "done" 002 legacy tom/legacy w2:p1)
 st_set "$L" PQ_LAUNCHED "$(now)"; st_set "$L" PQ_PR 7; st_set "$L" PQ_FINISHED "$(now)"
 reset_caches; cache_row "$REPO" tom/legacy 7 OPEN draft master; cache_row "$REPO" tom/fresh 42 OPEN draft master
 set_panes "$(printf 'w1:p1\tclaude\tworking\nw2:p1\tclaude\tidle')"
 tick 3 0
 eq "$(st "$L" PQ_REVIEW)" "" "an unset key stays unset"
 review_settled "$L" && ok || bad "and reads as settled, exactly as it always did"
-eq "$(agent_cell "$L" done)" "wrapping up" "with the cell it always had"
+eq "$(agent_cell "$L" "done")" "wrapping up" "with the cell it always had"
 
 echo "== pending defers while the agent is working, blocked, walled, or herdr is silent ==" >&2
 reset_tasks; reset_caches; reset_logs
@@ -319,7 +324,7 @@ slot_held "$G" && ok || bad "an idle implementer under review still holds its sl
 eq "$(st "$G" PQ_WRAPUP_SINCE)" "" "and the wrap-up clock is cleared, not run"
 eq "$(slot_state "$G")" "wrapping up" "slot_state agrees"
 eq "$(active_slots)" "$(printf '0\t1')" "so the cap counts it"
-eq "$(agent_cell "$G" done)" "reviewing $(age_since "$(st "$G" PQ_REVIEW_AT)")" "and the listing says why"
+eq "$(agent_cell "$G" "done")" "reviewing $(age_since "$(st "$G" PQ_REVIEW_AT)")" "and the listing says why"
 
 echo "== timeout kills the process group and counts a failed try ==" >&2
 FAKE_NOW=$(( FAKE_NOW + PQ_REVIEW_TIMEOUT + 1 ))
@@ -416,14 +421,14 @@ set_panes "$(printf 'w1:p1\tclaude\tidle')"
 reset_caches; cache_row "$REPO" tom/gated 42 OPEN draft master
 for pair in "pending:review due" "posted:reviewed" "prompted:resolving" "lapsed:review lapsed"; do
   st_set "$G" PQ_REVIEW "${pair%%:*}"; st_set "$G" PQ_REVIEW_RESULT ok
-  eq "$(agent_cell "$G" done)" "${pair#*:}" "cell for ${pair%%:*}"
+  eq "$(agent_cell "$G" "done")" "${pair#*:}" "cell for ${pair%%:*}"
 done
 st_set "$G" PQ_REVIEW posted; st_set "$G" PQ_REVIEW_RESULT failed
-eq "$(agent_cell "$G" done)" "review failed" "cell for a failed review"
+eq "$(agent_cell "$G" "done")" "review failed" "cell for a failed review"
 st_set "$G" PQ_REVIEW running; st_set "$G" PQ_REVIEW_AT "$(( $(date -u +%s) - 420 ))"
-eq "$(agent_cell "$G" done)" "reviewing 7m" "cell for a running review"
+eq "$(agent_cell "$G" "done")" "reviewing 7m" "cell for a running review"
 st_set "$G" PQ_BLOCKED permission
-eq "$(agent_cell "$G" done)" "permission" "a block word keeps precedence"
+eq "$(agent_cell "$G" "done")" "permission" "a block word keeps precedence"
 st_set "$G" PQ_BLOCKED ""
 st_set "$G" PQ_REVIEW lapsed
 LS=$(PQ_WIDTH=200 main ls 2>&1)
@@ -448,7 +453,7 @@ eq "$(st "$S" PQ_REVIEW_WHY)" "stuck" "for that reason"
 eq "$(claude_calls)" "0" "no reviewer"
 has "$(cat "$PQ_HOME/.out")" "STUCK pull request - not reviewing it" "said"
 eq "$(blocker_state "$REPO" tom/stuck master)" "stalled" "once the gate is settled, the draft is a stalled chain"
-eq "$(agent_cell "$S" done)" "wrapping up" "skipped has no cell of its own"
+eq "$(agent_cell "$S" "done")" "wrapping up" "skipped has no cell of its own"
 pr_json "Do the thing" OPEN true 3 100 20
 
 echo "== one big commit adds the restructure clause; several commits or few lines do not ==" >&2

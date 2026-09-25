@@ -11,6 +11,9 @@
 # never need the stub at all. Only the true end-to-end cases (a fresh
 # `--split`, and the collision retry, which needs the namer) exercise the
 # stub's `opus` and `haiku` branches.
+#
+# SC2015: `ok` never fails, so `[ ... ] && ok || bad` is an if/else.
+# shellcheck disable=SC2015
 set -uo pipefail
 
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
@@ -175,6 +178,8 @@ eq() {                                   # got want msg
   [ "$1" = "$2" ] && ok || bad "$3 (got '$1', want '$2')"
 }
 has() { case "$1" in *"$2"*) ok ;; *) bad "$3 (got '$1')" ;; esac; }
+# The first path a glob matched, or nothing: `ls -d glob | head -1` without parsing ls.
+first_of() { [ ! -e "${1:-}" ] || printf '%s' "$1"; }
 
 cleanup() { rm -rf "$PQ_HOME" "$STUBBIN" "$PQ_REPOS_DIR" "${SIBLINGROOT:-}" "${REPO:-}" "${REPO2:-}" "${CONTAINERROOT:-}"; }
 trap cleanup EXIT
@@ -269,7 +274,7 @@ new_split_dir_container_one() {          # name -> prints the dir path
   printf '%s' "$sd"
 }
 
-queue_count() { ls -d "$PQ_HOME/queue"/*/ 2>/dev/null | wc -l | tr -d ' '; }
+queue_count() { dir_count "$PQ_HOME/queue"; }
 
 echo "== happy path: a four-part diamond, fresh --split ==" >&2
 reset_tasks
@@ -302,6 +307,7 @@ p1=$(stamp_of "$t_schema"); p2=$(stamp_of "$t_parser"); p3=$(stamp_of "$t_notify
   || bad "stamps should ascend in topological order (got $p1 $p2 $p3 $p4)"
 
 case "$err" in *"3 waves"*) ok ;; *) bad "the diamond should report 3 waves (got: $err)" ;; esac
+# shellcheck disable=SC2016  # a dollar amount, not an expansion
 case "$err" in *'$0.42'*) ok ;; *) bad "the cost report should surface total_cost_usd (got: $err)" ;; esac
 
 echo "== pq tick --dry-run actually gates on the diamond's --after wiring ==" >&2
@@ -365,7 +371,7 @@ case "$(cat "$PQ_HOME/.err")" in
   *) ok ;;
 esac
 
-SD=$(ls -d "$PQ_HOME/splits"/*solo*/ | head -1); SD=${SD%/}
+SD=$(first_of "$PQ_HOME/splits"/*solo*/); SD=${SD%/}
 resumed_out=$(main add --split-dir "$SD" --repo "$REPO" <<<y 2>"$PQ_HOME/.err")
 rc=$?
 [ "$rc" -eq 0 ] && ok || bad "resuming via --split-dir should succeed: $(cat "$PQ_HOME/.err")"
@@ -443,7 +449,7 @@ eq "$(queue_count)" "0" "a declined split queues nothing"
 
 echo "== pq add refuses -y, --json, --branch and --intent - none of them are its flags ==" >&2
 reset_tasks
-before_splits=$(ls -d "$PQ_HOME/splits"/*/ 2>/dev/null | wc -l | tr -d ' ')
+before_splits=$(dir_count "$PQ_HOME/splits")
 for gone in "-y" "--json" "--branch tom/whatever" "--intent something"; do
   # shellcheck disable=SC2086  # $gone is a flag and, for two of them, its value
   if ( main add --repo "$REPO" --split $gone </dev/null ) >/dev/null 2>"$PQ_HOME/.err"; then
@@ -452,7 +458,7 @@ for gone in "-y" "--json" "--branch tom/whatever" "--intent something"; do
     has "$(cat "$PQ_HOME/.err")" "unknown option '${gone%% *}'" "pq add $gone is an unknown option"
   fi
 done
-after_splits=$(ls -d "$PQ_HOME/splits"/*/ 2>/dev/null | wc -l | tr -d ' ')
+after_splits=$(dir_count "$PQ_HOME/splits")
 eq "$after_splits" "$before_splits" "a refused flag creates no split directory"
 eq "$(queue_count)" "0" "and queues nothing"
 
@@ -816,7 +822,7 @@ printf 'FIXTURE: container\n\nA plan.\n' > "$PLANC"
 # sibling-scan tests stay single-repo - repo_candidates_container reads that
 # same override, so it must be cleared here or the container scan would look
 # in the wrong place entirely and find nothing.
-out=$(PQ_REPOS_DIR= cmd_add "$PLANC" "" "" "" --repo "$CONTAINERROOT" --split <<<y 2>"$PQ_HOME/.err")
+out=$(PQ_REPOS_DIR="" cmd_add "$PLANC" "" "" "" --repo "$CONTAINERROOT" --split <<<y 2>"$PQ_HOME/.err")
 rc=$?
 [ "$rc" -eq 0 ] && ok || bad "container-mode split should succeed: $(cat "$PQ_HOME/.err")"
 t_a=$(find_task ctr-a-thing); t_b=$(find_task ctr-b-thing)
@@ -827,7 +833,7 @@ echo "== container mode: cwd itself (not --repo) being a non-repo container trig
 reset_tasks
 PLANCWD="$PQ_HOME/.container-cwd-plan.md"
 printf 'FIXTURE: container\n\nA plan.\n' > "$PLANCWD"
-out=$(cd "$CONTAINERROOT" && PQ_REPOS_DIR= cmd_add "$PLANCWD" "" "" "" --split <<<y 2>"$PQ_HOME/.err")
+out=$(cd "$CONTAINERROOT" && PQ_REPOS_DIR="" cmd_add "$PLANCWD" "" "" "" --split <<<y 2>"$PQ_HOME/.err")
 rc=$?
 [ "$rc" -eq 0 ] && ok || bad "running from cwd=container should discover its children: $(cat "$PQ_HOME/.err")"
 t_a=$(find_task ctr-a-thing)
@@ -884,7 +890,7 @@ mkdir -p "$EMPTYCONTAINER/not-a-repo"
 reset_tasks
 PLANEMPTY="$PQ_HOME/.container-empty-plan.md"
 printf 'FIXTURE: container\n\nA plan.\n' > "$PLANEMPTY"
-if ( PQ_REPOS_DIR= cmd_add "$PLANEMPTY" "" "" "" --repo "$EMPTYCONTAINER" --split <<<y ) >/dev/null 2>"$PQ_HOME/.err"; then
+if ( PQ_REPOS_DIR="" cmd_add "$PLANEMPTY" "" "" "" --repo "$EMPTYCONTAINER" --split <<<y ) >/dev/null 2>"$PQ_HOME/.err"; then
   bad "a container with no git-repo children should die"
 else
   ok
@@ -922,7 +928,7 @@ echo "== container mode: a raw-branch --after is refused even with NO explicit -
 reset_tasks
 PLANRAW="$PQ_HOME/.container-rawafter-plan.md"
 printf 'FIXTURE: container\n\nA plan.\n' > "$PLANRAW"
-if ( PQ_REPOS_DIR= cmd_add "$PLANRAW" "" "" "" --repo "$CONTAINERROOT" --split --after tom/some-raw-branch <<<y ) >/dev/null 2>&1; then
+if ( PQ_REPOS_DIR="" cmd_add "$PLANRAW" "" "" "" --repo "$CONTAINERROOT" --split --after tom/some-raw-branch <<<y ) >/dev/null 2>&1; then
   bad "a raw branch --after should be refused in container/no-primary mode"
 else
   ok

@@ -6,6 +6,10 @@
 # Same conventions as test/pq-reap.sh: plain bash, no framework, a temp
 # PQ_HOME exported before sourcing pq, claude/gh/herdr stubbed so nothing here
 # ever makes a real call, ok/bad/eq, trap cleanup EXIT.
+#
+# SC2034: the knobs and caches set here are read by the pq sourced below.
+# SC2015: `ok` never fails, so `[ ... ] && ok || bad` is an if/else.
+# shellcheck disable=SC2034,SC2015
 set -uo pipefail
 
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
@@ -85,30 +89,30 @@ mk_task() {                             # state prefix slug repo branch [KEY=VAL
 reset_tasks
 
 echo "== archivable: all six shapes ==" >&2
-d=$(mk_task done 20260101000001 shape-merged-reaped "$REPO" tom/shape-merged-reaped \
+d=$(mk_task "done" 20260101000001 shape-merged-reaped "$REPO" tom/shape-merged-reaped \
   PQ_MERGED=2026-01-01T00:00:00Z PQ_REAPED=2026-01-01T00:00:01Z)
 archivable "$d" && ok || bad "merged+reaped should be archivable"
 
-d=$(mk_task done 20260101000002 shape-closed-reaped "$REPO" tom/shape-closed-reaped \
+d=$(mk_task "done" 20260101000002 shape-closed-reaped "$REPO" tom/shape-closed-reaped \
   PQ_CLOSED=2026-01-01T00:00:00Z PQ_REAPED=2026-01-01T00:00:01Z)
 archivable "$d" && ok || bad "closed+reaped should be archivable"
 
 # A closed PR now earns a teardown, so the verdict alone is not terminal any more.
 # Archiving here would file the task into archive/ - which tick never walks - with its
 # worktree, database and port still held and nothing left to reclaim them.
-d=$(mk_task done 20260101000006 shape-closed-only "$REPO" tom/shape-closed-only \
+d=$(mk_task "done" 20260101000006 shape-closed-only "$REPO" tom/shape-closed-only \
   PQ_CLOSED=2026-01-01T00:00:00Z)
 archivable "$d" && bad "closed with no teardown yet must not be archivable" || ok
 
-d=$(mk_task done 20260101000003 shape-reaped-only "$REPO" tom/shape-reaped-only \
+d=$(mk_task "done" 20260101000003 shape-reaped-only "$REPO" tom/shape-reaped-only \
   PQ_REAPED=2026-01-01T00:00:00Z)
 archivable "$d" && bad "reaped with no merge verdict must not be archivable" || ok
 
-d=$(mk_task done 20260101000004 shape-merged-held "$REPO" tom/shape-merged-held \
+d=$(mk_task "done" 20260101000004 shape-merged-held "$REPO" tom/shape-merged-held \
   PQ_MERGED=2026-01-01T00:00:00Z PQ_REAP_HELD=agent)
 archivable "$d" && bad "merged but still held (no REAPED yet) must not be archivable" || ok
 
-d=$(mk_task done 20260101000005 shape-no-verdict "$REPO" tom/shape-no-verdict)
+d=$(mk_task "done" 20260101000005 shape-no-verdict "$REPO" tom/shape-no-verdict)
 archivable "$d" && bad "no verdict at all must not be archivable" || ok
 
 echo "== archive_pass: tail retention sorts by stamp_of, not glob order ==" >&2
@@ -120,10 +124,10 @@ PQ_DONE_KEEP=2
 # archive the two modern ones and keep the legacy pair behind - exactly
 # backwards. Mirrors the disagreement done/ header comment (:313-318) warns
 # about.
-old1=$(mk_task done 800 legacy-old "$REPO" tom/legacy-old PQ_CLOSED=2026-01-01T00:00:00Z PQ_REAPED=2026-01-01T00:00:01Z)
-old2=$(mk_task done 900 legacy-mid "$REPO" tom/legacy-mid PQ_CLOSED=2026-01-01T00:00:00Z PQ_REAPED=2026-01-01T00:00:01Z)
-new1=$(mk_task done 20260101000001 modern-1 "$REPO" tom/modern-1 PQ_CLOSED=2026-01-01T00:00:00Z PQ_REAPED=2026-01-01T00:00:01Z)
-new2=$(mk_task done 20260101000002 modern-2 "$REPO" tom/modern-2 PQ_CLOSED=2026-01-01T00:00:00Z PQ_REAPED=2026-01-01T00:00:01Z)
+old1=$(mk_task "done" 800 legacy-old "$REPO" tom/legacy-old PQ_CLOSED=2026-01-01T00:00:00Z PQ_REAPED=2026-01-01T00:00:01Z)
+old2=$(mk_task "done" 900 legacy-mid "$REPO" tom/legacy-mid PQ_CLOSED=2026-01-01T00:00:00Z PQ_REAPED=2026-01-01T00:00:01Z)
+new1=$(mk_task "done" 20260101000001 modern-1 "$REPO" tom/modern-1 PQ_CLOSED=2026-01-01T00:00:00Z PQ_REAPED=2026-01-01T00:00:01Z)
+new2=$(mk_task "done" 20260101000002 modern-2 "$REPO" tom/modern-2 PQ_CLOSED=2026-01-01T00:00:00Z PQ_REAPED=2026-01-01T00:00:01Z)
 n_arch=$(archive_pass 0 2>/dev/null)
 eq "$n_arch" "2" "with 4 archivable and a tail of 2, exactly 2 should be archived"
 [ ! -d "$old1" ] && [ ! -d "$old2" ] && ok || bad "the two numerically-oldest (legacy-old, legacy-mid) should have left done/"
@@ -134,16 +138,16 @@ eq "$n_arch" "2" "with 4 archivable and a tail of 2, exactly 2 should be archive
 echo "== archive_pass: PQ_DONE_KEEP=0 is legal and means no tail ==" >&2
 reset_tasks
 PQ_DONE_KEEP=0
-mk_task done 20260101000001 keep-none-a "$REPO" tom/keep-none-a PQ_CLOSED=2026-01-01T00:00:00Z PQ_REAPED=2026-01-01T00:00:01Z >/dev/null
+mk_task "done" 20260101000001 keep-none-a "$REPO" tom/keep-none-a PQ_CLOSED=2026-01-01T00:00:00Z PQ_REAPED=2026-01-01T00:00:01Z >/dev/null
 n_arch=$(archive_pass 0 2>/dev/null)
 eq "$n_arch" "1" "PQ_DONE_KEEP=0 should archive every archivable task, none held back"
 
 echo "== archive_pass: --dry-run moves nothing ==" >&2
 reset_tasks
 PQ_DONE_KEEP=1
-da=$(mk_task done 20260101000001 dry-a "$REPO" tom/dry-a \
+da=$(mk_task "done" 20260101000001 dry-a "$REPO" tom/dry-a \
   PQ_MERGED=2026-01-01T00:00:00Z PQ_REAPED=2026-01-01T00:00:01Z)
-db=$(mk_task done 20260101000002 dry-b "$REPO" tom/dry-b PQ_CLOSED=2026-01-01T00:00:00Z PQ_REAPED=2026-01-01T00:00:01Z)
+db=$(mk_task "done" 20260101000002 dry-b "$REPO" tom/dry-b PQ_CLOSED=2026-01-01T00:00:00Z PQ_REAPED=2026-01-01T00:00:01Z)
 msgs=$(archive_pass 1 2>&1 1>/dev/null)
 n_arch=$(archive_pass 1 2>/dev/null)
 eq "$n_arch" "1" "one of the two archivable tasks exceeds the tail of 1"
@@ -154,7 +158,7 @@ case "$msgs" in *"would archive dry-a"*) ok ;; *) bad "should name the older tas
 echo "== archive_pass: a destination collision warns and skips, never dies ==" >&2
 reset_tasks
 PQ_DONE_KEEP=0
-dcol=$(mk_task done 20260101000001 collide "$REPO" tom/collide PQ_CLOSED=2026-01-01T00:00:00Z PQ_REAPED=2026-01-01T00:00:01Z)
+dcol=$(mk_task "done" 20260101000001 collide "$REPO" tom/collide PQ_CLOSED=2026-01-01T00:00:00Z PQ_REAPED=2026-01-01T00:00:01Z)
 mkdir -p "$PQ_HOME/archive/$(basename "$dcol")"     # hand-corrupted: already occupied
 out=$(archive_pass 0 2>&1 1>/dev/null)
 n_arch=$(archive_pass 0 2>/dev/null)
@@ -165,7 +169,7 @@ case "$out" in *"could not archive"*) ok ;; *) bad "should warn about the collis
 echo "== tick_body wiring: the archived count folds into the summary ==" >&2
 reset_tasks
 PQ_DONE_KEEP=0
-dt=$(mk_task done 20260101000001 tickarch-a "$REPO" tom/tickarch-a PQ_CLOSED=2026-01-01T00:00:00Z PQ_REAPED=2026-01-01T00:00:01Z)
+dt=$(mk_task "done" 20260101000001 tickarch-a "$REPO" tom/tickarch-a PQ_CLOSED=2026-01-01T00:00:00Z PQ_REAPED=2026-01-01T00:00:01Z)
 PQ_SUMMARY=""
 tick_body 0 0 >/dev/null 2>&1
 case "$PQ_SUMMARY" in *", 1 archived"*) ok ;; *) bad "summary should report 1 archived (got '$PQ_SUMMARY')" ;; esac
@@ -174,7 +178,7 @@ case "$PQ_SUMMARY" in *", 1 archived"*) ok ;; *) bad "summary should report 1 ar
 
 reset_tasks
 PQ_DONE_KEEP=0
-mk_task done 20260101000001 tickarch-dry "$REPO" tom/tickarch-dry PQ_CLOSED=2026-01-01T00:00:00Z PQ_REAPED=2026-01-01T00:00:01Z >/dev/null
+mk_task "done" 20260101000001 tickarch-dry "$REPO" tom/tickarch-dry PQ_CLOSED=2026-01-01T00:00:00Z PQ_REAPED=2026-01-01T00:00:01Z >/dev/null
 PQ_SUMMARY=""
 tick_body 0 1 >/dev/null 2>&1   # dry=1
 case "$PQ_SUMMARY" in *", 1 would archive"*) ok ;; *) bad "dry-run summary should report a would-archive (got '$PQ_SUMMARY')" ;; esac

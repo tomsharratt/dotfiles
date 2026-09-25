@@ -18,6 +18,9 @@
 # needs no herdr socket, which is exactly what this path does need - so it gets
 # the socket-and-HOME recipe from test/wt-new-url.sh instead, rather than putting
 # machinery behind ten assertions that do not want it.
+#
+# SC2015: `ok` never fails, so `[ ... ] && ok || bad` is an if/else.
+# shellcheck disable=SC2015
 set -uo pipefail
 
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
@@ -136,6 +139,7 @@ write_state() {                          # [port] [workspace]
 write_profile() {                        # with_dev(1|0)
   { printf 'WT_RESOURCES="port"\n'
     [ "$1" = 1 ] && printf 'wt_dev() { :; }\n'
+    # shellcheck disable=SC2016  # expanded by the profile when wt runs it, not here
     printf 'wt_open_url() { printf "%%s" "https://$WT_DOMAIN"; }\n'
   } > "$PROFILE_DIR/$REPO_NAME.sh"
 }

@@ -241,7 +241,7 @@ set_panes() {                           # "pane<TAB>agent<TAB>status" lines
 sec_calls()  { grep -c $'\t/security-review\t$' "$CLAUDE_LOG" 2>/dev/null || true; }
 code_calls() { grep -c $'\t/code-review ' "$CLAUDE_LOG" 2>/dev/null || true; }
 wait_for() {                            # command... -> polls up to 5s
-  local i; for i in $(seq 1 50); do "$@" && return 0; sleep 0.1; done
+  local _; for _ in $(seq 1 50); do "$@" && return 0; sleep 0.1; done
   return 1
 }
 calls_at_least() { [ "$("$1")" -ge "$2" ]; }

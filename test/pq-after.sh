@@ -10,6 +10,9 @@
 # Sources pq rather than exec-ing it, so the pure predicate functions
 # (pr_merged_into, pr_answered, blocker_state) are callable directly against a
 # hand-primed cache, with no live PR and no `gh` call in the loop.
+#
+# SC2015: `ok` never fails, so `[ ... ] && ok || bad` is an if/else.
+# shellcheck disable=SC2015
 set -uo pipefail
 
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
@@ -104,7 +107,8 @@ mk_task() {                              # state prio slug repo branch -> task_d
   # $((10#$prio)) rather than a bare $prio: inside $(( )) a leading-zero
   # literal like 020 is octal, exactly the bug this fixture must not
   # reintroduce.
-  local dir="$PQ_HOME/$st/$(printf '%014d' $(( 20260101000000 + 10#$prio )))-$slug"
+  local dir
+  dir="$PQ_HOME/$st/$(printf '%014d' $(( 20260101000000 + 10#$prio )))-$slug"
   mkdir -p "$dir"
   {
     printf -- '---\n'
@@ -176,13 +180,13 @@ eq "$(blocker_state "$REPO" tom/open-running master)" "waiting" "OPEN, owner run
 # OPEN, owner in done -> waiting (this is the chain WORKING, not stalled)
 reset_caches
 cache_row "$REPO" tom/open-done 9 OPEN "" master
-mk_task done 10 owner-open-done "$REPO" tom/open-done >/dev/null
+mk_task "done" 10 owner-open-done "$REPO" tom/open-done >/dev/null
 eq "$(blocker_state "$REPO" tom/open-done master)" "waiting" "OPEN, owner done"
 
 # DRAFT, owner in done -> stalled (a stuck agent, not a healthy wait)
 reset_caches
 cache_row "$REPO" tom/draft-done 10 OPEN draft master
-mk_task done 10 owner-draft-done "$REPO" tom/draft-done >/dev/null
+mk_task "done" 10 owner-draft-done "$REPO" tom/draft-done >/dev/null
 eq "$(blocker_state "$REPO" tom/draft-done master)" "stalled" "DRAFT, owner done"
 
 echo "== after_state / after_check aggregation ==" >&2
@@ -210,7 +214,7 @@ after_check "$t" >/dev/null
 # the gh-down case above, not just read as "waiting".
 reset_tasks; reset_caches
 cache_row "$REPO" tom/open-done-quiet 11 OPEN "" master
-t=$(mk_task done 10 owner-open-done-quiet "$REPO" tom/open-done-quiet)
+t=$(mk_task "done" 10 owner-open-done-quiet "$REPO" tom/open-done-quiet)
 u=$(mk_task queue 20 open-done-dependent "$REPO" tom/open-done-dependent)
 after_add "$u" "$(slug_of "$t")" "$REPO" tom/open-done-quiet
 after_check "$u" >/dev/null
@@ -222,7 +226,7 @@ echo "== after_check: warn once, then re-arm on recovery ==" >&2
 # (the draft goes away) clears it, per the plan's named re-arm requirement.
 reset_tasks; reset_caches
 cache_row "$REPO" tom/stall-branch 12 OPEN draft master
-owner=$(mk_task done 10 stall-owner "$REPO" tom/stall-branch)
+owner=$(mk_task "done" 10 stall-owner "$REPO" tom/stall-branch)
 dep=$(mk_task queue 20 stall-dependent "$REPO" tom/stall-dependent)
 after_add "$dep" "$(slug_of "$owner")" "$REPO" tom/stall-branch
 
@@ -311,7 +315,7 @@ else
   ok
 fi
 # A non-cyclic blocker on the same task must still be accepted.
-Z=$(mk_task queue 30 cyc-z "$REPO" tom/cyc-z)
+mk_task queue 30 cyc-z "$REPO" tom/cyc-z >/dev/null
 if ( main after "$(slug_of "$X")" tom/cyc-z ) >/dev/null 2>&1; then
   ok
 else

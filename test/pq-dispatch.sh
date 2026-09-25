@@ -7,6 +7,10 @@
 # recording `herdr` stub, plus `agent start` / `agent prompt` arms that answer
 # the way herdr really does: JSON on stdout and exit 0 either way, an error
 # being an {"error":{"code":...}} body.
+#
+# SC2034: the knobs and caches set here are read by the pq sourced below.
+# SC2015: `ok` never fails, so `[ ... ] && ok || bad` is an if/else.
+# shellcheck disable=SC2034,SC2015
 set -uo pipefail
 
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
@@ -67,6 +71,8 @@ pass=0 fail=0
 ok()  { pass=$((pass + 1)); }
 bad() { fail=$((fail + 1)); printf 'FAIL: %s\n' "$1" >&2; }
 eq() { [ "$1" = "$2" ] && ok || bad "$3 (got '$1', want '$2')"; }
+# The first path a glob matched, or nothing: `ls -d glob | head -1` without parsing ls.
+first_of() { [ ! -e "${1:-}" ] || printf '%s' "$1"; }
 has() { case "$1" in *"$2"*) ok ;; *) bad "$3 (got '$1')" ;; esac; }
 hasnt() { case "$1" in *"$2"*) bad "$3 (got '$1')" ;; *) ok ;; esac; }
 
@@ -94,7 +100,8 @@ reset_logs() { : > "$HERDR_LOG"; : > "$WT_LOG"; rm -f "$STUBBIN/.start-fail" "$S
 
 mk_task() {                             # state prio slug branch [base] [design] -> task_dir
   local state=$1 prio=$2 slug=$3 branch=$4 base=${5:-} design=${6:-}
-  local dir="$PQ_HOME/$state/$(printf '%014d' $(( 20260101000000 + 10#$prio )))-$slug"
+  local dir
+  dir="$PQ_HOME/$state/$(printf '%014d' $(( 20260101000000 + 10#$prio )))-$slug"
   mkdir -p "$dir"
   {
     printf -- '---\n'
@@ -348,7 +355,7 @@ reset_tasks; reset_logs; set_panes ""
 mk_task queue 010 viatick tom/viatick >/dev/null
 PQ_SUMMARY=""
 tick_body 1 0 >/dev/null 2>&1
-T=$(ls -d "$PQ_HOME/running"/*-viatick 2>/dev/null | head -1)
+T=$(first_of "$PQ_HOME/running"/*-viatick)
 [ -n "$T" ] && ok || bad "the task should have been claimed into running/"
 [ -n "$(st "$T" PQ_LAUNCHED)" ] && ok || bad "and launched"
 [ -f "$T/contract.md" ] && ok || bad "with a contract"

@@ -1,3 +1,4 @@
+# shellcheck shell=bash  # sourced by wt, never run
 # wt profile for supercast-android - a thin Hotwire native shell over the Rails
 # app, built with Gradle and run on the Android Emulator. Sourced by ~/.local/bin/wt.
 #
@@ -32,6 +33,7 @@
 # every boot here passes -writable-system: without it the system partition
 # reverts to the pristine image and both patches disappear.
 
+# shellcheck disable=SC2034  # read by the wt sourcing this
 WT_RESOURCES=""            # the emulator is shared; nothing to allocate
 
 : "${WT_ANDROID_AVD:=Pixel_6}"            # override to target a specific AVD
@@ -80,6 +82,7 @@ _wt_android_check() {
   local ca=$HOME/Library/'Application Support'/io.puma.dev/cert.pem hash
   if [ -f "$ca" ]; then
     hash=$(openssl x509 -inform PEM -subject_hash_old -in "$ca" 2>/dev/null | head -1)
+    # shellcheck disable=SC2016  # the fix is printed for you to paste, so its $ stay literal
     if [ -n "$hash" ] && ! adb shell "[ -f /system/etc/security/cacerts/$hash.0 ]" >/dev/null 2>&1; then
       warn "the puma-dev CA is not in the emulator's system trust store - fix with:"
       warn "  CERT=\"$ca\"; HASH=\$(openssl x509 -inform PEM -subject_hash_old -in \"\$CERT\" | head -1)"

@@ -23,6 +23,9 @@
 # nothing else here that matters: SELF (the command string sent to the dev tab,
 # which the stub swallows), the XDG defaults (both set explicitly below), and
 # rm_leftover's safety guard.
+#
+# SC2015: `ok` never fails, so `[ ... ] && ok || bad` is an if/else.
+# shellcheck disable=SC2015
 set -uo pipefail
 
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)

@@ -2,6 +2,10 @@
 # test/pq-reap.sh - tearing a task down once its PR has merged, exercised
 # directly against reap_ok / reap_watching / reap_task / pr_targets, the same
 # way test/pq-after.sh exercises the blocker predicate.
+#
+# SC2034: the knobs, caches and herdr variables set here are read by the pq sourced below.
+# SC2015: `ok` never fails, so `[ ... ] && ok || bad` is an if/else.
+# shellcheck disable=SC2034,SC2015
 set -uo pipefail
 
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
@@ -104,7 +108,8 @@ mk_done() {                             # prio slug repo branch worktree_path ->
   # $((10#$prio)) rather than a bare $prio: inside $(( )) a leading-zero
   # literal like 020 is octal, exactly the bug this fixture must not
   # reintroduce.
-  local dir="$PQ_HOME/done/$(printf '%014d' $(( 20260101000000 + 10#$prio )))-$slug"
+  local dir
+  dir="$PQ_HOME/done/$(printf '%014d' $(( 20260101000000 + 10#$prio )))-$slug"
   mkdir -p "$dir"
   {
     printf -- '---\n'
@@ -144,7 +149,7 @@ PYEOF
     && ok || bad "reap_ok should pass with PIDX_OK, HERDR_ENV, and a live socket all set"
   PIDX_OK=0 HERDR_ENV=1 HERDR_SOCKET_PATH="$SOCKPATH" reap_ok \
     && bad "reap_ok should fail when herdr never answered the snapshot (PIDX_OK=0)" || ok
-  PIDX_OK=1 HERDR_ENV= HERDR_SOCKET_PATH="$SOCKPATH" reap_ok \
+  PIDX_OK=1 HERDR_ENV="" HERDR_SOCKET_PATH="$SOCKPATH" reap_ok \
     && bad "reap_ok should fail without HERDR_ENV - a plain terminal, not a Herdr pane" || ok
   PIDX_OK=1 HERDR_ENV=1 HERDR_SOCKET_PATH="$SOCKDIR/no-such-socket" reap_ok \
     && bad "reap_ok should fail when the socket path names nothing live" || ok
@@ -277,7 +282,7 @@ second=$(reap_task "$d7" 0 2>&1 1>/dev/null); rc2=$?
 [ "$rc2" -ne 0 ] && ok || bad "a settled task must not report a second teardown"
 [ ! -s "$WT_LOG" ] && ok || bad "and must not invoke wt again"
 [ -z "$second" ] && ok || bad "a second pass on an already-settled task must stay silent (got '$second')"
-eq "$(agent_cell "$d7" done)" "-" \
+eq "$(agent_cell "$d7" "done")" "-" \
   "a closed-and-torn-down task wants nothing from you, so it reads as settled"
 archivable "$d7" && ok || bad "closed + reaped should be archivable"
 rm -rf "$wt7"
@@ -478,7 +483,7 @@ eq "$(st "$d16d" PQ_REAP_HELD)" "dirty" "the refusal is a hold: PQ_REAP_HELD sho
 [ -z "$(st "$d16d" PQ_REAPED)" ] && ok || bad "PQ_REAPED must not be stamped while the work is held"
 case "$first" in *"holding"*"4 uncommitted files"*) ok ;; *) bad "the first pass should say why it holds (got '$first')" ;; esac
 case "$first" in *"wt rm failed"*) bad "a refusal is not a failure (got '$first')" ;; *) ok ;; esac
-eq "$(agent_cell "$d16d" done)" "held dirty" "pq ls should show the hold, which wants you"
+eq "$(agent_cell "$d16d" "done")" "held dirty" "pq ls should show the hold, which wants you"
 archivable "$d16d" && bad "a held task must not be archivable" || ok
 second=$(WT_STUB_RC=3 WT_STUB_ERR="$refusal" reap_task "$d16d" 0 2>&1 1>/dev/null)
 [ -z "$second" ] && ok || bad "a second refusal must stay silent, wt's own line included (got '$second')"
@@ -526,6 +531,7 @@ cache_row "$REPO" tom/tickA 20 MERGED "" master
 PIDX_OK=1; PIDX=$'pane-A\tclaude\tidle'
 HERDR_ENV=1
 HERDR_SOCKET_PATH="$SOCKDIR/wired-fake"   # reap_ok itself is redefined below - contents unchecked
+# shellcheck disable=SC2329  # called by the tick_body below
 reap_ok() { return 0; }                  # exercise tick_body's wiring, not the environment gate again
 PQ_SUMMARY=""
 tick_body 0 0 >/dev/null 2>&1
@@ -536,8 +542,9 @@ rm -rf "$wtA"
 reset_tasks
 reset_caches; reset_wt_log
 wtB=$(mktemp -d)
-dB=$(mk_done 10 tickB "$REPO" tom/tickB "$wtB")
+mk_done 10 tickB "$REPO" tom/tickB "$wtB" >/dev/null
 cache_row "$REPO" tom/tickB 21 MERGED "" master
+# shellcheck disable=SC2329  # called by the tick_body below
 reap_ok() { return 1; }                  # gate closed, but done/ still has something merged and unreaped
 PQ_SUMMARY=""
 tick_body 0 0 >/dev/null 2>&1

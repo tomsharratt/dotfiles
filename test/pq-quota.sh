@@ -25,6 +25,10 @@
 # The case that decides whether the cure is real is the one where a rate-limit
 # statusline turns over at the reset while the agent stays idle: the tail moves, the
 # banner goes, nothing has resumed, and pq must knock rather than forget.
+#
+# SC2034: the knobs and caches set here are read by the pq sourced below.
+# SC2015: `ok` never fails, so `[ ... ] && ok || bad` is an if/else.
+# shellcheck disable=SC2034,SC2015
 set -uo pipefail
 
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
@@ -121,7 +125,8 @@ cache_row() { printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$@" >> "$PR_CACHE"; }
 
 mk_task() {                             # state prio slug branch pane -> task_dir
   local state=$1 prio=$2 slug=$3 branch=$4 pane=$5
-  local dir="$PQ_HOME/$state/$(printf '%014d' $(( 20260101000000 + 10#$prio )))-$slug"
+  local dir
+  dir="$PQ_HOME/$state/$(printf '%014d' $(( 20260101000000 + 10#$prio )))-$slug"
   mkdir -p "$dir"
   {
     printf -- '---\n'
@@ -731,11 +736,11 @@ DN=$(mk_task 'done' 040 dwall tom/dwall w5:p1)
 st_set "$DN" PQ_LAUNCHED "$(now)"; st_set "$DN" PQ_PR 700; st_set "$DN" PQ_FINISHED "$(now)"
 st_set "$DN" PQ_BLOCKED quota; st_set "$DN" PQ_QUOTA_SINCE "$(ago 60)"; st_set "$DN" PQ_RESETS_AT "$DUE"
 set_panes "$(printf 'w5:p1\tclaude\tidle')"
-eq "$(agent_cell "$DN" done)" "quota $(clock_of "$DUE")" "the done row names the wall and when it lifts"
+eq "$(agent_cell "$DN" "done")" "quota $(clock_of "$DUE")" "the done row names the wall and when it lifts"
 st_set "$DN" PQ_BLOCKED permission
-eq "$(agent_cell "$DN" done)" permission "and a permission prompt there still reads as one"
+eq "$(agent_cell "$DN" "done")" permission "and a permission prompt there still reads as one"
 st_set "$DN" PQ_BLOCKED ""
-eq "$(agent_cell "$DN" done)" "wrapping up" "with nothing blocking it, it is just wrapping up"
+eq "$(agent_cell "$DN" "done")" "wrapping up" "with nothing blocking it, it is just wrapping up"
 
 echo "== a walled agent still counts against the cap while it waits ==" >&2
 # The freeze is not the only thing keeping the arithmetic honest: it lifts on the

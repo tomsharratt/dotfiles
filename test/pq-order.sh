@@ -6,6 +6,9 @@
 # pq's own top-level `mkdir -p` for each state runs against the temp dir, not
 # the real queue), plus claude/gh/herdr stubbed so nothing here ever makes a
 # real call.
+#
+# SC2015: `ok` never fails, so `[ ... ] && ok || bad` is an if/else.
+# shellcheck disable=SC2015
 set -uo pipefail
 
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)

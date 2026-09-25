@@ -7,6 +7,9 @@
 # wt_open leak from one repo's profile into the next repo sourced in the same
 # process. `wt open` needs no herdr socket, which is what makes it testable as
 # a subprocess - same reasoning as test/pq-reap.sh for `wt`.
+#
+# SC2015: `ok` never fails, so `[ ... ] && ok || bad` is an if/else.
+# shellcheck disable=SC2015
 set -uo pipefail
 
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)

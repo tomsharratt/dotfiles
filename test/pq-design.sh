@@ -9,6 +9,11 @@
 # PQ_PLANS_DIR exported before sourcing pq, a PATH-stubbed `claude` that
 # dispatches on --model and on a marker line in the plan it is handed, and a
 # throwaway git repo with refs/remotes/origin/HEAD faked by hand.
+#
+# SC2034: the knobs set here, and the locals its wizard and prompt cases hand in
+# through bash's dynamic scope, are read by the pq sourced below.
+# SC2015: `ok` never fails, so `[ ... ] && ok || bad` is an if/else.
+# shellcheck disable=SC2034,SC2015
 set -uo pipefail
 
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
@@ -96,6 +101,8 @@ pass=0 fail=0
 ok()  { pass=$((pass + 1)); }
 bad() { fail=$((fail + 1)); printf 'FAIL: %s\n' "$1" >&2; }
 eq() { [ "$1" = "$2" ] && ok || bad "$3 (got '$1', want '$2')"; }
+# The first path a glob matched, or nothing: `ls -d glob | head -1` without parsing ls.
+first_of() { [ ! -e "${1:-}" ] || printf '%s' "$1"; }
 has() { case "$1" in *"$2"*) ok ;; *) bad "$3 (got '$1')" ;; esac; }
 hasnt() { case "$1" in *"$2"*) bad "$3 (got '$1')" ;; *) ok ;; esac; }
 
@@ -124,7 +131,7 @@ reset_tasks() {
   mkdir -p "$PQ_HOME/queue" "$PQ_HOME/running" "$PQ_HOME/done"
 }
 reset_tasks
-queue_count() { ls -d "$PQ_HOME/queue"/*/ 2>/dev/null | wc -l | tr -d ' '; }
+queue_count() { dir_count "$PQ_HOME/queue"; }
 mkplan() {                              # file marker [extra lines...]
   local f=$1 m=$2; shift 2
   { printf '# A plan\n\nMARKER: %s\n\n' "$m"; for l in "$@"; do printf '%s\n' "$l"; done; } > "$f"
@@ -196,6 +203,7 @@ eq "$(hdr "$t/plan.md" design)" "" "and nothing is attached"
 
 echo "== design_mentions, directly: the shapes it reads ==" >&2
 M="$PQ_HOME/.m.md"
+# shellcheck disable=SC2016  # the backticks are markdown, not a substitution
 printf 'See `%s` for the board.\n' "$DES/shot.png" > "$M"
 eq "$(design_mentions "$M")" "$DES/shot.png" "a backticked path is read up to the closing backtick"
 printf 'Two: %s and %s.\n' "$DES/shot.png" "$DES/shot.png" > "$M"
@@ -367,7 +375,7 @@ eq "$(hdr "$ta/plan.md" design)" "Onboarding Refresh.dc.html" "the part that nam
 eq "$(hdr "$tb/plan.md" design)" "" "the part that does not name it does not"
 hasnt "$(cat "$PQ_HOME/.err")" "attaching it to every part" "no attach-to-all warning when a part cites it"
 # The splitter was told to cite.
-SD=$(ls -d "$PQ_HOME/splits"/*/ | head -1); SD=${SD%/}
+SD=$(first_of "$PQ_HOME/splits"/*/); SD=${SD%/}
 [ -d "$SD" ] && ok || bad "a split directory should exist"
 
 echo "== split: a design no part names goes to every part, with a warning ==" >&2

@@ -20,6 +20,9 @@
 # `reap_one` is exercised directly rather than through the `wt rm` subcommand:
 # cmd_rm calls need_herdr, and the interesting half is all below it. cmd_rm's own
 # branch->path resolution gets its own case at the bottom, through state_get.
+#
+# SC2015: `ok` never fails, so `[ ... ] && ok || bad` is an if/else.
+# shellcheck disable=SC2015
 set -uo pipefail
 
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
@@ -59,6 +62,7 @@ WORKTREE_ROOT=$(mktemp -d)
 # path (HERDR="$HOME/.local/bin/herdr"), so a PATH stub is never consulted. Getting
 # this wrong makes the workspace assertions below silently vacuous - which is the
 # whole point of the test, since closing the wrong workspace is what kills an agent.
+# shellcheck disable=SC2034  # read by the wt sourced above
 HERDR="$STUBBIN/herdr"
 # in_herdr() gates every herdr call on both of these.
 HERDR_ENV=1
@@ -416,6 +420,7 @@ eq "$rc" 3 "a commit past the pull request's head was never pushed"
 
 echo "== at a terminal, wt rm asks instead - and N keeps everything ==" >&2
 # at_terminal stands in for a tty, in the subshell only.
+# shellcheck disable=SC2329  # called by the cmd_rm beside it
 out=$( ( at_terminal() { return 0; }; cd "$REPO" && cmd_rm tom/dirty ) <<<$'n\n' 2>&1 >/dev/null); rc=$?
 eq "$rc" 0 "declining is a clean cancel"
 case "$out" in *"1 uncommitted file"*"edited.txt"*) ok ;; *) bad "the question must name what would be lost (got '$out')" ;; esac
@@ -423,6 +428,7 @@ case "$out" in *"discard"*) ok ;; *) bad "and ask about discarding it in so many
 [ -f "$WTROOT/dirty/edited.txt" ] && ok || bad "declining must keep the work"
 
 echo "== ...and y discards it, on your say-so ==" >&2
+# shellcheck disable=SC2329  # called by the cmd_rm beside it
 ( at_terminal() { return 0; }; cd "$REPO" && cmd_rm tom/dirty ) <<<$'y\ny\n' >/dev/null 2>&1; rc=$?
 eq "$rc" 0 "an explicit yes removes it"
 [ ! -d "$WTROOT/dirty" ] && ok || bad "the worktree goes once you have said so"

@@ -13,6 +13,9 @@
 # is evaluated at source time. Exporting it after sourcing would leave
 # PLANS_DIR baked to the real ~/.claude/plans, and every test below would
 # read (and the wiring cases would queue) whatever is actually there.
+#
+# SC2015: `ok` never fails, so `[ ... ] && ok || bad` is an if/else.
+# shellcheck disable=SC2015
 set -uo pipefail
 
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
@@ -91,7 +94,8 @@ mk_task() {                             # state prio slug repo branch -> task_di
   # $((10#$prio)) rather than a bare $prio: inside $(( )) a leading-zero
   # literal like 020 is octal, exactly the bug this fixture must not
   # reintroduce - and this file's own call sites pass 010/020/030/040/005.
-  local dir="$PQ_HOME/$state/$(printf '%014d' $(( 20260101000000 + 10#$prio )))-$slug"
+  local dir
+  dir="$PQ_HOME/$state/$(printf '%014d' $(( 20260101000000 + 10#$prio )))-$slug"
   mkdir -p "$dir"
   {
     printf -- '---\n'
@@ -316,7 +320,7 @@ out=$(run_pick_after "$REPO" <<<$'foo\n2\n' 2>/dev/null)
 eq "$out" "task-b" "a non-numeric line is rejected outright; the retry (2) picks task-b"
 
 echo "== pick_after: a done task is never offered ==" >&2
-mk_task done 040 task-d "$REPO" tom/task-d >/dev/null
+mk_task "done" 040 task-d "$REPO" tom/task-d >/dev/null
 err=$(run_pick_after "$REPO" <<<$'\n' 2>&1 >/dev/null)
 case "$err" in *"3 tasks"*) ok ;; *) bad "a done task must not count as a candidate (got: $err)" ;; esac
 case "$err" in *"task-d"*) bad "a done task must never be listed" ;; *) ok ;; esac
@@ -414,6 +418,7 @@ out=$(PQ_DEFAULT_MODEL=opus run_wizard 1 1 0 <<<$'\n' 2>/dev/null)
 eq "$out" "split=1 model=opus after_vals=[]" "an overridden default should be what Enter takes"
 
 echo "== add_wizard: --model given explicitly skips the question ==" >&2
+# shellcheck disable=SC2034  # add_wizard reads these locals through bash's dynamic scope
 skip_wizard() {                         # model -> the model add_wizard leaves behind
   local split=1 split_dir="" after_vals="" after_explicit=1 repo=$REPO
   local model=$1 model_explicit=1

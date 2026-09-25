@@ -189,7 +189,7 @@ set_pane() {                            # pane status -> herdr reads it as a cla
   PIDX=$(printf '%s\tclaude\t%s' "$1" "$2"); PIDX_OK=1
 }
 set_idle() { set_pane "$1" idle; }
-wait_for() { local i; for i in $(seq 1 50); do "$@" && return 0; sleep 0.1; done; return 1; }
+wait_for() { local _; for _ in $(seq 1 50); do "$@" && return 0; sleep 0.1; done; return 1; }
 last_call() { grep "$1" "$CLAUDE_LOG" | tail -1; }
 prompts()   { grep -c "^agent	prompt	" "$HERDR_LOG" 2>/dev/null || true; }
 prompt_text() { grep "^agent	prompt	" "$HERDR_LOG" | tail -1 | cut -f4; }

@@ -10,6 +10,9 @@
 # The rows that matter here are the ones that used to fail SILENTLY: a task
 # whose PR merged into an integration branch read as "still in review" forever,
 # its worktree was never torn down, and `pq ls` printed "merged" the whole time.
+#
+# SC2015: `ok` never fails, so `[ ... ] && ok || bad` is an if/else.
+# shellcheck disable=SC2015
 set -uo pipefail
 
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
@@ -50,6 +53,8 @@ pass=0 fail=0
 ok()  { pass=$((pass + 1)); }
 bad() { fail=$((fail + 1)); printf 'FAIL: %s\n' "$1" >&2; }
 eq() { [ "$1" = "$2" ] && ok || bad "$3 (got '$1', want '$2')"; }
+# The first path a glob matched, or nothing: `ls -d glob | head -1` without parsing ls.
+first_of() { [ ! -e "${1:-}" ] || printf '%s' "$1"; }
 
 cleanup() { rm -rf "$PQ_HOME" "$STUBBIN" "${REPO:-}" "${REPO2:-}"; }
 trap cleanup EXIT
@@ -75,7 +80,7 @@ git -C "$REPO" update-ref refs/remotes/origin/master refs/heads/master
 git -C "$REPO" symbolic-ref refs/remotes/origin/HEAD refs/remotes/origin/master
 git -C "$REPO" branch live-events master
 git -C "$REPO" -c user.email=test@test -c user.name=test \
-  commit-tree -p "$OID_B" -m C "$(git -C "$REPO" rev-parse HEAD^{tree})" > "$PQ_HOME/.oidc"
+  commit-tree -p "$OID_B" -m C "$(git -C "$REPO" rev-parse "HEAD^{tree}")" > "$PQ_HOME/.oidc"
 OID_C=$(cat "$PQ_HOME/.oidc")
 git -C "$REPO" update-ref refs/heads/live-events "$OID_C"
 git -C "$REPO" update-ref refs/remotes/origin/live-events "$OID_C"
@@ -107,7 +112,8 @@ reset_tasks
 # byte-for-byte what it would have been before this header existed.
 mk_task() {                             # state prio slug repo branch base -> task_dir
   local st=$1 prio=$2 slug=$3 repo=$4 branch=$5 base=${6:-}
-  local dir="$PQ_HOME/$st/$(printf '%014d' $(( 20260101000000 + 10#$prio )))-$slug"
+  local dir
+  dir="$PQ_HOME/$st/$(printf '%014d' $(( 20260101000000 + 10#$prio )))-$slug"
   mkdir -p "$dir"
   {
     printf -- '---\n'
@@ -198,7 +204,7 @@ echo "== blocker_state / after_state judge against the DEPENDENT's base ==" >&2
 reset_tasks; reset_caches
 # The blocker landed on live-events. Its owning task is done.
 cache_row "$REPO" tom/blocker 8 MERGED "" live-events "$OID_C"
-mk_task done 20 blocker-owner "$REPO" tom/blocker live-events >/dev/null
+mk_task "done" 20 blocker-owner "$REPO" tom/blocker live-events >/dev/null
 
 # A dependent based on live-events: met.
 dep=$(mk_task queue 21 dep-on-feature "$REPO" tom/dep1 live-events)
@@ -226,7 +232,7 @@ echo "== a cross-repo blocker keeps its OWN repo's default branch ==" >&2
 # trunk - never the dependent's integration branch, which does not exist there.
 reset_tasks; reset_caches
 cache_row "$REPO2" ios/thing 9 MERGED "" trunk ""
-mk_task done 30 ios-owner "$REPO2" ios/thing >/dev/null
+mk_task "done" 30 ios-owner "$REPO2" ios/thing >/dev/null
 dep3=$(mk_task queue 31 dep-cross-repo "$REPO" tom/dep3 live-events)
 printf 'ios-owner\t%s\tios/thing\n' "$REPO2" > "$dep3/after"
 eq "$(blocker_base "$dep3" "$REPO2")" "trunk" "cross-repo blocker judged against its own default"
@@ -241,7 +247,7 @@ import socket,sys
 s=socket.socket(socket.AF_UNIX); s.bind('$SOCK')
 " 2>/dev/null || SOCK=""
 mk_reaped() {                           # prio slug branch base -> dir (with a live worktree)
-  local dir; dir=$(mk_task done "$1" "$2" "$REPO" "$3" "${4:-}")
+  local dir; dir=$(mk_task "done" "$1" "$2" "$REPO" "$3" "${4:-}")
   local wt="$PQ_HOME/wt-$2"; mkdir -p "$wt"
   st_set "$dir" PQ_WORKTREE "$wt"
   printf '%s' "$dir"
@@ -319,13 +325,13 @@ reset_tasks; reset_caches; : > "$WT_LOG"
 mk_task queue 60 base-is-gone "$REPO" tom/gone no-such-integration-branch >/dev/null
 # Filesystem, never state_of: that reads the path STRING it is handed, so it would
 # happily report "queue" for a directory fill had already moved to running/.
-where() { ls -d "$PQ_HOME"/*/*-"$1" 2>/dev/null | head -1; }
+where() { first_of "$PQ_HOME"/*/*-"$1"; }
 PQ_SUMMARY="" tick_body 3 0 >/dev/null 2>&1
 eq "$(basename "$(dirname "$(where base-is-gone)")")" "queue" \
   "a task whose base is gone stays in queue/, unclaimed"
 eq "$([ -s "$WT_LOG" ] && printf called || printf quiet)" "quiet" \
   "wt must never be reached for a task that cannot be forked"
-eq "$(ls -d "$PQ_HOME/running"/*/ 2>/dev/null | wc -l | tr -d ' ')" "0" \
+eq "$(dir_count "$PQ_HOME/running")" "0" \
   "it must not be holding a slot"
 # Once-only: the warning fires on the transition, not on every tick all night.
 second=$(PQ_SUMMARY="" tick_body 3 0 2>&1 >/dev/null | grep -c "no-such-integration-branch")
@@ -401,7 +407,7 @@ second_warn=$(base_check "$stale" 2>&1 >/dev/null)
 eq "$second_warn" "" "it must not re-warn every tick while it sits there"
 
 # Only what has not started, same rule as pq after's mutating forms.
-r=$(mk_task running 71 already-going "$REPO" tom/ag)
+mk_task running 71 already-going "$REPO" tom/ag >/dev/null
 ( cmd_base already-going master >/dev/null 2>&1 ) \
   && bad "pq base must refuse a task that has already been dispatched" || ok
 
@@ -416,7 +422,7 @@ addq() {                                # branch-to-stand-on [extra args...] -> 
   local stand=$1; shift
   git -C "$REPO" checkout -q "$stand"
   ( cmd_add "$PLAN/plan.md" "tom/$1" probe "" --repo "$REPO" "${@:2}" >/dev/null 2>&1 )
-  ls -d "$PQ_HOME"/queue/*-"$(branch_to_slug "tom/$1")" 2>/dev/null | head -1
+  first_of "$PQ_HOME"/queue/*-"$(branch_to_slug "tom/$1")"
 }
 
 # Standing on the integration branch: inherited, and recorded in the header.
@@ -447,7 +453,7 @@ repo_base_reset
 # Detached HEAD has no branch to inherit.
 git -C "$REPO" checkout -q --detach master
 ( cmd_add "$PLAN/plan.md" tom/inherit-6 probe "" --repo "$REPO" >/dev/null 2>&1 )
-d=$(ls -d "$PQ_HOME"/queue/*-inherit-6 2>/dev/null | head -1)
+d=$(first_of "$PQ_HOME"/queue/*-inherit-6)
 eq "$(hdr "$d/plan.md" base)" "" "a detached HEAD inherits nothing"
 git -C "$REPO" checkout -q master
 rm -rf "$PLAN"

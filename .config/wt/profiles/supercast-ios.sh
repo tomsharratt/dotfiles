@@ -1,3 +1,4 @@
+# shellcheck shell=bash  # sourced by wt, never run
 # wt profile for supercast-ios - a thin Hotwire native shell over the Rails app,
 # built with xcodebuild and run on the iOS Simulator. Sourced by ~/.local/bin/wt.
 #
@@ -23,6 +24,7 @@
 # actually be serving app.supercast.test for the app to show real content - wt_open
 # warns, but does not fail, when it isn't.
 
+# shellcheck disable=SC2034  # read by the wt sourcing this
 WT_RESOURCES=""            # the simulator is shared; no port, no redis, nothing to allocate
 
 : "${WT_IOS_DEVICE:=iPhone 17}"          # override to target a specific simulator

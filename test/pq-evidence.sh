@@ -5,6 +5,9 @@
 # A local bare repository stands in for origin, so every push here is real git
 # against a real remote and nothing reaches the network. `gh` is stubbed to
 # answer the one question asked of it (the repository's owner/name).
+#
+# SC2015: `ok` never fails, so `[ ... ] && ok || bad` is an if/else.
+# shellcheck disable=SC2015
 set -uo pipefail
 
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
@@ -86,7 +89,8 @@ EOF
 
 mkdir -p "$PQ_HOME/queue" "$PQ_HOME/running" "$PQ_HOME/done"
 mk_task() {                             # prio slug worktree -> task_dir (done/)
-  local dir="$PQ_HOME/done/$(printf '%014d' $(( 20260101000000 + 10#$1 )))-$2"
+  local dir
+  dir="$PQ_HOME/done/$(printf '%014d' $(( 20260101000000 + 10#$1 )))-$2"
   mkdir -p "$dir/evidence"
   {
     printf -- '---\n'
@@ -170,7 +174,7 @@ has "$out" "raw/pq-evidence/alpha/" "and it resolves to the task whose PQ_WORKTR
 has "$(cat "$PQ_HOME/.err")" "not inside a task's worktree" "and say how to name the task"
 
 echo "== an empty evidence/ dies ==" >&2
-E=$(mk_task 003 empty "$REPO")
+mk_task 003 empty "$REPO" >/dev/null
 ( publish empty ) >/dev/null 2>"$PQ_HOME/.err" && bad "nothing to publish must fail" || ok
 has "$(cat "$PQ_HOME/.err")" "nothing to publish" "and say so"
 "$REALGIT" -C "$BARE" ls-tree -r --name-only refs/heads/pq-evidence | grep -q '^empty/' && bad "and push nothing" || ok

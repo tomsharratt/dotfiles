@@ -9,6 +9,10 @@
 # DEV database (a spec run loading schema over the data its own dev server was
 # serving) and a bare `bundle exec rspec` fell through to the one machine-wide
 # supercast-web_test that every other worktree was using too.
+#
+# SC2034: the WT_* set here are read by the profile sourced below.
+# SC2015: `ok` never fails, so `[ ... ] && ok || bad` is an if/else.
+# shellcheck disable=SC2034,SC2015
 set -uo pipefail
 
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)

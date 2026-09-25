@@ -18,6 +18,10 @@
 # The profile is sourced directly. It needs msg/warn from wt and reads psql and
 # dropdb from PATH, both of which are stubbed, so nothing here touches a real
 # database.
+#
+# SC2034: the WT_* set here are read by the profile sourced below.
+# SC2015: `ok` never fails, so `[ ... ] && ok || bad` is an if/else.
+# shellcheck disable=SC2034,SC2015
 set -uo pipefail
 
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
@@ -109,7 +113,8 @@ $long_db
 $short_db
 $orphan_db
 EOF
-export WT_LIVE_SLUGS=$(printf '%s\n%s\n' "$LONG_SLUG" "$SHORT_SLUG")
+WT_LIVE_SLUGS=$(printf '%s\n%s\n' "$LONG_SLUG" "$SHORT_SLUG")
+export WT_LIVE_SLUGS
 # The dry run is the preview `wt gc --sweep` shows before asking to proceed, so
 # what it lists is exactly what a real sweep would take.
 preview=$(WT_SWEEP_DRY=1 wt_sweep 2>/dev/null)
@@ -140,7 +145,8 @@ eq "$(grep -c '^database ' <<<"$preview")" 3 \
   "with nothing live, all three worktree databases are orphans"
 
 echo "== a real sweep drops exactly what the preview listed ==" >&2
-export WT_LIVE_SLUGS=$(printf '%s\n%s\n' "$LONG_SLUG" "$SHORT_SLUG")
+WT_LIVE_SLUGS=$(printf '%s\n%s\n' "$LONG_SLUG" "$SHORT_SLUG")
+export WT_LIVE_SLUGS
 # The canonical app's route sits below WT_PORT_BASE, so no sweep may take it.
 printf '%s' 3000 > "$HOME/.puma-dev/supercast"
 printf '%s' 3101 > "$HOME/.puma-dev/$LONG_SLUG"
@@ -190,7 +196,8 @@ $short_tdb
 $orphan_db
 $orphan_tdb
 EOF
-export WT_LIVE_SLUGS=$(printf '%s\n%s\n' "$LONG_SLUG" "$SHORT_SLUG")
+WT_LIVE_SLUGS=$(printf '%s\n%s\n' "$LONG_SLUG" "$SHORT_SLUG")
+export WT_LIVE_SLUGS
 preview=$(WT_SWEEP_DRY=1 wt_sweep 2>/dev/null)
 for db in "$long_tdb" "$short_tdb"; do
   case "$preview" in
