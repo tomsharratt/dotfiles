@@ -482,12 +482,14 @@ What it leaves alone is a task with no verdict at all: no pull request, or one s
 A pull request you reopen before its teardown runs stops being settled, and `pr_all_closed` needs *every* row closed - so closing one alongside a fresh one is not a verdict either.
 But once the teardown has happened it is not undone; that is the point of saying you are done with it.
 
-Two things hold a teardown off, both checked only once the verdict is in:
+Three things hold a teardown off, all checked only once the verdict is in:
 
 - the agent is still going - Herdr reports `working` or `blocked` for its pane
 - `pq` is itself running inside that task's own Herdr workspace, where closing it would kill the pane mid-teardown
+- the worktree holds work that is not pushed - `wt rm --yes` refuses it (see "Reclaiming resources" below), since a settled pull request says nothing about edits nobody committed or commits on no remote
 
-`pq ls` shows a held task as `held agent`, `held here`, or `held nobase` (its repo's default branch could not be resolved).
+`pq ls` shows a held task as `held agent`, `held here`, `held dirty`, or `held nobase` (its repo's default branch could not be resolved).
+A `dirty` hold is said once, with what wt found, and every tick after asks wt again, so pushing the work - or discarding it with `wt rm` at a terminal - is what lets the teardown go.
 A task with nothing left to reclaim shows `-`, the same as any other task that needs nothing from you - a closed one included, since its teardown is automatic now and the `PR` column already reads `#N closed`.
 There is no off switch, for the same reason `pq` has none for dispatch-hours or the usage gate: one mechanism, not two.
 

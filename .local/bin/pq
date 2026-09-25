@@ -3959,11 +3959,12 @@ agent_cell() {                          # task_dir state
       # that fact belongs.
       local reason
       reason=$(st "$d" PQ_REAP_HELD)
-      # These two want a decision from you and say nothing about the agent, so
-      # they outrank the slot report below. `held agent` does not: it means the
+      # These three want a decision from you and say nothing about the agent, so
+      # they outrank the slot report below. `dirty` is wt refusing to discard work
+      # that is not pushed - see reap_task. `held agent` does not: it means the
       # very thing `wrapping up` says, and says it without mentioning the slot.
       case "$reason" in
-        nobase|here) printf 'held %s' "$reason"; return ;;
+        nobase|here|dirty) printf 'held %s' "$reason"; return ;;
       esac
       # A done task whose agent is still going still holds one of the cap's
       # slots (see the `slots` section). Without this the queue not advancing
@@ -4718,6 +4719,11 @@ wt_in() {                               # repo wt-subcommand args...
   local repo=$1; shift
   cd "$repo" || return 1
   "$WT" "$@"
+}
+# The same, with wt's stderr kept in a file for the caller to show or not.
+wt_in_errto() {                         # errfile repo wt-subcommand args...
+  local errf=$1; shift
+  wt_in "$@" 2> "$errf"
 }
 
 dispatch_task() {                       # task_dir  -> 0 launched, 1 failed
@@ -5995,8 +6001,9 @@ reap_task() {                           # task_dir dry -> 0 torn down, 2 would (
     fi
   fi
 
-  # 5. One place writes PQ_REAP_HELD, for all three reasons - stamp and warn on
-  #    the transition into it, clear it the moment the hold recovers.
+  # 5. One place writes PQ_REAP_HELD for these three reasons - stamp and warn on
+  #    the transition into it, clear it the moment the hold recovers. The fourth,
+  #    `dirty`, is wt's answer to the teardown itself, so step 6 writes it.
   case "$reason" in
     agent)  explanation="the agent is still going" ;;
     here)   explanation="pq is running inside this task's own workspace" ;;
@@ -6012,7 +6019,11 @@ reap_task() {                           # task_dir dry -> 0 torn down, 2 would (
     # distinct from "nothing to do" - it is what lets tick_body count a
     # would-be teardown into its summary, the same way fill tracks `would`
     # separately from `started`.
-    msg "would tear down $slug ($branch)"
+    if [ "$was" = dirty ]; then
+      msg "would ask wt to tear down $slug ($branch) again - it held work that was not pushed"
+    else
+      msg "would tear down $slug ($branch)"
+    fi
     return 2
   fi
   if [ -n "$reason" ]; then
@@ -6020,12 +6031,34 @@ reap_task() {                           # task_dir dry -> 0 torn down, 2 would (
       warn "$slug: ${why:-settled}, but holding - $explanation"; }
     return 1
   fi
-  [ -z "$was" ] || st_set "$d" PQ_REAP_HELD ""
+  # A `dirty` hold is wt's to lift, below, so it stays on file until wt says so.
+  case "$was" in ""|dirty) ;; *) st_set "$d" PQ_REAP_HELD "" ;; esac
 
   # 6. Tear it down - the same `wt rm` you would have run yourself. Shielded for
   #    the same reason `wt new` is: it drops a database, and a Ctrl-C mid-drop
   #    should not leave that half-done.
-  if shielded wt_in "$repo" rm --yes "$branch"; then
+  #
+  #    wt decides the last hold itself: it refuses, exiting 3, a worktree holding
+  #    work that exists nowhere else - edits nobody committed, commits on no
+  #    remote - and nothing has been released when it does. A settled pull
+  #    request says nothing about that: #6831 was closed with four uncommitted
+  #    files from a `/code-review --fix` still in its worktree. The refusal is a
+  #    hold like the three above, stamped and said once, in pq's words; and since
+  #    the next tick asks wt again (that is how pushing the work lets it go), wt's
+  #    own stderr is held back rather than repeated into the log every tick. A
+  #    teardown or a real failure shows it as before.
+  local errf="$PQ_HOME/.wtrm.$$" rc refusal
+  shielded wt_in_errto "$errf" "$repo" rm --yes "$branch"; rc=$?
+  if [ "$rc" = 3 ]; then
+    refusal=$(sed -e $'s/\033\\[[0-9;]*m//g' -e 's/^wt: //' "$errf" 2>/dev/null | sed '/^$/d' | tail -1)
+    rm -f "$errf"
+    [ "$was" = dirty ] || { st_set "$d" PQ_REAP_HELD dirty
+      warn "$slug: ${why:-settled}, but holding - ${refusal:-wt refused: the worktree holds work that is not pushed}"; }
+    return 1
+  fi
+  cat "$errf" >&2 2>/dev/null; rm -f "$errf"
+  if [ "$rc" = 0 ]; then
+    [ "$was" != dirty ] || st_set "$d" PQ_REAP_HELD ""
     st_set "$d" PQ_REAPED "$(now)"
     msg "$slug: ${why:-settled} - tore down $branch"
     return 0

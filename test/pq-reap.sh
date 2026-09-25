@@ -37,6 +37,7 @@ WT_LOG="$STUBBIN/.wt-calls"
 cat > "$STUBBIN/wt-stub" <<EOF
 #!/bin/sh
 { printf '%s\t' "\$PWD"; for a in "\$@"; do printf '%s\t' "\$a"; done; printf '\n'; } >> "$WT_LOG"
+[ -n "\${WT_STUB_ERR:-}" ] && printf '%s\n' "\$WT_STUB_ERR" >&2
 exit "\${WT_STUB_RC:-0}"
 EOF
 chmod +x "$STUBBIN/wt-stub"
@@ -457,6 +458,51 @@ rc=$?
 [ -z "$(st "$d14" PQ_REAPED)" ] && ok || bad "PQ_REAPED must not be stamped when wt rm fails"
 [ -n "$(st "$d14" PQ_MERGED)" ] && ok || bad "PQ_MERGED should still be recorded even though wt rm failed"
 rm -rf "$wt14"
+
+echo "== wt refuses unpushed work: held as 'dirty', warned once, never reaped ==" >&2
+# `wt rm --yes` exits 3 when the worktree holds work that exists nowhere else -
+# the four uncommitted files #6831 was torn down with. That is a hold, not a
+# failure: said once, in pq's words, and wt's own refusal line kept out of the
+# log on every tick after, since it re-runs each tick until the work is pushed.
+reset_caches; reset_wt_log
+wt16d=$(mktemp -d)
+d16d=$(mk_done 10 case16d "$REPO" tom/case16d "$wt16d")
+st_set "$d16d" PQ_PANE pane-16d
+cache_row "$REPO" tom/case16d 16 CLOSED "" master
+PIDX_OK=1; PIDX=$'pane-16d\tclaude\tidle'
+refusal="wt: 'tom/case16d' holds work that is not pushed (4 uncommitted files) - not removing it"
+first=$(WT_STUB_RC=3 WT_STUB_ERR="$refusal" reap_task "$d16d" 0 2>&1 1>/dev/null); rc=$?
+[ "$rc" -ne 0 ] && ok || bad "a refused teardown must not report one"
+[ -s "$WT_LOG" ] && ok || bad "wt rm is what decides, so it must have been asked"
+eq "$(st "$d16d" PQ_REAP_HELD)" "dirty" "the refusal is a hold: PQ_REAP_HELD should read dirty"
+[ -z "$(st "$d16d" PQ_REAPED)" ] && ok || bad "PQ_REAPED must not be stamped while the work is held"
+case "$first" in *"holding"*"4 uncommitted files"*) ok ;; *) bad "the first pass should say why it holds (got '$first')" ;; esac
+case "$first" in *"wt rm failed"*) bad "a refusal is not a failure (got '$first')" ;; *) ok ;; esac
+eq "$(agent_cell "$d16d" done)" "held dirty" "pq ls should show the hold, which wants you"
+archivable "$d16d" && bad "a held task must not be archivable" || ok
+second=$(WT_STUB_RC=3 WT_STUB_ERR="$refusal" reap_task "$d16d" 0 2>&1 1>/dev/null)
+[ -z "$second" ] && ok || bad "a second refusal must stay silent, wt's own line included (got '$second')"
+eq "$(st "$d16d" PQ_REAP_HELD)" "dirty" "and the hold stays on file"
+
+echo "== ...and once the work is pushed, the next tick tears it down ==" >&2
+reset_wt_log
+third=$(WT_STUB_RC=0 WT_STUB_ERR="wt: removed repo/tom/case16d" reap_task "$d16d" 0 2>&1 1>/dev/null); rc=$?
+eq "$rc" 0 "wt rm succeeding is a teardown"
+eq "$(st "$d16d" PQ_REAP_HELD)" "" "the hold clears"
+[ -n "$(st "$d16d" PQ_REAPED)" ] && ok || bad "PQ_REAPED is stamped"
+case "$third" in *"wt: removed"*) ok ;; *) bad "wt's own progress still reaches the log on a real teardown (got '$third')" ;; esac
+rm -rf "$wt16d"
+
+echo "== a real wt rm failure still reads as one, with wt's reason in the log ==" >&2
+reset_caches; reset_wt_log
+wt16f=$(mktemp -d)
+d16f=$(mk_done 10 case16f "$REPO" tom/case16f "$wt16f")
+cache_row "$REPO" tom/case16f 17 MERGED "" master
+PIDX_OK=1; PIDX=""
+out=$(WT_STUB_RC=1 WT_STUB_ERR="wt: herdr: boom" reap_task "$d16f" 0 2>&1 1>/dev/null)
+case "$out" in *"herdr: boom"*"wt rm failed"*) ok ;; *) bad "a failure shows wt's reason and pq's advice (got '$out')" ;; esac
+[ -z "$(st "$d16f" PQ_REAP_HELD)" ] && ok || bad "a failure is not a hold"
+rm -rf "$wt16f"
 
 echo "== reap_ok false: the whole pass is skipped by tick_body ==" >&2
 reset_tasks
