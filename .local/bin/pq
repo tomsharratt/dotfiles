@@ -816,27 +816,40 @@ outline_of() {                          # name_plan output -> the part titles, o
 # A branch already spoken for is the one failure that must be caught at add time.
 # `wt new` on an existing branch deliberately CHECKS IT OUT rather than failing, so
 # two tasks sharing a name would quietly land in the same worktree and fight over
-# it. Live tasks and git both get a say; `done` deliberately does not, so a name
-# whose branch has since been reclaimed is free to be used again.
+# it. And a name that has ever had a pull request is spoken for too, even once its
+# branch is gone: `gh pr list --head` answers by NAME, so a task reusing one would
+# inherit its predecessor's pull requests - the old merge read as this task's, and
+# reap tore down a worktree its agent was still working in (see pr_load, which
+# also guards the read side). So every task pq has ever run, archive included,
+# keeps its name, and the forge gets a say beside git.
 #
-# Three checks, cheapest first. The last one goes to the network, which is worth a
-# round trip to catch a branch pushed from somewhere else - but it is bounded, so an
-# add made offline fails fast instead of sitting on a TCP timeout, and a network we
-# could not reach reports "not taken". That is the safe direction to be wrong in:
-# the worst case is `wt new` later adopting the existing remote branch, which is a
-# thing it already knows how to do.
+# Cheapest first. The last two go to the network, which is worth a round trip to
+# catch a branch pushed, or a pull request opened, from somewhere else - but an add
+# made offline must fail fast rather than sit on a TCP timeout (the ls-remote
+# carries a connect timeout; gh gives up at once with no network), and a network
+# we could not reach reports "not taken". That is the safe
+# direction to be wrong in: the worst case is `wt new` later adopting the existing
+# remote branch, which it already knows how to do, and pr_since keeping an old
+# pull request out of the task's reading either way.
 branch_taken() {                        # branch repo
-  local branch=$1 repo=$2 d
+  local branch=$1 repo=$2 d pr
   while IFS= read -r d; do
     [ -n "$d" ] || continue
-    case "$(state_of "$d")" in done) continue ;; esac
-    [ "$(hdr "$d/plan.md" branch)" = "$branch" ] && { printf 'queued as %s' "$(slug_of "$d")"; return 0; }
-  done <<<"$(all_tasks)"
+    [ "$(hdr "$d/plan.md" branch)" = "$branch" ] || continue
+    case "$(state_of "$d")" in
+      queue|running) printf 'queued as %s' "$(slug_of "$d")" ;;
+      *)             printf 'the branch of %s (%s)' "$(slug_of "$d")" "$(state_of "$d")" ;;
+    esac
+    return 0
+  done <<<"$(all_tasks all)"
   git -C "$repo" show-ref --verify --quiet "refs/heads/$branch" && { printf 'a local git branch'; return 0; }
   git -C "$repo" show-ref --verify --quiet "refs/remotes/origin/$branch" && { printf 'a known remote branch'; return 0; }
   GIT_SSH_COMMAND="${GIT_SSH_COMMAND:-ssh -o ConnectTimeout=5 -o BatchMode=yes}" \
     git -C "$repo" ls-remote --exit-code --heads origin "$branch" >/dev/null 2>&1 \
     && { printf 'a remote branch'; return 0; }
+  pr=$(cd "$repo" 2>/dev/null && gh pr list --head "$branch" --state all --limit 1 \
+         --json number,state -q '.[] | "#\(.number) \(.state | ascii_downcase)"' 2>/dev/null)
+  [ -n "$pr" ] && { printf 'the branch of %s' "$pr"; return 0; }
   return 1
 }
 
@@ -1522,6 +1535,17 @@ cmd_add() {                             # plan branch intent security ("" "" "" 
   fi
   [ -n "$branch" ] || die "could not name the plan - Haiku gave no usable branch; try pq add again"
   git check-ref-format "refs/heads/$branch" || die "invalid branch name: '$branch'"
+  # A name Haiku chose that turns out to be taken is Haiku's to change, so it is
+  # asked once more with that name to avoid, as split_name_parts does for a part -
+  # far likelier now that every name pq has ever used, and every one with a pull
+  # request behind it, is taken. A branch handed in (a split part) is the caller's.
+  if why=$(branch_taken "$branch" "$repo") && [ -n "$named" ]; then
+    warn "branch '$branch' is already $why - asking for another name"
+    named=$(name_plan "$plan" "$branch" | head -1)
+    branch=$(cut -f1 <<<"$named"); intent=$(cut -f2 <<<"$named"); security=$(cut -f3 <<<"$named")
+    [ -n "$branch" ] || die "could not name the plan - Haiku gave no usable branch; try pq add again"
+    git check-ref-format "refs/heads/$branch" || die "invalid branch name: '$branch'"
+  fi
   why=$(branch_taken "$branch" "$repo") && die "branch '$branch' is already $why"
 
   # Validated at ADD time, not at dispatch: a typo here would otherwise sit in the
@@ -3315,22 +3339,37 @@ walled_note() {                         # resets_at -> text
 # Without this distinction "no PR yet" and "gh could not tell us" look
 # identical, and a blocker that has simply not started yet would be
 # misdiagnosed as an orphan the first time `gh` hiccups.
+#
+# A branch NAME is not a task, though, and `--head B` answers every pull request
+# that name has ever had. A task named after a branch whose old pull request had
+# merged was read as "finished #old merged" one tick after it was dispatched: its
+# review was skipped as settled, and reap tore down the worktree its agent was
+# still working in. So each branch's rows are cut to the pull requests its task
+# can have opened - those created after the task was claimed (pr_since) - here,
+# where every reader gets the cut at once: reconcile, reap, the review gate, the
+# blocker predicate and `pq ls` all read this cache. `branch_taken` stops a
+# name like that being handed out at all; this is what keeps one that got
+# through, or was queued before that check existed, from costing a worktree.
 PR_CACHE="" PR_ANS=""
 pr_load() {                             # repo branch...
-  local repo=$1 b n=0; shift
+  local repo=$1 b n=0 since; shift
   local pids=()
   PR_CACHE="$PQ_HOME/.pr.$$"; : > "$PR_CACHE"
   PR_ANS="$PQ_HOME/.pr.$$.ans"; : > "$PR_ANS"
   command -v gh >/dev/null 2>&1 || return 0
   for b in "$@"; do
     [ -n "$b" ] || continue
+    # Before the job forks: it walks the task directories, which is cheap once
+    # and would be N concurrent walks inside the jobs.
+    since=$(pr_since "$repo" "$b")
     (
       cd "$repo" 2>/dev/null || exit 1
       raw=$(gh pr list --head "$b" --state all --limit 5 \
-              --json number,state,isDraft,baseRefName,mergeCommit 2>/dev/null) || exit 1
+              --json number,state,isDraft,baseRefName,mergeCommit,createdAt 2>/dev/null) || exit 1
       printf '%s\t%s\n' "$repo" "$b" > "$PR_ANS.$n"
-      jq -r --arg b "$b" --arg r "$repo" \
-         '.[] | [$r, $b, (.number|tostring), .state,
+      jq -r --arg b "$b" --arg r "$repo" --argjson since "$since" \
+         '.[] | select($since == 0 or ((.createdAt // "" | try fromdateiso8601 catch 0) >= $since))
+              | [$r, $b, (.number|tostring), .state,
                  (if .isDraft then "draft" else "" end), .baseRefName,
                  (.mergeCommit.oid // "")] | @tsv' <<<"$raw"
     ) > "$PR_CACHE.$n" &
@@ -3342,6 +3381,23 @@ pr_load() {                             # repo branch...
   cat "$PR_ANS".[0-9]*   >> "$PR_ANS"   2>/dev/null
   rm -f "$PR_CACHE".[0-9]* "$PR_ANS".[0-9]*
 }
+# The earliest a pull request for (repo, branch) can have been opened and still be
+# the work of the task that owns the branch: the moment that task was claimed, as
+# epoch seconds. 0 means no bound - a branch no task owns (a raw blocker), or a
+# task claimed before PQ_CLAIMED was recorded, both of which read every row as
+# they always did. A task still in the queue has not been claimed, so nothing on
+# the forge can be its work yet: its bound is PQ_NEVER, which no row meets. The
+# owner is found live tasks first (task_by_branch), so the task a reused name
+# belongs to NOW is the one whose claim counts, not the archived one before it.
+PQ_NEVER=99999999999
+pr_since() {                            # repo branch -> epoch seconds, 0 for no bound
+  local d at
+  d=$(task_by_branch "$1" "$2") || { printf 0; return 0; }
+  [ "$(state_of "$d")" = queue ] && { printf '%s' "$PQ_NEVER"; return 0; }
+  at=$(epoch_of "$(st "$d" PQ_CLAIMED)")
+  printf '%s' "${at:-0}"
+}
+
 # Keyed on repo AND branch. The cache is one file spanning every project in the
 # queue, and a branch name is only unique within its own repo - `tom/fix-timezone`
 # in supercast and in supercast-ios are different branches with the same name. On

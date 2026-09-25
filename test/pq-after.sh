@@ -364,13 +364,14 @@ echo "== cmd_add --after reports an already-merged blocker and leaves no PR cach
 # canned gh stub above) rather than a hand-primed cache. cmd_add runs in a
 # command substitution here, as it does for every part split_queue queues, so
 # its $$ - and the cache it names after it - is this script's.
-merged_out=$(cmd_add "$PLAN_FILE" tom/already-merged "" "" --repo "$REPO" 2>"$PQ_HOME/.add.stderr")
-merged_rc=$?
-[ "$merged_rc" -eq 0 ] && ok || bad "adding the already-merged task should succeed: $(cat "$PQ_HOME/.add.stderr")"
-( cmd_add "$PLAN_FILE" tom/depends-on-merged "" "" --repo "$REPO" --after "$merged_out" ) \
+#
+# The blocker is a raw branch no task owns. A TASK on a branch that has already
+# merged is the reused-name shape pq now refuses (see test/pq-reuse.sh): its
+# owner would still be queued, and an unclaimed task owns no pull request yet.
+( cmd_add "$PLAN_FILE" tom/depends-on-merged "" "" --repo "$REPO" --after tom/already-merged ) \
   >/dev/null 2>"$PQ_HOME/.add.stderr"
 case "$(cat "$PQ_HOME/.add.stderr")" in
-  *"after $merged_out: already in"*) ok ;;
+  *"after already-merged: already in"*) ok ;;
   *) bad "an already-merged blocker should be reported as nothing to wait for (got: $(cat "$PQ_HOME/.add.stderr"))" ;;
 esac
 if [ -e "$PQ_HOME/.pr.$$" ] || [ -e "$PQ_HOME/.pr.$$.ans" ]; then

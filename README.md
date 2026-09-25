@@ -131,6 +131,8 @@ Each task holds an immutable `plan.md` (a settings header prepended to whatever 
 `pq add` with no plan, at a terminal, shows the ten most recently touched plans in `~/.claude/plans` - `n` and `p` page back through the older ones - and lets you pick one rather than silently guessing.
 See "Picking a plan" below.
 Either way, it then asks Haiku for a branch name and a one-line statement of intent (Claude Code auto-names plan files, so the filename is never a usable branch), and refuses a branch that is already spoken for - `wt new` checks out an existing branch rather than failing, so two tasks sharing a name would quietly land in the same worktree.
+Spoken for means any task `pq` has ever run under that name, archived ones included, a branch git knows of, or a name that has ever had a pull request: the forge answers by branch *name*, so a task reusing one would inherit its predecessor's pull requests.
+When the name Haiku chose is taken, it is asked once more with that name to avoid, before `pq add` gives up.
 
 Each task records its own project, so one queue serves all of them.
 The project is wherever you were standing when you added the plan, resolved to the main checkout so adding from inside a worktree still queues against the repo the new worktree gets forked from; `--repo PATH` sets it explicitly.
@@ -259,6 +261,9 @@ None of the three auto-holds anything; fill already costs no slot on a blocked t
 
 `pq tick` is one idempotent pass: reconcile, then fill.
 Reconcile runs first so a task that shipped leaves the queue promptly - any pull request, in any state, means the work is out of `queue`'s hands.
+Any pull request of the task's own, that is: only one opened after the task was claimed counts, for reconcile and for everything else that reads the task's pull request (the review gate, the teardown, the blocker predicate, `pq ls`).
+A name reused from an old task used to read as "finished, #old merged" one tick after dispatch, and the teardown then removed a worktree whose agent was still working in it.
+A blocker on a task still in the queue is judged the same way - nothing on the forge can be the work of a task nobody has claimed yet.
 Leaving the queue and giving up the slot are separate things, though: see the cap below, which keeps counting a task whose agent is still working on its PR.
 Fill claims a task by moving it to `running/` *before* calling `wt new`, because that call takes the better part of a minute and an unclaimed task is one a second tick would happily pick up too.
 Each dispatch step records itself as it succeeds, so an interrupted tick is resumed rather than restarted - and resuming deliberately skips `wt new` when the pane is still there, since re-provisioning would drop the worktree's database.
