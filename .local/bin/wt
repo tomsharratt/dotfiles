@@ -23,7 +23,8 @@
 #   wt open [name]       open the worktree's dev url in the browser
 #   wt provision <path>  (re)run the project's provisioning for a worktree (idempotent)
 #   wt rm  [name]        tear the worktree down (drop db, free port, remove worktree)
-#        -y, --yes       answer both prompts yes (needed to run unattended)
+#        -y, --yes       answer both prompts yes (needed to run unattended); a worktree
+#                        holding work that is not pushed is refused, exiting 3
 #   wt ls                every worktree: port, age, agent state, PR/CI state, url
 #   wt gc                reclaim resources from worktrees that no longer exist
 #   wt gc --settled      also reclaim worktrees whose PR has merged or closed (needs gh)
@@ -75,6 +76,14 @@ mkdir -p "$STATE_DIR"
 msg()  { printf 'wt: %s\n' "$*" >&2; }
 warn() { printf '\033[38;2;246;193;119mwt: %s\033[0m\n' "$*" >&2; }
 die()  { printf '\033[38;2;235;111;146mwt: %s\033[0m\n' "$*" >&2; exit 1; }
+# A refusal to destroy work, rather than a failure: exit 3, so a caller driving
+# `wt rm --yes` unattended (pq's teardown) can hold the worktree and say why,
+# instead of reading it as a teardown that broke and retrying it.
+refuse() { printf '\033[38;2;235;111;146mwt: %s\033[0m\n' "$*" >&2; exit 3; }
+
+# Whether there is someone at a terminal to ask. A function rather than a bare
+# `[ -t 0 ]`, so a test can stand in for the terminal and answer the prompts.
+at_terminal() { [ -t 0 ]; }
 
 # ── Herdr plumbing ────────────────────────────────────────────────────────
 in_herdr() { [ "${HERDR_ENV:-}" = 1 ] && [ -S "${HERDR_SOCKET_PATH:-/nonexistent}" ]; }
@@ -596,6 +605,53 @@ rm_leftover() {                         # path
   rm -rf "$p" && msg "removed leftover directory $p"
 }
 
+# What removing the worktree at PATH would destroy for good: edits nobody
+# committed, files nobody added, and commits that are on no remote. Removal is
+# `git worktree remove --force` and then `git branch -D`, so none of those survive
+# it, and it runs unattended - pq drives `wt rm --yes` the moment a pull request
+# settles, and a pull request settles whether or not somebody is still working in
+# its worktree. So every path that removes a worktree asks this first: `wt rm`
+# refuses under --yes and asks at a terminal, and `wt gc --settled` leaves the
+# worktree where it is. Prints e.g. "4 uncommitted files, 2 unpushed commits", or
+# nothing when nothing would be lost.
+#
+# "On no remote", not "ahead of its upstream": a branch that was never pushed has
+# no upstream to be ahead of, and it is the likeliest of all to hold the only copy
+# of its work. An untracked file counts, because a new file an agent never added
+# is exactly as gone afterwards as an edit it never committed; ignored files do
+# not, since a worktree is full of them (tmp/, log/, a linked node_modules).
+#
+# One false alarm is ruled out: the forge deletes a pull request's branch once it
+# merges, and a pruning fetch then takes the remote-tracking ref with it, so every
+# commit of a branch that was pushed in full reads as on no remote. When the forge
+# still names the tip as a pull request's head, it was pushed. Asked only when
+# there are commits to vouch for, and offline or without gh it cannot vouch - the
+# safe direction to be wrong in.
+unpushed_work() {                       # repo path branch -> what would be lost, or nothing
+  local repo=$1 p=$2 branch=$3 files commits out=""
+  git -C "$p" rev-parse --is-inside-work-tree >/dev/null 2>&1 || return 0
+  files=$(git -C "$p" status --porcelain 2>/dev/null | grep -c .)
+  commits=$(git -C "$p" rev-list --count HEAD --not --remotes 2>/dev/null) || commits=0
+  [ "${commits:-0}" -gt 0 ] && pr_head_is "$repo" "$branch" "$(git -C "$p" rev-parse HEAD 2>/dev/null)" && commits=0
+  [ "${files:-0}" -gt 0 ] && out="$files uncommitted file$([ "$files" = 1 ] || printf s)"
+  [ "${commits:-0}" -gt 0 ] && out="${out:+$out, }$commits unpushed commit$([ "$commits" = 1 ] || printf s)"
+  printf '%s' "$out"
+}
+# Whether some pull request for BRANCH has SHA as its head - the forge's word that
+# the commit was pushed, which outlives the branch it was pushed to.
+pr_head_is() {                          # repo branch sha
+  [ -n "${2:-}" ] && [ "$2" != "-" ] && [ -n "${3:-}" ] || return 1
+  command -v gh >/dev/null 2>&1 || return 1
+  ( cd "$1" 2>/dev/null && gh pr list --head "$2" --state all --limit 10 \
+      --json headRefOid -q '.[].headRefOid' 2>/dev/null ) | grep -qx "$3"
+}
+# The work itself, for a question asked at a terminal: `git status` lines, then
+# the unpushed commits when unpushed_work counted any.
+unpushed_list() {                       # path summary
+  git -C "$1" status --porcelain 2>/dev/null | head -20
+  case "$2" in *unpushed*) git -C "$1" log --oneline HEAD --not --remotes 2>/dev/null | head -20 ;; esac
+}
+
 # The Herdr workspace holding a worktree, if one is open. By path first, then by branch:
 # the recorded WT_WORKSPACE is the primary route and already survives a rename, but this
 # fallback used to match on the branch alone - the one identifier a worktree can change
@@ -697,7 +753,7 @@ reap_one() {                            # repo repo_name branch path del_branch(
 # Destructive and network-driven, so it is opt-in, lists what it intends to take before
 # taking it, and reclaims nothing when the PR state could not be read.
 gc_settled() {                          # yes(1|0)
-  local yes=$1 repo rn wts branches path branch st cur here="" n=0 ans
+  local yes=$1 repo rn wts branches path branch st cur here="" n=0 ans lost kept=""
   local plan="$STATE_DIR/.gc-settled.tsv"
   cur=$(realpath_p "$(git -C "$PWD" rev-parse --show-toplevel 2>/dev/null)")
   : > "$plan"
@@ -718,12 +774,22 @@ gc_settled() {                          # yes(1|0)
       # Never reclaim the worktree we are standing in: closing its Herdr workspace
       # would kill this pane partway through the batch.
       if [ "$path" = "$cur" ]; then here="$rn/$branch ($(tr '[:upper:]' '[:lower:]' <<<"$st"))"; continue; fi
+      # A settled pull request says nothing about the worktree: somebody may have
+      # gone on working in it, or reviewed it with --fix and never pushed. That
+      # work is kept whatever -y says; `wt rm` at a terminal is how it is let go.
+      lost=$(unpushed_work "$repo" "$path" "$branch")
+      if [ -n "$lost" ]; then kept="$kept  $rn/$branch - $lost"$'\n'; continue; fi
       printf '%s\t%s\t%s\t%s\t%s\n' "$repo" "$rn" "$path" "$branch" "$st" >> "$plan"
       n=$((n + 1))
     done <<<"$wts"
   done <<<"$(known_repos)"
 
   [ -n "$here" ] && msg "$here has settled too, but you are inside it - remove that one with: wt rm"
+  if [ -n "$kept" ]; then
+    warn "leaving $(grep -c . <<<"$kept") settled worktree(s) that hold work which is not pushed:"
+    printf '%s' "$kept" >&2
+    warn "  push it, or discard it with 'wt rm <branch>' at a terminal"
+  fi
   [ "$n" -gt 0 ] || { rm -f "$plan"; msg "nothing settled to reclaim"; return 0; }
 
   msg "$n settled worktree(s) to reclaim:"
@@ -837,7 +903,7 @@ cmd_new() {
   local name=${1:-}
   # Only prompt when there is someone to answer. A non-interactive caller that forgot the
   # name should fail immediately rather than hang forever on a read from a closed stdin.
-  if [ -z "$name" ] && [ -t 0 ]; then printf 'wt: task name (branch): ' >&2; read -r name || true; fi
+  if [ -z "$name" ] && at_terminal; then printf 'wt: task name (branch): ' >&2; read -r name || true; fi
   [ -n "$name" ] || die "no task name given"
   git check-ref-format "refs/heads/$name" || die "invalid task/branch name: '$name'"
 
@@ -1247,6 +1313,20 @@ cmd_rm() {
     [ -n "$path" ] || die "no worktree of $rn is on branch '$name'"
   fi
 
+  # Work that exists nowhere else is checked before anything is asked or released:
+  # reap_one drops the database first, so a refusal any later would leave the
+  # worktree half torn down. --yes never discards it - that is the unattended
+  # path, and nobody there can have meant to - so it refuses, exiting 3 for a
+  # caller to tell apart from a failure. At a terminal the question is asked
+  # instead, with the work listed and the prompt saying what yes costs.
+  local lost="" what="branch, db, port all go"
+  [ -d "$path" ] && lost=$(unpushed_work "$repo" "$path" "$name")
+  if [ -n "$lost" ]; then
+    [ "$yes" = 1 ] && refuse "'$name' holds work that is not pushed ($lost) - not removing it; push it, or run 'wt rm $name' at a terminal to discard it"
+    warn "'$name' holds work that is not pushed - $lost:"
+    unpushed_list "$path" "$lost" | sed 's/^/  /' >&2
+  fi
+
   # Ask both questions up front. Closing the workspace (reap_one's last step) tears
   # down the pane this command is running in whenever we're removing the worktree we're
   # sitting in - so nothing after that close is guaranteed to run: no prompts, no
@@ -1257,8 +1337,12 @@ cmd_rm() {
   if [ "$yes" = 1 ]; then
     ans=y
   else
-    [ -t 0 ] || die "no tty to confirm removal of '$name' - rerun with -y/--yes"
-    printf 'wt: remove worktree "%s" (branch, db, port all go)? [y/N] ' "$name" >&2
+    at_terminal || die "no tty to confirm removal of '$name' - rerun with -y/--yes"
+    if [ -n "$lost" ]; then
+      printf 'wt: remove worktree "%s" and discard that work (%s)? [y/N] ' "$name" "$what" >&2
+    else
+      printf 'wt: remove worktree "%s" (%s)? [y/N] ' "$name" "$what" >&2
+    fi
     read -r ans || ans=n
   fi
   [[ "${ans:-}" =~ ^[Yy]$ ]] || { msg "cancelled"; return 0; }

@@ -73,7 +73,8 @@ wt open [name]       open the worktree's dev url in the browser, starting the
                      -l to skip the build and just relaunch - this is a convention
                      of those two profiles, not a flag `wt` itself parses)
 wt provision <path>  re-run provisioning for a worktree (idempotent)
-wt rm  [-y] [name]   tear a worktree down (drop db, free port, remove worktree)
+wt rm  [-y] [name]   tear a worktree down (drop db, free port, remove worktree);
+                     one holding work that is not pushed is refused under -y
 wt ls                list worktrees with their allocated port / redis / url / db
 wt gc                reclaim resources from worktrees removed outside wt rm
 ```
@@ -518,6 +519,15 @@ Herdr has no worktree-removal hook, so removing a worktree through Herdr's own U
 `wt gc --settled` goes further and reclaims worktrees whose pull request has stopped moving - merged or closed - the case the orphan pass structurally cannot see, since a finished worktree is still a perfectly valid git worktree.
 Only `open` is still live: one branch shipped and the other was abandoned, and neither has anything left to come back to.
 It lists what it intends to take, and which verdict each row is, before taking any of it, and skips a repo whose PR state it could not read.
+
+Neither `wt rm` nor `wt gc --settled` destroys work that exists nowhere else.
+Removing a worktree is `git worktree remove --force` and then `git branch -D`, so edits nobody committed, files nobody added and commits that are on no remote would all be gone for good - and a settled pull request says nothing about any of them, since somebody may have gone on working in the worktree, or reviewed it with `--fix` and never pushed.
+So both check first, before anything is released.
+`wt rm --yes` refuses, naming what is at stake, and exits 3 so a script can tell a refusal from a failure; that is the path `pq`'s teardown drives, and nobody there can have meant to discard anything.
+`wt rm` at a terminal lists the work and asks whether to discard it, and no is the default.
+`wt gc --settled` leaves such a worktree where it is, even under `-y`, and says which ones it left.
+An untracked file counts, and an ignored one does not.
+A commit counts when no remote-tracking ref reaches it, unless the forge still names it as a pull request's head: a branch deleted on merge and then pruned would otherwise read as never pushed at all.
 
 `wt gc --sweep` reclaims project-owned resources (databases, puma-dev entries) whose worktree is gone entirely, so no state file points at them any more.
 It previews what it would reclaim first, since - unlike the other two passes - it deletes on a naming pattern rather than on a recorded fact.
