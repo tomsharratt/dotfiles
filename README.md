@@ -271,7 +271,11 @@ A blocker on a task still in the queue is judged the same way - nothing on the f
 Leaving the queue and giving up the slot are separate things, though: see the cap below, which keeps counting a task whose agent is still working on its PR.
 Fill claims a task by moving it to `running/` *before* calling `wt new`, because that call takes the better part of a minute and an unclaimed task is one a second tick would happily pick up too.
 Each dispatch step records itself as it succeeds, so an interrupted tick is resumed rather than restarted - and resuming deliberately skips `wt new` when the pane is still there, since re-provisioning would drop the worktree's database.
-A `mkdir` lock keeps two ticks from both filling to cap.
+A dispatch that fails is retried on the next tick, but only three times in a row: a repo that has moved or a branch `wt` cannot create never starts working on its own, so after the third the task is left for you - `failed` in `pq ls`, said once, no longer retried and no longer holding a slot - and `pq rm` drops it.
+A prompt that waits on a dialog, a trust prompt say, is not a failure and is never counted.
+A lock keeps two ticks from both filling to cap: a symlink naming its owner's pid and that process's start time, created in one atomic step.
+It used to be a directory with the pid written into it a moment later, so a tick arriving in that moment read the lock as stale and took it too; and a pid alone outlives its process, so a lock left behind across a reboot could name a pid someone else now had and block every tick.
+`pq rm`, and the forms of `pq after` and `pq base` that change a task, take the lock too, and find the task again under it: an answer given about a queued task is not applied to one a tick has since claimed.
 
 `pq tick --dry-run` shows what it would do and changes nothing.
 
@@ -397,6 +401,12 @@ What walls a task is usually a background agent, and its failure reaches the tra
 Only until the first knock, though, because a knock is precisely what demoted it to polling - the named time came and went with the wall still up - while the line that named it stays in the scrollback for ever.
 Re-reading that line afterwards would not even give back a stale time: a bare clock time is read as the next time the clock comes round to it, so `resets 4:20pm` read at 4:30 is tomorrow, and a ten-minute cycle would quietly become a day-long one.
 The same rollover is why a second look never accepts a reset further out than `pq` would keep knocking for anyway - a hint that has rolled sits a clear day away, well past a bound that a five-hour window's reset is nowhere near.
+
+The namer and the splitter can meet the wall too, and they say so: `pq add` stops with "behind the usage limit - pq add again once it resets" rather than reading the wall's one line as a reply that named nothing.
+
+A pane id is only an id, and herdr handed workspace ids out again after a restart, so an id `pq` recorded can come to name a pane in somebody else's workspace.
+A pane is only ever read, knocked on or prompted while Herdr places it inside the task's own worktree; otherwise it reads as missing, which is the truth about the task's own pane.
+`wt` checks the same thing before it closes a workspace by a recorded id, since closing one is `worktree remove --force` on whatever it holds.
 
 The wall is the only dialog `pq` ever answers.
 A permission prompt is recorded as `permission` and deliberately left alone - that is the trade for running everything in auto mode - so `pq ls` separates the agents waiting on the clock from the ones waiting on you.

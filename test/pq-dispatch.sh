@@ -270,10 +270,12 @@ reset_tasks; reset_logs; set_panes ""
 printf 'agent_blocked' > "$STUBBIN/.prompt-fail"
 DP=$(mk_task running 006 blockedp tom/blockedp)
 dispatch_task "$DP" >/dev/null 2>"$PQ_HOME/.err"; rc=$?
-eq "$rc" "1" "dispatch reports failure"
+eq "$rc" "2" "dispatch reports it is waiting on a dialog - not the task's failure (dispatch_try counts only 1)"
 [ -n "$(st "$DP" PQ_STARTED)" ] && ok || bad "the start itself succeeded and is kept"
 eq "$(st "$DP" PQ_LAUNCHED)" "" "no launch recorded"
-has "$(cat "$PQ_HOME/.err")" "could not deliver the prompt to w1:p1 (agent_blocked)" "the refusal is named"
+has "$(cat "$PQ_HOME/.err")" "the agent in w1:p1 is on a dialog - its prompt goes once somebody answers it" "the wait is named"
+dispatch_task "$DP" >/dev/null 2>"$PQ_HOME/.err"
+hasnt "$(cat "$PQ_HOME/.err")" "on a dialog" "said once, not every tick"
 # ...and the retry, once the dialog is gone, prompts without starting again.
 reset_logs
 set_panes "$(printf 'w1:p1\tclaude\tidle')"

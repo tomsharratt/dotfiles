@@ -35,9 +35,14 @@ mkdir -p "$XDG_STATE_HOME/wt" "$XDG_CONFIG_HOME/wt/profiles"
 STUBBIN=$(mktemp -d)
 HERDR_LOG="$STUBBIN/.herdr-calls"
 : > "$HERDR_LOG"
+# `api snapshot` answers from $SNAPSHOT, which says which checkout each workspace
+# holds - what wt checks before it closes one by a recorded id.
+SNAPSHOT="$STUBBIN/.snapshot.json"
+echo '{"result":{"snapshot":{"workspaces":[]}}}' > "$SNAPSHOT"
 cat > "$STUBBIN/herdr" <<EOF
 #!/bin/sh
 printf '%s\n' "\$*" >> "$HERDR_LOG"
+case "\$1 \$2" in "api snapshot") cat "$SNAPSHOT" ;; esac
 exit 0
 EOF
 chmod +x "$STUBBIN/herdr"
@@ -75,6 +80,14 @@ RN=$(basename "$REPO")
 WTROOT=$(mktemp -d)
 git -C "$REPO" worktree add -q -b tom/aaa-victim "$WTROOT/aaa-victim" master
 git -C "$REPO" worktree add -q -b tom/zzz-target "$WTROOT/zzz-target" master
+snapshot() {                            # ws path ... -> which checkout each workspace holds
+  local rows="[]"
+  while [ $# -gt 1 ]; do
+    rows=$(jq -c --arg w "$1" --arg p "$2" '. + [{workspace_id: $w, worktree: {checkout_path: $p}}]' <<<"$rows"); shift 2
+  done
+  jq -n --argjson r "$rows" '{result: {snapshot: {workspaces: $r}}}' > "$SNAPSHOT"
+}
+snapshot w27 "$WTROOT/aaa-victim" w29 "$WTROOT/zzz-target"
 
 # A profile that records whose resources a teardown was handed, so a wrong-target
 # teardown is visible rather than merely possible.
@@ -186,6 +199,55 @@ esac
 [ -d "$WTROOT/aaa-victim" ] && ok || bad "the worktree that file describes must be untouched"
 [ ! -d "$WTROOT/zzz-target" ] && ok \
   || bad "the worktree it WAS asked about should still be removed - a leak, not a no-op"
+
+echo "== a workspace id on file that now holds another worktree is never closed ==" >&2
+# herdr handed workspace ids out again after its restart on 2026-08-20, and closing
+# one is `worktree remove --force` on whatever it holds now.
+git -C "$REPO" worktree add -q -b tom/reissued "$WTROOT/reissued" master
+git -C "$REPO" worktree add -q -b tom/bystander "$WTROOT/bystander" master
+cat > "$XDG_STATE_HOME/wt/$RN--tom-reissued.env" <<EOF
+WT_NAME=tom/reissued
+WT_SLUG=tom-reissued
+WT_PATH=$WTROOT/reissued
+WT_REPO=$REPO
+WT_REPO_NAME=$RN
+WT_WORKSPACE=w40
+EOF
+snapshot w40 "$WTROOT/bystander"
+: > "$HERDR_LOG"
+sidx_load
+out=$(reap_one "$REPO" "$RN" tom/reissued "$WTROOT/reissued" y 2>&1)
+case "$(cat "$HERDR_LOG")" in *"--workspace w40"*|*"close w40"*) bad "w40 now holds another worktree and must not be closed" ;; *) ok ;; esac
+case "$out" in *"workspace w40 on file now holds $WTROOT/bystander"*) ok ;; *) bad "and it says why (got '$out')" ;; esac
+[ -d "$WTROOT/bystander" ] && ok || bad "the bystander worktree is untouched"
+[ ! -d "$WTROOT/reissued" ] && ok || bad "the worktree it was asked about is still removed"
+
+echo "== nor by gc, for an orphan whose workspace id has moved on ==" >&2
+cat > "$XDG_STATE_HOME/wt/$RN--tom-orphaned.env" <<EOF
+WT_NAME=tom/orphaned
+WT_SLUG=tom-orphaned
+WT_PATH=$WTROOT/orphaned-and-gone
+WT_REPO=$REPO
+WT_REPO_NAME=$RN
+WT_WORKSPACE=w41
+EOF
+snapshot w41 "$WTROOT/bystander"
+: > "$HERDR_LOG"
+gc_run >/dev/null 2>&1
+case "$(cat "$HERDR_LOG")" in *"w41"*"remove"*|*"--workspace w41"*|*"close w41"*) bad "gc must not close w41 either" ;; *) ok ;; esac
+snapshot w41 "$WTROOT/orphaned-and-gone"
+cat > "$XDG_STATE_HOME/wt/$RN--tom-orphaned.env" <<EOF
+WT_NAME=tom/orphaned
+WT_SLUG=tom-orphaned
+WT_PATH=$WTROOT/orphaned-and-gone
+WT_REPO=$REPO
+WT_REPO_NAME=$RN
+WT_WORKSPACE=w41
+EOF
+: > "$HERDR_LOG"
+gc_run >/dev/null 2>&1
+case "$(cat "$HERDR_LOG")" in *"--workspace w41"*) ok ;; *) bad "but closes it while it still holds the orphan's checkout (log: $(cat "$HERDR_LOG"))" ;; esac
+snapshot
 
 # ── work that exists nowhere else ───────────────────────────────────────────
 # `wt rm --yes` is `git worktree remove --force` plus `git branch -D`, and pq runs

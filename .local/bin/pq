@@ -418,7 +418,7 @@ cmd_cap() {
     [ -d "$d" ] || continue
     [ -n "$(slot_state "${d%/}")" ] && nwrap=$((nwrap + 1))
   done
-  active=$(( $(dir_count "$PQ_HOME/running") + nwrap ))
+  active=$(( $(running_count) + nwrap ))
   local also=""
   [ "$nwrap" -gt 0 ] && also=" ($nwrap of them wrapping up a PR)"
   # A wall outranks the arithmetic here as much as it does in fill: room the next
@@ -575,6 +575,27 @@ find_task() {                           # needle
 
 state_of() {                            # task_dir  -> queue|running|done
   local p=${1%/*}; basename "$p"
+}
+
+# Where a task directory is NOW, whatever state it has moved to since it was found
+# - a task keeps its name through every move - or nothing when it is gone.
+task_now() {                            # task_dir -> task_dir, or nothing
+  local name s; name=$(basename "$1")
+  for s in $STATES; do [ -d "$PQ_HOME/$s/$name" ] && { printf '%s' "$PQ_HOME/$s/$name"; return 0; }; done
+  return 1
+}
+# The lock, then the task found again under it: a command that asked a question, or
+# checked a state, before changing a task must not change one a tick has moved on
+# since. Dies, holding nothing, when it has moved or gone; the caller releases.
+task_locked() {                         # task_dir -> the same task_dir, under the lock
+  local d=$1 now slug; slug=$(slug_of "$d")
+  lock_wait
+  now=$(task_now "$d") || { release_lock; die "$slug is gone - nothing changed"; }
+  if [ "$now" != "$d" ]; then
+    release_lock
+    die "$slug moved to $(state_of "$now")/ while you were answering - nothing changed; run it again"
+  fi
+  printf '%s' "$d"
 }
 
 # ── the stable path ─────────────────────────────────────────────────────────
@@ -784,8 +805,19 @@ The branch must differ from these, which are already taken: $avoid"
   [ -n "$label" ] && prompt="$prompt
 This part lands in the $label repository, so make the branch name say which one if the task's own words would not already distinguish it from the same work elsewhere."
   raw=$(headless_claude -p --model "$PQ_NAMER_MODEL" "$prompt" < "$1" 2>/dev/null) || return 0
-  # Be forgiving about a fenced or chatty reply: take the first {...} span.
-  json=$(sed -n 's/.*\({.*}\).*/\1/p' <<<"$(tr '\n' ' ' <<<"$raw")" | head -1)
+  # A usage-limit reply is the wall's one line where the JSON should be, and read
+  # as a reply with no JSON it said "Haiku gave no usable branch; try pq add
+  # again" - which cannot work until the reset. Say that instead.
+  local wall
+  if wall=$(wall_reply "$raw"); then
+    warn "naming hit the usage limit: $wall"
+    return 3
+  fi
+  # Be forgiving about a fenced or chatty reply: take the span from the first `{`
+  # to the last `}`. From the last `{`, as this used to, a brace inside the intent
+  # - "Adds {placeholder} support" - cut the object in half, and every retry got
+  # the same reply and failed the same way.
+  json=$(sed -n 's/^[^{]*\({.*}\)[^}]*$/\1/p' <<<"$(tr '\n' ' ' <<<"$raw")" | head -1)
   [ -n "$json" ] || return 0
   # The branch is always tom/<words>, whatever came back: Haiku drops the
   # prefix it is asked for often enough to matter - 27 of the first 103 tasks
@@ -1462,7 +1494,8 @@ cmd_add() {                             # plan branch intent security ("" "" "" 
   # for nothing - and for a resumed split, which names its parts later.
   local named=""
   if [ -z "$split_dir" ] && [ -z "$branch" ]; then
-    local named_all; named_all=$(name_plan "$plan")
+    local named_all nrc; named_all=$(name_plan "$plan"); nrc=$?
+    [ "$nrc" = 3 ] && die "could not name the plan behind the usage limit - pq add again once it resets"
     named=$(head -1 <<<"$named_all")
     outline=$(outline_of "$named_all")
   fi
@@ -1544,7 +1577,8 @@ cmd_add() {                             # plan branch intent security ("" "" "" 
   # request behind it, is taken. A branch handed in (a split part) is the caller's.
   if why=$(branch_taken "$branch" "$repo") && [ -n "$named" ]; then
     warn "branch '$branch' is already $why - asking for another name"
-    named=$(name_plan "$plan" "$branch" | head -1)
+    named=$(name_plan "$plan" "$branch") || { [ $? = 3 ] && die "could not rename the plan behind the usage limit - pq add again once it resets"; }
+    named=$(head -1 <<<"$named")
     branch=$(cut -f1 <<<"$named"); intent=$(cut -f2 <<<"$named"); security=$(cut -f3 <<<"$named")
     [ -n "$branch" ] || die "could not name the plan - Haiku gave no usable branch; try pq add again"
     git check-ref-format "refs/heads/$branch" || die "invalid branch name: '$branch'"
@@ -2174,6 +2208,7 @@ split_name_parts() {                    # sd leveled_tsv multi
       else
         named=$(name_plan "$sd/$part" "$avoid")
       fi
+      [ $? = 3 ] && die "$part: could not be named behind the usage limit - nothing queued; resume once it resets with: $(split_resume_hint "$sd")"
       [ -n "$named" ] || die "$part: could not derive a branch name and intent - naming failed"
       # `cut`, not `read`: a tab is IFS whitespace, so an empty intent would
       # let the verdict slide into its place - see cmd_add.
@@ -2613,6 +2648,14 @@ do_split() {
     dur=$(jq -r       '.duration_ms // empty'    "$sd/splitter.json" 2>/dev/null)
     denials=$(jq -r   '.permission_denials // empty' "$sd/splitter.json" 2>/dev/null)
     [ -z "$denials" ] || [ "$denials" = "[]" ] || warn "the splitter reached for something denied: $denials"
+    # A wall is not a failed split and not a split with no graph, which is what
+    # it read as: "the splitter wrote no graph.tsv", with the reason buried in
+    # splitter.json. It exits 0 with the wall's one line for its whole reply.
+    local swall
+    if swall=$(wall_reply "$(jq -r 'if type == "object" then (.result // "" | tostring) else "" end' "$sd/splitter.json" 2>/dev/null)") \
+       || swall=$(wall_reply "$(sed '/^[[:space:]]*$/d' "$sd/splitter.err" 2>/dev/null | tail -n 1)"); then
+      die "the splitter hit the usage limit ($swall) - nothing was split; pq add --split again once it resets"
+    fi
     if [ "$rc" != 0 ] || [ "$is_error" = "true" ]; then
       die "the splitter session failed - see $sd/splitter.err and $sd/splitter.json"
     fi
@@ -2665,9 +2708,31 @@ pidx_load() {
   command -v herdr >/dev/null 2>&1 || return 0
   raw=$(herdr api snapshot 2>/dev/null) || return 0
   jq -e '.result.snapshot.panes' >/dev/null 2>&1 <<<"$raw" || return 0
-  PIDX=$(jq -r '.result.snapshot.panes[]? | [.pane_id // "", (.agent // ""), (.agent_status // "")] | @tsv' \
+  PIDX=$(jq -r '.result.snapshot.panes[]? | [.pane_id // "", (.agent // ""), (.agent_status // ""),
+                                             (.cwd // ""), (.foreground_cwd // "")] | @tsv' \
     2>/dev/null <<<"$raw")
   PIDX_OK=1
+}
+
+# The pane on file for a task, while it is still the task's own; nothing once it is
+# not. A pane id is only an id: herdr handed out workspace ids again after its
+# restart on 2026-08-20, so an id pq recorded can come to name a pane in somebody
+# else's workspace - and pq reads that pane, knocks on it and prompts it. What
+# herdr then does with a reused id is not something pq has seen, so it does not
+# find out: a pane sitting outside the task's worktree is not the task's, and
+# reads as missing to every caller, which is the truth about the task's own pane.
+#
+# Every read of PQ_PANE goes through this; only dispatch writes it. A pane herdr
+# gives no cwd for, or a task with no worktree on file, is taken as it stands.
+task_pane() {                           # task_dir -> pane id, or nothing
+  local d=$1 pane wt
+  pane=$(st "$d" PQ_PANE); [ -n "$pane" ] || return 0
+  wt=$(st "$d" PQ_WORKTREE)
+  if [ -z "$wt" ] || [ "${PIDX_OK:-0}" != 1 ]; then printf '%s' "$pane"; return 0; fi
+  awk -F'\t' -v p="$pane" -v w="$wt" '
+    function under(c) { return c != "" && (c == w || index(c, w "/") == 1) }
+    $1 == p { found = 1; ours = ($4 == "" && $5 == "") || under($4) || under($5); exit }
+    END { if (!found || ours) print p }' <<<"$PIDX"
 }
 # missing | noagent | working | idle | blocked | unknown. Empty when herdr never
 # answered at all, so a stopped server reads as "no idea" rather than "all dead".
@@ -2766,7 +2831,7 @@ slot_held() {                           # task_dir -> 0 holds, 1 released
   # one's agent is still running - the over-dispatch this whole section exists to
   # stop. PQ_CLOSED belonged here only while it meant "pq will never touch this".
   [ -n "$(st "$d" PQ_REAPED)" ] && return 1
-  pane=$(st "$d" PQ_PANE)
+  pane=$(task_pane "$d")
   [ -n "$pane" ] || return 1
   status=$(pane_state "$pane")
   case "$status" in
@@ -2821,13 +2886,8 @@ slot_held() {                           # task_dir -> 0 holds, 1 released
 # slot either way; it is only the stamping that differs), so the number a
 # dry-run reports is the number a real tick would have acted on.
 active_slots() {                        # [dry] -> run<TAB>wrap
-  local dry=${1:-0} d run=0 wrap=0
-  for d in "$PQ_HOME/running"/*/; do
-    [ -d "$d" ] || continue
-    # Not a task without its plan - see the reconcile loop's phantom check.
-    [ -f "${d%/}/plan.md" ] || continue
-    run=$((run + 1))
-  done
+  local dry=${1:-0} d run wrap=0
+  run=$(running_count)
   for d in "$PQ_HOME/done"/*/; do
     [ -d "$d" ] || continue
     d=${d%/}
@@ -2838,6 +2898,21 @@ active_slots() {                        # [dry] -> run<TAB>wrap
     fi
   done
   printf '%s\t%s' "$run" "$wrap"
+}
+
+# The running/ half of the count: every task there, but not a directory with no
+# plan (see the reconcile loop's phantom check) and not a task whose dispatch pq
+# has given up on (dispatch_try), since nothing is running in either. Every line
+# that reports the cap counts through this, so none of them disagrees with fill.
+running_count() {
+  local d n=0
+  for d in "$PQ_HOME/running"/*/; do
+    [ -d "$d" ] || continue
+    [ -f "${d%/}/plan.md" ] || continue
+    dispatch_gaveup "${d%/}" && continue
+    n=$((n + 1))
+  done
+  printf '%s' "$n"
 }
 
 # The read-only half of slot_held, for `pq ls` and `pq cap`: the same verdict
@@ -2851,7 +2926,7 @@ active_slots() {                        # [dry] -> run<TAB>wrap
 slot_state() {                          # task_dir -> "wrapping up" | ""
   local d=$1 pane status since
   [ -n "$(st "$d" PQ_REAPED)" ] && return 0
-  pane=$(st "$d" PQ_PANE)
+  pane=$(task_pane "$d")
   [ -n "$pane" ] || return 0
   status=$(pane_state "$pane")
   case "$status" in
@@ -3116,7 +3191,7 @@ clear_block() {                         # task_dir
 # `working` there means what it says. PIDX is loaded once per tick, so it is free.
 check_stall() {                         # task_dir
   local d=$1 slug pane text hash prev kind was tries at nowsec still moved
-  pane=$(st "$d" PQ_PANE); [ -n "$pane" ] || return 0
+  pane=$(task_pane "$d"); [ -n "$pane" ] || return 0
   text=$(pane_tail "$pane"); [ -n "$text" ] || return 0
   slug=$(slug_of "$d"); nowsec=$(epoch)
   hash=$(cksum <<<"$text" | awk '{ print $1 }')
@@ -3418,7 +3493,7 @@ walled_slot() {                         # -> who<TAB>resets_at | "", who being a
     fi
     [ "$(st "$d" PQ_BLOCKED)" = quota ] || continue
     [ "$(st "$d" PQ_GAVEUP)" = 1 ] && continue
-    case "$(pane_state "$(st "$d" PQ_PANE)")" in noagent|missing) continue ;; esac
+    case "$(pane_state "$(task_pane "$d")")" in noagent|missing) continue ;; esac
     printf '%s\t%s' "$(slug_of "$d")" "$(st "$d" PQ_RESETS_AT)"
     return 0
   done
@@ -4154,8 +4229,8 @@ agent_cell() {                          # task_dir state
       # this is the row that tells you it is being handled rather than waiting.
       blocked=$(block_cell "$d")
       if [ -n "$blocked" ]; then printf '%s' "$blocked"; return; fi
-      if [ "$(pane_state "$(st "$d" PQ_PANE)")" = blocked ]; then printf 'blocked'; return; fi
-      blocked=$(quiet_cell "$d" "$(pane_state "$(st "$d" PQ_PANE)")")
+      if [ "$(pane_state "$(task_pane "$d")")" = blocked ]; then printf 'blocked'; return; fi
+      blocked=$(quiet_cell "$d" "$(pane_state "$(task_pane "$d")")")
       if [ -n "$blocked" ]; then printf '%s' "$blocked"; return; fi
       # The review gate, ahead of the slot report: `review due`, `reviewing 7m`,
       # `security review 3m`, `reviewed`, `review failed`, `resolving`, `review lapsed` all say more
@@ -4173,10 +4248,14 @@ agent_cell() {                          # task_dir state
       ;;
   esac
   [ "$st" = running ] || { printf -- '-'; return; }
-  pane=$(st "$d" PQ_PANE)
+  pane=$(task_pane "$d")
   # Claimed but not yet launched: either mid-dispatch right now, or an interrupted
-  # tick left it half-done and the next reconcile will finish it.
-  [ -n "$(st "$d" PQ_LAUNCHED)" ] || { printf 'starting'; return; }
+  # tick left it half-done and the next reconcile will finish it - unless pq has
+  # given up on it, which wants you.
+  if [ -z "$(st "$d" PQ_LAUNCHED)" ]; then
+    if dispatch_gaveup "$d"; then printf 'failed'; else printf 'starting'; fi
+    return
+  fi
   status=$(pane_state "$pane")
   case "$status" in
     "")        printf '?';    return ;;       # herdr did not answer
@@ -4270,7 +4349,7 @@ cmd_ls() {
     repo=$(hdr "$d/plan.md" repo)
     agent=$(agent_cell "$d" "$st")
     case "$agent" in
-      permission|gone|exited|blocked|unknown|quiet|error) needs=$((needs + 1)) ;;
+      permission|gone|exited|blocked|unknown|quiet|error|failed) needs=$((needs + 1)) ;;
       dead\ *|stalled\ *|held\ *|base\ *)             needs=$((needs + 1)) ;;
       review\ lapsed|ci\ failed|conflict|new\ review)  needs=$((needs + 1)) ;;
     esac
@@ -4347,7 +4426,7 @@ cmd_ls() {
     render_table "$tbl"
     local nq nr narch
     nq=$(dir_count "$PQ_HOME/queue")
-    nr=$(dir_count "$PQ_HOME/running")
+    nr=$(running_count)
     narch=$(dir_count "$PQ_HOME/archive")
     printf '\n' >&2
     # The wrap-up count only earns its words when there is one, but when there
@@ -4421,14 +4500,18 @@ cmd_after() {
 
   # Both mutating forms - clearing and adding - are restricted to what has not
   # started: blockers only gate a task that has not been dispatched yet. Same
-  # message shape as cmd_base's own guard below.
+  # message shape as cmd_base's own guard below. Checked under the lock, which is
+  # held to the end, so a tick cannot claim the task between the check and the
+  # write - and write the blockers into a directory that has moved on.
   case "$(state_of "$d")" in
     queue) ;;
     *) die "$(slug_of "$d") is $(state_of "$d") - blockers only gate what has not started" ;;
   esac
+  task_locked "$d" >/dev/null || exit 1
 
   if [ "$1" = --clear ]; then
     rm -f "$d/after"
+    release_lock
     msg "cleared blockers on $(slug_of "$d")"
     return 0
   fi
@@ -4436,12 +4519,12 @@ cmd_after() {
   local owner_repo owner_branch value resolved label repo branch base
   owner_repo=$(hdr "$d/plan.md" repo); owner_branch=$(hdr "$d/plan.md" branch)
   for value in "$@"; do
-    resolved=$(resolve_after "$owner_repo" "$value") || die "could not resolve '$value' to a task or branch"
+    resolved=$(resolve_after "$owner_repo" "$value") || { release_lock; die "could not resolve '$value' to a task or branch"; }
     IFS=$'\t' read -r label repo branch <<<"$resolved"
-    [ -n "$repo" ] && [ -n "$branch" ] || die "could not resolve '$value' to a repo and branch"
-    [ "$repo" = "$owner_repo" ] && [ "$branch" = "$owner_branch" ] && die "a task cannot block on itself"
+    [ -n "$repo" ] && [ -n "$branch" ] || { release_lock; die "could not resolve '$value' to a repo and branch"; }
+    [ "$repo" = "$owner_repo" ] && [ "$branch" = "$owner_branch" ] && { release_lock; die "a task cannot block on itself"; }
     after_cycle "$owner_repo" "$owner_branch" "$repo" "$branch" \
-      && die "'$value' would create a cycle - $(slug_of "$d") already leads back to it"
+      && { release_lock; die "'$value' would create a cycle - $(slug_of "$d") already leads back to it"; }
     after_add "$d" "$label" "$repo" "$branch"
     pr_load_all "$(printf '%s\t%s\n' "$repo" "$branch")"
     base=$(blocker_base "$d" "$repo")
@@ -4451,6 +4534,7 @@ cmd_after() {
       msg "$(slug_of "$d") after $label ($branch)"
     fi
   done
+  release_lock
   rm -f "$PR_CACHE" "$PR_ANS"
   repo_base_reset
 }
@@ -4494,6 +4578,11 @@ cmd_base() {
     fi
   fi
 
+  # Under the lock, for the reason cmd_after gives: a task claimed between the
+  # state check above and this rewrite would have its plan changed under a
+  # dispatch that is already reading it.
+  task_locked "$d" >/dev/null || exit 1
+
   # Rewrites ONLY inside the header block. A plan body is prose and code, and a
   # line in it beginning `base:` is entirely possible - a blind sed would rewrite
   # the agent's instructions. Same header-block bookkeeping as `hdr` itself.
@@ -4504,9 +4593,10 @@ cmd_base() {
     inh && $0 ~ /^base:[ \t]/   { next }
     inh && $0 ~ /^branch:/      { print; if (nb != "") printf "base:     %s\n", nb; next }
                                 { print }
-  ' "$d/plan.md" > "$tmp" || { rm -f "$tmp"; die "could not rewrite $(slug_of "$d")'\''s plan.md"; }
-  [ -s "$tmp" ] || { rm -f "$tmp"; die "refusing to write an empty plan.md"; }
-  mv "$tmp" "$d/plan.md" || { rm -f "$tmp"; die "could not replace $(slug_of "$d")'\''s plan.md"; }
+  ' "$d/plan.md" > "$tmp" || { rm -f "$tmp"; release_lock; die "could not rewrite $(slug_of "$d")'\''s plan.md"; }
+  [ -s "$tmp" ] || { rm -f "$tmp"; release_lock; die "refusing to write an empty plan.md"; }
+  mv "$tmp" "$d/plan.md" || { rm -f "$tmp"; release_lock; die "could not replace $(slug_of "$d")'\''s plan.md"; }
+  release_lock
 
   # Cleared so a retarget that is ALSO wrong warns again rather than staying
   # silent behind the previous block.
@@ -4533,12 +4623,18 @@ cmd_rm() {
   reaped=$(st "$d" PQ_REAPED)
   printf 'pq: remove task "%s" (%s)? [y/N] ' "$slug" "$st" >&2; read -r ans || ans=n
   [[ "${ans:-}" =~ ^[Yy]$ ]] || { msg "cancelled"; return 0; }
+  # The answer was about the task as it was when the question was asked. A tick
+  # that claimed it meanwhile has it in running/ with a worktree on its way, and
+  # removing the old path then removed nothing, said "removed", and the task
+  # dispatched anyway. Under the lock, and only if it has not moved.
+  task_locked "$d" >/dev/null || exit 1
   # A reviewer still running would go on writing into a directory that is about
   # to vanish, and then post comments on a pull request pq has forgotten - and
   # the security reviewer can still be running once the gate is at `posted`.
   review_kill "$d"
-  rm -rf "$d" || die "could not remove $d"
+  rm -rf "$d" || { release_lock; die "could not remove $d"; }
   rm -f "$PQ_HOME/tasks/$(basename "$d")"
+  release_lock
   msg "removed $slug"
   # Removing A is exactly how B gets orphaned - nothing will ever open a PR for
   # a branch pq no longer knows about, so that is the moment to say so.
@@ -4911,7 +5007,7 @@ wt_in_errto() {                         # errfile repo wt-subcommand args...
   wt_in "$@" 2> "$errf"
 }
 
-dispatch_task() {                       # task_dir  -> 0 launched, 1 failed
+dispatch_task() {                       # task_dir  -> 0 launched, 1 failed, 2 waiting on a dialog
   local d=$1 repo branch model effort pane wtjson prompt
   repo=$(hdr "$d/plan.md" repo);     branch=$(hdr "$d/plan.md" branch)
   model=$(hdr "$d/plan.md" model);   effort=$(hdr "$d/plan.md" effort)
@@ -4928,7 +5024,7 @@ dispatch_task() {                       # task_dir  -> 0 launched, 1 failed
   # directory), since the prompt below hands it out.
   task_link "$d"
 
-  pane=$(st "$d" PQ_PANE)
+  pane=$(task_pane "$d")
   local fresh=0
   if [ -z "$pane" ] || [ "$(pane_state "$pane")" = missing ]; then
     # With the dev server, always. It used to be `--no-dev` - a foreman stack
@@ -5012,14 +5108,49 @@ dispatch_task() {                       # task_dir  -> 0 launched, 1 failed
   prompt=$(dispatch_prompt "$(task_home "$d")" "$basebr")
   local code rc
   code=$(agent_prompt "$pane" "$prompt"); rc=$?
+  if [ "$rc" = 2 ]; then
+    # On a dialog - a trust prompt, say. Not the task's failure: it goes on the
+    # first tick after somebody answers, and is said once rather than every tick.
+    [ "$(st "$d" PQ_DISPATCH_WAIT)" = blocked ] || { st_set "$d" PQ_DISPATCH_WAIT blocked
+      warn "$(slug_of "$d"): the agent in $pane is on a dialog - its prompt goes once somebody answers it"; }
+    return 2
+  fi
   if [ "$rc" != 0 ]; then
     warn "$(slug_of "$d"): could not deliver the prompt to $pane ($code) - the next tick will retry"
     return 1
   fi
+  [ -z "$(st "$d" PQ_DISPATCH_WAIT)" ] || st_set "$d" PQ_DISPATCH_WAIT ""
   st_set "$d" PQ_LAUNCHED "$(now)"
   msg "$(slug_of "$d"): running ${model:-$PQ_DEFAULT_MODEL}/${effort:-$PQ_DEFAULT_EFFORT} in $pane"
   return 0
 }
+
+# A dispatch that fails is retried every tick, which is right for the failures that
+# pass - a fetch that timed out, a herdr that was restarting - and was wrong for
+# the ones that never will: a repo that has moved, a branch wt cannot create. Those
+# retried all night with no count, holding a slot and saying so every two minutes.
+# So failures in a row are counted, and past DISPATCH_TRIES the task is left for
+# you: PQ_DISPATCH_GAVEUP, said once, `failed` in `pq ls`, no longer resumed, and
+# no longer holding a slot, since nothing is running in it. `pq rm` drops it. A
+# prompt waiting on a dialog is not a failure (dispatch_task says so with 2), and a
+# dispatch that goes through clears the count.
+DISPATCH_TRIES=3
+dispatch_try() {                        # task_dir -> dispatch_task's status
+  local d=$1 rc n
+  dispatch_task "$d"; rc=$?
+  case "$rc" in
+    0) [ -z "$(st "$d" PQ_DISPATCH_FAILS)" ] || st_set "$d" PQ_DISPATCH_FAILS ""; return 0 ;;
+    2) return 2 ;;
+  esac
+  n=$(st "$d" PQ_DISPATCH_FAILS); n=$(( ${n:-0} + 1 ))
+  st_set "$d" PQ_DISPATCH_FAILS "$n"
+  if [ "$n" -ge "$DISPATCH_TRIES" ]; then
+    st_set "$d" PQ_DISPATCH_GAVEUP 1
+    warn "$(slug_of "$d"): dispatch failed $n times in a row - leaving it for you (the reason is above; pq rm $(slug_of "$d") drops it)"
+  fi
+  return 1
+}
+dispatch_gaveup() { [ "$(st "$1" PQ_DISPATCH_GAVEUP)" = 1 ]; }
 
 # ── review gate ─────────────────────────────────────────────────────────────
 # Every pull request a task opens gets one independent review before the
@@ -5519,9 +5650,16 @@ security_collect() {                    # task_dir -> ok | failed
 # all has the same test put to the last line of its stderr.
 reviewer_wall_text() {                  # task_dir stem -> the wall's line, when that is all it said
   local d=$1 stem=$2 text
-  text=$(jq -r 'if type == "object" then (.result // "" | tostring) else empty end' "$d/$stem.json" 2>/dev/null \
-           | sed '/^[[:space:]]*$/d')
-  [ -n "$text" ] || text=$(sed '/^[[:space:]]*$/d' "$d/$stem.err" 2>/dev/null | tail -n 1)
+  text=$(jq -r 'if type == "object" then (.result // "" | tostring) else empty end' "$d/$stem.json" 2>/dev/null)
+  [ -n "$(tr -d '[:space:]' <<<"$text")" ] || text=$(sed '/^[[:space:]]*$/d' "$d/$stem.err" 2>/dev/null | tail -n 1)
+  wall_reply "$text"
+}
+# The same test on a reply already in hand: one non-blank line, reading as the wall.
+# Every headless session pq runs - the namer and the splitter too - can get that
+# line for its whole answer.
+wall_reply() {                          # text -> the wall's line, when that is all it is
+  local text
+  text=$(sed '/^[[:space:]]*$/d' <<<"${1:-}")
   [ -n "$text" ] && [ "$(grep -c . <<<"$text")" = 1 ] || return 1
   grep -qiE "$PQ_QUOTA_RE" <<<"$text" || return 1
   printf '%s' "$text"
@@ -5738,7 +5876,7 @@ review_task() {                         # task_dir dry
   IFS=$'\t' read -r num prstate draft <<<"$(pr_get "$repo" "$branch")"
   pr=$(st "$d" PQ_PR); [ -n "$pr" ] || pr=${num:-}
   case "${prstate:-}" in MERGED|CLOSED) settled=1 ;; esac
-  pstate=$(pane_state "$(st "$d" PQ_PANE)")
+  pstate=$(pane_state "$(task_pane "$d")")
 
   # A settled row outranks everything in every state but `prompted`, which has
   # its own reading of a merge below: the verdict is in, reap is next in this
@@ -5785,7 +5923,7 @@ review_task() {                         # task_dir dry
       text=$(review_prompt "$pr" "${result:-failed}" "$(st "$d" PQ_REVIEW_SPLIT)" "$(st "$d" PQ_REVIEW_LINES)" "$base" \
                "$sec" "$(st "$d" PQ_SECURITY_POSTED)" "$(task_home "$d")/security.md" \
                "$(st "$d" PQ_REVIEW_POSTED)" "$reply")
-      code=$(agent_prompt "$(st "$d" PQ_PANE)" "$text"); rc=$?
+      code=$(agent_prompt "$(task_pane "$d")" "$text"); rc=$?
       case "$rc" in
         0)
           st_set "$d" PQ_REVIEW prompted; st_set "$d" PQ_REVIEW_PROMPTED "$(now)"; st_set "$d" PQ_REVIEW_WAIT ""
@@ -6231,7 +6369,7 @@ watch_task() {                          # task_dir dry
   detail=$(watch_detail "$repo" "$pr") || return 0
   local head base baseoid conflict ci failed jobs author
   IFS=$'\t' read -r head base baseoid conflict ci failed jobs author <<<"$detail"
-  pstate=$(pane_state "$(st "$d" PQ_PANE)")
+  pstate=$(pane_state "$(task_pane "$d")")
 
   # What is most in the way, and the fingerprint that says whether it is new - a
   # checksum, since state.env holds words (see st_set).
@@ -6287,7 +6425,7 @@ watch_task() {                          # task_dir dry
   [ -n "$(st "$d" PQ_BLOCKED)" ] && return 0
   [ "$dry" = 1 ] && { msg "would prompt $slug about #$pr - $word"; return 0; }
   local code rc
-  code=$(agent_prompt "$(st "$d" PQ_PANE)" "$(watch_prompt "$need" "$pr" "$base" "$what")"); rc=$?
+  code=$(agent_prompt "$(task_pane "$d")" "$(watch_prompt "$need" "$pr" "$base" "$what")"); rc=$?
   case "$rc" in
     0)
       st_set "$d" PQ_WATCH_ASKED "$need"; st_set "$d" PQ_WATCH_NEEDS ""; st_set "$d" PQ_WATCH_WAIT ""
@@ -6487,7 +6625,7 @@ reap_task() {                           # task_dir dry -> 0 torn down, 2 would (
     if [ -n "${HERDR_WORKSPACE_ID:-}" ] && [ "$(st "$d" PQ_WORKSPACE)" = "$HERDR_WORKSPACE_ID" ]; then
       reason=here
     else
-      case "$(pane_state "$(st "$d" PQ_PANE)")" in
+      case "$(pane_state "$(task_pane "$d")")" in
         working|blocked) reason=agent ;;
       esac
     fi
@@ -6652,29 +6790,74 @@ archive_pass() {                        # dry -> count, via stdout; msg/warn as 
 # that shipped during the last interval hands its slot straight to the next one.
 # One tick at a time. The per-task `mv` already stops the same plan being claimed
 # twice, but two ticks running concurrently would each see the same free slots and
-# between them overshoot the cap. mkdir is the atomic primitive; a lock whose owner
-# is gone is stale and reclaimed.
+# between them overshoot the cap.
+#
+# The lock is a symlink whose target names its owner - its pid and that process's
+# start time - because creating one is atomic WITH its contents. It used to be a
+# directory with a pid file written into it a moment later, and both halves of that
+# were wrong. A tick that found the directory before the pid was in it read the
+# lock as stale and took it too, so two ticks ran at once. And a pid alone outlives
+# its process: after a reboot, a lock left behind names a pid some other process
+# may well have been given, `kill -0` says it is alive, and no tick ever runs again.
+# The start time is what tells the same process from a new one under an old pid.
+#
+# A stale lock is removed only if it still names the owner that was found dead, so
+# two ticks clearing the same one cannot remove each other's fresh lock. The
+# directory form is still understood, for a pq from before this change that may be
+# holding it.
 #
 # Taken and released around each tick rather than held for the life of the process,
 # because `pq run` ticks in a loop - a lock released only at exit would make every
 # tick after the first find the lock held, by itself, forever.
+LOCK_WAIT=30                            # seconds a command that must not race a tick waits for it
+lock_owner() { printf '%s %s' "$1" "$(ps -o lstart= -p "$1" 2>/dev/null)"; }   # pid -> "pid start"
+lock_live() {                           # "pid start" -> 0 when that very process still runs
+  local pid=${1%% *}
+  [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null || return 1
+  [ "$(lock_owner "$pid")" = "$1" ]
+}
 take_lock() {                           # -> 0 took it, 1 someone else has it
-  local owner
+  local owner me
   PQ_LOCK="$PQ_HOME/.tick.lock"
-  if ! mkdir "$PQ_LOCK" 2>/dev/null; then
+  me=$(lock_owner "$$")
+  if [ -d "$PQ_LOCK" ] && [ ! -L "$PQ_LOCK" ]; then
+    # The old directory form. A pid file not written yet is a lock being taken.
     owner=$(cat "$PQ_LOCK/pid" 2>/dev/null)
-    if [ -n "$owner" ] && kill -0 "$owner" 2>/dev/null; then PQ_LOCK=""; return 1; fi
+    if [ -n "$owner" ]; then
+      kill -0 "$owner" 2>/dev/null && { PQ_LOCK=""; return 1; }
+    elif [ $(( $(epoch) - $(stat -f %m "$PQ_LOCK" 2>/dev/null || echo 0) )) -lt 10 ]; then
+      PQ_LOCK=""; return 1
+    fi
     warn "clearing a stale tick lock"
-    rm -rf "$PQ_LOCK"; mkdir "$PQ_LOCK" 2>/dev/null || die "could not take the tick lock"
+    rm -rf "$PQ_LOCK"
   fi
-  printf '%s' "$$" > "$PQ_LOCK/pid"
+  if ! ln -s "$me" "$PQ_LOCK" 2>/dev/null; then
+    owner=$(readlink "$PQ_LOCK" 2>/dev/null)
+    if [ -z "$owner" ] || lock_live "$owner"; then PQ_LOCK=""; return 1; fi
+    [ "$(readlink "$PQ_LOCK" 2>/dev/null)" = "$owner" ] && rm -f "$PQ_LOCK"
+    ln -s "$me" "$PQ_LOCK" 2>/dev/null || { PQ_LOCK=""; return 1; }
+    warn "cleared a stale tick lock (pid ${owner%% *})"
+  fi
   # The EXIT trap is the backstop for an abnormal exit; the normal path releases below.
-  trap 'rm -rf "$PQ_LOCK"' EXIT
+  trap 'rm -f "$PQ_LOCK"' EXIT
   return 0
 }
 release_lock() {
-  [ -n "${PQ_LOCK:-}" ] && rm -rf "$PQ_LOCK"
+  [ -n "${PQ_LOCK:-}" ] && rm -f "$PQ_LOCK"
   PQ_LOCK=""; trap - EXIT; return 0
+}
+# The pid holding the lock, for a message.
+lock_pid() { local o; o=$(readlink "$PQ_HOME/.tick.lock" 2>/dev/null) || o=$(cat "$PQ_HOME/.tick.lock/pid" 2>/dev/null); printf '%s' "${o%% *}"; }
+# The lock, for a command that changes a task a tick might be moving at the same
+# moment - `pq rm`, and the mutating forms of `pq after` and `pq base`. Waited for
+# rather than refused outright, since a tick is usually over in seconds.
+lock_wait() {                           # -> 0 took it; dies after LOCK_WAIT seconds
+  local i=0
+  while ! take_lock; do
+    [ "$i" -ge "$LOCK_WAIT" ] && die "a tick has held the lock for ${LOCK_WAIT}s (pid $(lock_pid)) - try again once it is done"
+    [ "$i" = 0 ] && msg "waiting for the tick in progress (pid $(lock_pid))"
+    sleep 1; i=$((i + 1))
+  done
 }
 
 cmd_tick() {
@@ -6699,7 +6882,7 @@ cmd_tick() {
   [ "$PQ_RUN" = 1 ] || trap on_interrupt INT TERM
 
   if ! take_lock; then
-    msg "another tick is running (pid $(cat "$PQ_HOME/.tick.lock/pid" 2>/dev/null)) - nothing to do"
+    msg "another tick is running (pid $(lock_pid)) - nothing to do"
     return 0
   fi
   tick_body "$cap" "$dry"
@@ -6765,10 +6948,16 @@ tick_body() {                           # cap dry
         fi
         continue
       fi
-      # Claimed but never launched: an interrupted tick. Pick it up where it stopped.
+      # Claimed but never launched: an interrupted tick, or a dispatch that failed.
+      # Pick it up where it stopped - unless it has failed too often to be worth
+      # another go (dispatch_try).
       if [ -z "$(st "$d" PQ_LAUNCHED)" ]; then
+        dispatch_gaveup "$d" && continue
         if [ "$dry" = 1 ]; then msg "would resume the interrupted dispatch of $slug"
-        else warn "$slug: dispatch was interrupted - resuming"; dispatch_task "$d" || true; fi
+        else
+          [ "$(st "$d" PQ_DISPATCH_WAIT)" = blocked ] || warn "$slug: dispatch was interrupted - resuming"
+          dispatch_try "$d" || true
+        fi
         continue
       fi
       # The wall check runs for every state but `missing`, deliberately including
@@ -6776,7 +6965,7 @@ tick_body() {                           # cap dry
       # same kind of dependency the detection itself avoids - a walled session that
       # momentarily reads as `noagent` would otherwise be written off as exited and
       # never knocked on.
-      local pstate; pstate=$(pane_state "$(st "$d" PQ_PANE)")
+      local pstate; pstate=$(pane_state "$(task_pane "$d")")
       [ "$dry" = 1 ] || [ "$pstate" = missing ] || check_stall "$d"
       case "$pstate" in
         missing) warn "$slug: its workspace is gone and no PR exists - look at it, then: pq rm $slug" ;;
@@ -6807,7 +6996,7 @@ tick_body() {                           # cap dry
       [ -d "$d" ] || continue
       d=${d%/}
       [ -n "$(st "$d" PQ_REAPED)" ] && continue
-      [ "$(pane_state "$(st "$d" PQ_PANE)")" = missing ] && continue
+      [ "$(pane_state "$(task_pane "$d")")" = missing ] && continue
       check_stall "$d"
     done
   fi
@@ -6962,7 +7151,8 @@ tick_body() {                           # cap dry
       # left queue/ a second tick would happily pick up the very same plan.
       claimed=$(retitle "$d" running) || continue
       st_set "$claimed" PQ_CLAIMED "$(now)"
-      dispatch_task "$claimed" || warn "$slug: left in running/ half-dispatched - the next tick will retry it"
+      dispatch_try "$claimed"
+      [ $? = 1 ] && ! dispatch_gaveup "$claimed" && warn "$slug: left in running/ half-dispatched - the next tick will retry it"
       started=$((started + 1)); free=$((free - 1))
     done <<<"$ordered"
   fi
@@ -6973,7 +7163,7 @@ tick_body() {                           # cap dry
   # Only running/ is recounted - fill just moved tasks into it. The wrap-up half
   # is reused rather than recomputed: nothing after fill can change it, and a
   # second active_slots pass would re-walk done/ for the same answer.
-  n_run=$(dir_count "$PQ_HOME/running")
+  n_run=$(running_count)
   local queued; queued=$(dir_count "$PQ_HOME/queue")
   # Name the two halves separately. A cap of 3 reading "3 running" while three
   # more agents were still wrapping up in done/ is precisely what made six live
@@ -7079,7 +7269,7 @@ cmd_run() {
   # been. slot_state, not slot_held - the loop is over, and nobody's clock should
   # start on the way out.
   local n_run n_wrap d
-  n_run=$(dir_count "$PQ_HOME/running")
+  n_run=$(running_count)
   n_wrap=0
   for d in "$PQ_HOME/done"/*/; do
     [ -d "$d" ] || continue

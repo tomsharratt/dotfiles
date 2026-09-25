@@ -572,7 +572,8 @@ gc_run() {
     msg "orphan ${WT_REPO_NAME:-?}/${WT_NAME:-?} - worktree gone, reclaiming its resources"
     load_profile "${WT_REPO:-}" "${WT_REPO_NAME:-}"
     declare -F wt_teardown >/dev/null && run_profile_fn wt_teardown || true
-    if in_herdr && [ -n "${WT_WORKSPACE:-}" ] && [ "${WT_WORKSPACE:-}" != null ]; then
+    if in_herdr && [ -n "${WT_WORKSPACE:-}" ] && [ "${WT_WORKSPACE:-}" != null ] \
+       && ws_is_for "$WT_WORKSPACE" "${WT_PATH:-}"; then
       "$HERDR" worktree remove --workspace "$WT_WORKSPACE" --force --json >/dev/null 2>&1 \
         || "$HERDR" workspace close "$WT_WORKSPACE" >/dev/null 2>&1 || true
     fi
@@ -652,6 +653,26 @@ unpushed_list() {                       # path summary
   case "$2" in *unpushed*) git -C "$1" log --oneline HEAD --not --remotes 2>/dev/null | head -20 ;; esac
 }
 
+# Whether the Herdr workspace WS still holds the worktree at PATH. An id on file was
+# right when it was written, but herdr handed ids out again after its restart on
+# 2026-08-20, and what the close below does to a workspace is `worktree remove
+# --force` on whatever that workspace holds now - somebody else's worktree, agent
+# and all, if the id has been reissued. What herdr does with a reused id is not
+# something wt has seen, so it does not find out: the snapshot says which checkout
+# a workspace holds, and anything but this one is not closed. Herdr not answering
+# closes nothing either - the call would have failed anyway.
+ws_is_for() {                           # ws path
+  local cp; cp=$(ws_checkout "$1")
+  [ -n "$cp" ] && [ "$(realpath_p "$cp")" = "$(realpath_p "$2")" ]
+}
+# The checkout a Herdr workspace holds, or nothing when it is not open (or herdr
+# does not answer).
+ws_checkout() {                         # ws -> path
+  [ -n "${1:-}" ] && [ "$1" != null ] || return 0
+  "$HERDR" api snapshot 2>/dev/null | jq -r --arg w "$1" \
+    '.result.snapshot.workspaces[]? | select(.workspace_id == $w) | .worktree.checkout_path // empty' 2>/dev/null | head -1
+}
+
 # The Herdr workspace holding a worktree, if one is open. By path first, then by branch:
 # the recorded WT_WORKSPACE is the primary route and already survives a rename, but this
 # fallback used to match on the branch alone - the one identifier a worktree can change
@@ -699,8 +720,15 @@ reap_one() {                            # repo repo_name branch path del_branch(
   fi
   # Resolve the workspace NOW, while the worktree still exists for Herdr to name it by.
   # Asking after step 3 (as this used to) can only ever fail: git has let the worktree go
-  # by then, so it is in nobody's worktree list to be matched.
+  # by then, so it is in nobody's worktree list to be matched. The id on file is taken
+  # only while Herdr says it still holds this worktree (ws_is_for); otherwise it is
+  # found again by path, which herdr_ws_for does from herdr's own worktree list.
   ws=${WT_WORKSPACE:-}
+  if [ -n "$ws" ] && [ "$ws" != null ] && in_herdr && ! ws_is_for "$ws" "$path"; then
+    local held; held=$(ws_checkout "$ws")
+    [ -n "$held" ] && warn "$rn/$name: workspace $ws on file now holds $held, not $path - not closing it"
+    ws=""
+  fi
   [ -n "$ws" ] && [ "$ws" != null ] || ws=$(herdr_ws_for "$repo" "$path" "$name")
   [ -n "${WT_NAME:-}" ] || WT_NAME=$name
   [ -n "${WT_SLUG:-}" ] || WT_SLUG=$(slugify "$name")
