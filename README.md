@@ -473,6 +473,25 @@ A change with a SQL injection and two cross-tenant reads came back with all thre
 A clean change came back with none.
 A change forked from an integration branch that carried a command injection of its own was shown the whole integration branch by the skill, went by the brief's diff instead, and left the base's injection out of scope.
 
+#### Watching a ready pull request
+
+The review gate ends when the implementer marks its pull request ready, and for a long time that was the last thing `pq` said to it.
+What happens to a pull request after that - CI failing, the base moving until it conflicts, a person leaving review comments - was left for whoever looked next, which was you typing into the pane: "The CI is failing, maybe just flakey", "can you resolve the merge conflicts on the PR".
+So a task whose gate reached `ready` is still watched while its pull request is open and not a draft, and its agent is prompted about the one thing most in the way of a merge:
+
+- **conflict** - the pull request no longer merges into its base; the agent is told to merge the base in, since rebasing or force-pushing a ready pull request is not its call
+- **ci** - every check has finished and at least one failed; the prompt names each failed check and its run, and says how to rerun a job that is flaky rather than broken
+- **review** - a person has left feedback since the pull request was marked ready: a new inline thread, a reply from someone other than the author, a review with a verdict or a body, or a comment on the conversation
+
+Every comment `pq`'s own agents post is made from the account that opened the pull request, and so is anything you write yourself, so the author alone cannot tell a person from an agent.
+Time and shape can: only what arrived after the watch began counts, bots never do, and from the author only a new inline thread counts, which an implementer answering review never starts - so your own inline comments are picked up, and your conversation comments are not.
+
+Each condition is asked about once, and only of an idle agent that is not behind a wall or a dialog.
+A CI failure's fingerprint is the head commit and the failed jobs, so a push or a rerun that fails again is a new failure and a new prompt, while the same failure sitting there is not.
+An agent that comes back from a failure without a new commit or a rerun, one that has had three goes at a fix, or one that is gone hands the condition to you instead: `pq ls` reads `ci failed`, `conflict` or `new review`, counted into "needs you", and the tick warns once.
+While the agent is on it, the row reads `fixing ci`, `fixing conflict` or `answering review`.
+An agent whose slot had already been released takes it back while it works, so the cap can be passed by one for as long as a fix takes - the same soft overshoot the review follow-up accepts, since fixing a pull request that is about to merge is worth more than starting the next task a turn sooner.
+
 #### Tearing a task down
 
 Once a `done` task's pull request has **settled**, `pq` tears it down: the worktree, its database, its port, its redis index, its puma-dev entry, and the Herdr workspace holding its agent's pane.

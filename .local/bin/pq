@@ -91,7 +91,10 @@
 # with a review guide. Then the REVIEW GATE runs one independent `/code-review`
 # against the draft in the background - and a `/security-review` beside it when
 # the plan asks for one - and prompts the implementer to resolve what they found
-# and mark the pull request ready - see the `review gate` section.
+# and mark the pull request ready - see the `review gate` section. Once it is
+# ready, the pull request is still watched: a conflict, failed CI or a person's
+# review feedback gets the agent prompted again (see "watching a ready pull
+# request").
 #
 # Once a done task has settled AND been torn down - not on the verdict alone,
 # which would strand its worktree - `pq tick` files it away to `archive/`, keeping only the
@@ -4048,6 +4051,9 @@ agent_cell() {                          # task_dir state
       # agent wants an answer whatever the gate is doing.
       local rv; rv=$(review_cell "$d")
       if [ -n "$rv" ]; then printf '%s' "$rv"; return; fi
+      # And once the gate is over, what the watch on the ready pull request found.
+      rv=$(watch_cell "$d")
+      if [ -n "$rv" ]; then printf '%s' "$rv"; return; fi
       if [ -n "$(slot_state "$d")" ]; then printf 'wrapping up'; return; fi
       if [ -n "$reason" ]; then printf 'held %s' "$reason"; else printf -- '-'; fi
       return
@@ -4150,7 +4156,7 @@ cmd_ls() {
     case "$agent" in
       permission|gone|exited|blocked|unknown) needs=$((needs + 1)) ;;
       dead\ *|stalled\ *|held\ *|base\ *)             needs=$((needs + 1)) ;;
-      review\ lapsed)                                 needs=$((needs + 1)) ;;
+      review\ lapsed|ci\ failed|conflict|new\ review)  needs=$((needs + 1)) ;;
     esac
     # Which rows are spending the cap. `running` unconditionally, the same way
     # active_slots counts it; a done row only while its agent is still there.
@@ -5950,6 +5956,248 @@ review_cell() {                         # task_dir
   esac
 }
 
+# ── watching a ready pull request ───────────────────────────────────────────
+# The review gate ends when the implementer marks its pull request ready, and for
+# a long time that was the last thing pq ever said to it. Everything that happens
+# to a pull request after that - CI failing, the base moving under it until it
+# conflicts, a human reviewer leaving comments - was left for whoever looked next,
+# and that was Tom, typing into the pane by hand: about ten of his implementer
+# turns were "The CI is failing, maybe just flakey" or "can you resolve the merge
+# conflicts on the PR". The cutover agent marked #6820 ready without looking at CI
+# at all, and the failure was only caught by a stray knock.
+#
+# So a task whose gate reached `ready` goes on being watched for as long as its
+# pull request is open and not a draft, and its agent is prompted, the way the
+# review follow-up prompts it, about the one thing most in the way of a merge:
+#
+#   conflict   the pull request no longer merges into its base. First, because CI
+#              on a conflicted pull request does not run on the merge at all
+#   ci         every check has finished and at least one failed. Only once they
+#              have all finished, so one prompt carries the whole set rather than
+#              a prompt per check as they come in
+#   review     feedback from a person since the pull request was marked ready: a
+#              new inline thread, a reply from someone other than the author, a
+#              review with a verdict or a body, a comment on the conversation
+#
+# Every comment pq's own agents post is under the account the pull request was
+# opened from - the implementer, both reviewers, pq's security report - and so is
+# anything Tom writes himself, so the author cannot tell a person from an agent on
+# its own. What does is time and shape: only what arrived after the watch began
+# (PQ_WATCH_SINCE, the tick the gate reached `ready`), bots never, and from the
+# author only a new inline thread, which an implementer answering review does not
+# start. Its replies, its conversation comments and the empty reviews GitHub makes
+# of them are left out; Tom's own conversation comments go with them, and his
+# inline ones still count.
+#
+# Each condition is asked about once. CI's fingerprint is the head commit and
+# the failed runs, so a push or a rerun that fails again is a new failure and
+# gets a new prompt, while the same failure sitting there does not; a conflict's
+# is the head and the base. A fix that produced no new commit, or WATCH_FIXES of
+# them that each failed again, is handed to you instead - `ci failed` or
+# `conflict` in `pq ls`, counted into "needs you" - as is anything found while
+# the agent is gone. Feedback has no such bound, since a person is on the other
+# end of it; the watermark moves past each batch once it has been handed over.
+#
+# The agent is only ever prompted idle, never behind a wall or a dialog, and on
+# the tick it is prompted its wrap-up clock is cleared as the review follow-up's
+# is. An agent whose slot the grace had already released takes one back while it
+# works, so the cap can be passed by one for as long as a fix takes: the soft
+# overshoot the review follow-up already accepts, since a fix to a pull request
+# about to merge is worth more than starting the next task a turn sooner.
+WATCH_FIXES=3
+
+# One `gh pr view`: head, base, mergeability and every check, reduced to one TSV
+# line - head<TAB>base<TAB>base_oid<TAB>conflict(1|0)<TAB>ci<TAB>failed<TAB>jobs<TAB>author,
+# where ci is pass | run | fail | none, failed names each failed check with its run
+# ("build (run 36137360155)") for the prompt, and jobs is the failed checks' own
+# urls for the fingerprint - a rerun keeps its run but gets a new job, and one that
+# fails again is a new failure. Both sorted, so the same failure reads the same,
+# and `-` for an empty field: `read` collapses two tabs into one, which would
+# slide every field after an empty one into the wrong name.
+# The classification is wt's (PR_DETAIL_JQ); a skipped or neutral check passes.
+watch_detail() {                        # repo pr -> the line, or nothing when gh cannot say
+  local raw
+  raw=$(cd "$1" 2>/dev/null && gh pr view "$2" \
+          --json headRefOid,baseRefName,baseRefOid,mergeable,mergeStateStatus,author,statusCheckRollup 2>/dev/null) \
+    || return 1
+  jq -er '
+    def verdict: (.conclusion // .state // .status // "") | ascii_upcase;
+    def failed: verdict | . == "FAILURE" or . == "ERROR" or . == "TIMED_OUT"
+                            or . == "ACTION_REQUIRED" or . == "STARTUP_FAILURE" or . == "CANCELLED";
+    def running: ((.status // "") | ascii_upcase | . != "" and . != "COMPLETED")
+                 or (verdict | . == "PENDING" or . == "QUEUED" or . == "IN_PROGRESS" or . == "EXPECTED" or . == "");
+    def run: ((.detailsUrl // .targetUrl // "") | capture("/runs/(?<id>[0-9]+)").id // "");
+    def word: if . == "" then "-" else . end;
+    [ .statusCheckRollup[]? ] as $c
+    | [ .headRefOid, .baseRefName, (.baseRefOid // "" | word),
+        (if .mergeable == "CONFLICTING" or .mergeStateStatus == "DIRTY" then "1" else "0" end),
+        (if ($c | length) == 0 then "none"
+         elif ($c | any(running)) then "run"
+         elif ($c | any(failed)) then "fail"
+         else "pass" end),
+        ([ $c[] | select(failed) | (.name // .context // "a check") + (if run != "" then " (run " + run + ")" else "" end) ]
+           | unique | join(", ") | word),
+        ([ $c[] | select(failed) | (.detailsUrl // .targetUrl // .name // .context // "") ] | unique | join(" ") | word),
+        (.author.login // "" | word) ] | @tsv' <<<"$raw" 2>/dev/null
+}
+
+# Feedback from a person on the pull request since SINCE: count<TAB>who<TAB>newest,
+# or 0 and nothing when there is none - see the section head for what counts.
+# Three reads, every page of each. Nothing at all when gh cannot say, which is
+# not the same answer as 0.
+watch_feedback() {                      # repo pr since author -> count<TAB>logins<TAB>newest
+  local repo=$1 pr=$2 since=$3 author=$4 inline issue reviews
+  inline=$(cd "$repo" 2>/dev/null && gh api --paginate "repos/{owner}/{repo}/pulls/$pr/comments" 2>/dev/null) || return 1
+  issue=$(cd "$repo" 2>/dev/null && gh api --paginate "repos/{owner}/{repo}/issues/$pr/comments" 2>/dev/null) || return 1
+  reviews=$(cd "$repo" 2>/dev/null && gh api --paginate "repos/{owner}/{repo}/pulls/$pr/reviews" 2>/dev/null) || return 1
+  jq -nr --arg since "$since" --arg author "$author" \
+     --slurpfile inline <(printf '%s' "$inline") --slurpfile issue <(printf '%s' "$issue") \
+     --slurpfile reviews <(printf '%s' "$reviews") '
+    def person: (.user.type // "") != "Bot" and ((.user.login // "") | endswith("[bot]") | not);
+    def other: (.user.login // "") != $author;
+    ( [ ($inline | add // [])[]  | select(person and .created_at > $since and (.in_reply_to_id == null or other))
+                                  | {at: .created_at, who: .user.login} ]
+    + [ ($issue | add // [])[]   | select(person and other and .created_at > $since)
+                                  | {at: .created_at, who: .user.login} ]
+    + [ ($reviews | add // [])[] | select(person and other and (.submitted_at // "") > $since
+                                           and (.state == "CHANGES_REQUESTED" or ((.body // "") != "")))
+                                  | {at: .submitted_at, who: .user.login} ] ) as $all
+    | [ ($all | length), ([ $all[].who ] | unique | join(", ")), ([ $all[].at ] | max // "") ] | @tsv'
+}
+
+# What the agent is told about each condition. Quote-free, by the convention
+# dispatch_prompt and review_prompt keep.
+watch_prompt() {                        # kind pr base detail
+  local kind=$1 pr=$2 base=$3 what=$4 tail="Never wait for input - there is nobody watching."
+  case "$kind" in
+    conflict)
+      printf '%s' "Pull request #$pr has merge conflicts with $base, so it cannot merge. \
+Merge the latest $base into your branch (git fetch origin $base, then git merge origin/$base), \
+resolve every conflict, run the tests the conflicting code is covered by, and push. \
+It is no longer a draft, so do not rebase and do not force-push. $tail" ;;
+    ci)
+      printf '%s' "CI failed on pull request #$pr: $what. \
+Read why (gh pr checks $pr, then gh run view <run> --log-failed for each failed run), fix the cause and push. \
+If a failure has nothing to do with this change and is a flaky test, rerun only the failed jobs \
+(gh run rerun <run> --failed) and say so in a comment on the pull request. $tail" ;;
+    review)
+      printf '%s' "There is new review feedback on pull request #$pr since it was marked ready, from $what. \
+Read all of it (gh api repos/{owner}/{repo}/pulls/$pr/comments for the inline threads, gh pr view $pr --comments for the rest) \
+and resolve each point: fix it and push, or reply on its thread with your reasoning. Leave none unanswered. $tail" ;;
+  esac
+}
+
+# One task, one tick. Every write is gated on `dry` at its own site, as the review
+# gate's are.
+watch_task() {                          # task_dir dry
+  local d=$1 dry=$2 slug repo branch num prstate draft pr since detail pstate
+  [ "$(st "$d" PQ_REVIEW)" = ready ] || return 0
+  [ -z "$(st "$d" PQ_REAPED)" ] || return 0
+  slug=$(slug_of "$d"); repo=$(hdr "$d/plan.md" repo); branch=$(hdr "$d/plan.md" branch)
+  num=""; prstate=""; draft=""
+  IFS=$'\t' read -r num prstate draft <<<"$(pr_get "$repo" "$branch")"
+  # Merged or closed is reap's; a draft is back in its author's hands; no row this
+  # tick is nothing to judge. None of them costs a call.
+  [ "${prstate:-}" = OPEN ] && [ -z "${draft:-}" ] || return 0
+  pr=$(st "$d" PQ_PR); [ -n "$pr" ] || pr=$num
+  since=$(st "$d" PQ_WATCH_SINCE)
+  if [ -z "$since" ]; then
+    since=$(now)
+    [ "$dry" = 1 ] || st_set "$d" PQ_WATCH_SINCE "$since"
+  fi
+  detail=$(watch_detail "$repo" "$pr") || return 0
+  local head base baseoid conflict ci failed jobs author
+  IFS=$'\t' read -r head base baseoid conflict ci failed jobs author <<<"$detail"
+  pstate=$(pane_state "$(st "$d" PQ_PANE)")
+
+  # What is most in the way, and the fingerprint that says whether it is new - a
+  # checksum, since state.env holds words (see st_set).
+  local need="" fp="" what="" newest=""
+  if [ "$conflict" = 1 ]; then
+    need=conflict; fp=$(printf '%s %s' "$head" "$baseoid" | cksum | awk '{ print $1 }')
+  elif [ "$ci" = fail ]; then
+    need=ci; fp=$(printf '%s %s' "$head" "$jobs" | cksum | awk '{ print $1 }'); what=$failed
+  else
+    local fb n
+    fb=$(watch_feedback "$repo" "$pr" "$since" "$author") || fb=""
+    IFS=$'\t' read -r n what newest <<<"$fb"
+    [ "${n:-0}" -gt 0 ] 2>/dev/null && need=review
+  fi
+
+  # An ask is answered once its agent is idle again: it has had its turn. What it
+  # did with it is the fingerprint's to say - a fix that pushed, or reran the job,
+  # is a new failure or none at all, and one that did neither is handed over below.
+  local asked; asked=$(st "$d" PQ_WATCH_ASKED)
+  if [ -n "$asked" ]; then
+    case "$pstate" in
+      idle|done|unknown|noagent|missing)
+        [ "$dry" = 1 ] || st_set "$d" PQ_WATCH_ASKED ""
+        asked="" ;;
+    esac
+  fi
+  if [ -z "$need" ]; then
+    [ "$dry" = 1 ] || { [ -z "$(st "$d" PQ_WATCH_NEEDS)" ] || st_set "$d" PQ_WATCH_NEEDS ""; }
+    return 0
+  fi
+  [ -n "$asked" ] && return 0              # the agent is on it
+
+  # Handed to you, once, rather than prompted: the agent is gone, or it has had
+  # its tries at this, or it came back from this very failure without a commit.
+  local handover="" key tries
+  key=$(printf 'PQ_WATCH_%s' "$(tr '[:lower:]' '[:upper:]' <<<"$need")")
+  tries=$(st "$d" PQ_WATCH_FIXES); tries=${tries:-0}
+  case "$pstate" in noagent|missing) handover="its agent is gone" ;; esac
+  if [ -z "$handover" ] && [ "$need" != review ]; then
+    if [ "$(st "$d" "$key")" = "$fp" ]; then handover="its agent looked and left it as it was"
+    elif [ "$tries" -ge "$WATCH_FIXES" ]; then handover="its agent has had $tries goes at fixing it"; fi
+  fi
+  local word
+  case "$need" in ci) word="CI is failing on it" ;; conflict) word="it has merge conflicts" ;; review) word="it has new review feedback" ;; esac
+  if [ -n "$handover" ]; then
+    [ "$dry" = 1 ] && { msg "would leave $slug's #$pr to you - $word and $handover"; return 0; }
+    [ "$(st "$d" PQ_WATCH_NEEDS)" = "$need" ] || { st_set "$d" PQ_WATCH_NEEDS "$need"
+      warn "$slug: #$pr is marked ready, but $word and $handover - look at it"; }
+    return 0
+  fi
+
+  case "$pstate" in idle|done|unknown) ;; *) return 0 ;; esac   # working, blocked, or herdr silent
+  [ -n "$(st "$d" PQ_BLOCKED)" ] && return 0
+  [ "$dry" = 1 ] && { msg "would prompt $slug about #$pr - $word"; return 0; }
+  local code rc
+  code=$(agent_prompt "$(st "$d" PQ_PANE)" "$(watch_prompt "$need" "$pr" "$base" "$what")"); rc=$?
+  case "$rc" in
+    0)
+      st_set "$d" PQ_WATCH_ASKED "$need"; st_set "$d" PQ_WATCH_NEEDS ""; st_set "$d" PQ_WATCH_WAIT ""
+      if [ "$need" = review ]; then st_set "$d" PQ_WATCH_SINCE "$newest"
+      else st_set "$d" "$key" "$fp"; st_set "$d" PQ_WATCH_FIXES "$(( tries + 1 ))"; fi
+      [ -z "$(st "$d" PQ_WRAPUP_SINCE)" ] || st_set "$d" PQ_WRAPUP_SINCE ""
+      msg "$slug: #$pr is marked ready, but $word - asked its agent to deal with it" ;;
+    2)
+      [ "$(st "$d" PQ_WATCH_WAIT)" = blocked ] || { st_set "$d" PQ_WATCH_WAIT blocked
+        msg "$slug: the agent is on a dialog - telling it that $word waits for you to answer it"; } ;;
+    *)
+      [ "$(st "$d" PQ_WATCH_WAIT)" = error ] || { st_set "$d" PQ_WATCH_WAIT error
+        warn "$slug: could not tell its agent that $word ($code) - retrying each tick"; } ;;
+  esac
+  return 0
+}
+
+# What `pq ls` says about the watch. `fixing ci`, `fixing conflict` and
+# `answering review` while the agent is on it; `ci failed`, `conflict` and `new
+# review` once it has been handed to you.
+watch_cell() {                          # task_dir
+  case "$(st "$1" PQ_WATCH_ASKED)" in
+    ci)       printf 'fixing ci'; return ;;
+    conflict) printf 'fixing conflict'; return ;;
+    review)   printf 'answering review'; return ;;
+  esac
+  case "$(st "$1" PQ_WATCH_NEEDS)" in
+    ci)       printf 'ci failed' ;;
+    conflict) printf 'conflict' ;;
+    review)   printf 'new review' ;;
+  esac
+}
+
 # ── reap ────────────────────────────────────────────────────────────────────
 # `pq` frees a slot the moment a pull request exists, in any state, and stops
 # caring - everything the task was built on survives: the worktree, its database,
@@ -6455,6 +6703,15 @@ tick_body() {                           # cap dry
     [ -n "$(st "$d" PQ_REAPED)" ] && continue
     review_task "$d" "$dry"
     review_inflight "$d" && n_reviewing=$((n_reviewing + 1))
+  done
+
+  # 1.23 The watch on a pull request marked ready - see its section. After the
+  # gate, so a pull request marked ready this tick is watched from this tick; after
+  # check_stall, for the same PQ_BLOCKED reason; before reap, which it does not
+  # hold up - a pull request that settles is simply not watched any more.
+  for d in "$PQ_HOME/done"/*/; do
+    [ -d "$d" ] || continue
+    watch_task "${d%/}" "$dry"
   done
 
   # 1.25 Reap - tear down what merged, once the agent has stopped and pq is not
