@@ -21,8 +21,7 @@ export PQ_HOME
 # The default scan root for `repo_candidates`: permanently empty, so every
 # case below that does not deliberately opt into multi-repo scanning stays
 # single-repo regardless of what else happens to be sitting in $TMPDIR.
-PQ_REPOS_DIR=$(mktemp -d)
-export PQ_REPOS_DIR
+SCAN_ROOT=$(mktemp -d)
 
 STUBBIN=$(mktemp -d)
 SPLIT_COUNTER="$PQ_HOME/.opus-calls"
@@ -166,6 +165,8 @@ export PATH="$STUBBIN:$PATH"
 
 # shellcheck source=/dev/null
 source "$HERE/../.local/bin/pq"
+# Assigned after the source: pq sets its own, and the constant would win.
+PQ_REPOS_DIR=$SCAN_ROOT
 
 pass=0 fail=0
 ok()  { pass=$((pass + 1)); }
@@ -223,7 +224,7 @@ new_split_dir() {                        # name -> prints the dir path
   local sd="$PQ_HOME/splits/$1"
   rm -rf "$sd"; mkdir -p "$sd"
   printf '# source plan\n\nSomething.\n' > "$sd/source.md"
-  printf '%s\n' "$REPO" > "$sd/repo"
+  printf '%s\t%s\n' "$(basename "$REPO")" "$REPO" > "$sd/repos"
   printf '%s' "$sd"
 }
 
@@ -554,7 +555,6 @@ reset_tasks
 SD=$(new_split_dir val-repo-mismatch)
 printf 'MARKER: alpha\nA.\n' > "$SD/01-a.md"
 printf '01-a.md\t\n' > "$SD/graph.tsv"
-printf '%s\n' "$REPO" > "$SD/repo"
 # No --repo passed - resolved from cwd, which is REPO2 here, so it disagrees
 # with the recorded REPO and must be rejected.
 if ( cd "$REPO2" && main add --split-dir "$SD" ) >/dev/null 2>&1; then
@@ -604,19 +604,6 @@ rc=$?
 [ "$rc" -eq 0 ] && ok || bad "a 2-column graph.tsv alongside a repos file should still work: $(cat "$PQ_HOME/.err")"
 t=$(find_task mr-solo2col-thing)
 eq "$(hdr "$t/plan.md" repo)" "$REPO" "no third field at all still means the primary"
-
-echo "== a legacy split directory (repo file only, no repos) still resumes, and repos gets materialized ==" >&2
-reset_tasks
-SD=$(new_split_dir legacy-resume)
-printf 'MARKER: solo\nDo the one thing.\n' > "$SD/01-solo.md"
-printf '01-solo.md\t\n' > "$SD/graph.tsv"
-[ -f "$SD/repos" ] && bad "should not have a repos file yet" || ok
-out=$(main add --split-dir "$SD" --repo "$REPO" <<<y 2>"$PQ_HOME/.err")
-rc=$?
-[ "$rc" -eq 0 ] && ok || bad "resuming a legacy (repo-only) split dir should still work: $(cat "$PQ_HOME/.err")"
-eq "$out" "do-solo-thing" "it should still queue the one part"
-[ -s "$SD/repos" ] && ok || bad "resuming should materialize a repos file"
-eq "$(cut -f2 "$SD/repos" | head -1)" "$REPO" "the materialized repos file's primary path is REPO"
 
 echo "== multi-repo: branch_taken is checked against the PART'S OWN repo, not the primary ==" >&2
 reset_tasks
@@ -776,8 +763,8 @@ warn15=$(PQ_REPOS_DIR="$SCAN15" PQ_REPOS_MAX=3 repo_candidates "$REPO" 2>&1 >/de
 result15=$(PQ_REPOS_DIR="$SCAN15" PQ_REPOS_MAX=3 repo_candidates "$REPO" 2>/dev/null)
 eq "$(wc -l <<<"$result15" | tr -d ' ')" "3" "primary plus 2 kept (PQ_REPOS_MAX=3)"
 case "$warn15" in
-  *"PQ_REPOS_MAX"*) ok ;;
-  *) bad "should warn naming PQ_REPOS_MAX (got: $warn15)" ;;
+  *"more than the 3 the splitter is shown"*) ok ;;
+  *) bad "should warn saying how many the splitter is shown (got: $warn15)" ;;
 esac
 droppedcount=0
 for d in "${made15[@]}"; do
@@ -921,8 +908,8 @@ warnc=$(PQ_REPOS_DIR="$SCANC" PQ_REPOS_MAX=3 repo_candidates_container "$SCANC" 
 resultc=$(PQ_REPOS_DIR="$SCANC" PQ_REPOS_MAX=3 repo_candidates_container "$SCANC" 2>/dev/null)
 eq "$(wc -l <<<"$resultc" | tr -d ' ')" "3" "kept exactly PQ_REPOS_MAX (3) - no primary consuming a slot"
 case "$warnc" in
-  *"PQ_REPOS_MAX"*) ok ;;
-  *) bad "should warn naming PQ_REPOS_MAX (got: $warnc)" ;;
+  *"more than the 3 the splitter is shown"*) ok ;;
+  *) bad "should warn saying how many the splitter is shown (got: $warnc)" ;;
 esac
 droppedcountc=0
 for d in "${madec[@]}"; do

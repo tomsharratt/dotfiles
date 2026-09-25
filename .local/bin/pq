@@ -31,7 +31,7 @@
 #   pq ls --all           also show archive/ - settled history pq no longer walks
 #   pq rm <task>         drop a task (never touches a worktree or a branch)
 #   pq tick              free finished slots, then fill them from the queue
-#   pq run               tick on an interval until you stop it
+#   pq run               tick every RUN_INTERVAL seconds until you stop it
 #   pq cap [N]           how many may run at once; 0 pauses. Read every tick.
 #
 # `pq tick` is one idempotent pass, safe to run by hand at any time - including
@@ -131,7 +131,6 @@
 #
 #   <split>/source.md     the plan being split, copied in
 #          repos          the repo inventory the splitter was shown: TSV  label <TAB> path, primary first - what --split-dir checks against
-#                         (a split written before this file's field was called `repo` - one bare line, the primary only - and do_split still reads it as a fallback)
 #                         (row 1 can instead be a no-primary sentinel - an empty label, a container directory's path - when the plan was split from a directory that is not itself a repo; see repo_candidates_container)
 #          graph.tsv      one line per part: filename <TAB> comma-separated filenames that must merge first <TAB> repo label (empty for the primary, REQUIRED when there is none)
 #          NN-*.md        the parts themselves, written by the splitter
@@ -167,84 +166,69 @@ STATES="queue running done archive"
 # produced - which is what makes the low range safe to reserve for --urgent.
 PQ_STAMP_REAL=10000000000000
 
-PQ_DEFAULT_MODEL="${PQ_DEFAULT_MODEL:-sonnet}"
-PQ_DEFAULT_EFFORT="${PQ_DEFAULT_EFFORT:-xhigh}"
-PQ_NAMER_MODEL="${PQ_NAMER_MODEL:-haiku}"
-PQ_SPLITTER_MODEL="${PQ_SPLITTER_MODEL:-opus}"
-PQ_SPLITTER_EFFORT="${PQ_SPLITTER_EFFORT:-xhigh}"
-PQ_PICK_LIMIT="${PQ_PICK_LIMIT:-10}"       # plans per page in pick_plan; `n`/`p` walk the rest
-# A non-positive limit would break "Enter takes 1" - the table would have
-# zero rows, yet Enter still defaults to a row 1 that can't exist - so this
-# one, unlike its neighbours, is worth guarding against a bad override. It is
-# also the page STRIDE, so a zero would divide by zero working out how many
-# pages there are.
-[[ "$PQ_PICK_LIMIT" =~ ^[0-9]+$ ]] && [ "$PQ_PICK_LIMIT" -ge 1 ] || PQ_PICK_LIMIT=10
-PQ_PICK_PREVIEW="${PQ_PICK_PREVIEW:-12}"   # lines of a plan pick_plan previews
-PQ_REPOS_MAX="${PQ_REPOS_MAX:-12}"         # cap on repo_candidates'/repo_candidates_container's scanned inventory
-# Same reasoning as PQ_PICK_LIMIT above: a non-numeric override makes the
-# `-gt` truncation check below throw and, under `set -uo pipefail` (no -e),
-# silently take the false branch - disabling the cap rather than erroring -
-# and a non-positive one drives `head -n` with a zero or negative count,
-# which BSD and GNU head disagree on.
-[[ "$PQ_REPOS_MAX" =~ ^[0-9]+$ ]] && [ "$PQ_REPOS_MAX" -ge 1 ] || PQ_REPOS_MAX=12
-PQ_REPOS_DIR="${PQ_REPOS_DIR:-}"           # scan root override; default is the primary's dirname, or a container split's own path
-PQ_LABEL_MAX="${PQ_LABEL_MAX:-16}"         # max chars of a blocker label in AGENT's cell, before the +N count
-[[ "$PQ_LABEL_MAX" =~ ^[0-9]+$ ]] && [ "$PQ_LABEL_MAX" -ge 1 ] || PQ_LABEL_MAX=16
-PQ_DONE_KEEP="${PQ_DONE_KEEP:-3}"           # newest archivable done/ tasks archive_pass leaves behind; 0 is legal
-[[ "$PQ_DONE_KEEP" =~ ^[0-9]+$ ]] || PQ_DONE_KEEP=3
+# Fixed values, not knobs: nothing has ever set one of these but a test, and a
+# test assigns them after sourcing this file, which a plain assignment allows. The
+# four that ARE knobs - read from the environment, and documented - are
+# PQ_QUOTA_RE, PQ_REVIEWER_MODEL, PQ_REVIEW_MAX_TRIES and PQ_REVIEW_TOOLS below.
+PQ_DEFAULT_MODEL=sonnet                 # what the wizard's Enter takes
+PQ_DEFAULT_EFFORT=xhigh
+PQ_DEFAULT_CAP=1                        # the cap before `pq cap` has ever been run - see "the cap"
+PQ_NAMER_MODEL=haiku
+PQ_SPLITTER_MODEL=opus
+PQ_SPLITTER_EFFORT=xhigh
+PQ_PICK_LIMIT=10                        # plans per page in pick_plan; `n`/`p` walk the rest
+PQ_PICK_PREVIEW=12                      # lines of a plan pick_plan previews
+PQ_REPOS_MAX=12                         # cap on repo_candidates'/repo_candidates_container's scanned inventory
+PQ_REPOS_DIR=""                         # scan root; empty is the primary's dirname, or a container split's own path
+PQ_LABEL_MAX=16                         # max chars of a blocker label in AGENT's cell, before the +N count
+PQ_DONE_KEEP=3                          # newest archivable done/ tasks archive_pass leaves behind
 # How long a done/ task's agent must have stopped working before its slot is
-# released - see the `slots` section. 0 is legal and restores the old
-# release-on-PR behaviour; a non-numeric override is a typo, not a request to
-# disable the cap, so it falls back to the default rather than to 0.
-PQ_WRAPUP_GRACE="${PQ_WRAPUP_GRACE:-300}"
-[[ "$PQ_WRAPUP_GRACE" =~ ^[0-9]+$ ]] || PQ_WRAPUP_GRACE=300
+# released - see the `slots` section.
+PQ_WRAPUP_GRACE=300
+RUN_INTERVAL=120                        # seconds between `pq run`'s ticks
 
 # What the session wall looks like on screen, and how hard to knock. These are
-# Claude Code UI strings, so they will change - hence up here and overridable
-# rather than buried in the logic that uses them.
+# Claude Code UI strings, so they will change - hence up here rather than buried
+# in the logic that uses them, and the wall's pattern overridable.
 #
-# No braces in these defaults: `${VAR:-...}` ends at the first unescaped `}`, so a
+# No braces in this default: `${VAR:-...}` ends at the first unescaped `}`, so a
 # bounded repetition like {0,24} gets cut in half and the rest leaks out as literal
 # text. It fails as a corrupt pattern at match time, not as a syntax error here.
 PQ_QUOTA_RE="${PQ_QUOTA_RE:-limit to reset|usage limit reached|out of usage credits|hit your .*limit}"
-PQ_PERM_RE="${PQ_PERM_RE:-Do you want to |Yes, and don.t ask again|Allow once}"
-PQ_QUOTA_RETRY="${PQ_QUOTA_RETRY:-600}"           # seconds between "continue" attempts
-PQ_QUOTA_MAX_TRIES="${PQ_QUOTA_MAX_TRIES:-40}"    # ~7h at that interval, then stop knocking
-PQ_TAIL_LINES="${PQ_TAIL_LINES:-30}"
+PQ_PERM_RE='Do you want to |Yes, and don.t ask again|Allow once'
+PQ_QUOTA_RETRY=600                      # seconds between "continue" attempts
+PQ_QUOTA_MAX_TRIES=40                   # ~7h at that interval, then stop knocking
+PQ_TAIL_LINES=30
 
 # The one branch every task's screenshots are published to (`pq evidence`), in
 # the task's own repo. Never deleted: a merged pull request's description keeps
 # pointing at it.
-PQ_EVIDENCE_BRANCH="${PQ_EVIDENCE_BRANCH:-pq-evidence}"
+PQ_EVIDENCE_BRANCH=pq-evidence
 
 # How long `herdr agent start` may wait for a fresh Claude Code to come up and
 # read as ready. A cold start with plugins is slow; herdr itself caps this at
 # 300000. Milliseconds, because that is what herdr takes.
-PQ_AGENT_START_MS="${PQ_AGENT_START_MS:-60000}"
-[[ "$PQ_AGENT_START_MS" =~ ^[0-9]+$ ]] && [ "$PQ_AGENT_START_MS" -ge 1000 ] || PQ_AGENT_START_MS=60000
+PQ_AGENT_START_MS=60000
 
 # The review gate - see the `review gate` section. Every pull request a task opens
 # gets one independent `/code-review` run by pq itself, in the background, and the
 # implementer is then told to resolve what it posted and mark the draft ready.
 # A plan that asks for a security review gets a `/security-review` beside it, run
-# on these same knobs - the model, effort, timeout, tries and retry below - since
-# it is the same job for a different eye, and a second set would be knobs nobody
-# turns. There is no off switch: PQ_REVIEW_MAX_TRIES=0 is the honest degraded
-# mode, where no reviewer is ever launched and the implementer is sent straight
-# to the self-review fallback.
+# on these same settings - the model, effort, timeout, tries and retry below -
+# since it is the same job for a different eye. There is no off switch:
+# PQ_REVIEW_MAX_TRIES=0 is the honest degraded mode, where no reviewer is ever
+# launched and the implementer is sent straight to the self-review fallback - the
+# reason that one is a knob.
 PQ_REVIEWER_MODEL="${PQ_REVIEWER_MODEL:-opus}"
-PQ_REVIEW_EFFORT="${PQ_REVIEW_EFFORT:-xhigh}"
+PQ_REVIEW_EFFORT=xhigh
 # An hour. Reviews ran 747s, 822s, then 1083s against the 1500 this used to be,
 # and a reviewer killed at the ceiling throws the whole review away for the
 # self-review fallback - the one outcome the gate exists to avoid.
-PQ_REVIEW_TIMEOUT="${PQ_REVIEW_TIMEOUT:-3600}"    # seconds a reviewer may run before it is killed
-[[ "$PQ_REVIEW_TIMEOUT" =~ ^[0-9]+$ ]] || PQ_REVIEW_TIMEOUT=3600
+PQ_REVIEW_TIMEOUT=3600                  # seconds a reviewer may run before it is killed
 PQ_REVIEW_MAX_TRIES="${PQ_REVIEW_MAX_TRIES:-2}"   # launches (a failed probe counts too) before falling back to self-review
 [[ "$PQ_REVIEW_MAX_TRIES" =~ ^[0-9]+$ ]] || PQ_REVIEW_MAX_TRIES=2
-PQ_REVIEW_RETRY="${PQ_REVIEW_RETRY:-600}"         # seconds between tries
-[[ "$PQ_REVIEW_RETRY" =~ ^[0-9]+$ ]] || PQ_REVIEW_RETRY=600
-PQ_REVIEW_SPLIT_LINES="${PQ_REVIEW_SPLIT_LINES:-150}"  # a single commit over this many changed lines is asked to be restructured
-[[ "$PQ_REVIEW_SPLIT_LINES" =~ ^[0-9]+$ ]] || PQ_REVIEW_SPLIT_LINES=150
+PQ_REVIEW_RETRY=600                     # seconds between tries
+PQ_REVIEW_SPLIT_LINES=150               # a single commit over this many changed lines is asked to be restructured
 # `/code-review --comment` posts through `gh`, and a reviewer refused there runs
 # to completion and posts nothing, with the JSON's permission_denials the only
 # place that shows. Posting is its whole output, so it is allowed by rule rather
@@ -253,9 +237,8 @@ PQ_REVIEW_SPLIT_LINES="${PQ_REVIEW_SPLIT_LINES:-150}"  # a single commit over th
 PQ_REVIEW_TOOLS="${PQ_REVIEW_TOOLS:-Bash(gh:*)}"
 # A pull request whose title says the agent stopped for a reason is not reviewed:
 # telling an agent that gave up to "resolve the findings and mark it ready" is
-# the wrong instruction. Brace-free, like the two patterns above, and matched
-# case-insensitively.
-PQ_STUCK_RE="${PQ_STUCK_RE:-^(\[stuck\]|stuck:)}"
+# the wrong instruction. Matched case-insensitively.
+PQ_STUCK_RE='^(\[stuck\]|stuck:)'
 
 # Paths that a trap has to clean up must be globals: an EXIT trap runs after the
 # function has returned, so a `local` it referenced is already out of scope - and
@@ -397,7 +380,7 @@ CAP_FILE="$PQ_HOME/cap"
 cap_get() {
   local c
   c=$( { tr -dc '0-9' < "$CAP_FILE"; } 2>/dev/null )
-  [ -n "$c" ] || c=${PQ_DEFAULT_CAP:-1}
+  [ -n "$c" ] || c=$PQ_DEFAULT_CAP
   printf '%s' "$c"
 }
 cap_set() { printf '%s\n' "$1" > "$CAP_FILE"; }
@@ -1217,14 +1200,6 @@ design_hinted() {                       # plan_file -> 0 when it cites Claude De
   grep -qE 'claude\.ai/design|\.dc\.html' "$1" 2>/dev/null
 }
 
-# The design files a task carries, one basename per line, from its header.
-design_list() {                         # task_dir
-  local v; v=$(hdr "$1/plan.md" design)
-  [ -n "$v" ] || return 0
-  # A bash substitution, not sed: BSD sed does not read `\n` in a replacement.
-  printf '%s\n' "${v//, /$'\n'}" | sed '/^$/d'
-}
-
 # The four questions that shape how a task runs, asked right after pick_plan
 # actually chose something - see cmd_add's `interactive` gate. `split`,
 # `split_dir`, `outline`, `model` and the `design_*` variables are reached the
@@ -1259,8 +1234,7 @@ add_wizard() {
     fi
   fi
   # Which model runs it. The three offered are the ones worth choosing between
-  # for a queued task; Enter takes PQ_DEFAULT_MODEL, whatever that is set to, so
-  # an env override still decides the default rather than this list. `--model`
+  # for a queued task; Enter takes PQ_DEFAULT_MODEL. `--model`
   # given explicitly skips the question, like every other *_explicit - and the
   # flag itself deliberately stays unvalidated, since it is passed straight to
   # `claude --model` and any id that tool accepts is a legitimate answer. Only
@@ -1355,7 +1329,14 @@ cmd_add() {                             # plan branch intent security ("" "" "" 
   # Haiku's outline of the plan - the pull requests it lays out itself - read
   # by add_wizard through dynamic scope, so it must be declared here.
   local outline=""
+  # A flag that takes a value, given last, has none to take: `shift 2` then
+  # fails without shifting anything, and this loop spun on the same argument at
+  # 100% CPU. So each one checks for its value first.
   while [ $# -gt 0 ]; do
+    case "$1" in
+      --base|--model|--effort|--repo|--after|--design|--split-dir)
+        [ $# -ge 2 ] || die "$1 needs a value" ;;
+    esac
     case "$1" in
       --base)      basebr=${2:-}; basebr=${basebr#origin/}; shift 2 ;;
       --model)     model=${2:-}; model_explicit=1; shift 2 ;;
@@ -1763,7 +1744,7 @@ repo_candidates() {                     # primary_repo -> label<TAB>path, primar
     local keep=$(( PQ_REPOS_MAX - 1 )) dropped
     dropped=$(tail -n +"$(( keep + 1 ))" <<<"$found" | cut -f1 | tr '\n' ' ')
     found=$(head -n "$keep" <<<"$found")
-    warn "found $total candidate repos, more than PQ_REPOS_MAX ($PQ_REPOS_MAX) - dropped: $dropped - pass --repo explicitly to include one of these"
+    warn "found $total candidate repos, more than the $PQ_REPOS_MAX the splitter is shown - dropped: $dropped - pass --repo explicitly to include one of these"
   fi
   printf '%s' "$found"
 }
@@ -1806,7 +1787,7 @@ repo_candidates_container() {           # dir -> label<TAB>path, sorted by label
     local keep=$PQ_REPOS_MAX dropped
     dropped=$(tail -n +"$(( keep + 1 ))" <<<"$found" | cut -f1 | tr '\n' ' ')
     found=$(head -n "$keep" <<<"$found")
-    warn "found $total candidate repos under $dir, more than PQ_REPOS_MAX ($PQ_REPOS_MAX) - dropped: $dropped - pass --repo explicitly to include one of these"
+    warn "found $total candidate repos under $dir, more than the $PQ_REPOS_MAX the splitter is shown - dropped: $dropped - pass --repo explicitly to include one of these"
   fi
   printf '%s' "$found"
 }
@@ -2453,16 +2434,8 @@ do_split() {
     sd=$split_dir
     [ -f "$sd/source.md" ] || die "$sd has no source.md - not a split directory"
 
-    if [ -s "$sd/repos" ]; then
-      candidates=$(cat "$sd/repos")
-    else
-      # Pre-multi-repo split directory: a single recorded repo is a
-      # single-candidate inventory, so every split written before this
-      # change still resumes.
-      local legacy; legacy=$(cat "$sd/repo" 2>/dev/null)
-      [ -n "$legacy" ] && candidates=$(printf '%s\t%s' "$(basename "$legacy")" "$legacy")
-    fi
-    [ -n "$candidates" ] || die "$sd has no repo or repos file - not a split directory"
+    [ -s "$sd/repos" ] && candidates=$(cat "$sd/repos")
+    [ -n "$candidates" ] || die "$sd has no repos file - not a split directory"
 
     # `cut`, not `read`: a no-primary sentinel row starts with a literal tab
     # (empty label), and `read` strips a LEADING tab as "IFS whitespace"
@@ -5200,8 +5173,6 @@ dispatch_gaveup() { [ "$(st "$1" PQ_DISPATCH_GAVEUP)" = 1 ]; }
 # that hits the usage limit is the one exception, and holds the slot for as long
 # as the wall does (see reviewer_walled): nothing else could use it meanwhile,
 # since the wall is the account's, and the queue is frozen on it anyway.
-# `PQ_WRAPUP_GRACE=0` therefore no longer means release-on-PR for a gated task;
-# it means release once the gate is through.
 #
 # "Settled" is everything else, an unset key included, so a task from before the
 # gate reads exactly as it did - `blocker_state`'s stalled verdict rests on it.
@@ -5229,7 +5200,7 @@ dispatch_gaveup() { [ "$(st "$1" PQ_DISPATCH_GAVEUP)" = 1 ]; }
 # "run /security-review" in so many words, and say what it should focus on - and
 # name_plan reads that into a `security: yes` header at add time. Such a task gets
 # a second reviewer beside the first: `claude -p "/security-review"`, in the same
-# worktree, on the same knobs and the same read-only rules. The implementer's
+# worktree, on the same settings and the same read-only rules. The implementer's
 # contract tells it not to run one itself, as it does for /code-review. The
 # skill takes no target and posts nothing - it reviews `git diff origin/HEAD...`
 # of wherever it runs and replies with a markdown report - so pq delivers: the
@@ -6861,20 +6832,17 @@ lock_wait() {                           # -> 0 took it; dies after LOCK_WAIT sec
 }
 
 cmd_tick() {
-  local cap="" dry=0
+  local cap dry=0
   while [ $# -gt 0 ]; do
     case "$1" in
-      --cap)     cap=${2:-}; shift 2 ;;
       --dry-run) dry=1; shift ;;
-      -*)        die "unknown option '$1' (usage: pq tick [--cap N] [--dry-run])" ;;
+      -*)        die "unknown option '$1' (usage: pq tick [--dry-run])" ;;
       *)         die "unexpected argument '$1'" ;;
     esac
   done
   # Re-read the cap every tick, so `pq cap 0` takes effect on the next pass of a
-  # loop that is already running. An explicit --cap overrides for this tick only and
-  # deliberately does not write the file.
-  [ -n "$cap" ] || cap=$(cap_get)
-  [[ "$cap" =~ ^[0-9]+$ ]] || die "--cap must be a number, got '$cap'"
+  # loop that is already running.
+  cap=$(cap_get)
 
   # A one-shot tick needs the handler too, not just the loop: dispatch shields its
   # slow child from SIGINT, so without a trap here a Ctrl-C would kill pq and leave
@@ -7230,19 +7198,8 @@ nap() {                                 # seconds
 }
 
 cmd_run() {
-  local interval=120 cap=""
-  while [ $# -gt 0 ]; do
-    case "$1" in
-      --interval) interval=${2:-}; shift 2 ;;
-      --cap)      cap=${2:-}; shift 2 ;;
-      -*)         die "unknown option '$1' (usage: pq run [--interval SECONDS] [--cap N])" ;;
-      *)          die "unexpected argument '$1'" ;;
-    esac
-  done
-  [[ "$interval" =~ ^[0-9]+$ ]] && [ "$interval" -ge 5 ] || die "--interval must be a number of seconds, at least 5"
-  # --cap here SETS the cap rather than overriding for one pass, since this is the
-  # long-running thing: what you pass at startup should be what `pq cap` reports.
-  [ -n "$cap" ] && { [[ "$cap" =~ ^[0-9]+$ ]] || die "--cap must be a number"; cap_set "$cap"; }
+  local interval=$RUN_INTERVAL
+  [ $# -eq 0 ] || die "pq run takes no arguments - set the cap with pq cap N"
 
   PQ_RUN=1
   trap on_interrupt INT TERM
@@ -7290,10 +7247,10 @@ main() {
     tick)       shift; cmd_tick "$@" ;;
     run)        shift; cmd_run "$@" ;;
     cap)        shift; cmd_cap "$@" ;;
-    ls|list)    shift; cmd_ls "$@" ;;
-    rm|remove)  shift; cmd_rm "$@" ;;
+    ls)         shift; cmd_ls "$@" ;;
+    rm)         shift; cmd_rm "$@" ;;
     evidence)   shift; cmd_evidence "$@" ;;
-    *) die "usage: pq {add [--base B] [--urgent] [--after task|branch]... [--design PATH]... [--split | --split-dir DIR] | after <task> [<task|branch>... | --clear] | base <task> [<branch> | --clear] | ls [--all] [--json] | tick [--cap N] [--dry-run] | run [--interval S] [--cap N] | cap [N] | rm <task> | evidence [task]}" ;;
+    *) die "usage: pq {add [--base B] [--urgent] [--after task|branch]... [--design PATH]... [--split | --split-dir DIR] | after <task> [<task|branch>... | --clear] | base <task> [<branch> | --clear] | ls [--all] [--json] | tick [--dry-run] | run | cap [N] | rm <task> | evidence [task]}" ;;
   esac
 }
 if [ "${BASH_SOURCE[0]}" = "$0" ]; then main "$@"; fi

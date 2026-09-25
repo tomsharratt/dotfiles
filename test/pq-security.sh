@@ -24,8 +24,7 @@ export PQ_HOME
 PQ_PLANS_DIR=$(mktemp -d)
 export PQ_PLANS_DIR
 # An empty scan root, so a --split here stays single-repo.
-PQ_REPOS_DIR=$(mktemp -d)
-export PQ_REPOS_DIR
+SCAN_ROOT=$(mktemp -d)
 
 STUBBIN=$(mktemp -d)
 PANES_JSON="$STUBBIN/.panes.json"
@@ -126,6 +125,8 @@ export PQ_WT="$STUBBIN/wt-stub"
 
 # shellcheck source=/dev/null
 source "$HERE/../.local/bin/pq"
+# Assigned after the source: pq sets its own, and the constant would win.
+PQ_REPOS_DIR=$SCAN_ROOT
 
 pr_load_all() { :; }
 

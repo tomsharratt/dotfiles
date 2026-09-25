@@ -237,8 +237,8 @@ esac
 
 echo "== wt_teardown's own exit status never invents a failure ==" >&2
 # The bug: its last statement used to be `[ -e "$pf" ] && rm -f "$pf"`, so a
-# worktree that never ran a dev server - every --no-dev worktree, which is every
-# pq task - made the function return non-zero after a completely clean teardown,
+# worktree that never ran a dev server - which was every pq task, while pq
+# dispatched without one - made the function return non-zero after a completely clean teardown,
 # and `wt rm` printed "teardown reported errors" on top of it.
 printf '%s\n%s\n' "$td_db" "$td_tdb" > "$DB_LIST"
 : > "$DROP_LOG"

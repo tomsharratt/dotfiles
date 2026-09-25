@@ -16,8 +16,8 @@
 # reset predicts. A wrong url reads as broken puma routing, which is why the
 # repair reached for was `wt provision` then `wt open && wt dev`.
 #
-# Driven through the real `wt new --no-agent --no-focus --no-dev --json`, which
-# is what pq dispatches. Unlike test/wt-open.sh, `wt new` does need a herdr
+# Driven through the real `wt new --no-agent --no-focus --json`, which is what
+# pq dispatches. Unlike test/wt-open.sh, `wt new` does need a herdr
 # socket, and wt resolves the binary as "$HOME/.local/bin/herdr" rather than
 # off PATH - so HOME is pointed at a fixture holding a stub. HOME reaches
 # nothing else here that matters: SELF (the command string sent to the dev tab,
@@ -141,7 +141,7 @@ EOF
 
 # ── the exact call pq dispatches ────────────────────────────────────────────
 ERRLOG="$FIX/wt-new.err"
-out=$(cd "$REPO" && "$WT" new --no-agent --no-focus --no-dev --json my/new-task 2>"$ERRLOG")
+out=$(cd "$REPO" && "$WT" new --no-agent --no-focus --json my/new-task 2>"$ERRLOG")
 # All of wt's human-facing output is on stderr, so an empty stdout means it died
 # there - show that rather than reporting four blank-value failures.
 [ -n "$out" ] || printf 'wt new produced no JSON; its stderr was:\n%s\n' "$(cat "$ERRLOG")" >&2

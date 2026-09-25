@@ -95,20 +95,19 @@ Two things it does not fix.
 A bare `bundle exec rspec` that bypasses `wt` entirely still lands on the shared `supercast-web_test`; making *that* safe would need `database.yml` to name a variable only worktrees set.
 And the test **redis** index is still shared, because `config/initializers/redis.rb` hardcodes db 15 in test with no override - so Redis-backed specs can still race a concurrent run even though the databases no longer do.
 
-`wt new` layers three things on top of "prepare a worktree", and each can be dropped so the command can be driven by a script rather than by `prefix+t`:
+`wt new` layers things on top of "prepare a worktree", and two of them can be dropped so the command can be driven by a script rather than by `prefix+t`:
 
 ```
 --no-agent   don't start Claude in the root pane
---no-dev     provision, but don't boot the dev server
 --no-focus   leave focus where it is
+--base REF   fork a new branch off REF rather than the default branch
 --json       print the worktree's facts (path, pane ids, port, url) to stdout
 ```
 
 Human-facing output always goes to stderr, so `--json` leaves stdout clean for a caller to parse.
-`--no-dev` deliberately still provisions: the dev server is four long-running foreman processes, while provisioning is the one-off that creates the isolated database - skip that too and `wt run bin/rails test` inside the worktree fails confusingly.
 
-`pq` dispatches with the dev server on.
-It used to pass `--no-dev`, because a batch running overnight would otherwise hold a foreman stack per task behind agents that never opened a browser - but batches no longer run overnight, most of the work is visual, and the delivery contract (see "Delivering a reviewable pull request" below) has every implementer verify each screen it touches in the browser and screenshot it.
+The dev server always comes with it, and `pq` dispatches with it on.
+`pq` used to pass a `--no-dev` flag, because a batch running overnight would otherwise hold a foreman stack per task behind agents that never opened a browser - but batches no longer run overnight, most of the work is visual, and the delivery contract (see "Delivering a reviewable pull request" below) has every implementer verify each screen it touches in the browser and screenshot it.
 An agent with no running app cannot do that, so the server is part of what dispatch provides.
 `wt open`'s own autostart stays, for a server that has died by the time you come to look: it starts the server itself when nothing is serving that port, waits for it to bind, and then opens the browser.
 
@@ -152,8 +151,8 @@ pq after <task> T...     add blockers to a task still in queue/
 pq after <task> --clear  drop them all
 pq base <task> [B]       what branch it forks from and aims its PR at; B retargets it
 pq ls [--all] [--json]   every task, its state, and what it is waiting on
-pq tick [--cap N]        free finished slots, then fill them from the queue
-pq run [--interval S]    tick on an interval until you stop it
+pq tick [--dry-run]      free finished slots, then fill them from the queue
+pq run                   tick every two minutes until you stop it
 pq cap [N]               how many may run at once; 0 pauses
 pq rm <task>             drop a task (never touches a worktree or a branch)
 pq evidence [task]       publish a task's screenshots to the pq-evidence branch; prints the markdown to paste
@@ -169,13 +168,12 @@ The fourteen-digit prefix on a task directory is a UTC timestamp and nothing els
 Ten is a page, not a limit.
 `n` pages back to older plans and `p` pages forward again, and the header says where you are - `11-20 of 47 (page 2/5)`.
 The keys are offered only when there is more than one page, and paging past either end says so rather than doing nothing.
-`PQ_PICK_LIMIT` sets the page size.
 
 Row numbers are absolute: row 11 is the eleventh-newest plan whichever page you are looking at, so a number always means the same plan and any listed row can be picked from any page.
 Pick a number - Enter takes the top row of the page you are on, which is the most recent plan on page one - and it previews the plan before asking `use this plan? [y/N]`; answering `n` returns to the number prompt, on the page you were reading, rather than aborting the whole command.
 That `n` is "no", not "next page" - the two prompts read the key differently, and each one's hint says which is in force.
 Once you confirm, it asks the things that actually shape how a task runs: which model should run it and which of the tasks already queued or running it should wait on - and, first, for a plan that lays out several pull requests of its own, whether to queue one task per pull request.
-The model question offers `sonnet`, `opus` and `fable`, and Enter takes `PQ_DEFAULT_MODEL` (`sonnet` unless you have overridden it); an initial and any case will do.
+The model question offers `sonnet`, `opus` and `fable`, and Enter takes `sonnet`; an initial and any case will do.
 Only what is typed at the prompt is held to those three - `--model` itself still takes any id `claude --model` accepts.
 `--effort` stays a flag, with no question of its own.
 
@@ -293,7 +291,7 @@ So a task that reconcile has already moved to `done/` goes on spending its slot 
 Counting only `running/` is what once ran six agents at a cap of 3, three fresh ones alongside three still wrapping up, and reported it as "3 running".
 
 The release has to be a timer rather than an exit, because an agent that has genuinely finished sits idle indefinitely instead of exiting - so waiting for one to disappear would stall the queue outright rather than merely overshoot it.
-`PQ_WRAPUP_GRACE` (default 300s) is that timer: once an agent has not been working for that long, its slot goes.
+Five minutes is that timer: once an agent has not been working for that long, its slot goes.
 It governs the tasks whose PR is still open or in draft; a task whose PR has *settled* - merged or closed - gets torn down by the reap pass as soon as its agent stops, and a torn-down task releases its slot at once with no grace at all.
 A settled task still holds its slot until then, exactly as an open one does: the teardown is waiting on that agent, so handing the slot away on the verdict alone would start a second agent beside one still running.
 The grace applies to `idle` and to herdr's `done` alike, because both are per-turn rather than per-task: an agent that opens a PR and then goes back in to fix CI passes through them between every turn, and releasing on the first sighting would be the same bug in a subtler form.
@@ -304,7 +302,6 @@ Note that a dismissed wall reads as `idle` to herdr - dismissing the dialog is w
 An exited agent or a vanished workspace releases immediately, with no grace at all, and while herdr is unreachable the slot is held rather than guessed at.
 A task whose review gate is in flight - waiting for the reviewer, or for the follow-up to be delivered - holds its slot with no clock at all, for the same reason a blocked one does: the implementer is idle because it is waiting, and it is about to be handed more work.
 That hold is bounded by the gate's own bounds (see "The review gate" below), and ends the moment the follow-up is delivered, after which the ordinary grace applies.
-Setting `PQ_WRAPUP_GRACE=0` restores the old release-on-PR behaviour for a task the gate does not apply to; for a gated task it means release once the gate is through, not on the pull request.
 
 The other reason the queue can sit still with slots apparently free is that **a wall anywhere stops dispatch entirely**.
 Every agent `pq` runs draws on one account-wide usage window, so a second agent started behind the wall does not get an allowance of its own: it walls on its first request, having spent a minute of `wt new`, a database, a port and a puma-dev entry to get there, and it arrives with its own knock cycle to run.
@@ -345,7 +342,7 @@ Declining leaves the split directory on disk and costs nothing: `pq add --split-
 `--after` on the split itself only applies to the root parts - the ones with no dependency inside the split - since `pq after`'s own reporting already surfaces the rest of the chain to anyone asking why a downstream part hasn't started.
 
 A plan that names more than one checkout - a mobile feature spanning the Rails monolith and the iOS app, say - gets its parts assigned across repositories instead of forced into one.
-The splitter is shown every git checkout sitting alongside the primary, or under `PQ_REPOS_DIR` if you'd rather point it somewhere else, and told to use the primary unless the plan clearly places some of the work elsewhere - it never assigns a part to a repository the plan doesn't talk about.
+The splitter is shown every git checkout sitting alongside the primary, and told to use the primary unless the plan clearly places some of the work elsewhere - it never assigns a part to a repository the plan doesn't talk about.
 A part belongs to exactly one repository, because a part is one pull request; work that genuinely spans two repositories is two parts, wired with an ordinary `--after` the same way an intra-repo dependency is - a client part waiting on the server part it needs is just that edge crossing a repo boundary.
 `--repo PATH` is repeatable and is the escape hatch for the discovery, not the normal path: passing it once still lets the scan contribute, which is how you fix a wrong cwd without silently turning multi-repo splitting off, and only passing it two or more times narrows the set to exactly those repos.
 The repo assignment is yours to check at the confirmation: the table grows a `REPO` column once a split actually spans more than one repository.
@@ -436,7 +433,7 @@ Neither freezes the queue the way the wall does: a regex over a terminal can be 
 Every pull request a task opens gets one independent review before the implementer may call it ready - run by `pq`, not asked of the agent.
 The agent could run `/code-review` itself, and a repository's conventions often ask it to - supercast's CLAUDE.md wants one before every pull request, and one task was reviewed three times - but a review by the session that wrote the change is not independent.
 So its contract says `pq`'s review stands in for the repository's and that it runs none of its own, and `pq` runs `claude -p "/code-review <level> --comment N"` itself, in the task's worktree, with the task's own directory opened to it so it can read the plan and the design files, and the skill posts its findings as inline review comments on the pull request.
-`PQ_REVIEWER_MODEL` (default `opus`) and `PQ_REVIEW_EFFORT` (default `xhigh`) are what it runs at, the second passed both as the session's `--effort` and as the skill's own level argument.
+`PQ_REVIEWER_MODEL` (default `opus`) is what it runs on, at `xhigh`, passed both as the session's `--effort` and as the skill's own level argument.
 The order of that prompt is load-bearing, and was wrong for the gate's first few runs.
 The skill reads the first non-flag token as the level and everything after it as the target, so sending the pull request first (`/code-review N <level> --comment`) meant the level was ignored - silently falling back to `codeReviewLastEffort` in `~/.claude.json`, the level last typed at an interactive prompt, which is what "Reusing xhigh effort (the level you typed last)" at the top of those transcripts was reporting - and the target became the string `N <level>` rather than the pull request number.
 It read as harmless only because the level last typed on this machine happened to be `xhigh` as well.
@@ -445,7 +442,7 @@ Nobody reviews the review.
 The point is that a second pair of eyes has been over the diff, and the first pair has had to answer them, before you read either.
 
 It is a state ladder on the task, one step per tick, so a tick never blocks on it: `pending` once reconcile has seen the pull request, `running` while the reviewer is a background process of its own, `posted` when it has finished, `prompted` once the follow-up is with the implementer, and `ready` when the pull request stops being a draft.
-The reviewer waits for the agent to go quiet first, and probes the pull request once before launching: a title beginning `STUCK:` is skipped outright (telling an agent that stopped for a reason to mark its work ready is the wrong instruction), and a single commit over `PQ_REVIEW_SPLIT_LINES` changed lines earns an extra clause in the follow-up asking for the branch to be restructured into small logical commits before it is marked ready.
+The reviewer waits for the agent to go quiet first, and probes the pull request once before launching: a title beginning `STUCK:` is skipped outright (telling an agent that stopped for a reason to mark its work ready is the wrong instruction), and a single commit over 150 changed lines earns an extra clause in the follow-up asking for the branch to be restructured into small logical commits before it is marked ready.
 `pq ls` reads `review due`, `reviewing 7m`, `reviewed`, `resolving`, then falls back to `wrapping up`, and the tick summary counts `N reviewing` - see "The security review" below for the words it adds.
 
 The reviewer runs in the background rather than shielded, because a tick must never block for up to an hour: everything needed to collect it is on disk, so a `pq run` stopped with Ctrl-C leaves the reviewer alone and a later tick, from any `pq` process, finishes the job.
@@ -453,7 +450,7 @@ Liveness is the process group, not the pid, so a recycled pid is neither counted
 A pull request that settles mid-review has its reviewer killed before the reap pass closes the workspace it runs in, and `pq rm` kills one too.
 
 Failure is loud, once, and falls back rather than blocking.
-A reviewer that errors or runs past `PQ_REVIEW_TIMEOUT` is retried after `PQ_REVIEW_RETRY`, up to `PQ_REVIEW_MAX_TRIES` launches, and then given up on; the implementer is then told the review did not happen and to review its own diff as a stranger would, fix, push, and mark the pull request ready anyway, and `pq ls` reads `review failed` until it does.
+A reviewer that errors or runs past an hour is retried after ten minutes, up to `PQ_REVIEW_MAX_TRIES` launches (default 2), and then given up on; the implementer is then told the review did not happen and to review its own diff as a stranger would, fix, push, and mark the pull request ready anyway, and `pq ls` reads `review failed` until it does.
 A reviewer that was refused `gh` and posted nothing is `denied` and never retried, since it cannot succeed until `PQ_REVIEW_TOOLS` changes - and it is reported the same way, on the first task it happens to.
 
 A clean exit is not taken as a review, either: what decides is whether anything landed.
@@ -467,7 +464,7 @@ A reviewer that hits the usage limit has not failed, and is not treated as if it
 In `claude -p` the wall is not an error: the first reviewer to hit it had spent fifteen minutes and $5.52 on a review, then exited 0, with `is_error: false` and nothing in its reply but "You've hit your session limit · resets 7pm (America/Toronto)" - and the gate read that as a review that had posted, and told the implementer to resolve comments that did not exist.
 So a reply that is one line and reads as the wall (`PQ_QUOTA_RE`, as on a pane) is caught before anything else is read off a finished reviewer, code or security, whatever its exit code says; a reply that is not JSON has the last line of its stderr put to the same test.
 One line, because a real review is never that short, while a review of rate-limiting code can say "hit your API limit" somewhere in a longer one.
-The reviewer then waits out the wall the way a walled pane does: it goes back to `pending` with its retry a minute past the reset its line names, or every `PQ_QUOTA_RETRY` when it names none, and spends none of its `PQ_REVIEW_MAX_TRIES` - walls are counted apart, up to `PQ_QUOTA_MAX_TRIES`, after which the follow-up asks for a self-review and says why.
+The reviewer then waits out the wall the way a walled pane does: it goes back to `pending` with its retry a minute past the reset its line names, or every ten minutes when it names none, and spends none of its `PQ_REVIEW_MAX_TRIES` - walls are counted apart, up to forty, after which the follow-up asks for a self-review and says why.
 At the reset it resumes its own session, with every flag again and a plain "carry on" rather than the skill, which would start the review over - so the work done before the wall is not paid for twice.
 A session that has gone since is started afresh, at once, with no try spent.
 While it waits, `pq ls` reads `review quota 7pm`, the slot stays held, and the queue is frozen on it exactly as on a walled pane, since the wall is the account's; the freeze is read off the reviewer's own ladder, so it lets go the moment the ladder ends, however it ends.
@@ -486,7 +483,7 @@ The wording was checked against ten real plans, four runs each, and came back ri
 A split carries the ask into the parts it is about, and each part gets a verdict of its own.
 
 The implementer's contract says `pq` runs the review, and not to run one itself.
-Once the draft is open, `pq` runs `claude -p "/security-review"` in the task's worktree beside the code reviewer, launched on the same tick, on the same `PQ_REVIEWER_MODEL`, `PQ_REVIEW_EFFORT`, `PQ_REVIEW_TIMEOUT`, `PQ_REVIEW_MAX_TRIES` and `PQ_REVIEW_RETRY`, and under the same read-only deny rules, with `gh` denied outright.
+Once the draft is open, `pq` runs `claude -p "/security-review"` in the task's worktree beside the code reviewer, launched on the same tick, on the same `PQ_REVIEWER_MODEL`, effort, timeout, `PQ_REVIEW_MAX_TRIES` and retry, and under the same read-only deny rules, with `gh` denied outright.
 The skill takes no target and posts nothing: it reviews `git diff origin/HEAD...` of wherever it runs and replies with a markdown report.
 So its brief names the diff to go by - `git diff origin/<base>...HEAD`, since `origin/HEAD` is the default branch whatever the pull request is aimed at - and points it at the plan, which says why it asked and what to look at.
 Then `pq` delivers the report itself: it is saved as `<task>/security.md` and posted on the pull request as one comment, next to the code review's inline ones.
@@ -564,7 +561,7 @@ A task with no verdict yet, one held on `PQ_REAP_HELD`, and one reaped with no v
 
 A blocker survives this by construction: it is a resolved `(label, repo, branch)` triple, not a task reference, so a dependent still resolves it correctly once its blocker has archived - see "Blockers" above.
 
-The newest `PQ_DONE_KEEP` (default 3) archivable tasks are kept behind in `done/`, so `pq ls` still answers "did last night's batch ship?" at a glance.
+The newest three archivable tasks are kept behind in `done/`, so `pq ls` still answers "did last night's batch ship?" at a glance.
 `pq ls` hides `archive/` by default and reports how many rows it is hiding; `pq ls --all` shows everything, and `--json` composes with either.
 
 Archiving is entirely automatic - there is no manual form.

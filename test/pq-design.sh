@@ -19,8 +19,7 @@ PQ_PLANS_DIR=$(mktemp -d)
 export PQ_PLANS_DIR
 # The default scan root for repo_candidates, permanently empty, so a --split
 # here stays single-repo whatever else is sitting in $TMPDIR.
-PQ_REPOS_DIR=$(mktemp -d)
-export PQ_REPOS_DIR
+SCAN_ROOT=$(mktemp -d)
 
 STUBBIN=$(mktemp -d)
 # `haiku` reads the plan on stdin, keeps the prompt it was given in
@@ -90,6 +89,8 @@ export PATH="$STUBBIN:$PATH"
 
 # shellcheck source=/dev/null
 source "$HERE/../.local/bin/pq"
+# Assigned after the source: pq sets its own, and the constant would win.
+PQ_REPOS_DIR=$SCAN_ROOT
 
 pass=0 fail=0
 ok()  { pass=$((pass + 1)); }
@@ -138,7 +139,6 @@ t=$(find_task "$slug")
 [ -f "$t/design/Onboarding Refresh.dc.html" ] && ok || bad "the .dc.html should be copied into design/, space and all"
 [ -f "$t/design/shot.png" ] && ok || bad "the png should be copied into design/"
 eq "$(hdr "$t/plan.md" design)" "Onboarding Refresh.dc.html, shot.png" "the design: header lists the basenames, comma separated"
-eq "$(design_list "$t" | tr '\n' '|')" "Onboarding Refresh.dc.html|shot.png|" "design_list reads them back one per line"
 has "$(cat "$PQ_HOME/.err")" "design: Onboarding Refresh.dc.html, shot.png" "the add reports the design set"
 cmp -s "$DC" "$t/design/Onboarding Refresh.dc.html" && ok || bad "the copy must be byte-identical to the source"
 eq "$(readlink "$PQ_HOME/tasks/$(basename "$t")")" "$t" "add makes the stable tasks/ link"

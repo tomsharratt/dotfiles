@@ -33,7 +33,6 @@
 # reverts to the pristine image and both patches disappear.
 
 WT_RESOURCES=""            # the emulator is shared; nothing to allocate
-WT_AGENT="claude"
 
 : "${WT_ANDROID_AVD:=Pixel_6}"            # override to target a specific AVD
 WT_ANDROID_PKG="com.supercast.supercast"

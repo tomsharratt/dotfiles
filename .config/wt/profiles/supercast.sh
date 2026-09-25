@@ -10,10 +10,8 @@
 #   - Procfile.dev binds ${PORT:-3000}                      -> per-worktree port
 #   - config/application.rb has config.hosts.clear          -> any *.test host is allowed
 
-WT_RESOURCES="port redis"   # allocate an isolated port + redis db index
-WT_PORT_BASE=3101           # 3000 stays with the canonical checkout
+WT_RESOURCES="port redis"   # allocate an isolated port + redis db index (from wt's 3101 - 3000 stays with the canonical checkout)
 WT_REDIS_MAX=14             # reserve db 15 for the spec suite (config/initializers/redis.rb)
-WT_AGENT="claude"
 
 # The dev db has a hyphen; a bareword pg db name can't, so the slug's dashes
 # become underscores for the worktree's db.
@@ -383,8 +381,8 @@ wt_teardown() {
   # wt_dev writes this outside the repo (see there); nothing else removes it.
   # No -e guard: `rm -f` is already silent about a path that was never there, and
   # as the LAST statement the guard made this function return non-zero for every
-  # worktree that never ran a dev server - which is every --no-dev worktree, so
-  # every pq task - and `wt rm` reported "teardown reported errors" after a
+  # worktree that never ran a dev server - which was every pq task, while pq
+  # dispatched without one - and `wt rm` reported "teardown reported errors" after a
   # completely clean teardown. Each step above now reports its own failure, so the
   # function's own status carries no information and should not invent any.
   rm -f "$pf"

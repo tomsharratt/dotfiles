@@ -24,7 +24,6 @@
 # warns, but does not fail, when it isn't.
 
 WT_RESOURCES=""            # the simulator is shared; no port, no redis, nothing to allocate
-WT_AGENT="claude"
 
 : "${WT_IOS_DEVICE:=iPhone 17}"          # override to target a specific simulator
 WT_IOS_SCHEME="supercast-ios"

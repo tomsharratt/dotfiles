@@ -12,7 +12,6 @@
 #   wt new [name]        create/open an isolated worktree, provision it,
 #                        start the dev server + Claude, focus it
 #        --no-agent      don't start Claude in the root pane
-#        --no-dev        provision, but don't boot the dev server
 #        --no-focus      leave focus where it is
 #        --base REF      fork a NEW branch off REF instead of the default branch
 #                        (ignored when the branch already exists locally or on origin)
@@ -41,7 +40,6 @@
 #   WT_PORT_BASE=3101           first port to hand out (default 3101)
 #   WT_REDIS_MAX=15             highest redis db index to hand out (default 15); lower it
 #                               to reserve indices for something else, e.g. a spec suite
-#   WT_AGENT="claude"           agent command to launch in the worktree (default claude)
 # and define any of these functions, which run with the worktree's facts
 # exported (WT_NAME WT_SLUG WT_PATH WT_REPO WT_REPO_NAME WT_DOMAIN WT_PORT WT_REDIS):
 #   wt_provision   prepare the worktree so its dev server can boot in isolation
@@ -306,13 +304,12 @@ load_profile() {
   # Every tunable a profile may set is reset here for the same reason the functions are:
   # `wt ls` and `wt gc` load one profile after another in a single process, and a value
   # left behind by the previous repo is indistinguishable from one this repo chose.
-  WT_RESOURCES="" WT_PORT_BASE=3101 WT_REDIS_MAX=15 WT_AGENT="claude"
+  WT_RESOURCES="" WT_PORT_BASE=3101 WT_REDIS_MAX=15
   for f in "$repo/.wt/profile.sh" "$PROFILE_DIR/$name.sh"; do
     [ -f "$f" ] || continue
     # shellcheck disable=SC1090
-    . "$f"; WT_PROFILE=$f; return 0
+    . "$f"; return 0
   done
-  WT_PROFILE=""
 }
 
 # Establish (or top up) a worktree's identity + allocated resources, persisted to
@@ -908,22 +905,24 @@ cmd_gc() {
 # thing: worktree, dev server, an agent typed into the root pane, and your focus moved there.
 # A script driving a queue of tasks wants only the worktree - it starts its own agent, with
 # its own model and effort, and a 3am dispatch that stole focus or booted four foreman stacks
-# would be actively hostile. The flags below are that separation: --no-agent / --no-dev /
-# --no-focus each drop one of the three things layered on top of "prepare a worktree", and
-# --json prints the resulting facts to stdout so a caller can act on them. All human-facing
-# output already goes to stderr, so stdout stays clean for the JSON.
+# would be actively hostile. The flags below are that separation: --no-agent and --no-focus
+# each drop one of the things layered on top of "prepare a worktree", and --json prints the
+# resulting facts to stdout so a caller can act on them. All human-facing output already
+# goes to stderr, so stdout stays clean for the JSON. The dev server always comes with it:
+# pq dispatches with it on, since its implementers verify every screen in the browser.
 cmd_new() {
   need_herdr
-  local no_agent=0 no_focus=0 no_dev=0 as_json=0 want_base=""
+  local no_agent=0 no_focus=0 as_json=0 want_base=""
   while [ $# -gt 0 ]; do
     case "$1" in
       --no-agent) no_agent=1; shift ;;
       --no-focus) no_focus=1; shift ;;
-      --no-dev)   no_dev=1;   shift ;;
-      --base)     want_base=${2:-}; shift 2 ;;
+      # Given last with no value, `shift 2` fails without shifting and this loop
+      # would spin on the same argument for ever.
+      --base)     [ $# -ge 2 ] || die "--base needs a ref"
+                  want_base=$2; shift 2 ;;
       --json)     as_json=1;  shift ;;
-      --)         shift; break ;;
-      -*)         die "unknown option '$1' (usage: wt new [--no-agent] [--no-dev] [--no-focus] [--base REF] [--json] [name])" ;;
+      -*)         die "unknown option '$1' (usage: wt new [--no-agent] [--no-focus] [--base REF] [--json] [name])" ;;
       *)          break ;;
     esac
   done
@@ -1010,7 +1009,7 @@ cmd_new() {
   # migrate, flag seed) is the slow part, so it does NOT block this - it runs in a
   # background dev tab below and the worktree just isn't server-ready until it lands.
   if [ "$no_agent" = 0 ]; then
-    "$HERDR" pane send-text "$root_pane" "${WT_AGENT:-claude}" >/dev/null 2>&1
+    "$HERDR" pane send-text "$root_pane" claude >/dev/null 2>&1
     "$HERDR" pane send-keys "$root_pane" enter >/dev/null 2>&1
   fi
   [ "$no_focus" = 1 ] || "$HERDR" workspace focus "$ws" >/dev/null 2>&1
@@ -1032,18 +1031,14 @@ cmd_new() {
   # the same worktree gets provisioned twice into two state files with two ports. Both
   # variables are normally unset, which is the only reason this has never bitten.
   #
-  # --no-dev drops the server but KEEPS provisioning. The two are not the same cost: the
-  # server is four long-running foreman processes held for the life of the worktree, while
-  # provisioning is a one-off that creates the isolated database. Skip provisioning too and
-  # `wt run bin/rails test` inside the worktree fails in a way that reads as a broken
-  # checkout rather than a missing step - so the expensive, always-on half goes and the
-  # cheap, load-bearing half stays.
+  # A profile with provisioning and no dev server gets a `setup` tab rather than a `dev`
+  # one, so the label says what is running in it.
   local setup="" prov dev notify envp="" v label=dev have_prov=0 have_dev=0
   for v in XDG_STATE_HOME XDG_CONFIG_HOME; do
     [ -n "${!v:-}" ] && envp="$envp$(printf '%s=%q ' "$v" "${!v}")"
   done
   declare -F wt_provision >/dev/null && have_prov=1
-  { declare -F wt_dev >/dev/null && [ "$no_dev" = 0 ]; } && have_dev=1
+  declare -F wt_dev >/dev/null && have_dev=1
   [ "$have_dev" = 1 ] || label=setup
   prov=$envp$(printf '%q provision %q' "$SELF" "$WT_PATH")
   dev=$envp$(printf '%q dev %q' "$SELF" "$WT_PATH")
@@ -1182,9 +1177,7 @@ port_listening() {                      # port
 # `yarn build --watch` on one output directory and two sidekiq on one redis index.
 #
 # Read off herdr rather than out of the profile's Procfile: wt created this tab and
-# chose its label, so this is wt's own fact. A worktree pq dispatched has a `setup`
-# tab instead (cmd_new's label when --no-dev drops the server), which is why those
-# are the ones this finds nothing for.
+# chose its label, so this is wt's own fact.
 dev_tab_for() {                         # workspace_id -> tab_id, or empty
   [ -n "${1:-}" ] || return 0
   "$HERDR" api snapshot 2>/dev/null \
@@ -1197,10 +1190,10 @@ dev_tab_for() {                         # workspace_id -> tab_id, or empty
 # alone does what `wt open && wt dev` did by hand.
 #
 # The gap this closes: provisioning routes <slug>.test at the worktree's port, but
-# nothing answers there until the profile's dev server runs - and pq dispatches with
-# --no-dev, deliberately, so an overnight batch does not leave a foreman stack per
-# task. So `wt open` on last night's work landed on a dead url, which reads exactly
-# like broken puma routing, and the repair was always the same two commands.
+# nothing answers there until the profile's dev server runs, and a server that has
+# died - or a worktree from before pq kept its dev server on - leaves `wt open` on a
+# dead url, which reads exactly like broken puma routing. The repair was always the
+# same two commands.
 #
 # Every gate here is a reason NOT to touch anything:
 #   no herdr        - there is no pane to start a server in
@@ -1489,10 +1482,10 @@ main() {
     test)       shift; cmd_test "$@" ;;
     open)       shift; cmd_open "$@" ;;
     provision)  shift; cmd_provision "$@" ;;
-    rm|remove)  shift; cmd_rm "$@" ;;
+    rm)         shift; cmd_rm "$@" ;;
     ls|list)    shift; cmd_ls "$@" ;;
     gc)         shift; cmd_gc "$@" ;;
-    *) die "usage: wt {new [--no-agent] [--no-dev] [--no-focus] [--json] [name] | dev <path> | run [cmd...] | test [cmd...] | open [name] | provision <path> | rm [-y] [name] | ls | gc [--settled] [--sweep] [-y]}" ;;
+    *) die "usage: wt {new [--no-agent] [--no-focus] [--base REF] [--json] [name] | dev <path> | run [cmd...] | test [cmd...] | open [name] | provision <path> | rm [-y] [name] | ls | gc [--settled] [--sweep] [-y]}" ;;
   esac
 }
 if [ "${BASH_SOURCE[0]}" = "$0" ]; then main "$@"; fi

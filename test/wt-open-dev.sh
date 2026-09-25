@@ -3,9 +3,8 @@
 # the worktree's url, so one command does what `wt open && wt dev` did by hand.
 #
 # The gap it closes: provisioning routes <slug>.test at the worktree's port, but
-# nothing answers there until the profile's dev server runs - and pq dispatches
-# with --no-dev on purpose, so an overnight batch does not hold a foreman stack
-# per task. `wt open` on last night's work therefore landed on a dead url, which
+# nothing answers there until the profile's dev server runs, so `wt open` on a
+# worktree whose server had died, or never started, landed on a dead url, which
 # reads exactly like broken puma routing.
 #
 # Every gate is a reason to touch nothing, and each is a case below: no herdr, no
