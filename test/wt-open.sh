@@ -127,9 +127,9 @@ REPO2_NAME=$(basename "$REPO2")
 result=$(
   # shellcheck source=/dev/null
   source "$WT"
-  load_profile "$REPO" "$REPO_NAME"
+  load_profile "$REPO_NAME"
   declare -F wt_open >/dev/null && echo "sanity=ok" || echo "sanity=fail"
-  load_profile "$REPO2" "$REPO2_NAME"
+  load_profile "$REPO2_NAME"
   declare -F wt_open >/dev/null && echo "leaked=yes" || echo "leaked=no"
 )
 case "$result" in *"sanity=ok"*) ok ;; *) bad "sanity: wt_open should be defined right after loading $REPO_NAME's profile (got: $result)" ;; esac

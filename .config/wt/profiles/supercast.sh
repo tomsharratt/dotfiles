@@ -417,7 +417,7 @@ wt_sweep() {
     slug=$(basename "$f")
     grep -qxF "$slug" <<<"$live" && continue
     port=$(tr -dc '0-9' < "$f" 2>/dev/null)
-    [ -n "$port" ] && [ "$port" -ge "${WT_PORT_BASE:-3101}" ] 2>/dev/null || continue
+    [ -n "$port" ] && [ "$port" -ge "$WT_PORT_BASE" ] 2>/dev/null || continue
     [ -n "$dry" ] && { printf 'puma-dev entry %s (:%s)\n' "$slug" "$port"; continue; }
     rm -f "$f" && msg "swept puma-dev entry $slug (was :$port)"
   done

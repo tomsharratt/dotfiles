@@ -34,12 +34,10 @@
 # Bind `wt new` to a key in ~/.config/herdr/config.toml (see README).
 #
 # PROFILES ───────────────────────────────────────────────────────────────────
-# For repo <name>, wt sources the first profile it finds:
-#   1. <repo>/.wt/profile.sh              (committed with the project, team-shared)
-#   2. ~/.config/wt/profiles/<name>.sh    (personal, tracked in dotfiles)
-# A profile may set:
-#   WT_RESOURCES="port redis"   isolated resources to allocate (default: none)
-#   WT_PORT_BASE=3101           first port to hand out (default 3101)
+# For repo <name>, wt sources ~/.config/wt/profiles/<name>.sh (tracked in
+# dotfiles), when there is one. A profile may set:
+#   WT_RESOURCES="port redis"   isolated resources to allocate (default: none);
+#                               ports are handed out from WT_PORT_BASE (3101) up
 #   WT_REDIS_MAX=15             highest redis db index to hand out (default 15); lower it
 #                               to reserve indices for something else, e.g. a spec suite
 # and define any of these functions, which run with the worktree's facts
@@ -73,6 +71,8 @@ SELF="$HOME/.local/bin/wt"
 WORKTREE_ROOT="$HOME/.herdr/worktrees"
 STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/wt"
 PROFILE_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/wt/profiles"
+# The first port a worktree is handed: 3000 stays with the canonical checkout.
+WT_PORT_BASE=3101
 mkdir -p "$STATE_DIR"
 
 msg()  { printf 'wt: %s\n' "$*" >&2; }
@@ -273,7 +273,7 @@ load_state_for_path() {                 # path repo_name branch
 
 # Allocate the lowest free value not recorded in any worktree's state file.
 alloc_port() {
-  local base=${WT_PORT_BASE:-3101} p used
+  local base=$WT_PORT_BASE p used
   used=$(awk -F= '/^WT_PORT=/{print $2}' "$STATE_DIR"/*.env 2>/dev/null)
   for ((p=base; p<base+500; p++)); do
     grep -qx "$p" <<<"$used" && continue
@@ -304,18 +304,17 @@ alloc_redis() {
 # is not a cosmetic bug - it would hand one project's "these slugs are still live"
 # list to another project's reclaim logic, which is a recipe for dropping every
 # database of a project that is not even being swept.
-load_profile() {
-  local repo=$1 name=$2 f
+load_profile() {                        # repo_name
+  local f
   unset -f wt_provision wt_dev wt_env wt_open wt_open_url wt_teardown wt_sweep 2>/dev/null || true
   # Every tunable a profile may set is reset here for the same reason the functions are:
   # `wt ls` and `wt gc` load one profile after another in a single process, and a value
   # left behind by the previous repo is indistinguishable from one this repo chose.
-  WT_RESOURCES="" WT_PORT_BASE=3101 WT_REDIS_MAX=15
-  for f in "$repo/.wt/profile.sh" "$PROFILE_DIR/$name.sh"; do
-    [ -f "$f" ] || continue
-    # shellcheck disable=SC1090
-    . "$f"; return 0
-  done
+  WT_RESOURCES="" WT_REDIS_MAX=15
+  f="$PROFILE_DIR/$1.sh"
+  [ -f "$f" ] || return 0
+  # shellcheck disable=SC1090
+  . "$f"
 }
 
 # Establish (or top up) a worktree's identity + allocated resources, persisted to
@@ -575,7 +574,7 @@ gc_run() {
     [ -n "${WT_PATH:-}" ] && git -C "$WT_PATH" rev-parse --is-inside-work-tree >/dev/null 2>&1 && continue
     GC_RECLAIMED=$((GC_RECLAIMED + 1))
     msg "orphan ${WT_REPO_NAME:-?}/${WT_NAME:-?} - worktree gone, reclaiming its resources"
-    load_profile "${WT_REPO:-}" "${WT_REPO_NAME:-}"
+    load_profile "${WT_REPO_NAME:-}"
     local own_ws=""
     in_herdr && ws_is_for "${WT_WORKSPACE:-}" "${WT_PATH:-}" && own_ws=$WT_WORKSPACE
     # The worktree is gone, but a dev server left running in its workspace is not,
@@ -781,7 +780,7 @@ reap_one() {                            # repo repo_name branch path del_branch(
   local repo=$1 rn=$2 name=$3 path=$4 del=$5 sf ws
   sf=$(sf_for_path "$path")
   [ -n "$sf" ] || sf=$(state_file "$rn" "$(slugify "$name")")
-  load_profile "$repo" "$rn"
+  load_profile "$rn"
   wt_reset
   load_state "$sf" || warn "$rn/$name: no saved state - its db/redis/dns entry may not be fully freed"
   # Everything below this line acts on the loaded state: it drops the database WT_SLUG
@@ -936,7 +935,7 @@ gc_sweep() {                            # yes(1|0)
   while IFS= read -r repo; do
     [ -n "$repo" ] || continue
     rn=$(basename "$repo")
-    load_profile "$repo" "$rn"
+    load_profile "$rn"
     declare -F wt_sweep >/dev/null || continue
     live=""
     while IFS=$'\t' read -r path branch; do
@@ -1031,7 +1030,7 @@ cmd_new() {
   [ -n "$repo" ] && [ "$repo" != null ] || repo=$(main_worktree "$PWD")
   [ -n "$repo" ] || die "not inside a git repo: $PWD"
   repo_name=$(basename "$repo")
-  load_profile "$repo" "$repo_name"
+  load_profile "$repo_name"
 
   # Resolve the branch, then create the worktree+workspace in Herdr. Three cases,
   # matching the tmux-era wt: reuse an existing local branch, adopt an existing
@@ -1190,7 +1189,7 @@ cmd_dev() {
   local path=${1:-$PWD} repo repo_name name
   repo=$(main_worktree "$path"); [ -n "$repo" ] || die "not a git worktree: $path"
   repo_name=$(basename "$repo"); name=$(cur_branch "$path")
-  load_profile "$repo" "$repo_name"
+  load_profile "$repo_name"
   load_state_for_path "$path" "$repo_name" "$name" \
     || warn "no saved state for this worktree - run 'wt provision $path' first"
   WT_PATH=$path WT_REPO=$repo WT_REPO_NAME=$repo_name
@@ -1213,7 +1212,7 @@ cmd_run() {
   local path=$PWD repo repo_name name
   repo=$(main_worktree "$path"); [ -n "$repo" ] || die "not inside a git worktree: $path"
   repo_name=$(basename "$repo"); name=$(cur_branch "$path")
-  load_profile "$repo" "$repo_name"
+  load_profile "$repo_name"
   load_state_for_path "$path" "$repo_name" "$name" \
     || die "no saved state for this worktree - run 'wt provision $path' first"
   WT_PATH=$path WT_REPO=$repo WT_REPO_NAME=$repo_name
@@ -1361,7 +1360,7 @@ cmd_restart() {
   local path repo repo_name name ws
   path=$(git -C "${1:-$PWD}" rev-parse --show-toplevel 2>/dev/null) || die "not inside a git worktree: ${1:-$PWD}"
   repo=$(main_worktree "$path"); repo_name=$(basename "$repo"); name=$(cur_branch "$path")
-  load_profile "$repo" "$repo_name"
+  load_profile "$repo_name"
   declare -F wt_dev >/dev/null || die "no dev server configured for $repo_name (add wt_dev to its profile)"
   load_state_for_path "$path" "$repo_name" "$name" \
     || die "no saved state for this worktree - run 'wt provision $path' first"
@@ -1382,7 +1381,7 @@ cmd_open() {
   if [ -n "$name" ] && [ "${name#-}" = "$name" ]; then shift; else name=$(cur_branch "$PWD"); fi
   [ -n "$name" ] || die "no worktree name given (and not on a branch)"
   repo_name=$(basename "$repo")
-  load_profile "$repo" "$repo_name"
+  load_profile "$repo_name"
   # `wt open <name>` names a branch, so find the worktree sitting on it and load state
   # by that path rather than by the slug the name implies (see load_state_for_path).
   path=$(repo_worktrees "$repo" | awk -F'\t' -v b="$name" '$2 == b { print $1; exit }')
@@ -1417,7 +1416,7 @@ cmd_provision() {
   local path=${1:-$PWD} repo repo_name name
   repo=$(main_worktree "$path"); [ -n "$repo" ] || die "not a git worktree: $path"
   repo_name=$(basename "$repo"); name=$(cur_branch "$path")
-  load_profile "$repo" "$repo_name"
+  load_profile "$repo_name"
   prepare_state "$name" "$path" "$repo" "$repo_name"
   declare -F wt_provision >/dev/null || { msg "no provisioning configured for $repo_name"; return 0; }
   run_profile_fn wt_provision
@@ -1652,7 +1651,7 @@ main() {
     open)       shift; cmd_open "$@" ;;
     provision)  shift; cmd_provision "$@" ;;
     rm)         shift; cmd_rm "$@" ;;
-    ls|list)    shift; cmd_ls "$@" ;;
+    ls)         shift; cmd_ls "$@" ;;
     gc)         shift; cmd_gc "$@" ;;
     *) die "usage: wt {new [--no-agent] [--no-focus] [--base REF] [--json] [name] | dev <path> | restart [path] | run [cmd...] | test [cmd...] | open [name] | provision <path> | rm [-y] [name] | ls | gc [--settled] [--sweep] [-y]}" ;;
   esac
