@@ -7,7 +7,7 @@
 # Same shape as test/pq-review.sh - a pinned clock, `set_panes` steering herdr's
 # snapshot, a `claude` stub that records how it was called - but the stub tells
 # its callers apart by the prompt: the namer (haiku) answers off a marker line in
-# the plan, the splitter writes parts, and each reviewer behaves per a mode file
+# the plan, and each reviewer behaves per a mode file
 # of its own, so "the code review passed and the security review failed" is one
 # test rather than a race. `hold` keeps a reviewer running until the test
 # releases it, which is how the two are made to finish in a chosen order.
@@ -23,8 +23,6 @@ PQ_HOME=$(mktemp -d)
 export PQ_HOME
 PQ_PLANS_DIR=$(mktemp -d)
 export PQ_PLANS_DIR
-# An empty scan root, so a --split here stays single-repo.
-SCAN_ROOT=$(mktemp -d)
 
 STUBBIN=$(mktemp -d)
 PANES_JSON="$STUBBIN/.panes.json"
@@ -51,13 +49,10 @@ for a in "\$@"; do [ "\$prev" = --model ] && model=\$a; prev=\$a; last=\$a; done
 if [ "\$model" = haiku ]; then
   content=\$(cat)
   case "\$content" in
-    *"MARKER: secure"*)     printf '{"branch":"tom/secure-it","intent":"Lock it down.","security":true,"parts":["Lock it down"]}\n' ;;
-    *"MARKER: guessed"*)    printf '{"branch":"tom/guessed-it","intent":"Guessed.","security":true,"parts":["Guessed"]}\n' ;;
-    *"MARKER: waived"*)     printf '{"branch":"tom/waived-it","intent":"Waived.","security":false,"parts":["Waived"]}\n' ;;
-    *"MARKER: nointent"*)   printf '{"branch":"tom/no-intent","intent":"","security":true,"parts":["No intent"]}\n' ;;
-    *"MARKER: splitsec"*)   printf '{"branch":"tom/split-source","intent":"Two parts.","security":true,"parts":["API","UI"]}\n' ;;
-    *"MARKER: part-sec"*)   printf '{"branch":"tom/part-api","intent":"The API.","security":true,"parts":["API"]}\n' ;;
-    *"MARKER: part-plain"*) printf '{"branch":"tom/part-ui","intent":"The UI.","security":false,"parts":["UI"]}\n' ;;
+    *"MARKER: secure"*)     printf '{"branch":"tom/secure-it","intent":"Lock it down.","security":true}\n' ;;
+    *"MARKER: guessed"*)    printf '{"branch":"tom/guessed-it","intent":"Guessed.","security":true}\n' ;;
+    *"MARKER: waived"*)     printf '{"branch":"tom/waived-it","intent":"Waived.","security":false}\n' ;;
+    *"MARKER: nointent"*)   printf '{"branch":"tom/no-intent","intent":"","security":true}\n' ;;
     *) printf '{}\n' ;;
   esac
   exit 0
@@ -66,13 +61,6 @@ printf 'pane=%s tab=%s workspace=%s\n' "\${HERDR_PANE_ID-unset}" "\${HERDR_TAB_I
 case "\$last" in
   /security-review) kind=security; m=\$(cat "$SMODE") ;;
   /code-review*)    kind=code;     m=\$(cat "$MODE") ;;
-  "Read ./source.md"*)
-    printf '%s' "\$last" > "$STUBBIN/.splitter-prompt"
-    printf 'MARKER: part-sec\nThe API. Run \`/security-review\` as well: it must stay tenant-scoped.\n' > 01-api.md
-    printf 'MARKER: part-plain\nThe UI, nothing security-relevant.\n' > 02-ui.md
-    printf '01-api.md\t\n02-ui.md\t01-api.md\n' > graph.tsv
-    printf '{"is_error":false,"total_cost_usd":0.1,"duration_ms":1000,"permission_denials":[]}\n'
-    exit 0 ;;
   *) exit 1 ;;
 esac
 if [ "\$m" = hold ]; then
@@ -125,8 +113,6 @@ export PQ_WT="$STUBBIN/wt-stub"
 
 # shellcheck source=/dev/null
 source "$HERE/../.local/bin/pq"
-# Assigned after the source: pq sets its own, and the constant would win.
-PQ_REPOS_DIR=$SCAN_ROOT
 
 pr_load_all() { :; }
 
@@ -142,7 +128,7 @@ cleanup() {
   local d
   touch "$STUBBIN/.release-code" "$STUBBIN/.release-security" 2>/dev/null
   for d in "$PQ_HOME"/done/*/; do [ -d "$d" ] && review_kill "${d%/}"; done
-  rm -rf "$PQ_HOME" "$PQ_PLANS_DIR" "$PQ_REPOS_DIR" "$STUBBIN" "${REPO:-}" "${WT:-}"
+  rm -rf "$PQ_HOME" "$PQ_PLANS_DIR" "$STUBBIN" "${REPO:-}" "${WT:-}"
 }
 trap cleanup EXIT
 
@@ -175,7 +161,7 @@ reset_tasks() {
   touch "$STUBBIN/.release-code" "$STUBBIN/.release-security"
   for d in "$PQ_HOME"/done/*/ "$PQ_HOME"/running/*/; do [ -d "$d" ] && review_kill "${d%/}"; done
   rm -f "$STUBBIN/.release-code" "$STUBBIN/.release-security"
-  rm -rf "$PQ_HOME/queue" "$PQ_HOME/running" "$PQ_HOME/done" "$PQ_HOME/archive" "$PQ_HOME/splits"
+  rm -rf "$PQ_HOME/queue" "$PQ_HOME/running" "$PQ_HOME/done" "$PQ_HOME/archive"
   mkdir -p "$PQ_HOME/queue" "$PQ_HOME/running" "$PQ_HOME/done" "$PQ_HOME/archive"
 }
 reset_tasks
@@ -262,44 +248,34 @@ eq "$(head -1 <<<"$(name_plan "$PGUESS")" | cut -f3)" "" "a yes for a plan that 
 eq "$(head -1 <<<"$(name_plan "$PWAIVE")" | cut -f3)" "" "a plan that waives it is a no"
 IFS=$'\t' read -r _ i <<<"$(name_plan "$PWAIVE")"
 eq "$i" "Waived." "an IFS=tab read of branch and intent still gets a clean intent"
-eq "$(outline_of "$(name_plan "$PSEC")")" "Lock it down" "and the outline still rides below line 1"
 grep -q 'security is true only when the plan asks for a security review' "$CLAUDE_LOG" \
   && ok || bad "the namer is told what a yes means"
 
-echo "== cmd_add: the verdict becomes the header, and a stale caller fails loudly ==" >&2
+echo "== cmd_add: the verdict becomes the header ==" >&2
+# The picker stood in for, in a subshell; Haiku's stub names the plan. stdin is
+# /dev/null, so every wizard question takes its default.
+add_picked() {                          # plan [flags...]
+  local as_plan=$1; shift
+  # shellcheck disable=SC2329  # called by cmd_add, not here
+  ( at_terminal() { return 0; }
+    pick_plan() { printf '%s' "$as_plan"; }
+    cmd_add "$@" </dev/null )
+}
 reset_tasks
-slug=$(cmd_add "$PSEC" "" "" "" --repo "$REPO" 2>"$PQ_HOME/.err")
-t=$(find_task "$slug")
+add_picked "$PSEC" --repo "$REPO" 2>"$PQ_HOME/.err"
+t=$(find_task secure-it)
 eq "$(hdr "$t/plan.md" security)" "yes" "a plan that asks carries security: yes"
 has "$(cat "$PQ_HOME/.err")" "review: code and security - the plan asks for a /security-review" "and the add says so"
-slug=$(cmd_add "$PWAIVE" "" "" "" --repo "$REPO" 2>"$PQ_HOME/.err")
-t=$(find_task "$slug")
+add_picked "$PWAIVE" --repo "$REPO" 2>"$PQ_HOME/.err"
+t=$(find_task waived-it)
 grep -q '^security:' "$t/plan.md" && bad "a waived review writes no header at all" || ok
 hasnt "$(cat "$PQ_HOME/.err")" "review: code and security" "and the add says nothing about it"
 # The verdict is the third field of line 1: an empty intent before it must not
 # let it slide into the intent's place, as a tab-split `read` would.
-slug=$(cmd_add "$PNOINT" "" "" "" --repo "$REPO" 2>"$PQ_HOME/.err")
-t=$(find_task "$slug")
+add_picked "$PNOINT" --repo "$REPO" 2>"$PQ_HOME/.err"
+t=$(find_task no-intent)
 eq "$(hdr "$t/plan.md" security)" "yes" "an empty intent does not swallow the verdict"
 eq "$(hdr "$t/plan.md" intent)" "" "nor does the verdict become the intent"
-( cmd_add "$PSEC" tom/stale x --repo "$REPO" ) >/dev/null 2>"$PQ_HOME/.err" && bad "a three-positional caller must fail" || ok
-has "$(cat "$PQ_HOME/.err")" "security verdict is yes or empty, not '--repo'" "and name what it got"
-( cmd_add "$PSEC" tom/named x yes --repo "$REPO" ) >/dev/null 2>&1
-t=$(find_task named)
-eq "$(hdr "$t/plan.md" security)" "yes" "a caller that names the task hands its verdict in too"
-
-echo "== a split: each part gets its own verdict, and the splitter is told to carry the ask ==" >&2
-reset_tasks
-PSPLIT="$PQ_PLANS_DIR/splitsec.md"; mkplan "$PSPLIT" splitsec "PR 1: the API. PR 2: the UI." "Run \`/security-review\` on the API."
-out=$(cmd_add "$PSPLIT" "" "" "" --repo "$REPO" --split <<<y 2>"$PQ_HOME/.err")
-eq "$(grep -c . <<<"$out")" "2" "two parts queued: $(tail -3 "$PQ_HOME/.err")"
-ta=$(find_task part-api); tu=$(find_task part-ui)
-eq "$(hdr "$ta/plan.md" security)" "yes" "the part that asks carries the header"
-eq "$(hdr "$tu/plan.md" security)" "" "the part that does not, does not"
-has "$(cat "$STUBBIN/.splitter-prompt" 2>/dev/null)" "ask for one in every part whose changes that review is about" "the splitter is told to carry it"
-named=""
-for f in "$PQ_HOME"/splits/*/.named.tsv; do [ -f "$f" ] && named=$f && break; done
-eq "$(awk -F'\t' '$1 == "01-api.md" { print $5 }' "$named")" "yes" ".named.tsv carries the verdict in its fifth column"
 
 echo "== the contract names the security reviewer only when the plan asked ==" >&2
 reset_tasks

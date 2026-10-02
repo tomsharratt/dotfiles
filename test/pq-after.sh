@@ -102,8 +102,8 @@ reset_tasks() {
 # work.
 mk_task() {                              # state prio slug repo branch -> task_dir
   local st=$1 prio=$2 slug=$3 repo=$4 branch=$5
-  # $prio is relative order, not a stamp - it is offset into the real
-  # (non-urgent) range so a fixture never accidentally reads as --urgent.
+  # $prio is relative order, not a stamp - it is offset into a real
+  # timestamp so a fixture reads like a task pq made.
   # $((10#$prio)) rather than a bare $prio: inside $(( )) a leading-zero
   # literal like 020 is octal, exactly the bug this fixture must not
   # reintroduce.
@@ -121,6 +121,21 @@ mk_task() {                              # state prio slug repo branch -> task_d
     printf -- '---\n\nplan body\n'
   } > "$dir/plan.md"
   printf '%s' "$dir"
+}
+
+
+# cmd_add with the picker and the namer stood in for, in a subshell: the plan
+# is $1 and Haiku's answer is the branch $2; the rest are cmd_add's own flags.
+# stdin is /dev/null, so every wizard question takes its default.
+add_as() {                              # plan branch [flags...]
+  # Names cmd_add never declares: the stand-ins read them through dynamic
+  # scope at call time, under cmd_add's own locals.
+  local as_plan=$1 as_branch=$2; shift 2
+  # shellcheck disable=SC2329  # called by cmd_add, not here
+  ( at_terminal() { return 0; }
+    pick_plan() { printf '%s' "$as_plan"; }
+    name_plan() { printf '%s\t\t\n' "$as_branch"; }
+    cmd_add "$@" </dev/null )
 }
 
 echo "== pure predicates (no task directories at all) ==" >&2
@@ -271,19 +286,14 @@ case "$verdict" in waiting\ *) ok ;; *) bad "a trailing-newline-less after file 
 deps=$(dependents_of "$REPO" tom/no-newline-blocker)
 eq "$deps" "no-newline-dependent" "dependents_of must not drop the last line either"
 
-echo "== queue_ordered: an urgent task sorts ahead of every normal one, and two normal stamps sort chronologically ==" >&2
+echo "== queue_ordered: two stamps sort chronologically, whatever order they were made in ==" >&2
 reset_tasks
-# A bare mkdir, not mk_task: queue_ordered never reads plan.md, and a real
-# stamp under PQ_STAMP_REAL is exactly what an urgent task looks like on disk.
-mkdir -p "$PQ_HOME/queue/$(printf '%014d' 1)-prio-urgent"
 mk_task queue 20 prio-later "$REPO" tom/prio-later >/dev/null
 mk_task queue 10 prio-earlier "$REPO" tom/prio-earlier >/dev/null
 first_slug=$(slug_of "$(queue_ordered | sed -n 1p)")
-mid_slug=$(slug_of "$(queue_ordered | sed -n 2p)")
-last_slug=$(slug_of "$(queue_ordered | sed -n 3p)")
-eq "$first_slug" "prio-urgent"  "an urgent stamp must sort ahead of every normal one"
-eq "$mid_slug"   "prio-earlier" "the earlier normal stamp must come before the later one"
-eq "$last_slug"  "prio-later"   "the later normal stamp must sort last"
+last_slug=$(slug_of "$(queue_ordered | sed -n 2p)")
+eq "$first_slug" "prio-earlier" "the earlier stamp must come first"
+eq "$last_slug"  "prio-later"   "the later stamp must sort last"
 
 echo "== a chain of three, middle link unmerged ==" >&2
 reset_tasks
@@ -322,31 +332,26 @@ else
   bad "a genuine, non-cyclic blocker should have been accepted"
 fi
 
-echo "== pq add: stdout is exactly the slug ==" >&2
+echo "== pq add --after: a blocker named by slug gates the new task ==" >&2
 reset_tasks
 PLAN_FILE="$PQ_HOME/.test-plan.md"
 printf '# Test plan\n\nDo the thing.\n' > "$PLAN_FILE"
-add_out=$(cmd_add "$PLAN_FILE" tom/add-stdout-test "" "" --repo "$REPO" 2>"$PQ_HOME/.add.stderr")
+add_as "$PLAN_FILE" tom/add-chain-a --repo "$REPO" 2>"$PQ_HOME/.add.stderr"
 add_rc=$?
 [ "$add_rc" -eq 0 ] && ok || bad "pq add should succeed (rc=$add_rc): $(cat "$PQ_HOME/.add.stderr")"
-lines=$(printf '%s\n' "$add_out" | wc -l | tr -d ' ')
-eq "$lines" "1" "pq add stdout should be exactly one line"
-eq "$add_out" "add-stdout-test" "pq add stdout should be the slug, nothing else"
-if find_task "$add_out" >/dev/null 2>&1; then ok; else bad "find_task should resolve the printed slug"; fi
+if find_task add-chain-a >/dev/null 2>&1; then ok; else bad "the added task should be found by its slug"; fi
 
-# Chaining through the printed slug, the way split_queue wires each part's
-# --after from the slugs of the parts queued before it.
-b_out=$(cmd_add "$PLAN_FILE" tom/add-chain-b "" "" --repo "$REPO" --after "$add_out" 2>"$PQ_HOME/.add.stderr")
+add_as "$PLAN_FILE" tom/add-chain-b --repo "$REPO" --after add-chain-a 2>"$PQ_HOME/.add.stderr"
 b_rc=$?
 [ "$b_rc" -eq 0 ] && ok || bad "chained pq add should succeed: $(cat "$PQ_HOME/.add.stderr")"
-b_dir=$(find_task "$b_out" 2>/dev/null)
+b_dir=$(find_task add-chain-b 2>/dev/null)
 if [ -n "$b_dir" ] && [ -f "$b_dir/after" ]; then ok; else bad "chained add should have written an after file"; fi
 verdict=$(after_state "$b_dir" 2>/dev/null); verdict=${verdict%%$'\t'*}
 case "$verdict" in waiting\ *) ok ;; *) bad "B should be waiting on A right after being chained (got '$verdict')" ;; esac
 
 echo "== an --after blocker is recorded, and pq ls --json sees the task blocked ==" >&2
-add_json=$(cmd_add "$PLAN_FILE" tom/add-json-test "" "" --repo "$REPO" --after "$add_out" 2>"$PQ_HOME/.add.stderr")
-eq "$(cut -f1 "$(find_task "$add_json")/after")" "add-stdout-test" "the blocker is recorded under its own label"
+add_as "$PLAN_FILE" tom/add-json-test --repo "$REPO" --after add-chain-a 2>"$PQ_HOME/.add.stderr"
+eq "$(cut -f1 "$(find_task add-json-test)/after")" "add-chain-a" "the blocker is recorded under its own label"
 
 ls_json=$(main ls --json 2>/dev/null)
 if printf '%s' "$ls_json" \
@@ -366,13 +371,13 @@ repo_base_reset
 echo "== cmd_add --after reports an already-merged blocker and leaves no PR cache behind ==" >&2
 # A real MERGED row, through the actual pr_load -> gh -> jq pipeline (via the
 # canned gh stub above) rather than a hand-primed cache. cmd_add runs in a
-# command substitution here, as it does for every part split_queue queues, so
-# its $$ - and the cache it names after it - is this script's.
+# subshell here, so its $$ - and the cache it names after it - is this
+# script's.
 #
 # The blocker is a raw branch no task owns. A TASK on a branch that has already
 # merged is the reused-name shape pq now refuses (see test/pq-reuse.sh): its
 # owner would still be queued, and an unclaimed task owns no pull request yet.
-( cmd_add "$PLAN_FILE" tom/depends-on-merged "" "" --repo "$REPO" --after tom/already-merged ) \
+add_as "$PLAN_FILE" tom/depends-on-merged --repo "$REPO" --after tom/already-merged \
   >/dev/null 2>"$PQ_HOME/.add.stderr"
 case "$(cat "$PQ_HOME/.add.stderr")" in
   *"after already-merged: already in"*) ok ;;

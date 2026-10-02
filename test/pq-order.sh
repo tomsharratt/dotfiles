@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# test/pq-order.sh - the timestamp queue: next_stamp, --urgent, queue order.
+# test/pq-order.sh - the timestamp queue: next_stamp and queue order.
 #
 # Plain bash, no framework, matching the repo's zero-dependency habit and
 # test/pq-after.sh's preamble: a temp PQ_HOME exported before sourcing pq (so
@@ -56,12 +56,18 @@ reset_tasks() {
 PLAN="$PQ_HOME/.test-plan.md"
 printf '# Test plan\n\nDo the thing.\n' > "$PLAN"
 
-# A branch is handed in here: the claude stub above fails closed, so
-# name_plan never derives one, and cmd_add would otherwise die before it ever
-# allocates a stamp.
+# The picker and the namer are stood in for: the claude stub above fails
+# closed, so name_plan would never derive a name, and cmd_add would otherwise
+# die before it ever allocates a stamp. Prints the slug the branch reduces to.
 add_task() {                             # branch [extra cmd_add args...] -> slug
-  local branch=$1; shift
-  cmd_add "$PLAN" "$branch" "" "" --repo "$REPO" "$@" 2>/dev/null
+  # A name cmd_add never declares: name_plan's stand-in reads it through
+  # dynamic scope at call time, under cmd_add's own `branch`.
+  local as_branch=$1; shift
+  # shellcheck disable=SC2329  # called by cmd_add, not here
+  ( at_terminal() { return 0; }
+    pick_plan() { printf '%s' "$PLAN"; }
+    name_plan() { printf '%s\t\t\n' "$as_branch"; }
+    cmd_add --repo "$REPO" "$@" </dev/null 2>/dev/null ) && branch_to_slug "$as_branch"
 }
 
 queue_slugs() {
@@ -72,36 +78,24 @@ queue_slugs() {
   done
 }
 
-# `--urgent` at add time is the whole of re-ordering now: the queue is
-# add-order, and the one exception is "do this next", declared when the task is
-# queued rather than moved afterwards. So what has to hold is that the reserved
-# range really does outrank every real date, in both directions - ahead of what
-# is already queued, and still ahead of what is queued after it.
-echo "== the queue is add-order, and --urgent outranks every real date in it ==" >&2
+# The queue is add-order and nothing else: there is no re-ordering after the
+# fact, and no reserved range to jump it.
+echo "== the queue is add-order ==" >&2
 reset_tasks
 add_task tom/order-a >/dev/null; add_task tom/order-b >/dev/null
 eq "$(queue_slugs | tr '\n' ' ')" "order-a order-b " "fresh adds should queue in add-order"
-add_task tom/order-c --urgent >/dev/null
-eq "$(queue_slugs | tr '\n' ' ')" "order-c order-a order-b " \
-  "an urgent add should lead tasks that were already queued"
-add_task tom/order-d >/dev/null
-eq "$(queue_slugs | tr '\n' ' ')" "order-c order-a order-b order-d " \
-  "and should still lead a normal task queued after it"
+add_task tom/order-c >/dev/null
+eq "$(queue_slugs | tr '\n' ' ')" "order-a order-b order-c " "and a later add queues last"
 
-echo "== two --urgent adds keep add-order within the urgent group ==" >&2
-reset_tasks
-add_task tom/urgent-one --urgent >/dev/null; add_task tom/urgent-two --urgent >/dev/null
-eq "$(queue_slugs | tr '\n' ' ')" "urgent-one urgent-two " "two urgent adds should queue in urgent add-order"
-
-# This file owned `pq urgent` and `pq later`; the guard covers all six commands
-# removed in the same pass, so there is one place to look. Each is checked
+# This file owned `pq urgent` and `pq later`; the guard covers every command
+# removed since, so there is one place to look. Each is checked
 # through `main`, which is where the dispatch decision actually lives - and in a
 # command substitution, so `die`'s exit kills the subshell rather than this
 # script.
-echo "== the six removed commands are gone from the dispatch table ==" >&2
+echo "== the removed commands are gone from the dispatch table ==" >&2
 reset_tasks
 gone=$(add_task tom/order-gone)
-for removed in show urgent later hold unhold archive; do
+for removed in show urgent later hold unhold archive base; do
   out=$(main "$removed" "$gone" 2>&1 1>/dev/null); rc=$?
   if [ "$rc" -ne 0 ] && [ "${out#*usage: pq}" != "$out" ]; then ok
   else bad "pq $removed should be an unknown subcommand now (rc=$rc, got: $out)"; fi
@@ -125,56 +119,39 @@ reset_tasks
 # would also rewrite the added: field cmd_add writes, testing two things at
 # once instead of one.
 mkdir -p "$PQ_HOME/queue/29991231235959-future-task"
-got=$(next_stamp 0)
-eq "$got" "29991231235960" "next_stamp should return one past the highest existing real stamp, not today's date"
+got=$(next_stamp)
+eq "$got" "29991231235960" "next_stamp should return one past the highest existing stamp, not today's date"
 
-echo "== pq ls renders queue! for an urgent task and queue for a normal one ==" >&2
+echo "== a hand-made NNN-slug directory in done/ does not break stamp_of or pq ls ==" >&2
 reset_tasks
-add_task tom/order-normal >/dev/null
-add_task tom/order-urgent-ls --urgent >/dev/null
-ls_out=$(main ls 2>/dev/null)
-urgent_line=$(printf '%s\n' "$ls_out" | grep '^order-urgent-ls')
-normal_line=$(printf '%s\n' "$ls_out" | grep '^order-normal')
-case "$urgent_line" in *"queue!"*) ok ;; *) bad "an urgent queued task should render STATE as queue! (got: $urgent_line)" ;; esac
-case "$normal_line" in
-  *"queue!"*) bad "a normal queued task should not render queue! (got: $normal_line)" ;;
-  *"queue"*)  ok ;;
-  *)          bad "a normal queued task should render STATE as queue (got: $normal_line)" ;;
-esac
-
-echo "== a legacy NNN-slug directory in done/ does not break stamp_of or pq ls ==" >&2
-reset_tasks
-legacy="$PQ_HOME/done/060-legacy-task"
-mkdir -p "$legacy"
+short="$PQ_HOME/done/060-short-task"
+mkdir -p "$short"
 {
   printf -- '---\n'
   printf 'repo:     %s\n' "$REPO"
-  printf 'branch:   %s\n' "tom/legacy-task"
+  printf 'branch:   %s\n' "tom/short-task"
   printf 'model:    sonnet\n'
   printf 'effort:   xhigh\n'
-  printf 'intent:   legacy fixture\n'
+  printf 'intent:   short-prefix fixture\n'
   printf 'added:    2026-01-01T00:00:00Z\n'
   printf -- '---\n\nplan body\n'
-} > "$legacy/plan.md"
-eq "$(stamp_of "$legacy")" "60" "stamp_of should tolerate a legacy 3-digit prefix"
+} > "$short/plan.md"
+eq "$(stamp_of "$short")" "60" "stamp_of should tolerate a 3-digit prefix"
 ls_out=$(main ls 2>/dev/null); rc=$?
-[ "$rc" -eq 0 ] && ok || bad "pq ls must not choke on a legacy directory"
-case "$ls_out" in *"legacy-task"*) ok ;; *) bad "pq ls should still list the legacy task (got: $ls_out)" ;; esac
+[ "$rc" -eq 0 ] && ok || bad "pq ls must not choke on a short-prefix directory"
+case "$ls_out" in *"short-task"*) ok ;; *) bad "pq ls should still list the short-prefix task (got: $ls_out)" ;; esac
 
-echo "== a legacy short-prefix directory sitting in queue/ still sorts predictably under queue_ordered ==" >&2
+echo "== a hand-made short-prefix directory sitting in queue/ still sorts predictably under queue_ordered ==" >&2
 reset_tasks
-# A bare mkdir, not add_task: this is what a directory left over from before
-# this rewrite - or dropped into a queue that skipped the migration - looks
-# like. queue_ordered is dispatch's own view and must stay well-defined even
-# with a directory of a different width mixed in; all_tasks' glob order
-# (what pq ls displays) can legitimately disagree with it in that case - see
-# the caveat on all_tasks' own comment - which is exactly why the migration
-# step exists. There is no escape hatch for a directory that lands at the front
-# because of it: `pq later` was that, and it is gone.
-mkdir -p "$PQ_HOME/queue/900-legacy-in-queue"
+# A bare mkdir, not add_task: this is what a directory made by hand looks like.
+# queue_ordered is dispatch's own view and must stay well-defined even with a
+# directory of a different width mixed in; all_tasks' glob order (what pq ls
+# displays) can legitimately disagree with it in that case - see the caveat on
+# all_tasks' own comment.
+mkdir -p "$PQ_HOME/queue/900-short-in-queue"
 add_task tom/order-fresh >/dev/null
-eq "$(queue_slugs | tr '\n' ' ')" "legacy-in-queue order-fresh " \
-  "queue_ordered must sort the legacy directory by its numeric stamp (900), ahead of a real 14-digit date"
+eq "$(queue_slugs | tr '\n' ' ')" "short-in-queue order-fresh " \
+  "queue_ordered must sort the short-prefix directory by its numeric stamp (900), ahead of a real 14-digit date"
 
 printf '\n%d passed, %d failed\n' "$pass" "$fail" >&2
 [ "$fail" -eq 0 ]

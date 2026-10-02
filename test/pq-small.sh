@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 # test/pq-small.sh - the smaller bugs, each on its own:
 #
-#   pq rm, and the mutating forms of pq after and pq base, acting on a task a
-#     tick had moved since they found it
+#   pq rm, and the mutating forms of pq after, acting on a task a tick had
+#     moved since they found it
 #   name_plan cutting Haiku's JSON at the last `{`, not the first
 #   the tick lock: a missing pid read as stale, and a reused pid read as alive
 #   a dispatch that can never succeed, retried every tick without end
-#   the namer and the splitter reading the usage limit as an unusable reply
+#   the namer reading the usage limit as an unusable reply
 #   a pane id herdr has since given to another workspace, knocked on as ours
 #
 # SC2034: the knobs and pane index set here are read by the pq sourced below.
@@ -132,7 +132,7 @@ out=$( (main rm stayed <<<y) 2>&1)
 has "$out" "removed stayed" "and says so"
 [ -e "$PQ_HOME/.tick.lock" ] && bad "the lock is released" || ok
 
-echo "== pq after and pq base wait for a tick that is running, rather than race it ==" >&2
+echo "== pq after waits for a tick that is running, rather than race it ==" >&2
 reset_tasks
 Q=$(mk_task queue 12 blocked)
 sleep 30 & SLEEPER=$!
@@ -141,8 +141,6 @@ out=$( (main after blocked tom/some-branch) 2>&1); rc=$?
 eq "$rc" "1" "a tick holding the lock past LOCK_WAIT stops pq after"
 has "$out" "try again once it is done" "saying so"
 [ -f "$Q/after" ] && bad "and nothing is written" || ok
-out=$( (main base blocked --clear) 2>&1); rc=$?
-eq "$rc" "1" "pq base too"
 kill "$SLEEPER" 2>/dev/null; wait "$SLEEPER" 2>/dev/null; SLEEPER=""
 out=$( (main after blocked tom/some-branch) 2>&1); rc=$?
 eq "$rc" "0" "once the tick is gone (its lock stale), it goes through"
@@ -151,31 +149,27 @@ eq "$rc" "0" "once the tick is gone (its lock stale), it goes through"
 
 echo "== name_plan takes Haiku's JSON from its first brace, not its last ==" >&2
 PLANF="$STUBBIN/plan.md"; printf '# A plan\n\nAdd placeholders.\n' > "$PLANF"
-printf '%s\n' 'Here it is: {"branch":"tom/template-placeholders","intent":"Adds {placeholder} support to templates.","security":false,"parts":["Add {placeholder} support"]} - done.' > "$REPLY"
+printf '%s\n' 'Here it is: {"branch":"tom/template-placeholders","intent":"Adds {placeholder} support to templates.","security":false} - done.' > "$REPLY"
 out=$(name_plan "$PLANF")
 eq "$(head -1 <<<"$out" | cut -f1)" "tom/template-placeholders" "a brace inside the intent no longer breaks naming"
 eq "$(head -1 <<<"$out" | cut -f2)" "Adds {placeholder} support to templates." "and the intent keeps it"
-printf '%s\n' '```json' '{"branch":"tom/fenced","intent":"i","security":false,"parts":["p"]}' '```' > "$REPLY"
+printf '%s\n' '```json' '{"branch":"tom/fenced","intent":"i","security":false}' '```' > "$REPLY"
 eq "$(name_plan "$PLANF" | head -1 | cut -f1)" "tom/fenced" "a fenced reply still reads"
 
-echo "== the namer and the splitter know the usage limit when they see it ==" >&2
+echo "== the namer knows the usage limit when it sees it ==" >&2
 printf "You've hit your individual spend limit · visit claude.ai/admin-settings/usage to raise it\n" > "$REPLY"
 out=$(name_plan "$PLANF" 2>&1); rc=$?
 eq "$rc" "3" "the namer's limit is its own answer"
 has "$out" "naming hit the usage limit: You've hit your individual spend limit" "and says so, in the limit's own words"
 reset_tasks
-out=$( (cmd_add "$PLANF" "" "" "" --repo "$REPO") 2>&1); rc=$?
+# shellcheck disable=SC2329  # called by cmd_add, not here
+out=$( (at_terminal() { return 0; }; pick_plan() { printf '%s' "$PLANF"; }; cmd_add --repo "$REPO" </dev/null) 2>&1); rc=$?
 eq "$rc" "1" "pq add stops"
 has "$out" "behind the usage limit - pq add again once it lifts" "saying when trying again can work"
 hasnt "$out" "Haiku gave no usable branch" "not that the reply was unusable"
-printf '%s\n' '{"is_error":false,"result":"You'"'"'ve hit your individual spend limit · visit claude.ai/admin-settings/usage to raise it"}' > "$REPLY"
-out=$( (PQ_REPOS_DIR=$(mktemp -d); plan=$PLANF; repo=$REPO; repo_explicit=0; repo_vals=""; model=sonnet; effort=xhigh; urgent=0; after_vals=""; split_dir=""; do_split) 2>&1); rc=$?
-eq "$rc" "1" "a splitter at the limit stops the split"
-has "$out" "the splitter hit the usage limit" "saying why"
-hasnt "$out" "wrote no graph.tsv" "not that it wrote no graph"
 # The namer's own answer is one line too, and a plan about running out of
 # credits puts the limit's very words in it.
-printf '%s\n' '{"branch":"tom/usage-banner","intent":"Warn members before they run out of usage credits or hit your plan limit.","security":false,"parts":["Add the usage banner"]}' > "$REPLY"
+printf '%s\n' '{"branch":"tom/usage-banner","intent":"Warn members before they run out of usage credits or hit your plan limit.","security":false}' > "$REPLY"
 out=$(name_plan "$PLANF" 2>/dev/null); rc=$?
 eq "$rc" "0" "a one-line JSON answer that mentions the limit is an answer"
 eq "$(head -1 <<<"$out" | cut -f1)" "tom/usage-banner" "and names the plan"

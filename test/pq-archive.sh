@@ -118,22 +118,22 @@ archivable "$d" && bad "no verdict at all must not be archivable" || ok
 echo "== archive_pass: tail retention sorts by stamp_of, not glob order ==" >&2
 reset_tasks
 PQ_DONE_KEEP=2
-# "800" and "900" are legacy-width stamps - numerically far smaller than any
-# real UTC timestamp (which starts with 2, for the year), but ALPHABETICALLY
-# they sort after one (since '8'/'9' > '2'). A plain lexical sort here would
-# archive the two modern ones and keep the legacy pair behind - exactly
-# backwards. Mirrors the disagreement done/ header comment (:313-318) warns
+# "800" and "900" are short, hand-made stamps - numerically far smaller than
+# any real UTC timestamp (which starts with 2, for the year), but
+# ALPHABETICALLY they sort after one (since '8'/'9' > '2'). A plain lexical
+# sort here would archive the two modern ones and keep the short pair behind -
+# exactly backwards. Mirrors the disagreement all_tasks' header comment warns
 # about.
-old1=$(mk_task "done" 800 legacy-old "$REPO" tom/legacy-old PQ_CLOSED=2026-01-01T00:00:00Z PQ_REAPED=2026-01-01T00:00:01Z)
-old2=$(mk_task "done" 900 legacy-mid "$REPO" tom/legacy-mid PQ_CLOSED=2026-01-01T00:00:00Z PQ_REAPED=2026-01-01T00:00:01Z)
+old1=$(mk_task "done" 800 short-old "$REPO" tom/short-old PQ_CLOSED=2026-01-01T00:00:00Z PQ_REAPED=2026-01-01T00:00:01Z)
+old2=$(mk_task "done" 900 short-mid "$REPO" tom/short-mid PQ_CLOSED=2026-01-01T00:00:00Z PQ_REAPED=2026-01-01T00:00:01Z)
 new1=$(mk_task "done" 20260101000001 modern-1 "$REPO" tom/modern-1 PQ_CLOSED=2026-01-01T00:00:00Z PQ_REAPED=2026-01-01T00:00:01Z)
 new2=$(mk_task "done" 20260101000002 modern-2 "$REPO" tom/modern-2 PQ_CLOSED=2026-01-01T00:00:00Z PQ_REAPED=2026-01-01T00:00:01Z)
 n_arch=$(archive_pass 0 2>/dev/null)
 eq "$n_arch" "2" "with 4 archivable and a tail of 2, exactly 2 should be archived"
-[ ! -d "$old1" ] && [ ! -d "$old2" ] && ok || bad "the two numerically-oldest (legacy-old, legacy-mid) should have left done/"
+[ ! -d "$old1" ] && [ ! -d "$old2" ] && ok || bad "the two numerically-oldest (short-old, short-mid) should have left done/"
 [ -d "$new1" ] && [ -d "$new2" ] && ok || bad "the two numerically-newest (modern-1, modern-2) should stay in done/"
-[ -d "$PQ_HOME/archive/800-legacy-old" ] && ok || bad "legacy-old should now sit in archive/"
-[ -d "$PQ_HOME/archive/900-legacy-mid" ] && ok || bad "legacy-mid should now sit in archive/"
+[ -d "$PQ_HOME/archive/800-short-old" ] && ok || bad "short-old should now sit in archive/"
+[ -d "$PQ_HOME/archive/900-short-mid" ] && ok || bad "short-mid should now sit in archive/"
 
 echo "== archive_pass: PQ_DONE_KEEP=0 is legal and means no tail ==" >&2
 reset_tasks
@@ -247,11 +247,12 @@ ans_row "$REPO" tom/shipped-owner   # gh answered: zero rows for this branch
 bst=$(blocker_state "$REPO" tom/shipped-owner master)
 eq "$bst" "waiting" "an archived owner must read as waiting, never orphan"
 
-echo "== next_stamp: spans archive, so an urgent stamp is never reissued once its task has archived ==" >&2
+echo "== next_stamp: spans archive, so a stamp is never reissued once its task has archived ==" >&2
 reset_tasks
-mk_task archive 00000000000005 urgent-done "$REPO" tom/urgent-done PQ_CLOSED=2026-01-01T00:00:00Z >/dev/null
-got=$(next_stamp 1)
-eq "$got" "6" "next_stamp 1 should return one past the archived urgent maximum, not 1"
+# Ahead of the clock, so only the archive scan can explain the answer.
+mk_task archive 99990101000000 future-done "$REPO" tom/future-done PQ_CLOSED=2026-01-01T00:00:00Z >/dev/null
+got=$(next_stamp)
+eq "$got" "99990101000001" "next_stamp should return one past the archived maximum, not the clock"
 
 printf '\n%d passed, %d failed\n' "$pass" "$fail" >&2
 [ "$fail" -eq 0 ]

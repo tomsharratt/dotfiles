@@ -129,6 +129,21 @@ mk_task() {                             # state prio slug repo branch base -> ta
   printf '%s' "$dir"
 }
 
+
+# cmd_add with the picker and the namer stood in for, in a subshell: the plan
+# is $1 and Haiku's answer is the branch $2; the rest are cmd_add's own flags.
+# stdin is /dev/null, so every wizard question takes its default.
+add_as() {                              # plan branch [flags...]
+  # Names cmd_add never declares: the stand-ins read them through dynamic
+  # scope at call time, under cmd_add's own locals.
+  local as_plan=$1 as_branch=$2; shift 2
+  # shellcheck disable=SC2329  # called by cmd_add, not here
+  ( at_terminal() { return 0; }
+    pick_plan() { printf '%s' "$as_plan"; }
+    name_plan() { printf '%s\t\t\n' "$as_branch"; }
+    cmd_add "$@" </dev/null )
+}
+
 echo "== task_base ==" >&2
 reset_tasks
 d=$(mk_task queue 10 no-base "$REPO" tom/a)
@@ -367,67 +382,48 @@ case "$(agent_cell "$nb" queue)" in
   *) ok ;;
 esac
 
-echo "== pq base: retarget or clear a queued task ==" >&2
+echo "== a queued task whose base has gone is gated, and warned about once ==" >&2
 reset_tasks; reset_caches
-b=$(mk_task queue 70 rebase-me "$REPO" tom/rb live-events)
-cmd_base rebase-me master >/dev/null 2>&1
-eq "$(hdr "$b/plan.md" base)" "master" "pq base <task> <branch> rewrites the header"
-eq "$(task_base "$b")" "master" "...and task_base agrees"
-repo_base_reset
-cmd_base rebase-me --clear >/dev/null 2>&1
-eq "$(hdr "$b/plan.md" base)" "" "pq base --clear removes the header entirely"
-eq "$(task_base "$b")" "master" "...falling back to the repo default"
-repo_base_reset
-# The plan BODY must survive being rewritten - it is the agent's instructions.
-grep -q "plan body" "$b/plan.md" && ok || bad "pq base must not damage the plan body"
-# Subshells around every expected-to-die call: this file SOURCES pq, so `die`
-# would exit the test run itself rather than just the command under test.
-( cmd_base rebase-me no-such-branch-at-all >/dev/null 2>&1 ) \
-  && bad "pq base must reject a base that does not resolve" || ok
-# Inserting a base where there was NEVER one: the awk's ^branch: rule has to fire
-# for a header that has no base: line to drop first. This is the path taken by
-# someone who realises mid-queue that a task should target an integration branch.
-fresh=$(mk_task queue 72 no-base-yet "$REPO" tom/nby)
-eq "$(hdr "$fresh/plan.md" base)" "" "fixture starts with no base: header at all"
-cmd_base no-base-yet live-events >/dev/null 2>&1
-eq "$(hdr "$fresh/plan.md" base)" "live-events" "pq base inserts a header where none existed"
-eq "$(hdr "$fresh/plan.md" branch)" "tom/nby" "...without disturbing the branch it sits under"
-eq "$(hdr "$fresh/plan.md" model)" "sonnet" "...or anything after it"
-grep -q "plan body" "$fresh/plan.md" && ok || bad "insert must not damage the plan body"
-eq "$(grep -c '^base:' "$fresh/plan.md")" "1" "exactly one base: line, never a duplicate"
-
 # A long-queued task is where a stale base accumulates - the branch it names can
 # be merged and deleted while it waits - so it must be gated, and warned about
 # only once however many ticks it then sits through.
 stale=$(mk_task queue 73 queued-base-gone "$REPO" tom/qbg no-such-integration-branch)
+first_warn=$(base_check "$stale" 2>&1 >/dev/null)
+case "$first_warn" in
+  *"pq rm queued-base-gone, then add it again"*) ok ;;
+  *) bad "the warning should say how to recover (got: $first_warn)" ;;
+esac
+st_set "$stale" PQ_BASE_GONE ""
 eq "$(base_check "$stale")" "basegone no-such-integration-branch" "a task whose base is gone is gated"
 eq "$(st "$stale" PQ_BASE_GONE)" "1" "...and stamped on the transition"
 eq "$(base_check "$stale")" "basegone no-such-integration-branch" "still gated on the next pass"
 second_warn=$(base_check "$stale" 2>&1 >/dev/null)
 eq "$second_warn" "" "it must not re-warn every tick while it sits there"
 
-# Only what has not started, same rule as pq after's mutating forms.
-mk_task running 71 already-going "$REPO" tom/ag >/dev/null
-( cmd_base already-going master >/dev/null 2>&1 ) \
-  && bad "pq base must refuse a task that has already been dispatched" || ok
-
 echo "== pq add infers the base from the branch the repo is on ==" >&2
 # The workflow this serves: you plan the work while standing on the branch it
-# belongs to, so the checkout already knows the answer and nobody has to remember
-# --base. The failure it replaces was silent - a forgotten --base queues against
-# the trunk and only shows up at dispatch.
+# belongs to, so the checkout already knows the answer and nobody has to name it.
+# The failure it replaces was silent - a forgotten base queues against the trunk
+# and only shows up at dispatch.
 reset_tasks
 PLAN=$(mktemp -d); printf '# probe\n\nbody\n' > "$PLAN/plan.md"
 addq() {                                # branch-to-stand-on [extra args...] -> the task dir
   local stand=$1; shift
   git -C "$REPO" checkout -q "$stand"
-  ( cmd_add "$PLAN/plan.md" "tom/$1" probe "" --repo "$REPO" "${@:2}" >/dev/null 2>&1 )
+  add_as "$PLAN/plan.md" "tom/$1" --repo "$REPO" "${@:2}" >/dev/null 2>&1
   first_of "$PQ_HOME"/queue/*-"$(branch_to_slug "tom/$1")"
 }
 
 # Standing on the integration branch: inherited, and recorded in the header.
 d=$(addq live-events inherit-1)
 eq "$(hdr "$d/plan.md" base)" "live-events" "standing on live-events queues against live-events"
+# And says how to get the default instead, now that the checkout is the only way.
+git -C "$REPO" checkout -q live-events
+note=$(add_as "$PLAN/plan.md" tom/inherit-1b --repo "$REPO" 2>&1 >/dev/null)
+case "$note" in
+  *"base:   live-events (the branch "*" is on - check out master first to queue against it)"*) ok ;;
+  *) bad "the base note should say how to queue against the default (got: $note)" ;;
+esac
 
 # Standing on the default: nothing recorded, because task_base already answers
 # master - every task queued before this feature keeps its exact plan.md.
@@ -435,12 +431,6 @@ d=$(addq master inherit-2)
 eq "$(hdr "$d/plan.md" base)" "" "standing on the default writes no base: header at all"
 eq "$(task_base "$d")" "master" "...and still resolves to master"
 repo_base_reset
-
-# An explicit --base always wins over the branch you happen to be on.
-d=$(addq live-events inherit-3 --base master)
-eq "$(hdr "$d/plan.md" base)" "" "--base master overrides the branch, and normalises to no header"
-d=$(addq master inherit-4 --base live-events)
-eq "$(hdr "$d/plan.md" base)" "live-events" "--base wins when standing on the default too"
 
 # A branch that exists only locally cannot be forked from by wt, and no pull
 # request can target it - so it must NOT be inherited.
@@ -452,7 +442,7 @@ repo_base_reset
 
 # Detached HEAD has no branch to inherit.
 git -C "$REPO" checkout -q --detach master
-( cmd_add "$PLAN/plan.md" tom/inherit-6 probe "" --repo "$REPO" >/dev/null 2>&1 )
+add_as "$PLAN/plan.md" tom/inherit-6 --repo "$REPO" >/dev/null 2>&1
 d=$(first_of "$PQ_HOME"/queue/*-inherit-6)
 eq "$(hdr "$d/plan.md" base)" "" "a detached HEAD inherits nothing"
 git -C "$REPO" checkout -q master

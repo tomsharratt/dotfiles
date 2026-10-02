@@ -151,21 +151,18 @@ When the name Haiku chose is taken, it is asked once more with that name to avoi
 
 Each task records its own project, so one queue serves all of them.
 The project is wherever you were standing when you added the plan, resolved to the main checkout so adding from inside a worktree still queues against the repo the new worktree gets forked from; `--repo PATH` sets it explicitly.
+So is the branch: when that checkout is on a branch other than the default, and the branch is on origin, the task forks from it and opens its pull request against it, recorded as a `base:` header.
+To queue against the default from a feature branch, check the default out first.
 Dispatch runs `wt new` in that repo, which picks up its profile, and everything downstream is per-task from there - `pq ls` grows a `PROJECT` column as soon as the queue holds more than one.
 Branch *lookups* are keyed on the repo as well as the name, but a task's slug is a single global namespace, so two live tasks can never share a branch leaf even across two different projects - `tom/fix-timezone` cannot be queued in both at once.
 
 ```
 pq add                   pick a plan and add it to the queue
-pq add --urgent          allocate from a reserved range, ahead of every real date
 pq add --after T         repeatable, at add time: don't dispatch until T's PR has merged
 pq add --design PATH     repeatable: a design file the implementer builds to (auto-detected from the plan too)
-pq add --repo PATH       repeatable, only with --split/--split-dir: name the repos a split may use
-pq add --split           queue a plan that lays out several pull requests as one task each, wired with --after
-pq add --split-dir D     queue an already-split directory, skipping the split step
 pq after <task>          list a task's blockers and what each is waiting on
 pq after <task> T...     add blockers to a task still in queue/
 pq after <task> --clear  drop them all
-pq base <task> [B]       what branch it forks from and aims its PR at; B retargets it
 pq ls [--all] [--json]   every task, its state, and what it is waiting on
 pq tick [--dry-run]      free finished slots, then fill them from the queue
 pq run                   tick every two minutes until you stop it
@@ -188,12 +185,12 @@ The keys are offered only when there is more than one page, and paging past eith
 Row numbers are absolute: row 11 is the eleventh-newest plan whichever page you are looking at, so a number always means the same plan and any listed row can be picked from any page.
 Pick a number - Enter takes the top row of the page you are on, which is the most recent plan on page one - and it previews the plan before asking `use this plan? [y/N]`; answering `n` returns to the number prompt, on the page you were reading, rather than aborting the whole command.
 That `n` is "no", not "next page" - the two prompts read the key differently, and each one's hint says which is in force.
-Once you confirm, it asks the things that actually shape how a task runs: which model should run it and which of the tasks already queued or running it should wait on - and, first, for a plan that lays out several pull requests of its own, whether to queue one task per pull request.
+Once you confirm, it asks the things that actually shape how a task runs: which model should run it and which of the tasks already queued or running it should wait on.
 The model question offers `sonnet`, `opus` and `fable`, and Enter takes `sonnet`; an initial and any case will do.
 Only what is typed at the prompt is held to those three - `--model` itself still takes any id `claude --model` accepts.
 `--effort` stays a flag, with no question of its own.
 
-Passing a flag the wizard would otherwise ask about skips just that one question and leaves the rest standing - `pq add --split` skips the split question, `pq add --model opus` skips the model question, `pq add --after some-task` skips the blocker question, and any combination of them skips exactly the questions it has already answered.
+Passing a flag the wizard would otherwise ask about skips just that one question and leaves the rest standing - `pq add --model opus` skips the model question, `pq add --after some-task` skips the blocker question, and any combination of them skips exactly the questions it has already answered.
 
 There is no unattended add: with no terminal to ask at, `pq add` stops rather than guessing which plan you meant.
 
@@ -232,7 +229,6 @@ The rule in `AGENTS.md` closes the loop from the planning side: a plan built fro
 
 The files are copied into `<task>/design/` inside the same staging step that writes `plan.md`, so a task lands with its design or not at all, and the `design:` header lists them - absent, like `base:`, when there are none.
 A plan that reads as built from a design (it cites `claude.ai/design` or a `.dc.html`) with no file found gets one question at the wizard - the path, or Enter to go without, loudly.
-On a split, each part carries the design files it names by filename (the splitter is told to cite them), and a file no part names goes to every part with a warning rather than to none.
 The contract then tells the implementer exactly what to do with them.
 
 #### Evidence
@@ -249,12 +245,8 @@ Neither the reap pass nor `wt rm` touches it.
 #### Order
 
 The queue is add-order, oldest first - a task's position is exactly when it was added, nothing more.
-`--urgent` allocates from a reserved range below any real date, so an urgent task always sorts ahead of every ordinary one.
-Two urgent tasks are still ordered oldest first between themselves, by the order they were added.
-`--urgent` is the only move there is, and it is declared when the task is queued rather than applied afterwards.
 There is no number to slot between two tasks, and nothing to promote or demote one later, because plans are added in the order they should run - so there was never anything to insert between them, or any position to correct.
-The fourteen-digit prefix is a fixed-width UTC timestamp, which is what makes bash's own glob order agree with numeric order - `pq ls` and the queue's actual dispatch order are the same order, as long as every task directory carries that prefix.
-A lingering directory from before this scheme won't - that is what the one-time migration is for.
+The fourteen-digit prefix is a fixed-width UTC timestamp, which is what makes bash's own glob order agree with numeric order - `pq ls` and the queue's actual dispatch order are the same order.
 
 #### Blockers
 
@@ -289,7 +281,7 @@ A dispatch that fails is retried on the next tick, but only three times in a row
 A prompt that waits on a dialog, a trust prompt say, is not a failure and is never counted.
 A lock keeps two ticks from both filling to cap: a symlink naming its owner's pid and that process's start time, created in one atomic step.
 It used to be a directory with the pid written into it a moment later, so a tick arriving in that moment read the lock as stale and took it too; and a pid alone outlives its process, so a lock left behind across a reboot could name a pid someone else now had and block every tick.
-`pq rm`, and the forms of `pq after` and `pq base` that change a task, take the lock too, and find the task again under it: an answer given about a queued task is not applied to one a tick has since claimed.
+`pq rm`, and the forms of `pq after` that change a task, take the lock too, and find the task again under it: an answer given about a queued task is not applied to one a tick has since claimed.
 
 `pq tick --dry-run` shows what it would do and changes nothing.
 
@@ -323,41 +315,6 @@ That needs a little care, because a terminal signals the whole foreground proces
 
 A second Ctrl-C abandons the work in flight, killing that child too, so "force" does not leave a `wt new` running with nobody to record what it produced.
 Either way nothing is lost - a task caught mid-dispatch keeps its claim without a launch record, which the next reconcile recognises and resumes.
-
-#### Plans that lay out several pull requests
-
-A big change is one pull request: the implementer commits it as a series of small, self-contained steps, and the commits are how it is reviewed.
-Cutting it into several pull requests on top of that only buys a waterfall - each piece waits on the merge of the one before it, and so does its review - so `pq` never proposes dividing a plan just because it is big.
-Some plans do lay out several pull requests of their own, though: a "PR 1" and a "PR 2" the plan names, or work in more than one repository, which one pull request cannot span.
-`pq add --split` is for those: one Opus session reads the plan and writes each of its pull requests up as a standalone plan of its own, plus a dependency graph - then queues every part through the ordinary `pq add` path, with `--after` already wired from the graph.
-It follows the plan's own boundaries and never draws its own: no pull request is divided further or merged with another, and a plan that lays out one pull request in one repository comes back as a single part.
-The order the plan gives its pull requests in is not a dependency - only real ones are wired (an endpoint, a schema, a helper one part introduces and another uses, or two parts that would edit the same code), so parts that do not depend on each other run side by side.
-
-You do not have to notice that by yourself.
-The Haiku call that names every task also returns an outline: the pull requests the plan itself lays out, in its order, one title each - and a single entry for any plan that does not, however large it is.
-When the outline has more than one entry the wizard lists it and asks whether to queue one task per pull request, with Enter meaning yes; a plan with a one-entry outline is not asked at all.
-The outline is shown to you, not fed to the splitter, which reads the plan's pull requests off the plan itself and still shows its table for confirmation before anything is queued, so a split that comes out differently from the outline is visible before it costs anything.
-`--split` is still the way in when Haiku has missed a plan that lays out several.
-
-The load-bearing constraint is that parts wait for merges, never for branches - no part is ever built on top of a sibling's branch.
-Each part starts from the default branch with its declared dependencies already merged, and every part is written for an agent that sees only that one file: it never mentions another part, its filename, or its branch.
-`pq` validates this before anything is queued - full coverage of the original plan, no missing or forgotten parts, no cycles, and no part referencing a sibling by name - and refuses to queue anything if a check fails.
-
-The split artifacts land in `$PQ_HOME/splits/<plan>-<stamp>-<pid>/`: the source plan, one `NN-short-slug.md` per part, and `graph.tsv` recording which parts must merge before which others.
-Before queueing anything, `pq` shows a table of the parts, their wave (how many merges deep they are), their branch, and what each waits on, then asks to confirm.
-Declining leaves the split directory on disk and costs nothing: `pq add --split-dir <dir>` resumes from it later, without paying for the Opus session again, which is what makes hand-editing a part before it ships a first-class path.
-
-`--after` on the split itself only applies to the root parts - the ones with no dependency inside the split - since `pq after`'s own reporting already surfaces the rest of the chain to anyone asking why a downstream part hasn't started.
-
-A plan that names more than one checkout - a mobile feature spanning the Rails monolith and the iOS app, say - gets its parts assigned across repositories instead of forced into one.
-The splitter is shown every git checkout sitting alongside the primary, and told to use the primary unless the plan clearly places some of the work elsewhere - it never assigns a part to a repository the plan doesn't talk about.
-A part belongs to exactly one repository, because a part is one pull request; work that genuinely spans two repositories is two parts, wired with an ordinary `--after` the same way an intra-repo dependency is - a client part waiting on the server part it needs is just that edge crossing a repo boundary.
-`--repo PATH` is repeatable and is the escape hatch for the discovery, not the normal path: passing it once still lets the scan contribute, which is how you fix a wrong cwd without silently turning multi-repo splitting off, and only passing it two or more times narrows the set to exactly those repos.
-The repo assignment is yours to check at the confirmation: the table grows a `REPO` column once a split actually spans more than one repository.
-
-Running `pq add --split` from `~/projects` itself - a directory that holds several checkouts but is not a checkout of anything - works the same way in reverse: instead of scanning the primary's siblings, `pq` discovers `~/projects`' own immediate children that are git repositories and offers those as the candidate set.
-There is no primary in that case, deliberately: nothing among a container's children is privileged as a default the splitter can fall back into, so every part's repository assignment becomes required rather than optional, and a part left unassigned fails validation instead of silently landing wherever the primary would have been.
-The same `--repo PATH` naming a directory instead of a checkout triggers this from anywhere, not only from inside the container itself.
 
 #### Reading the pane
 
@@ -399,7 +356,7 @@ The cap is what bounds the damage, since a task in `running/` holds its slot unt
 
 The headless sessions are the exception, because in `claude -p` the limit is not an error: the session exits 0 with the limit's one line as its whole reply.
 A reply that is exactly one line and reads as the limit (`PQ_LIMIT_RE`) is caught before anything else is read off it.
-`pq add` stops with "behind the usage limit - pq add again once it lifts" rather than reading that line as a reply that named nothing, and the splitter stops the same way.
+`pq add` stops with "behind the usage limit - pq add again once it lifts" rather than reading that line as a reply that named nothing.
 The reviewers are covered under "The review gate" below.
 
 #### The review gate
@@ -450,7 +407,6 @@ Some plans ask for a security review as well - "run `/security-review` as well a
 The same Haiku call that names a task at add time reads whether its plan asks for one, and a plan that does gets a `security: yes` header (absent, like `base:` and `design:`, when it does not) and says `review: code and security` as it is queued.
 It has to be read rather than matched: plans name the skill as often to waive it as to ask for it - "`/security-review` is not warranted" - so a pattern cannot tell the two apart, and a yes stands only when the plan's text mentions a security review at all.
 The wording was checked against ten real plans, four runs each, and came back right all forty times, including one that asks for it inside an aside about CSRF and `pq`'s own plan, which names it only as follow-up work.
-A split carries the ask into the parts it is about, and each part gets a verdict of its own.
 
 The implementer's contract says `pq` runs the review, and not to run one itself.
 Once the draft is open, `pq` runs `claude -p "/security-review"` in the task's worktree beside the code reviewer, launched on the same tick, on the same `PQ_REVIEWER_MODEL`, effort, timeout, `PQ_REVIEW_MAX_TRIES` and retry, and under the same read-only deny rules, with `gh` denied outright.

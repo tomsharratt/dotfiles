@@ -3,8 +3,7 @@
 # ordering, plan_title, cell, age_since, pick_plan, pick_after, add_wizard,
 # and the wiring into cmd_add.
 #
-# Same conventions as test/pq-split.sh: plain bash, no framework, a temp
-# PQ_HOME exported BEFORE sourcing pq, a PATH-stubbed `claude` and `gh` so
+# Plain bash, no framework, a temp PQ_HOME exported BEFORE sourcing pq, a PATH-stubbed `claude` and `gh` so
 # nothing here ever reaches the network, ok/bad/eq, trap cleanup EXIT, and a
 # throwaway git repo with refs/remotes/origin/HEAD faked by hand.
 #
@@ -26,9 +25,8 @@ PQ_PLANS_DIR=$(mktemp -d)
 export PQ_PLANS_DIR
 
 STUBBIN=$(mktemp -d)
-# Dispatches on --model, same shape as test/pq-split.sh's stub. Only the
-# wiring case at the bottom ever reaches this without a branch handed to
-# cmd_add (which skips the naming call entirely), so only one marker is needed.
+# Dispatches on --model. Only the wiring cases at the bottom ever reach this
+# without add_as standing in for the namer, so only one marker is needed.
 cat > "$STUBBIN/claude" <<'STUBEOF'
 #!/usr/bin/env bash
 model=""
@@ -89,8 +87,8 @@ reset_tasks
 # test/pq-reap.sh's mk_done, just parameterised over the state.
 mk_task() {                             # state prio slug repo branch -> task_dir
   local state=$1 prio=$2 slug=$3 repo=$4 branch=$5
-  # $prio is relative order, not a stamp - it is offset into the real
-  # (non-urgent) range so a fixture never accidentally reads as --urgent.
+  # $prio is relative order, not a stamp - it is offset into a real
+  # timestamp so a fixture reads like a task pq made.
   # $((10#$prio)) rather than a bare $prio: inside $(( )) a leading-zero
   # literal like 020 is octal, exactly the bug this fixture must not
   # reintroduce - and this file's own call sites pass 010/020/030/040/005.
@@ -108,6 +106,21 @@ mk_task() {                             # state prio slug repo branch -> task_di
     printf -- '---\n\nplan body\n'
   } > "$dir/plan.md"
   printf '%s' "$dir"
+}
+
+
+# cmd_add with the picker and the namer stood in for, in a subshell: the plan
+# is $1 and Haiku's answer is the branch $2; the rest are cmd_add's own flags.
+# stdin is /dev/null, so every wizard question takes its default.
+add_as() {                              # plan branch [flags...]
+  # Names cmd_add never declares: the stand-ins read them through dynamic
+  # scope at call time, under cmd_add's own locals.
+  local as_plan=$1 as_branch=$2; shift 2
+  # shellcheck disable=SC2329  # called by cmd_add, not here
+  ( at_terminal() { return 0; }
+    pick_plan() { printf '%s' "$as_plan"; }
+    name_plan() { printf '%s\t\t\n' "$as_branch"; }
+    cmd_add "$@" </dev/null )
 }
 
 echo "== recent_plans: ordering by max(mtime, birth) ==" >&2
@@ -294,7 +307,7 @@ mk_task queue 030 task-c "$REPO" tom/task-c >/dev/null
 # forks a subshell, but the mutation only needs to survive long enough for
 # this wrapper's own final printf, which happens before the subshell exits.
 run_pick_after() {                      # repo -> echoes the resulting after_vals
-  local split=0 split_dir="" after_vals="" after_explicit=0 repo=$1
+  local after_vals="" after_explicit=0 repo=$1
   pick_after
   printf '%s' "$after_vals"
 }
@@ -357,70 +370,59 @@ echo "== add_wizard: every question already decided asks nothing at all ==" >&2
 reset_tasks
 # `model_explicit` defaults to 1 so the cases that are about the OTHER questions
 # stay about them - the model cases below pass 0 explicitly.
-run_wizard() {                          # split after_explicit [model_explicit] -> "split=X model=M after_vals=[Y]"
-  local split=$1 split_dir="" after_vals="" after_explicit=$2 repo=$REPO
-  local model=$PQ_DEFAULT_MODEL model_explicit=${3:-1}
+run_wizard() {                          # after_explicit [model_explicit] -> "model=M after_vals=[Y]"
+  local after_vals="" after_explicit=$1 repo=$REPO
+  local model=$PQ_DEFAULT_MODEL model_explicit=${2:-1}
   add_wizard
-  printf 'split=%s model=%s after_vals=[%s]' "$split" "$model" "$after_vals"
+  printf 'model=%s after_vals=[%s]' "$model" "$after_vals"
 }
-out=$(run_wizard 1 1 </dev/null)
-eq "$out" "split=1 model=sonnet after_vals=[]" "all already decided: no prompt should even try to read stdin"
+out=$(run_wizard 1 </dev/null)
+eq "$out" "model=sonnet after_vals=[]" "all already decided: no prompt should even try to read stdin"
 
-echo "== add_wizard: the split question is asked only of a plan that lays out several pull requests ==" >&2
-# `outline` reaches add_wizard through dynamic scope, like every other local
-# cmd_add hands it - set here, in the caller, the same way.
-out=$(outline=$'First half\nSecond half' run_wizard 0 1 <<<$'y\n' 2>/dev/null)
-eq "$out" "split=1 model=sonnet after_vals=[]" "y at the split prompt should set split=1; after_explicit=1 skips the blocker prompt"
-out=$(outline=$'First half\nSecond half' run_wizard 0 1 <<<$'n\n' 2>/dev/null)
-eq "$out" "split=0 model=sonnet after_vals=[]" "n at the split prompt should leave split=0"
-out=$(outline="The one thing" run_wizard 0 1 </dev/null 2>"$PQ_HOME/.wiz.err")
-eq "$out" "split=0 model=sonnet after_vals=[]" "a one-entry outline leaves split=0"
-eq "$(cat "$PQ_HOME/.wiz.err")" "" "and asks nothing - no prompt is printed at all"
-
-echo "== add_wizard: split already 1 skips that question; the blocker prompt still runs ==" >&2
+echo "== add_wizard: the blocker prompt runs when no --after was given ==" >&2
 mk_task queue 010 task-a "$REPO" tom/task-a >/dev/null
 # 2>/dev/null like every run_pick_after call above: the command substitution
 # captures stdout, but pick_after's prompt goes to stderr, so without this the
 # "block on which?" line leaks into the suite's own output.
-out=$(run_wizard 1 0 <<<$'1\n' 2>/dev/null)
-eq "$out" "split=1 model=sonnet after_vals=[task-a"$'\n'"]" \
-  "split=1 skips its question outright; picking 1 at the blocker prompt selects task-a"
+out=$(run_wizard 0 <<<$'1\n' 2>/dev/null)
+eq "$out" "model=sonnet after_vals=[task-a"$'\n'"]" \
+  "picking 1 at the blocker prompt selects task-a"
 
 echo "== add_wizard: the model question - Enter takes PQ_DEFAULT_MODEL ==" >&2
 reset_tasks
-out=$(run_wizard 1 1 0 <<<$'\n' 2>/dev/null)
-eq "$out" "split=1 model=sonnet after_vals=[]" "Enter should take the default, sonnet"
+out=$(run_wizard 1 0 <<<$'\n' 2>/dev/null)
+eq "$out" "model=sonnet after_vals=[]" "Enter should take the default, sonnet"
 
 echo "== add_wizard: each of the three names is taken ==" >&2
 for m in sonnet opus fable; do
-  out=$(run_wizard 1 1 0 <<<"$m" 2>/dev/null)
-  eq "$out" "split=1 model=$m after_vals=[]" "'$m' should be taken as the model"
+  out=$(run_wizard 1 0 <<<"$m" 2>/dev/null)
+  eq "$out" "model=$m after_vals=[]" "'$m' should be taken as the model"
 done
 
 echo "== add_wizard: an initial and any case are taken too ==" >&2
-out=$(run_wizard 1 1 0 <<<$'o\n' 2>/dev/null)
-eq "$out" "split=1 model=opus after_vals=[]" "a bare 'o' should mean opus"
-out=$(run_wizard 1 1 0 <<<$'Fable\n' 2>/dev/null)
-eq "$out" "split=1 model=fable after_vals=[]" "'Fable' should mean fable"
+out=$(run_wizard 1 0 <<<$'o\n' 2>/dev/null)
+eq "$out" "model=opus after_vals=[]" "a bare 'o' should mean opus"
+out=$(run_wizard 1 0 <<<$'Fable\n' 2>/dev/null)
+eq "$out" "model=fable after_vals=[]" "'Fable' should mean fable"
 
 echo "== add_wizard: an unknown answer re-prompts and recovers ==" >&2
-err=$(run_wizard 1 1 0 <<<$'haiku\nopus\n' 2>&1 >/dev/null)
+err=$(run_wizard 1 0 <<<$'haiku\nopus\n' 2>&1 >/dev/null)
 case "$err" in *"pick one of sonnet, opus or fable"*) ok ;; *) bad "an unknown model should say what is on offer (got: $err)" ;; esac
-out=$(run_wizard 1 1 0 <<<$'haiku\nopus\n' 2>/dev/null)
-eq "$out" "split=1 model=opus after_vals=[]" "the retry after an unknown answer should stick"
+out=$(run_wizard 1 0 <<<$'haiku\nopus\n' 2>/dev/null)
+eq "$out" "model=opus after_vals=[]" "the retry after an unknown answer should stick"
 
 echo "== add_wizard: EOF at the model question is Enter, not a hang ==" >&2
-out=$(run_wizard 1 1 0 </dev/null 2>/dev/null)
-eq "$out" "split=1 model=sonnet after_vals=[]" "EOF should take the default rather than spin"
+out=$(run_wizard 1 0 </dev/null 2>/dev/null)
+eq "$out" "model=sonnet after_vals=[]" "EOF should take the default rather than spin"
 
 echo "== add_wizard: PQ_DEFAULT_MODEL is what Enter takes, not a hardcoded sonnet ==" >&2
-out=$(PQ_DEFAULT_MODEL=opus run_wizard 1 1 0 <<<$'\n' 2>/dev/null)
-eq "$out" "split=1 model=opus after_vals=[]" "an overridden default should be what Enter takes"
+out=$(PQ_DEFAULT_MODEL=opus run_wizard 1 0 <<<$'\n' 2>/dev/null)
+eq "$out" "model=opus after_vals=[]" "an overridden default should be what Enter takes"
 
 echo "== add_wizard: --model given explicitly skips the question ==" >&2
 # shellcheck disable=SC2034  # add_wizard reads these locals through bash's dynamic scope
 skip_wizard() {                         # model -> the model add_wizard leaves behind
-  local split=1 split_dir="" after_vals="" after_explicit=1 repo=$REPO
+  local after_vals="" after_explicit=1 repo=$REPO
   local model=$1 model_explicit=1
   add_wizard
   printf '%s' "$model"
@@ -445,14 +447,13 @@ eq "$(find "$PQ_HOME/queue" -mindepth 1 -maxdepth 1 | wc -l | tr -d ' ')" "0" "n
 
 echo "== wiring: at a terminal, main add runs the picker, names the plan and asks the wizard ==" >&2
 # at_terminal stood in for, in the subshell only: pick row 1, confirm it, and
-# Enter at the model question. The stub names the plan with no outline, so
-# there is no split question, and an empty queue leaves no blocker to ask about.
+# Enter at the model question. An empty queue leaves no blocker to ask about.
 # shellcheck disable=SC2329  # at_terminal is called by main add, not here
-slug=$( ( at_terminal() { return 0; }; main add --repo "$REPO" ) <<<$'1\ny\n\n' 2>"$PQ_HOME/.wire2.err")
+out=$( ( at_terminal() { return 0; }; main add --repo "$REPO" ) <<<$'1\ny\n\n' 2>"$PQ_HOME/.wire2.err")
 rc=$?
 [ "$rc" -eq 0 ] && ok || bad "main add through the wizard should succeed: $(cat "$PQ_HOME/.wire2.err")"
-eq "$slug" "wiring-fixture-task" "stdout is the slug Haiku's name gives"
-t=$(find_task "$slug")
+eq "$out" "" "nothing goes to stdout - everything a human reads is on stderr"
+t=$(find_task wiring-fixture-task)
 eq "$(hdr "$t/plan.md" source)" "$PQ_PLANS_DIR/wiring.md" "the picked plan is the one queued"
 eq "$(hdr "$t/plan.md" branch)" "tom/wiring-fixture-task" "named by Haiku"
 eq "$(hdr "$t/plan.md" model)" "$PQ_DEFAULT_MODEL" "Enter at the model question takes the default"
@@ -467,10 +468,10 @@ mk_task queue 005 blocker-cand "$REPO" tom/blocker-cand >/dev/null
 via_picker=$(run_pick_after "$REPO" <<<$'1\n' 2>/dev/null)
 eq "$via_picker" "blocker-cand" "pick_after should resolve to the candidate's own slug"
 
-out_x=$(cmd_add "$PQ_PLANS_DIR/wiring.md" tom/task-x x "" --repo "$REPO" --after blocker-cand 2>"$PQ_HOME/.x.err")
-t_x=$(find_task "$out_x")
-out_y=$(cmd_add "$PQ_PLANS_DIR/wiring.md" tom/task-y y "" --repo "$REPO" --after "$via_picker" 2>"$PQ_HOME/.y.err")
-t_y=$(find_task "$out_y")
+add_as "$PQ_PLANS_DIR/wiring.md" tom/task-x --repo "$REPO" --after blocker-cand 2>"$PQ_HOME/.x.err"
+t_x=$(find_task task-x)
+add_as "$PQ_PLANS_DIR/wiring.md" tom/task-y --repo "$REPO" --after "$via_picker" 2>"$PQ_HOME/.y.err"
+t_y=$(find_task task-y)
 eq "$(cat "$t_x/after")" "$(cat "$t_y/after")" \
   "queuing via --after blocker-cand and via --after <pick_after's own output> must produce identical after files"
 

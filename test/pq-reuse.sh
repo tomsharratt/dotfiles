@@ -199,15 +199,17 @@ cat > "$STUBBIN/claude" <<'EOF'
 #!/bin/sh
 cat >/dev/null
 case "$*" in
-  *"already taken: tom/shipped-once"*) echo '{"branch":"tom/fresh-name","intent":"the retry","security":false,"parts":["p"]}' ;;
-  *) echo '{"branch":"tom/shipped-once","intent":"the first","security":false,"parts":["p"]}' ;;
+  *"already taken: tom/shipped-once"*) echo '{"branch":"tom/fresh-name","intent":"the retry","security":false}' ;;
+  *) echo '{"branch":"tom/shipped-once","intent":"the first","security":false}' ;;
 esac
 EOF
 PLAN="$PQ_HOME/plan-src.md"; printf '# A plan\n\nDo it.\n' > "$PLAN"
-slug=$(cmd_add "$PLAN" "" "" "" --repo "$REPO" 2>"$PQ_HOME/.err"); rc=$?
+# The picker stood in for; Haiku's stub names the plan, twice.
+# shellcheck disable=SC2329  # called by cmd_add, not here
+( at_terminal() { return 0; }; pick_plan() { printf '%s' "$PLAN"; }; cmd_add --repo "$REPO" </dev/null ) 2>"$PQ_HOME/.err"; rc=$?
 eq "$rc" 0 "the add goes through on the second name ($(cat "$PQ_HOME/.err"))"
-eq "$slug" "fresh-name" "under the name Haiku gave when told the first was taken"
 t=$(find_task fresh-name)
+[ -n "$t" ] && ok || bad "under the name Haiku gave when told the first was taken"
 eq "$(hdr "$t/plan.md" intent)" "the retry" "with that reply's intent"
 case "$(cat "$PQ_HOME/.err")" in *"tom/shipped-once"*"#105"*) ok ;; *) bad "and it says why it asked again (got '$(cat "$PQ_HOME/.err")')" ;; esac
 

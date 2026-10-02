@@ -103,8 +103,8 @@ reset_tasks
 # "already gone").
 mk_done() {                             # prio slug repo branch worktree_path -> task_dir
   local prio=$1 slug=$2 repo=$3 branch=$4 wt=$5
-  # $prio is relative order, not a stamp - it is offset into the real
-  # (non-urgent) range so a fixture never accidentally reads as --urgent.
+  # $prio is relative order, not a stamp - it is offset into a real
+  # timestamp so a fixture reads like a task pq made.
   # $((10#$prio)) rather than a bare $prio: inside $(( )) a leading-zero
   # literal like 020 is octal, exactly the bug this fixture must not
   # reintroduce.

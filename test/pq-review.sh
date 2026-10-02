@@ -283,7 +283,7 @@ line=$(head -1 "$CLAUDE_LOG")
 eq "$(cut -f1 <<<"$line")" "$WT" "it runs in the task's worktree"
 eq "$(head -1 "$CLAUDE_ENV")" "pane=unset tab=unset workspace=unset env=1 socket=/tmp/herdr-test.sock" \
   "without the launching pane's identity, but still able to reach herdr for wt"
-# The namer and the splitter handed their panes a session the same way, so every
+# The namer handed its pane a session the same way, so every
 # headless claude goes through headless_claude - a bare `claude -p` outside a
 # comment is one more pane about to be handed a session.
 bare=$(grep -nE '(^|[^_[:alnum:]])claude -p' "$HERE/../.local/bin/pq" | grep -vE '^[0-9]+:[[:space:]]*#')
