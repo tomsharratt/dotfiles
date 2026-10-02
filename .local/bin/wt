@@ -21,7 +21,9 @@
 #                        new gem, an initializer, anything a running stack misses
 #   wt run  [cmd...]     run a command with the worktree's isolated env loaded
 #                        (e.g. `wt run bin/rails console`); no cmd -> a shell
-#   wt open [name]       open the worktree's dev url in the browser
+#   wt open [subdomain]  open this worktree's dev url in the browser - at a
+#                        subdomain of it, when the profile serves several; any
+#                        args go to the profile's wt_open / wt_open_url
 #   wt provision <path>  (re)run the project's provisioning for a worktree (idempotent)
 #   wt rm  [name]        tear the worktree down (drop db, free port, remove worktree)
 #        -y, --yes       answer both prompts yes (needed to run unattended); a worktree
@@ -52,7 +54,8 @@
 #                  extra `wt open` args and its exit status becomes wt open's.
 #                  When defined, wt_open_url is ignored.
 #   wt_open_url    print the url `wt open` should launch (default: WT_URL);
-#                  receives any extra `wt open` args (e.g. a login email)
+#                  receives any `wt open` args (e.g. a subdomain), and a
+#                  non-zero exit stops `wt open` - it has said why
 #   wt_teardown    release external resources on `wt rm` (best-effort)
 #   wt_sweep       reclaim leftover project resources (databases, dns entries)
 #                  whose worktree is gone entirely, so nothing records them any
@@ -1375,36 +1378,38 @@ cmd_restart() {
   dev_autostart
 }
 
+# Always this worktree, the one you are standing in: every argument is the
+# profile's - a subdomain for a web app, `--launch-only` for a device build.
 cmd_open() {
-  local name=${1:-} repo repo_name url path
-  repo=$(main_worktree "$PWD"); [ -n "$repo" ] || die "not inside a git worktree"
-  if [ -n "$name" ] && [ "${name#-}" = "$name" ]; then shift; else name=$(cur_branch "$PWD"); fi
-  [ -n "$name" ] || die "no worktree name given (and not on a branch)"
-  repo_name=$(basename "$repo")
+  local path repo repo_name name url=""
+  path=$(git -C "$PWD" rev-parse --show-toplevel 2>/dev/null) || die "not inside a git worktree: $PWD"
+  repo=$(main_worktree "$path"); repo_name=$(basename "$repo"); name=$(cur_branch "$path")
   load_profile "$repo_name"
-  # `wt open <name>` names a branch, so find the worktree sitting on it and load state
-  # by that path rather than by the slug the name implies (see load_state_for_path).
-  path=$(repo_worktrees "$repo" | awk -F'\t' -v b="$name" '$2 == b { print $1; exit }')
-  load_state_for_path "${path:-$PWD}" "$repo_name" "$name" \
-    || die "no saved state for '$name' - run 'wt provision' first"
+  load_state_for_path "$path" "$repo_name" "$name" \
+    || die "no saved state for this worktree - run 'wt provision $path' first"
+  # The url before the dev server, so an argument the profile refuses stops here
+  # rather than after a wait for a server that was never going to be shown. A
+  # profile whose "open" is an action rather than a url (build, install and launch
+  # an app on a device) defines wt_open instead, and has no url to work out.
+  if ! declare -F wt_open >/dev/null; then
+    if declare -F wt_open_url >/dev/null; then
+      url=$(run_profile_fn wt_open_url "$@") || exit 1
+    else
+      url=${WT_URL:-https://${WT_DOMAIN}}
+    fi
+    [ -n "$url" ] || die "no url to open for this worktree"
+  fi
   # Above the wt_open branch below, so ONE place decides whether a dev server is
   # wanted. Which profiles are affected is then a property of what they declare -
   # a port - rather than of where this line happens to sit.
   dev_autostart
-  # A profile whose "open" is an action rather than a url (build, install and launch an
-  # app on a device) defines wt_open and owns the command outright. NOT captured in
-  # $(...) like wt_open_url: a build is long and noisy and has to stream to the terminal,
-  # and its exit status has to become `wt open`'s.
+  # wt_open owns the command outright. NOT captured in $(...) like wt_open_url: a
+  # build is long and noisy and has to stream to the terminal, and its exit status
+  # has to become `wt open`'s.
   if declare -F wt_open >/dev/null; then
     run_profile_fn wt_open "$@"
     return $?
   fi
-  if declare -F wt_open_url >/dev/null; then
-    url=$(run_profile_fn wt_open_url "$@")
-  else
-    url=${WT_URL:-https://${WT_DOMAIN}}
-  fi
-  [ -n "$url" ] || die "no url to open for '$name'"
   msg "opening $url"
   # Quote the url everywhere: query strings like ?user[email]= are valid globs.
   if command -v open >/dev/null 2>&1; then open "$url"
@@ -1653,7 +1658,7 @@ main() {
     rm)         shift; cmd_rm "$@" ;;
     ls)         shift; cmd_ls "$@" ;;
     gc)         shift; cmd_gc "$@" ;;
-    *) die "usage: wt {new [--no-agent] [--no-focus] [--base REF] [--json] [name] | dev <path> | restart [path] | run [cmd...] | test [cmd...] | open [name] | provision <path> | rm [-y] [name] | ls | gc [--settled] [--sweep] [-y]}" ;;
+    *) die "usage: wt {new [--no-agent] [--no-focus] [--base REF] [--json] [name] | dev <path> | restart [path] | run [cmd...] | test [cmd...] | open [subdomain] | provision <path> | rm [-y] [name] | ls | gc [--settled] [--sweep] [-y]}" ;;
   esac
 }
 if [ "${BASH_SOURCE[0]}" = "$0" ]; then main "$@"; fi

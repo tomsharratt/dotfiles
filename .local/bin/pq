@@ -3111,7 +3111,7 @@ EOF
       cat <<EOF
 The app is served at $url from the \`dev\` tab in this workspace.
 If nothing answers there, or once you have added a gem, changed an initializer or anything else a running server will not pick up, run \`wt restart\` to restart it in that tab - never \`wt dev\`, which would run the whole stack in your own shell.
-Log in with the project's development credentials: the ones its seed data (\`db/seeds.rb\`) or its docs name, and \`wt open ${wt:-$repo}\` opens the login page the project's profile points at, with the seed admin pre-filled.
+Log in with the project's development credentials: the ones its seed data (\`db/seeds.rb\`) or its docs name, and \`wt open\`, run from this worktree, opens the login page the project's profile points at, with the seed admin pre-filled; \`wt open <subdomain>\` opens the same login on another subdomain the app serves, a podcast's own site say.
 Before changing any screen the plan names, capture it as it is today.
 Walk every user-facing path the change touches, in the browser.
 \`chrome-devtools-axi\` is on PATH: \`chrome-devtools-axi open <url>\`, \`chrome-devtools-axi emulate --viewport "1440x900x1"\` (or \`chrome-devtools-axi emulate --viewport "390x844x1"\`) to set the width, and \`chrome-devtools-axi screenshot <file>\`.

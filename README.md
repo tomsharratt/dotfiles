@@ -67,13 +67,14 @@ wt restart [path]    restart the worktree's dev server in its dev tab, and wait 
 wt run  [cmd...]     run a command with the worktree's isolated env loaded
 wt test [cmd...]     the same, with RAILS_ENV=test, so the command gets the
                      worktree's own test database rather than its dev copy
-wt open [name]       open the worktree's dev url in the browser, starting the
+wt open [subdomain]  open this worktree's dev url in the browser, starting the
                      dev server first if nothing is serving it yet, or hand the
                      command to the profile's own open action (build, install
-                     and launch on a device) when it defines one instead of a url
-                     (the mobile profiles' own open action accepts --launch-only/
-                     -l to skip the build and just relaunch - this is a convention
-                     of those two profiles, not a flag `wt` itself parses)
+                     and launch on a device) when it defines one instead of a url;
+                     its arguments are the profile's: supercast takes a subdomain
+                     to open its login on, with the seed admin pre-filled (app by
+                     default, or a podcast's own), and the mobile profiles take
+                     --launch-only/-l to skip the build and just relaunch
 wt provision <path>  re-run provisioning for a worktree (idempotent)
 wt rm  [-y] [name]   tear a worktree down (drop db, free port, remove worktree);
                      one holding work that is not pushed is refused under -y

@@ -326,14 +326,17 @@ $_WT_RSPEC_MARK
 EOF
 }
 
-# Browser entry point for `wt open`: the app login with an email pre-filled, so a
-# fresh worktree drops you onto a session in one click. Served off the app.
-# subdomain - puma-dev routes any *.<slug>.test host through this worktree's entry,
-# so app.<slug>.test resolves the same as the bare <slug>.test does. Override the
-# email with `wt open <name> <email>` or WT_OPEN_EMAIL; default is the seed admin.
+# Browser entry point for `wt open [subdomain]`: the login with the seed admin's
+# email pre-filled, so a fresh worktree drops you onto a session in one click.
+# puma-dev routes any *.<slug>.test host through this worktree's entry, and the
+# login is served on every subdomain, so the one argument picks where that
+# session starts - app by default, or a podcast's own site.
 wt_open_url() {
-  local email=${1:-${WT_OPEN_EMAIL:-admin@supercast.tech}}
-  printf 'https://app.%s/login?user[email]=%s' "$WT_DOMAIN" "$email"
+  local sub=${1:-app}
+  [ $# -le 1 ] || { warn "wt open takes one subdomain, not $#"; return 1; }
+  [[ "$sub" =~ ^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?$ ]] \
+    || { warn "wt open takes a subdomain - app, or a podcast's - not '$sub'; run it from inside the worktree"; return 1; }
+  printf 'https://%s.%s/login?user[email]=admin@supercast.tech' "$sub" "$WT_DOMAIN"
 }
 
 # The Procfile a worktree's dev server runs: Procfile.dev, derived fresh each boot

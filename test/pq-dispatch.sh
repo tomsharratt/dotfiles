@@ -171,6 +171,8 @@ has "$(cat "$C")" "pq evidence first" "it names the evidence command for this sl
 has "$(cat "$C")" "https://task.test" "it names the worktree's own url"
 has "$(cat "$C")" "run \`wt restart\` to restart it in that tab" "and how to restart its server"
 hasnt "$(cat "$C")" "\`wt dev " "never by running wt dev in its own shell"
+has "$(cat "$C")" "\`wt open\`, run from this worktree" "wt open is run bare, from the worktree"
+hasnt "$(cat "$C")" "\`wt open /" "and never handed a path, which it would read as a subdomain"
 has "$(cat "$C")" "gh pr create --draft" "the pull request opens as a draft"
 has "$(cat "$C")" "STUCK:" "and a stuck agent knows how to say so"
 has "$(cat "$C")" "$H/evidence/" "screenshots go into the task's evidence/, through the stable path"
