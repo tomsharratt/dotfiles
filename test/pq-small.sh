@@ -159,20 +159,26 @@ printf '%s\n' '```json' '{"branch":"tom/fenced","intent":"i","security":false,"p
 eq "$(name_plan "$PLANF" | head -1 | cut -f1)" "tom/fenced" "a fenced reply still reads"
 
 echo "== the namer and the splitter know the usage limit when they see it ==" >&2
-printf "You've hit your session limit · resets 7pm (America/Toronto)\n" > "$REPLY"
+printf "You've hit your individual spend limit · visit claude.ai/admin-settings/usage to raise it\n" > "$REPLY"
 out=$(name_plan "$PLANF" 2>&1); rc=$?
-eq "$rc" "3" "the namer's wall is its own answer"
-has "$out" "naming hit the usage limit: You've hit your session limit" "and says so, with the reset"
+eq "$rc" "3" "the namer's limit is its own answer"
+has "$out" "naming hit the usage limit: You've hit your individual spend limit" "and says so, in the limit's own words"
 reset_tasks
 out=$( (cmd_add "$PLANF" "" "" "" --repo "$REPO") 2>&1); rc=$?
 eq "$rc" "1" "pq add stops"
-has "$out" "behind the usage limit - pq add again once it resets" "saying when trying again can work"
+has "$out" "behind the usage limit - pq add again once it lifts" "saying when trying again can work"
 hasnt "$out" "Haiku gave no usable branch" "not that the reply was unusable"
-printf '%s\n' '{"is_error":false,"result":"You'"'"'ve hit your session limit · resets 7pm (America/Toronto)"}' > "$REPLY"
+printf '%s\n' '{"is_error":false,"result":"You'"'"'ve hit your individual spend limit · visit claude.ai/admin-settings/usage to raise it"}' > "$REPLY"
 out=$( (PQ_REPOS_DIR=$(mktemp -d); plan=$PLANF; repo=$REPO; repo_explicit=0; repo_vals=""; model=sonnet; effort=xhigh; urgent=0; after_vals=""; split_dir=""; do_split) 2>&1); rc=$?
-eq "$rc" "1" "a walled splitter stops the split"
+eq "$rc" "1" "a splitter at the limit stops the split"
 has "$out" "the splitter hit the usage limit" "saying why"
 hasnt "$out" "wrote no graph.tsv" "not that it wrote no graph"
+# The namer's own answer is one line too, and a plan about running out of
+# credits puts the limit's very words in it.
+printf '%s\n' '{"branch":"tom/usage-banner","intent":"Warn members before they run out of usage credits or hit your plan limit.","security":false,"parts":["Add the usage banner"]}' > "$REPLY"
+out=$(name_plan "$PLANF" 2>/dev/null); rc=$?
+eq "$rc" "0" "a one-line JSON answer that mentions the limit is an answer"
+eq "$(head -1 <<<"$out" | cut -f1)" "tom/usage-banner" "and names the plan"
 
 echo "== the tick lock: atomic with its owner, and a reused pid is not its owner ==" >&2
 reset_tasks
@@ -235,7 +241,7 @@ st_set "$T" PQ_PANE w5:p1; st_set "$T" PQ_WORKTREE "$WT_A"; st_set "$T" PQ_LAUNC
 set_panes "$(printf 'w5:p1\tclaude\tidle\t%s' "$WT_B")"
 eq "$(task_pane "$T")" "" "a pane sitting in another worktree is not this task's"
 eq "$(pane_state "$(task_pane "$T")")" "missing" "so the task's own pane reads as missing"
-printf "You've hit your session limit · resets 7pm\n" > "$STUBBIN/pane.w5_p1"
+printf "  Do you want to proceed?\n" > "$STUBBIN/pane.w5_p1"
 : > "$HERDR_LOG"                        # set_panes' own snapshot read is not the question
 check_stall "$T" >/dev/null 2>&1
 grep -q "w5:p1" "$HERDR_LOG" && bad "and nothing reads or knocks on somebody else's pane" || ok

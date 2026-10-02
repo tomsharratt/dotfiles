@@ -232,7 +232,7 @@ eq "$(st "$L" PQ_REVIEW)" "" "an unset key stays unset"
 review_settled "$L" && ok || bad "and reads as settled, exactly as it always did"
 eq "$(agent_cell "$L" "done")" "wrapping up" "with the cell it always had"
 
-echo "== pending defers while the agent is working, blocked, walled, or herdr is silent ==" >&2
+echo "== pending defers while the agent is working, blocked, on a prompt, or herdr is silent ==" >&2
 reset_tasks; reset_caches; reset_logs
 G=$(mk_gated 010 gated w1:p1)
 for s in working blocked; do
@@ -241,9 +241,9 @@ for s in working blocked; do
   eq "$(st "$G" PQ_REVIEW)" "pending" "a $s agent is left alone"
 done
 set_panes "$(printf 'w1:p1\tclaude\tidle')"
-st_set "$G" PQ_BLOCKED quota
+st_set "$G" PQ_BLOCKED permission
 review_task "$G" 0
-eq "$(st "$G" PQ_REVIEW)" "pending" "a dismissed wall reads idle to herdr - PQ_BLOCKED holds it back"
+eq "$(st "$G" PQ_REVIEW)" "pending" "a prompt herdr reads as idle - PQ_BLOCKED holds it back"
 st_set "$G" PQ_BLOCKED ""
 PIDX=""; PIDX_OK=0
 review_task "$G" 0
@@ -611,14 +611,6 @@ has "$(prompt_text)" "posted its findings as inline review comments" "the follow
 echo "== the count reads every page, and only the threads a review opens ==" >&2
 grep -q -- '--paginate' "$GH_LOG" && ok || bad "the count must page past GitHub's 30 (log: $(cat "$GH_LOG"))"
 grep -q 'in_reply_to_id == null' "$GH_LOG" && ok || bad "and count top-level comments, not the replies under them"
-
-echo "== a resumed review keeps the count from before it first ran ==" >&2
-reset_tasks; reset_caches; reset_logs; mode ok; printf '9' > "$COMMENTS"
-S2=$(mk_gated 055 resumed w6:p1)
-st_set "$S2" PQ_REVIEW_SESSION s-walled; st_set "$S2" PQ_REVIEW_COMMENTS 5
-set_panes "$(printf 'w6:p1\tclaude\tidle')"
-review_task "$S2" 0 >/dev/null 2>&1
-eq "$(st "$S2" PQ_REVIEW_COMMENTS)" "5" "what it posted before the wall still counts as its own"
 
 echo "== a stale pid is a failed try ==" >&2
 reset_tasks; reset_caches; reset_logs; mode sleep

@@ -168,8 +168,8 @@ PQ_STAMP_REAL=10000000000000
 
 # Fixed values, not knobs: nothing has ever set one of these but a test, and a
 # test assigns them after sourcing this file, which a plain assignment allows. The
-# four that ARE knobs - read from the environment, and documented - are
-# PQ_QUOTA_RE, PQ_REVIEWER_MODEL, PQ_REVIEW_MAX_TRIES and PQ_REVIEW_TOOLS below.
+# three that ARE knobs - read from the environment, and documented - are
+# PQ_REVIEWER_MODEL, PQ_REVIEW_MAX_TRIES and PQ_REVIEW_TOOLS below.
 PQ_DEFAULT_MODEL=sonnet                 # what the wizard's Enter takes
 PQ_DEFAULT_EFFORT=xhigh
 PQ_DEFAULT_CAP=1                        # the cap before `pq cap` has ever been run - see "the cap"
@@ -187,17 +187,15 @@ PQ_DONE_KEEP=3                          # newest archivable done/ tasks archive_
 PQ_WRAPUP_GRACE=300
 RUN_INTERVAL=120                        # seconds between `pq run`'s ticks
 
-# What the session wall looks like on screen, and how hard to knock. These are
-# Claude Code UI strings, so they will change - hence up here rather than buried
-# in the logic that uses them, and the wall's pattern overridable.
-#
-# No braces in this default: `${VAR:-...}` ends at the first unescaped `}`, so a
-# bounded repetition like {0,24} gets cut in half and the rest leaks out as literal
-# text. It fails as a corrupt pattern at match time, not as a syntax error here.
-PQ_QUOTA_RE="${PQ_QUOTA_RE:-limit to reset|usage limit reached|out of usage credits|hit your .*limit}"
+# What pq reads off a session's screen or its reply. These are Claude Code UI
+# strings, so they will change - hence up here rather than buried in the logic
+# that uses them. PQ_LIMIT_RE is what a session says when the account has run
+# out: the monthly spend limit, in whichever words the plan uses - "You've hit
+# your individual spend limit", "...your org's monthly spend limit", "You're out
+# of usage credits". It is only ever matched against a headless session's WHOLE
+# reply (see limit_reply), never against a pane.
+PQ_LIMIT_RE='hit your .*limit|usage limit reached|out of usage'
 PQ_PERM_RE='Do you want to |Yes, and don.t ask again|Allow once'
-PQ_QUOTA_RETRY=600                      # seconds between "continue" attempts
-PQ_QUOTA_MAX_TRIES=40                   # ~7h at that interval, then stop knocking
 PQ_TAIL_LINES=30
 
 # The one branch every task's screenshots are published to (`pq evidence`), in
@@ -290,9 +288,9 @@ st() {                                  # task_dir key
 #
 # Values must be shell-safe WORDS, because `st` reads this file by sourcing it and
 # nothing here quotes anything. That is not a style note: a value containing a
-# bracket - `PQ_RESETS=3pm (PDT)`, as the session wall used to store its hint - is a
-# syntax error, and bash abandons the whole file at that line, so every key written
-# after it silently reads empty. Store the machine form of a fact (an epoch, an id, a
+# bracket - `PQ_RESETS=3pm (PDT)`, as pq once stored a reset time - is a syntax
+# error, and bash abandons the whole file at that line, so every key written after
+# it silently reads empty. Store the machine form of a fact (an epoch, an id, a
 # stamp) and format it on the way out; never store prose.
 st_set() {                              # task_dir key value
   local f="$1/state.env"
@@ -404,14 +402,8 @@ cmd_cap() {
   active=$(( $(running_count) + nwrap ))
   local also=""
   [ "$nwrap" -gt 0 ] && also=" ($nwrap of them wrapping up a PR)"
-  # A wall outranks the arithmetic here as much as it does in fill: room the next
-  # tick will not use is not room, and the reason is the whole answer.
-  local walled_by walled_at
-  IFS=$'\t' read -r walled_by walled_at <<<"$(walled_slot)"
   if [ "$1" = 0 ]; then
     msg "cap 0 - paused. $active still running$also; nothing new will start."
-  elif [ -n "$walled_by" ]; then
-    msg "cap $1 - $active running$also, but $walled_by is $(walled_note "$walled_at"), so nothing new starts until it is moving again."
   elif [ "$active" -gt "$1" ]; then
     msg "cap $1 - $active already running$also, so nothing new starts until $(( active - $1 + 1 )) of them finish."
   else
@@ -788,12 +780,12 @@ The branch must differ from these, which are already taken: $avoid"
   [ -n "$label" ] && prompt="$prompt
 This part lands in the $label repository, so make the branch name say which one if the task's own words would not already distinguish it from the same work elsewhere."
   raw=$(headless_claude -p --model "$PQ_NAMER_MODEL" "$prompt" < "$1" 2>/dev/null) || return 0
-  # A usage-limit reply is the wall's one line where the JSON should be, and read
+  # A usage-limit reply is the limit's one line where the JSON should be, and read
   # as a reply with no JSON it said "Haiku gave no usable branch; try pq add
-  # again" - which cannot work until the reset. Say that instead.
-  local wall
-  if wall=$(wall_reply "$raw"); then
-    warn "naming hit the usage limit: $wall"
+  # again" - which cannot work until the limit lifts. Say that instead.
+  local limit
+  if limit=$(limit_reply "$raw"); then
+    warn "naming hit the usage limit: $limit"
     return 3
   fi
   # Be forgiving about a fenced or chatty reply: take the span from the first `{`
@@ -1476,7 +1468,7 @@ cmd_add() {                             # plan branch intent security ("" "" "" 
   local named=""
   if [ -z "$split_dir" ] && [ -z "$branch" ]; then
     local named_all nrc; named_all=$(name_plan "$plan"); nrc=$?
-    [ "$nrc" = 3 ] && die "could not name the plan behind the usage limit - pq add again once it resets"
+    [ "$nrc" = 3 ] && die "could not name the plan behind the usage limit - pq add again once it lifts"
     named=$(head -1 <<<"$named_all")
     outline=$(outline_of "$named_all")
   fi
@@ -1558,7 +1550,7 @@ cmd_add() {                             # plan branch intent security ("" "" "" 
   # request behind it, is taken. A branch handed in (a split part) is the caller's.
   if why=$(branch_taken "$branch" "$repo") && [ -n "$named" ]; then
     warn "branch '$branch' is already $why - asking for another name"
-    named=$(name_plan "$plan" "$branch") || { [ $? = 3 ] && die "could not rename the plan behind the usage limit - pq add again once it resets"; }
+    named=$(name_plan "$plan" "$branch") || { [ $? = 3 ] && die "could not rename the plan behind the usage limit - pq add again once it lifts"; }
     named=$(head -1 <<<"$named")
     branch=$(cut -f1 <<<"$named"); intent=$(cut -f2 <<<"$named"); security=$(cut -f3 <<<"$named")
     [ -n "$branch" ] || die "could not name the plan - Haiku gave no usable branch; try pq add again"
@@ -2189,7 +2181,7 @@ split_name_parts() {                    # sd leveled_tsv multi
       else
         named=$(name_plan "$sd/$part" "$avoid")
       fi
-      [ $? = 3 ] && die "$part: could not be named behind the usage limit - nothing queued; resume once it resets with: $(split_resume_hint "$sd")"
+      [ $? = 3 ] && die "$part: could not be named behind the usage limit - nothing queued; resume once it lifts with: $(split_resume_hint "$sd")"
       [ -n "$named" ] || die "$part: could not derive a branch name and intent - naming failed"
       # `cut`, not `read`: a tab is IFS whitespace, so an empty intent would
       # let the verdict slide into its place - see cmd_add.
@@ -2621,13 +2613,13 @@ do_split() {
     dur=$(jq -r       '.duration_ms // empty'    "$sd/splitter.json" 2>/dev/null)
     denials=$(jq -r   '.permission_denials // empty' "$sd/splitter.json" 2>/dev/null)
     [ -z "$denials" ] || [ "$denials" = "[]" ] || warn "the splitter reached for something denied: $denials"
-    # A wall is not a failed split and not a split with no graph, which is what
-    # it read as: "the splitter wrote no graph.tsv", with the reason buried in
-    # splitter.json. It exits 0 with the wall's one line for its whole reply.
-    local swall
-    if swall=$(wall_reply "$(jq -r 'if type == "object" then (.result // "" | tostring) else "" end' "$sd/splitter.json" 2>/dev/null)") \
-       || swall=$(wall_reply "$(sed '/^[[:space:]]*$/d' "$sd/splitter.err" 2>/dev/null | tail -n 1)"); then
-      die "the splitter hit the usage limit ($swall) - nothing was split; pq add --split again once it resets"
+    # The usage limit is not a failed split and not a split with no graph, which
+    # is what it read as: "the splitter wrote no graph.tsv", with the reason buried
+    # in splitter.json. It exits 0 with the limit's one line for its whole reply.
+    local slimit
+    if slimit=$(limit_reply "$(jq -r 'if type == "object" then (.result // "" | tostring) else "" end' "$sd/splitter.json" 2>/dev/null)") \
+       || slimit=$(limit_reply "$(sed '/^[[:space:]]*$/d' "$sd/splitter.err" 2>/dev/null | tail -n 1)"); then
+      die "the splitter hit the usage limit ($slimit) - nothing was split; pq add --split again once it lifts"
     fi
     if [ "$rc" != 0 ] || [ "$is_error" = "true" ]; then
       die "the splitter session failed - see $sd/splitter.err and $sd/splitter.json"
@@ -2747,8 +2739,8 @@ pane_state() {                          # pane_id
 #
 #   working           holds it, and clears the clock - this is real work
 #   blocked           holds it, and clears the clock. Same trade `running/`
-#                     already makes: a permission prompt or a quota wall is an
-#                     agent that will resume, not one that has finished. It is
+#                     already makes: an agent on a permission prompt will
+#                     resume, not one that has finished. It is
 #                     the one state besides `working` with no deadline, and
 #                     `pq ls` reports a blocked done row as `blocked` rather
 #                     than `wrapping up`, counting it into "needs you"
@@ -2767,21 +2759,6 @@ pane_state() {                          # pane_id
 #                     agent from a finished one, and guessing "finished" is
 #                     exactly the over-dispatch this exists to stop. Dispatch
 #                     needs herdr too, so nothing is lost by waiting.
-#
-# On top of herdr's word, pq's own PQ_BLOCKED=quota holds the slot with no
-# deadline, exactly as `blocked` does, and for a reason herdr cannot see: the
-# first thing check_stall does about a wall is DISMISS it, which stops the
-# spinner, so from that moment a walled agent reads `idle` and the grace would
-# hand its slot away while it waits for its window. It is then handed back on the
-# very tick the block clears - the tick its agent starts working again - which is
-# the "six agents at a cap of 3" bug arriving one tick late.
-#
-# One asymmetry that is deliberate, since two functions otherwise look like they
-# disagree: reap_task decides "the agent is still going" from herdr's
-# `working`/`blocked` alone, so it will tear down a walled task that this one is
-# still holding a slot for. Reap wins, and should - it only fires once the pull
-# request has settled, and one that merged or was closed leaves the agent nothing
-# to come back to either way. The slot goes with the teardown.
 #
 # `running/` is deliberately NOT put through this: it counts unconditionally.
 # That preserves the documented trade that a blocked task still holds its slot,
@@ -2810,11 +2787,8 @@ slot_held() {                           # task_dir -> 0 holds, 1 released
   case "$status" in
     noagent|missing) return 1 ;;
   esac
-  # A dismissed wall reads `idle`, so pq's own verdict has to be consulted before
-  # the grace is applied to one - see the note above.
-  [ "$(st "$d" PQ_BLOCKED)" = quota ] && status=blocked
-  # So does a review in flight against this task's pull request, for the same
-  # shape of reason: the implementer is idle because it is WAITING - for the
+  # A review in flight against this task's pull request holds the slot with no
+  # deadline: the implementer is idle because it is WAITING - for the
   # reviewer, then for the follow-up - and releasing the slot would start a fresh
   # agent beside one about to be told to fix things. Deadline-free here, bounded
   # by the gate's own bounds (see the `review gate` section); `prompted` is not
@@ -2905,9 +2879,8 @@ slot_state() {                          # task_dir -> "wrapping up" | ""
   case "$status" in
     noagent|missing) return 0 ;;
   esac
-  # Same overrides as slot_held, for the same reasons: a dismissed wall reads
-  # `idle`, and so does an agent waiting on the review gate.
-  [ "$(st "$d" PQ_BLOCKED)" = quota ] && status=blocked
+  # The same override as slot_held, for the same reason: an agent waiting on the
+  # review gate reads `idle`.
   review_inflight "$d" && status=blocked
   case "$status" in
     working|blocked|"") printf 'wrapping up'; return 0 ;;
@@ -2922,398 +2895,65 @@ slot_state() {                          # task_dir -> "wrapping up" | ""
   return 0
 }
 
-# ── the session wall ────────────────────────────────────────────────────────
-# Claude Code turns a 429 into a dialog - "Wait for limit to reset · Resets 3pm" -
-# and every option on it only dismisses the dialog. Nothing resumes by itself. So
-# an agent that hits the wall at 2am sits there until morning unless something
-# knocks on it, and that knock is the only reason this section exists.
+# ── reading the pane ────────────────────────────────────────────────────────
+# Every tick reads the bottom of each dispatched agent's pane, for the two ways an
+# unattended agent stops without exiting: a permission prompt, which is recorded
+# and left for you, and going quiet, which check_quiet below knocks on.
 #
-# Three deliberate choices, each of which the obvious alternative gets wrong.
+# The account's usage limit is deliberately not a third. It is a monthly spend
+# limit - a hard stop, with no reset an hour or two out to wait for - so pq does
+# not knock on it, time it or hold the queue for it. An agent that hits it stops
+# like any other: on Claude Code's dialog it reads as `blocked`, a running one left
+# idle is nudged and then handed to you as `quiet`, and one wrapping up in done/
+# simply sits until you see to it. The cap bounds the damage: a task in running/
+# holds its slot until it opens a pull request, so no more than the cap can be
+# dispatched into it.
 #
-# **Detection is the pane's TEXT, never herdr's status.** Herdr derives status from
-# its own regexes over terminal regions, and its top rule (priority 1100,
-# `osc_title_working`: a braille spinner in the window title) outranks every
-# blocked rule it has. A spinner is exactly what is on screen while the request
-# that hit the wall is still in flight. Gating on `blocked` would risk never firing.
-#
-# **Liveness is the tail's HASH, not a status either.** We act only when the wall's
-# text is on screen AND the tail has not changed since the last tick. That matters
-# in both directions: a working agent's tail moves every few seconds so this cannot
-# interrupt one, and the wall's message stays in the scrollback for a while after
-# the session recovers, so the text alone would keep firing long after it should.
-#
-# **We wait for the time the dialog names, and poll only if we cannot read it.**
-# The dialog carries "Resets 8:30pm", and that hint beats any other source of the
-# same fact: it comes from the error that walled us, so it already refers to the
-# right window. The account has two (five-hour and weekly) and nothing else on hand
-# would say which one we are behind.
-#
-# Its format is fixed by Claude Code's own formatter and worth writing down, because
-# two of its habits will bite anyone who assumes otherwise: minutes are omitted when
-# they are zero ("8pm", not "8:00pm"), and no date is printed for anything less than
-# 24 hours out - so a bare "1am" seen at 11pm means tomorrow. Beyond 24 hours it
-# becomes "Jul 28, 8:30pm", and gains a year only when the year differs.
-#
-# A hint we cannot read is not a failure: PQ_QUOTA_RETRY polling is the fallback,
-# and it also takes over after a knock at the named time turns out to be too early.
-# Waiting on an unparsed guess is the only outcome worth ruling out, since that
-# strands a task silently, where a knock sent early costs one instantly-failing call.
 # `pane read`, not `agent read`, and `--format text` is already text - it is not a
-# JSON envelope with the terminal inside it. Piping it through jq is how this
-# returned the empty string on every tick of every task for as long as the section
-# existed, which check_stall reads as "could not see the pane" and returns on. The
-# wall was never once detected.
+# JSON envelope with the terminal inside it. Piping it through jq is how an early
+# version of this returned the empty string on every tick of every task, which
+# check_stall reads as "could not see the pane" and returns on.
 #
 # `pane read` is also the only one of the two that answers for a pane whose agent
 # binding has lapsed - `agent read` returns an `agent_not_found` error object - and
 # answering for exactly that pane is the point of the `noagent` case reconcile goes
 # out of its way to include. An error object is still possible (a dead socket, a
 # pane id that is gone), so drop one: it is not terminal text, and letting it
-# through would have `classify_tail` reading somebody's error message.
+# through would have check_stall reading somebody's error message.
 pane_tail() {                           # pane_id -> the last lines on screen
   [ -n "${1:-}" ] || return 0
   herdr pane read "$1" --source visible --format text 2>/dev/null \
     | grep -v '^{"error":' | tail -n "$PQ_TAIL_LINES"
 }
 
-# "Resets 8:30pm" / "Resets Jul 28, 8pm" -> epoch. Local time throughout, because
-# that is what Claude Code printed. Silence means "could not read it" and the caller
-# falls back to polling, so every branch here fails closed rather than guessing.
-#
-# Every format below carries an explicit `%S` against a literal `00`, because BSD
-# `date -j -f` fills a field the format does not mention from the CURRENT time - so a
-# hint with no seconds in it silently picked up however many seconds past the minute
-# it happened to be parsed at. Harmless in the arithmetic, but it made a stored reset
-# disagree with the one on screen, and `clock_of` its own inverse only by luck.
-parse_reset() {                         # hint text -> epoch seconds
-  local s=$1 dpart tpart e nowe
-  s=${s%%(*}                                          # drop a trailing " (PDT)"
-  s=$(sed 's/^[[:space:]]*//; s/[[:space:]]*$//' <<<"$s")
-  [ -n "$s" ] || return 1
-  # Split on the LAST comma: the with-year form is "Jan 3, 2027, 9am".
-  case "$s" in
-    *,*) dpart=$(tr -d ',' <<<"${s%,*}"); tpart=${s##*,} ;;
-    *)   dpart=""; tpart=$s ;;
-  esac
-  tpart=$(tr -d ' ' <<<"$tpart" | tr '[:lower:]' '[:upper:]')
-  # shellcheck disable=SC2001  # a backreference, which no parameter expansion does
-  case "$tpart" in *:*) ;; *) tpart=$(sed 's/\([0-9]\{1,2\}\)\([AP]M\)/\1:00\2/' <<<"$tpart") ;; esac
-  case "$tpart" in *AM|*PM) ;; *) return 1 ;; esac
-  nowe=$(date '+%s')
-  if [ -n "$dpart" ]; then
-    dpart=$(sed 's/^[[:space:]]*//; s/[[:space:]]*$//' <<<"$dpart")
-    case "$dpart" in
-      *[0-9][0-9][0-9][0-9]*) e=$(date -j -f '%b %d %Y %I:%M%p %S' "$dpart $tpart 00" '+%s' 2>/dev/null) ;;
-      *) e=$(date -j -f '%b %d %Y %I:%M%p %S' "$dpart $(date '+%Y') $tpart 00" '+%s' 2>/dev/null)
-         # No year printed means this year - unless we are reading it across new year.
-         [ -n "$e" ] && [ "$e" -lt $(( nowe - 86400 )) ] &&
-           e=$(date -j -f '%b %d %Y %I:%M%p %S' "$dpart $(( $(date '+%Y') + 1 )) $tpart 00" '+%s' 2>/dev/null) ;;
-    esac
-  else
-    e=$(date -j -f '%Y-%m-%d %I:%M%p %S' "$(date '+%Y-%m-%d') $tpart 00" '+%s' 2>/dev/null)
-    # A bare clock time is the next time the clock reads it, so 1am seen at 11pm
-    # is tomorrow. The small grace keeps a reset we have just passed from jumping.
-    [ -n "$e" ] && [ "$e" -lt $(( nowe - 300 )) ] && e=$(( e + 86400 ))
-  fi
-  [ -n "$e" ] || return 1
-  printf '%s' "$e"
-}
-
-# The pane WRAPS, and the wall line that turns up most nights is long enough to
-# need it: what walls a task is usually a background agent, and its failure is
-# reported into the transcript with the whole API error inside it, under a bullet
-# that indents the lot ("Agent "..." failed: Agent terminated early due to an API
-# error: You've hit your session limit - resets 4:20pm (America/Toronto)").
-#
-# Claude Code breaks on word boundaries, and almost every break point is harmless:
-# the hint lands whole on one row or the other, and parse_reset stops at the first
-# bracket, so a break inside "(America/Toronto)" costs nothing. Exactly one hurts,
-# and it is the one that happens - a break straight after "resets", which leaves
-# the time on a row that no longer looks like the wall and a wall row with nothing
-# after "resets" at all. Herdr trims the row, so not even the trailing space
-# survives to mark it as a hint that was cut off. Both greps below then come up
-# empty on a pane that is showing the reset time in plain sight.
-#
-# Rejoining those two rows before looking at anything is the whole fix, and the
-# continuation's indent goes with the join so the hint comes out clean.
-unwrap_resets() {                       # pane text -> the same, wrapped hints whole
-  awk '
-    held != "" { cont = $0; sub(/^[[:space:]]+/, "", cont)
-                 print held " " cont; held = ""; next }
-    /[Rr]esets[[:space:]]*$/ { held = $0; next }
-                             { print }
-    END { if (held != "") print held }
-  ' <<<"$1"
-}
-
-# The hint sits at the end of a line that may well be inside a bordered box, so
-# anything trailing that cannot be part of a date is dropped.
-#
-# Which line it comes off matters, because there are usually two. The wall's own
-# line carries one ("You've hit your session limit - resets 3pm (PDT)"), and a
-# statusline that reports rate limits carries another ("session 70% (resets
-# 10:40pm)") - so a plain `tail -1` takes the statusline's, purely because the
-# statusline is drawn below the transcript. That is the wrong one twice over: it
-# names the five-hour window even when what walled us was the weekly one, and its
-# trailing bracket makes parse_reset fail, silently demoting a reset we could have
-# read to blind polling.
-#
-# So prefer a hint on a line that also looks like the wall, and only fall back to
-# any other. The fallback is worth keeping - a statusline hint beats no hint, and
-# it is right in the common case - which is why the two shapes it comes in are
-# tolerated below: a trailing bracket, and a weekday for a reset that crosses
-# midnight. Dropping the weekday loses nothing, since parse_reset already reads a
-# bare clock time as the next time the clock reads it.
-#
-# Preference, though, is not the same as one shot at it. Picking the last line of
-# the better group and giving up if nothing came of it lets a single unreadable
-# line hide a perfectly good one lower down - a dangling "...resets" at the very
-# bottom of the visible area, with no next row to be joined to, is enough to do it.
-# So the groups are a queue in priority order, newest line of each first, and the
-# answer is the first hint that parse_reset will actually take.
-reset_hint() {                          # pane text -> the time the wall names
-  local text cand hint
-  text=$(unwrap_resets "$1")
-  while IFS= read -r cand; do
-    # The weekday strip is anchored to a whole bare clock time on purpose: a
-    # leading three-letter word is a weekday in "Sat 1:00am" and a MONTH in
-    # "Jul 28, 8pm", and dropping the month would move the reset by up to a year.
-    # A timezone may follow the clock time and is kept for parse_reset to trim:
-    # a wall whose reset falls after midnight reads "resets Thu 12:10am
-    # (America/Toronto)", and with the strip anchored to the clock time alone
-    # that line never parsed - pq fell back to whatever the statusline named.
-    hint=$(sed -n 's/.*[Rr]esets \(.*\)$/\1/p' <<<"$cand" \
-      | sed 's/[^0-9A-Za-z:,() ]*$//
-             s/)$//
-             s/^[A-Za-z][a-z][a-z] \([0-9]\{1,2\}\(:[0-9][0-9]\)*[APap][Mm]\)\( (.*\)*$/\1\3/')
-    [ -n "$hint" ] || continue
-    parse_reset "$hint" >/dev/null 2>&1 || continue
-    printf '%s' "$hint"; return 0
-  done <<<"$( { grep -iE "$PQ_QUOTA_RE" <<<"$text" | grep -i 'resets ' | tail -r
-                grep -i 'resets ' <<<"$text" | tail -r; } )"
-}
-
-# parse_reset's inverse, for the one place a stored reset is shown to a human. What
-# is KEPT is the epoch - a hint is prose, and prose does not survive a round trip
-# through state.env (see st_set) - so the display form is rebuilt on the way out
-# rather than stored alongside it.
-#
-# Formatted the way Claude Code formats the same fact, since that is what you saw on
-# the pane: minutes dropped when they are zero, and a weekday only once the reset is
-# not today. ASCII throughout, as every `pq ls` cell must be.
-clock_of() {                            # epoch seconds -> "8:30pm" | "Sat 1am"
-  [ -n "${1:-}" ] || return 0
-  local fmt='+%-I:%M%p'
-  [ "$(date -r "$1" '+%M' 2>/dev/null)" = 00 ] && fmt='+%-I%p'
-  [ "$(date -r "$1" '+%j' 2>/dev/null)" = "$(date '+%j')" ] || fmt="+%a ${fmt#+}"
-  # Only the meridiem is lowercased, and by substitution rather than `tr`, which
-  # would take the weekday with it. Same two expressions the statusline uses.
-  date -r "$1" "$fmt" 2>/dev/null | sed 's/AM$/am/; s/PM$/pm/'
-}
-
-classify_tail() {                       # text -> quota | permission | none
-  if   grep -qiE "$PQ_QUOTA_RE" <<<"$1"; then printf 'quota'
-  elif grep -qiE "$PQ_PERM_RE"  <<<"$1"; then printf 'permission'
-  else                                        printf 'none'; fi
-}
-
-# Escape rather than picking an option off the list. There are at least two
-# different limit dialogs in the binary and their option sets differ - one of them
-# offers "Upgrade to Team plan" - so arrowing to the Nth entry is a bet on which
-# dialog turned up. Escape does not care, and since every option merely dismisses,
-# it loses nothing.
-unstick() {                             # pane_id [text to send after]
-  herdr pane send-keys "$1" escape >/dev/null 2>&1 || return 1
-  [ -n "${2:-}" ] || return 0
-  sleep 1
-  herdr pane send-text "$1" "$2" >/dev/null 2>&1 \
-    && herdr pane send-keys "$1" enter >/dev/null 2>&1
-}
-
-clear_block() {                         # task_dir
-  local d=$1 k
-  for k in PQ_BLOCKED PQ_QUOTA_SINCE PQ_TRIES PQ_RETRY_AT PQ_GAVEUP PQ_RESETS_AT; do st_set "$d" "$k" ""; done
-}
-
-# One task, one tick: record what its pane is waiting on, and knock if it is the
-# wall. Everything else is classified and left alone - answering a dialog nobody has
-# identified is how an unattended system approves something it shouldn't.
-#
-# **Once the wall has been seen, the schedule is pq's own.** The banner is not
-# transcript text: it is live UI that Claude Code derives from the reset time it is
-# waiting for, so it clears ITSELF at the reset - which is the exact moment the knock
-# comes due. Cancelling the plan whenever the wall is no longer on screen therefore
-# threw it away at the one moment it mattered, and an agent walled at 2am sat there
-# until morning with nothing left on file to say it ever had been.
-#
-# So the text is treated as a signal, not as state. It puts the block on; from then
-# on PQ_RETRY_AT decides, and what is on screen decides nothing until the knock is
-# due.
-#
-# What takes the block off is evidence the agent is MOVING again, and "moving" needs
-# two things, not one. The tail hash alone is not enough, because a statusline that
-# reports rate limits is inside the tail and turns over at the reset - a one-tick
-# hash change landing at precisely `due + 60`, indistinguishable from the agent
-# picking its work back up, and it would clear the block on an idle agent that never
-# resumed. So movement has to be corroborated by herdr calling the pane `working`.
-#
-# That is not a retreat from "detection is the pane's TEXT, never herdr's status".
-# That rule is about DETECTION, where herdr's top rule reads the spinner still in the
-# title as `working` while the request that hit the wall is in flight. By the time a
-# knock is due the dialog has long been dismissed and nothing is in flight, so
-# `working` there means what it says. PIDX is loaded once per tick, so it is free.
+# One task, one tick: record whether its pane is on a permission prompt, and hand
+# anything else to check_quiet on the same read. A prompt is recorded and
+# deliberately never answered. That is the trade for running everything in auto
+# mode - answering a dialog nobody has identified is how an unattended system
+# approves something it shouldn't - and it is the distinction `pq ls` draws in the
+# morning between an agent waiting on you and one that has simply stopped.
 check_stall() {                         # task_dir
-  local d=$1 slug pane text hash prev kind was tries at nowsec still moved
+  local d=$1 pane text
   pane=$(task_pane "$d"); [ -n "$pane" ] || return 0
   text=$(pane_tail "$pane"); [ -n "$text" ] || return 0
-  slug=$(slug_of "$d"); nowsec=$(epoch)
-  hash=$(cksum <<<"$text" | awk '{ print $1 }')
-  prev=$(st "$d" PQ_TAIL); st_set "$d" PQ_TAIL "$hash"
-  kind=$(classify_tail "$text")
-  was=$(st "$d" PQ_BLOCKED)
-  # "Has this screen stopped" and "has this screen moved" are not each other's
-  # negation: with no hash on file yet, the honest answer to both is no. Folding them
-  # into one flag has to pick a side, and each side is wrong somewhere - a first read
-  # counted as still detects a wall off a single glimpse, and a first read counted as
-  # moved lets one glimpse of a `working` title clear a block that is real.
-  still=0; moved=0
-  if [ -n "$prev" ]; then
-    if [ "$prev" = "$hash" ]; then still=1; else moved=1; fi
-  fi
-
-  # A permission prompt is recorded and deliberately never answered. That is the
-  # trade for running everything in auto mode, and it is the distinction `pq ls`
-  # draws in the morning between waiting on the clock and waiting on you.
-  #
-  # It also ends a wall, wherever we had got to with one: a session that is asking
-  # for something is a session that is running again. Ending it here matters, because
-  # the alternative is a knock sending Escape at a prompt - refusing it - and then
-  # doing that again every ten minutes.
-  if [ "$kind" = permission ]; then
-    [ "$was" = quota ] && msg "$slug: moving again after the session limit"
-    [ -n "$was" ] && [ "$was" != permission ] && clear_block "$d"
-    st_set "$d" PQ_BLOCKED permission
+  if grep -qiE "$PQ_PERM_RE" <<<"$text"; then
+    [ "$(st "$d" PQ_BLOCKED)" = permission ] || st_set "$d" PQ_BLOCKED permission
     return 0
   fi
-
-  if [ "$was" != quota ]; then
-    if [ "$kind" != quota ]; then
-      # Only when there is something to clear: this is the overwhelmingly common
-      # branch, and each clear is six rewrites of state.env for no change at all.
-      [ -n "$was" ] && clear_block "$d"
-      # No wall and no prompt - but an agent can stop without either, and that
-      # is the next thing to look at, on the same read of the pane.
-      check_quiet "$d" "$pane" "$text" "$hash" "$nowsec"
-      return 0
-    fi
-    # The wall is on screen, but only a screen that has stopped moving is stuck.
-    [ "$still" = 1 ] || return 0
-    local hint due plan
-    hint=$(reset_hint "$text")
-    due=$(parse_reset "$hint") || due=""
-    if [ -n "$due" ] && [ "$due" -gt "$nowsec" ]; then
-      plan="waiting until $(clock_of "$due")"
-      st_set "$d" PQ_RESETS_AT "$due"
-      due=$(( due + 60 ))               # a minute past it, so clock skew cannot land early
-    else
-      due=$(( nowsec + PQ_QUOTA_RETRY ))
-      plan="no reset time on screen, so knocking every $(( PQ_QUOTA_RETRY / 60 ))m"
-      st_set "$d" PQ_RESETS_AT ""
-    fi
-    st_set "$d" PQ_BLOCKED quota;  st_set "$d" PQ_QUOTA_SINCE "$(now)"
-    st_set "$d" PQ_TRIES 0;        st_set "$d" PQ_RETRY_AT "$due"
-    unstick "$pane"
-    warn "$slug: hit the session limit - dismissed it, $plan"
-    return 0
-  fi
-
-  # Already walled. The pane is moving under its own steam, so it is back - let it
-  # be, whatever the clock says. Waiting for the reset before believing this would
-  # strand the block for hours whenever you rescue an agent yourself in the morning,
-  # and a block still on file is a block that freezes the queue (see the freeze in
-  # tick_body). A wall that is over is over.
-  #
-  # Both halves are needed. `moved` alone is the statusline turning over at the
-  # reset; `working` alone risks a spinner herdr has not caught up with yet, one tick
-  # after the Escape. Together they are only ever true of an agent doing work: while
-  # walled and dismissed the pane is both still and idle.
-  if [ "$moved" = 1 ] && [ "$(pane_state "$pane")" = working ]; then
-    msg "$slug: moving again after the session limit"
-    clear_block "$d"
-    return 0
-  fi
-
-  tries=$(st "$d" PQ_TRIES); tries=${tries:-0}
-  at=$(st "$d" PQ_RETRY_AT); at=${at:-0}
-
-  # Until the knock is due, nothing on screen changes anything - the banner going
-  # away is what the reset looks like, not what recovery looks like - with one
-  # exception, which is a reset time that was not there to be read at detection.
-  #
-  # It often is not. What walls a task is usually a BACKGROUND agent's request, and
-  # its failure reaches the transcript seconds before the session's own next
-  # request fails and puts the same time in the statusline - so the tick that
-  # catches the wall can be one that honestly has nothing to read, on a pane that
-  # is showing the time plainly by the time you look at it. Reading once and
-  # settling for polling all night is the worst of both, because the reset was
-  # there.
-  #
-  # Two guards, and both are load-bearing. The knock must not be due yet, so this
-  # only ever refines a plan still in force rather than overruling one that has run
-  # its course. And nothing may have been knocked on yet, because a knock DEMOTES
-  # us to polling on purpose - it means the named time came and went with the wall
-  # still up - while the line that named it stays in the scrollback for ever.
-  # Re-reading that line afterwards would not even give back a stale time:
-  # parse_reset reads a bare clock time as the next time the clock comes round to
-  # it, so `resets 4:20pm` read at 4:30 is TOMORROW, and a ten-minute cycle would
-  # become a day-long one. Before any knock neither applies - nothing has been
-  # demoted, and what is on screen is minutes old.
-  if [ "$nowsec" -lt "$at" ]; then
-    [ "$tries" = 0 ] && [ -z "$(st "$d" PQ_RESETS_AT)" ] || return 0
-    local late
-    late=$(parse_reset "$(reset_hint "$text")") || return 0
-    [ "$late" -gt "$nowsec" ] || return 0
-    # Later than now is not enough on its own, because there is a second way into
-    # this branch: detection DID read a hint, and rejected it for being already
-    # past. That line then stays on screen, and parse_reset reads a bare clock time
-    # as the next time the clock comes round to it - so `resets 4:20pm`, rejected
-    # at 4:21, reads as TOMORROW's 4:20pm by 4:26 and walks straight through a
-    # "later than now" test. The bound is what pq is prepared to keep knocking for
-    # anyway: past PQ_QUOTA_MAX_TRIES it gives up, so a longer wait buys nothing,
-    # and a hint that has rolled over sits a clear day out - far outside it.
-    [ $(( late - nowsec )) -le $(( PQ_QUOTA_MAX_TRIES * PQ_QUOTA_RETRY )) ] || return 0
-    st_set "$d" PQ_RESETS_AT "$late"
-    st_set "$d" PQ_RETRY_AT "$(( late + 60 ))"   # a minute past, so skew cannot land early
-    msg "$slug: the pane named its reset after all - waiting until $(clock_of "$late")"
-    return 0
-  fi
-
-  if [ "$tries" -ge "$PQ_QUOTA_MAX_TRIES" ]; then
-    [ "$(st "$d" PQ_GAVEUP)" = 1 ] || {
-      st_set "$d" PQ_GAVEUP 1
-      warn "$slug: still walled after $tries attempts - leaving it for you"
-    }
-    return 0
-  fi
-
-  # Past the named reset and still there means the hint was optimistic, so from here
-  # it is the poll interval. PQ_RESETS_AT goes with it - a time already gone is worse
-  # than no time at all in `pq ls`.
-  tries=$(( tries + 1 ))
-  st_set "$d" PQ_TRIES "$tries"; st_set "$d" PQ_RETRY_AT "$(( nowsec + PQ_QUOTA_RETRY ))"
-  st_set "$d" PQ_RESETS_AT ""
-  unstick "$pane" "Continue with what you were doing."
-  msg "$slug: knocking after the session limit (attempt $tries)"
+  # Only when there is something to clear: this is the overwhelmingly common
+  # branch, and a clear is a rewrite of state.env for no change at all.
+  [ -z "$(st "$d" PQ_BLOCKED)" ] || st_set "$d" PQ_BLOCKED ""
+  check_quiet "$d" "$pane" "$text" "$(cksum <<<"$text" | awk '{ print $1 }')" "$(epoch)"
 }
 
 # ── an agent that has gone quiet ─────────────────────────────────────────────
-# The wall is not the only way an unattended agent stops. tap-to-reveal sat idle
+# A prompt is not the only way an unattended agent stops. tap-to-reveal sat idle
 # for 56 minutes and then 52 more before Tom asked "has this stalled?", with no
 # pull request and nothing on screen asking for anything. tiptap sat 18 minutes on
 # "Login expired · Please run /login" until he typed "continue" - which was all it
 # took. Both are an idle agent whose screen has stopped, which check_stall already
-# reads every tick, so this runs on the same read, for every pane that is neither
-# walled nor on a prompt.
+# reads every tick, so this runs on the same read, for every pane that is not on
+# a prompt.
 #
 # The stretch is the evidence: herdr calling the pane idle, AND its tail unchanged
 # since the tick that first saw it idle (PQ_QUIET_SINCE, PQ_QUIET_HASH). Nothing is
@@ -3335,10 +2975,10 @@ check_stall() {                         # task_dir
 # agent resting idle is simply finished; an error is knocked on in either.
 #
 # Both go through `herdr agent prompt`, which refuses a pane sitting on a dialog, so
-# a knock can never answer one. And neither freezes the queue, unlike the wall: a
-# regex over a terminal can be wrong, and a real account-wide failure - a login that
-# will not refresh - shows itself at the next dispatch's agent_start, which costs one
-# worktree rather than a night.
+# a knock can never answer one. And neither holds up the queue: a regex over a
+# terminal can be wrong, and a real account-wide failure - a login that will not
+# refresh, the usage limit - shows itself at the next dispatch, which costs one
+# worktree, and the cap bounds how many.
 # Anchored to where Claude Code prints them - a line of their own, after the
 # transcript's `⎿` - because the words themselves turn up mid-line in plenty of
 # panes: a diff of error-handling code, a command that greps for them. The first
@@ -3412,70 +3052,6 @@ check_quiet() {                         # task_dir pane text hash now
 quiet_cell() {                          # task_dir pane_state
   case "$2" in idle|done) ;; *) return 0 ;; esac
   case "$(st "$1" PQ_QUIET)" in error|quiet) printf '%s' "$(st "$1" PQ_QUIET)" ;; esac
-}
-
-# Is anybody behind the wall right now, and when does their window reopen? The first
-# one found, as `slug<TAB>epoch` with an empty epoch when no reset could be read;
-# nothing at all when nobody is walled. Writes nothing, so a listing may call it.
-#
-# Fill consults this and starts NOTHING while it answers, because the usage window is
-# one account-wide budget rather than a per-agent one. A second agent dispatched
-# behind the wall does not get its own allowance: it walls on its first request,
-# having spent a minute of `wt new`, a database, a port and a puma-dev entry to get
-# there, and it arrives with its own knock cycle to run. Waiting costs nothing by
-# comparison - the queue is a queue, and the tick that clears the block is the tick
-# that fills again.
-#
-# It takes a LIVE agent to freeze anything, which is why `noagent` is excluded
-# alongside `missing`, and this is the one place where reading the pane properly (see
-# pane_tail) makes something newly possible rather than only fixing it. Claude Code
-# renders inline rather than on the alternate screen, so a session that exited while
-# walled leaves its banner sitting in the visible viewport above a shell prompt -
-# and `pane read`, unlike the `agent read` it replaced, returns that quite happily.
-# classify_tail would go on reading `quota` off dead scrollback for ever, the knocks
-# would land on bash, and a freeze that only asked whether the PANE existed would
-# hold the entire queue until somebody looked. check_stall still runs on `noagent`
-# panes - a binding that lapsed for a moment is worth knocking through - it just
-# does not get to stop everybody else.
-# A task pq has GIVEN UP on stops freezing anything, which is the only bound on how
-# long a freeze can last, and it is worth one. Detection is a regex over a terminal,
-# so it can be wrong: any pane showing the words - a diff of this very file, a plan
-# that quotes the wall, `pq ls` output about somebody else - is a candidate, and one
-# that goes idle rather than resuming can never satisfy `moved && working`. Before the
-# freeze existed that cost one task's status cell. With it, and without this, it costs
-# every night after it: forty knocks is under seven hours, and nothing past that ever
-# clears the block on its own.
-#
-# Releasing it costs one worktree in the case where the wall was real all along - the
-# agent dispatched behind it walls on its first request, is detected, and the freeze
-# comes back. That is the right way round: a misread pane should cost a worktree, not
-# a night.
-#
-# A reviewer that hit the wall is the same evidence, and freezes the same way
-# (see review_wall_until) - until its retry is due, which is the next knock on the
-# wall that pq has. It is named as "<slug>'s review", since the first field is
-# only ever shown, and a bare slug would say the task's own agent is walled.
-walled_slot() {                         # -> who<TAB>resets_at | "", who being a slug or "<slug>'s review"
-  local d resets
-  for d in "$PQ_HOME/running"/*/ "$PQ_HOME/done"/*/; do
-    [ -d "$d" ] || continue
-    d=${d%/}
-    if resets=$(review_wall_until "$d"); then
-      printf "%s's review\t%s" "$(slug_of "$d")" "$resets"
-      return 0
-    fi
-    [ "$(st "$d" PQ_BLOCKED)" = quota ] || continue
-    [ "$(st "$d" PQ_GAVEUP)" = 1 ] && continue
-    case "$(pane_state "$(task_pane "$d")")" in noagent|missing) continue ;; esac
-    printf '%s\t%s' "$(slug_of "$d")" "$(st "$d" PQ_RESETS_AT)"
-    return 0
-  done
-}
-
-# "walled until 3pm", or just "walled" when the reset could not be read.
-walled_note() {                         # resets_at -> text
-  local at; at=$(clock_of "${1:-}")
-  [ -n "$at" ] && printf 'walled until %s' "$at" || printf 'walled'
 }
 
 # One `gh` lookup per dispatched branch, concurrently. Only tasks that have been
@@ -3917,12 +3493,11 @@ after_state() {                         # task_dir
 }
 
 # The tick-time wrapper: after_state plus the once-only warning. dead, orphan
-# and stalled all set PQ_AFTER_DEAD via the PQ_GAVEUP idiom (clear_block) -
-# warn on the transition into it, stay quiet on every tick after, and clear it
-# the moment the blocker recovers, so a reopened PR or a draft marked ready
-# re-arms the warning. An unresolvable default branch warns once under its own
-# PQ_AFTER_NOBASE key instead, because the fix is different - it names a repo,
-# not a blocker.
+# and stalled all set PQ_AFTER_DEAD, a once-only flag: warn on the transition
+# into it, stay quiet on every tick after, and clear it the moment the blocker
+# recovers, so a reopened PR or a draft marked ready re-arms the warning. An
+# unresolvable default branch warns once under its own PQ_AFTER_NOBASE key
+# instead, because the fix is different - it names a repo, not a blocker.
 #
 # `pq ls` calls after_state directly and never this: a mere listing must not
 # write to state.env or print a warning, the same way `agent_cell` never has.
@@ -3980,7 +3555,7 @@ after_check() {                         # task_dir
 # as the agent's own `gh pr create --base` failing into a draft PR, which is a
 # visible `done/` row rather than a silent stall.
 #
-# Warns once on the transition and clears on recovery, the same PQ_GAVEUP idiom
+# Warns once on the transition and clears on recovery, the same once-only flag
 # after_check uses, so a base that comes back re-arms the warning.
 base_check() {                          # task_dir -> "basegone <branch>" | ""
   local d=$1 b repo was
@@ -4111,20 +3686,13 @@ age_of() {                              # iso8601
   age_since "$at"
 }
 
-# What check_stall recorded about a pane, as a cell: `quota 8:30pm`, `walled 2h`,
-# `permission`, or nothing at all when the task is not blocked. Shared by the running
-# and the done branches below, because check_stall now knocks on both and a wrapping-up
-# agent behind the wall has exactly as much to say about it as a running one.
+# What check_stall recorded about a pane, as a cell: `permission`, or nothing at
+# all when the task is not blocked. Shared by the running and the done branches
+# below, because check_stall reads both, and a wrapping-up agent on a prompt has
+# exactly as much to say about it as a running one.
 block_cell() {                          # task_dir
-  local d=$1 at
-  case "$(st "$d" PQ_BLOCKED)" in
-    quota)      [ "$(st "$d" PQ_GAVEUP)" = 1 ] && printf 'walled ' || printf 'quota '
-                # The time it comes back beats how long it has been gone, when the
-                # wall told us one. Both are ASCII, as every cell here must be.
-                at=$(clock_of "$(st "$d" PQ_RESETS_AT)")
-                printf '%s' "${at:-$(age_of "$(st "$d" PQ_QUOTA_SINCE)")}" ;;
-    permission) printf 'permission' ;;
-  esac
+  [ "$(st "$1" PQ_BLOCKED)" = permission ] && printf 'permission'
+  return 0
 }
 
 # What an agent is waiting on, in the words that decide what you do about it.
@@ -4197,9 +3765,8 @@ agent_cell() {                          # task_dir state
       # already has for that word.
       #
       # What pq read off the pane comes first, exactly as it does for a running
-      # row: `quota 8:30pm` says which of the two it is and when it comes back,
-      # where herdr's bare `blocked` cannot. A wall here is knocked on now, so
-      # this is the row that tells you it is being handled rather than waiting.
+      # row: `permission` says what the agent is waiting on, where herdr's bare
+      # `blocked` cannot.
       blocked=$(block_cell "$d")
       if [ -n "$blocked" ]; then printf '%s' "$blocked"; return; fi
       if [ "$(pane_state "$(task_pane "$d")")" = blocked ]; then printf 'blocked'; return; fi
@@ -4234,10 +3801,9 @@ agent_cell() {                          # task_dir state
     "")        printf '?';    return ;;       # herdr did not answer
     missing)   printf 'gone'; return ;;       # workspace is gone, so nothing else applies
   esac
-  # What pq itself read off the pane outranks whatever herdr makes of it - herdr
-  # can call a walled agent `working` off the spinner still in its title, or
-  # `noagent` if the binding lapsed, and the wall is the whole reason this column
-  # exists at 8am. Same ordering as reconcile, for the same reason.
+  # What pq itself read off the pane outranks whatever herdr makes of it: a prompt
+  # on screen is what the agent is waiting on, whatever herdr's own regexes call
+  # the pane. Same ordering as reconcile, for the same reason.
   blocked=$(block_cell "$d")
   [ -n "$blocked" ] && { printf '%s' "$blocked"; return; }
   case "$status" in
@@ -4929,7 +4495,7 @@ agent_start() {                         # task_dir pane model effort -> 0 an age
     if [ -z "$code" ] && { [ "$rc" != 0 ] || [ -z "$SHIELDED_OUT" ]; }; then code="herdr exited $rc with no answer"; fi
     case "$code" in
       "") return 0 ;;
-      # Up, but on a dialog before it was ready - a trust prompt, a wall. The
+      # Up, but on a dialog before it was ready - a trust prompt, say. The
       # agent IS there, which is all this step promises; whether it can be
       # talked to yet is the prompt's question, this tick or the next.
       agent_not_ready) warn "$slug: the agent started but is not ready for input yet"; return 0 ;;
@@ -5169,17 +4735,15 @@ dispatch_gaveup() { [ "$(st "$1" PQ_DISPATCH_GAVEUP)" = 1 ]; }
 # MAX_TRIES x (TIMEOUT + RETRY) at the very worst, about two hours twenty, then
 # the fallback prompt. A security reviewer runs to the same bound beside it, but
 # can only start once the gate's probe has passed, so probes that fail first add
-# up to MAX_TRIES x RETRY on top - two hours forty at the very worst. A reviewer
-# that hits the usage limit is the one exception, and holds the slot for as long
-# as the wall does (see reviewer_walled): nothing else could use it meanwhile,
-# since the wall is the account's, and the queue is frozen on it anyway.
+# up to MAX_TRIES x RETRY on top - two hours forty at the very worst.
 #
 # "Settled" is everything else, an unset key included, so a task from before the
 # gate reads exactly as it did - `blocker_state`'s stalled verdict rests on it.
 #
-# The usage limit is not a failure, and is caught before anything else is read
-# off a finished reviewer: see reviewer_walled, which holds either reviewer until
-# the reset and resumes its session, spending none of its tries.
+# The usage limit is caught before anything else is read off a finished
+# reviewer (see reviewer_limit_text): a reply that is nothing but the limit's one
+# line is a failed try like any other, with `limit` for its result, never a
+# review that posted.
 #
 # Failure is loud, once, and falls back rather than blocking: a reviewer that
 # errors is retried on a backoff and then given up on, and the implementer is
@@ -5335,25 +4899,14 @@ REVIEWER_GIT_DENY=("Bash(git checkout:*)" "Bash(git switch:*)" "Bash(git restore
 # real review reached for the design file to check the change against it and was
 # refused, because the task directory is outside the worktree it runs in - and a
 # reviewer that can see what the change was built to is a better reviewer.
-#
-# With a session, the same reviewer picks up where the usage limit stopped it
-# (see reviewer_walled): every flag again, since none of them is kept with the
-# session, and a plain continue for the prompt - typing the skill again would
-# expand it afresh and start the review over.
-review_cmd() {                          # pr task_home [session]
-  local resume=() prompt="/code-review $PQ_REVIEW_EFFORT --comment $1"
-  if [ -n "${3:-}" ]; then
-    resume=(--resume "$3")
-    prompt="The usage limit that stopped you has reset. Carry on with this review exactly where you left off, and post it on the pull request as the review asked."
-  fi
+review_cmd() {                          # pr task_home
   headless_claude -p --model "$PQ_REVIEWER_MODEL" --effort "$PQ_REVIEW_EFFORT" \
-    ${resume[@]+"${resume[@]}"} \
     --permission-mode auto --allowedTools "$PQ_REVIEW_TOOLS" \
     --disallowedTools "Edit(/$HOME/**)" "Bash(gh pr ready:*)" "Bash(gh pr merge:*)" "Bash(gh pr close:*)" \
       "${REVIEWER_GIT_DENY[@]}" \
     --append-system-prompt "$(review_brief "$1")" \
     --add-dir "$2" \
-    --output-format json "$prompt"
+    --output-format json "/code-review $PQ_REVIEW_EFFORT --comment $1"
 }
 
 # What the reviewer is told beside the skill: what it may touch, where its
@@ -5382,19 +4935,13 @@ review_brief() {                        # pr
 # own was shown the whole integration branch by the skill, went by the brief's
 # `git diff origin/<base>...HEAD` instead, and left the base's injection out of
 # scope. None was denied anything, and none touched its worktree.
-security_cmd() {                        # pr task_home base [session]
-  local resume=() prompt="/security-review"
-  if [ -n "${4:-}" ]; then
-    resume=(--resume "$4")
-    prompt="The usage limit that stopped you has reset. Carry on with this security review exactly where you left off, and reply with the markdown report as the review asked."
-  fi
+security_cmd() {                        # pr task_home base
   headless_claude -p --model "$PQ_REVIEWER_MODEL" --effort "$PQ_REVIEW_EFFORT" \
-    ${resume[@]+"${resume[@]}"} \
     --permission-mode auto \
     --disallowedTools "Edit(/$HOME/**)" "Bash(gh:*)" "${REVIEWER_GIT_DENY[@]}" \
     --append-system-prompt "$(security_brief "$1" "$2" "$3")" \
     --add-dir "$2" \
-    --output-format json "$prompt"
+    --output-format json "/security-review"
 }
 
 # What the security reviewer is told beside the skill. The base is named because
@@ -5488,7 +5035,6 @@ reviewer_launch() {                     # task_dir stem cwd cmd...
   disown "$pid" 2>/dev/null || true
   st_set "$d" "${key}_PID" "$pid"
   st_set "$d" "${key}_AT" "$(epoch)"
-  [ -z "$(st "$d" "${key}_WALL")" ] || { st_set "$d" "${key}_WALL" ""; st_set "$d" "${key}_RESETS_AT" ""; }
   st_set "$d" "$key" running
 }
 
@@ -5576,8 +5122,6 @@ reviewer_try_failed() {                 # task_dir stem result why
   case "$stem" in review) noun=review; final=posted ;; *) noun="security review"; final="done" ;; esac
   slug=$(slug_of "$d"); tries=$(st "$d" "${key}_TRIES"); tries=${tries:-0}
   st_set "$d" "${key}_RESULT" "$result"
-  # A session that failed is not one to resume: whatever went wrong is in it.
-  [ -z "$(st "$d" "${key}_SESSION")" ] || st_set "$d" "${key}_SESSION" ""
   if [ "$tries" -lt "$PQ_REVIEW_MAX_TRIES" ]; then
     st_set "$d" "$key" pending
     st_set "$d" "${key}_RETRY_AT" "$(( $(epoch) + PQ_REVIEW_RETRY ))"
@@ -5606,135 +5150,39 @@ security_collect() {                    # task_dir -> ok | failed
 }
 
 # THE USAGE LIMIT. A reviewer is a headless session on the same account as every
-# agent pq runs, and it can hit the same wall - and in `-p` the wall is not an
-# error. The first one seen ran for fifteen minutes and $5.52 of a review, then
-# exited 0 with `is_error: false`, `subtype: success` and, for its whole reply,
-# the one line "You've hit your session limit · resets 7pm (America/Toronto)".
+# agent pq runs, and it can hit the account's limit too - and in `-p` the limit is
+# not an error. The first one seen ran for fifteen minutes and $5.52 of a review,
+# then exited 0 with `is_error: false`, `subtype: success` and, for its whole
+# reply, the one line "You've hit your session limit · resets 7pm (America/Toronto)".
 # review_collect read that as a review that had posted, and the implementer was
 # told to resolve inline comments that did not exist. security_collect would have
 # posted the line on the pull request as the security review.
 #
-# So the wall is looked for first, whatever the exit code says: a reply that is
-# ONE line and reads as the wall (PQ_QUOTA_RE, as on a pane). One line, because a
-# real review is never that short, while one of rate-limiting code may well say
-# "hit your API limit" somewhere in a longer reply. A reply that is not JSON at
-# all has the same test put to the last line of its stderr.
-reviewer_wall_text() {                  # task_dir stem -> the wall's line, when that is all it said
+# So the limit is looked for first, whatever the exit code says: a reply that is
+# ONE line and reads as the limit (PQ_LIMIT_RE). One line, because a real review is
+# never that short, while one of rate-limiting code may well say "hit your API
+# limit" somewhere in a longer reply. A reply that is not JSON at all has the same
+# test put to the last line of its stderr. What follows is an ordinary failed try,
+# with `limit` for its result so the follow-up can say why: the limit is a monthly
+# hard stop, and there is no reset worth waiting on.
+reviewer_limit_text() {                 # task_dir stem -> the limit's line, when that is all it said
   local d=$1 stem=$2 text
   text=$(jq -r 'if type == "object" then (.result // "" | tostring) else empty end' "$d/$stem.json" 2>/dev/null)
   [ -n "$(tr -d '[:space:]' <<<"$text")" ] || text=$(sed '/^[[:space:]]*$/d' "$d/$stem.err" 2>/dev/null | tail -n 1)
-  wall_reply "$text"
+  limit_reply "$text"
 }
-# The same test on a reply already in hand: one non-blank line, reading as the wall.
-# Every headless session pq runs - the namer and the splitter too - can get that
-# line for its whole answer.
-wall_reply() {                          # text -> the wall's line, when that is all it is
+# The same test on a reply already in hand: one non-blank line, reading as the
+# limit. Every headless session pq runs - the namer and the splitter too - can get
+# that line for its whole answer. A line with a brace in it is never the limit:
+# the namer's own answer is one line of JSON, and a plan about running out of
+# credits puts the very words in its intent.
+limit_reply() {                         # text -> the limit's line, when that is all it is
   local text
   text=$(sed '/^[[:space:]]*$/d' <<<"${1:-}")
   [ -n "$text" ] && [ "$(grep -c . <<<"$text")" = 1 ] || return 1
-  grep -qiE "$PQ_QUOTA_RE" <<<"$text" || return 1
+  case "$text" in *"{"*) return 1 ;; esac
+  grep -qiE "$PQ_LIMIT_RE" <<<"$text" || return 1
   printf '%s' "$text"
-}
-
-# A wall is not the reviewer's failure, so it spends none of PQ_REVIEW_MAX_TRIES:
-# the try counted at launch is handed back, and walls are counted apart - up to
-# PQ_QUOTA_MAX_TRIES, the same bound the knock on a walled pane has, after which
-# the result is final as `quota` and the follow-up asks for a self-review.
-#
-# Until then the ladder goes back to `pending`, with the retry a minute past the
-# reset its line names - read by reset_hint and parse_reset, as off a pane - or
-# every PQ_QUOTA_RETRY when it names none. The session is kept, and the relaunch
-# resumes it (see review_cmd), so fifteen minutes of review are not paid for twice.
-#
-# A bare clock time is the next time the clock reads it, read against NOW - so a
-# wall collected a while after its reset had come round would read as tomorrow's.
-# The wall was printed when the reviewer finished, which the .rc file's mtime
-# records, and a time that was still ahead of it then is today's, and past.
-reviewer_walled() {                     # task_dir stem wall_text
-  local d=$1 stem=$2 text=$3 key noun final slug tries walls sid hint e at nowsec due plan
-  key=$(reviewer_key "$stem")
-  case "$stem" in review) noun=reviewer; final=posted ;; *) noun="security reviewer"; final="done" ;; esac
-  slug=$(slug_of "$d"); nowsec=$(epoch)
-  tries=$(st "$d" "${key}_TRIES"); tries=${tries:-0}
-  [ "$tries" -gt 0 ] && st_set "$d" "${key}_TRIES" "$(( tries - 1 ))"
-  walls=$(st "$d" "${key}_WALLS"); walls=$(( ${walls:-0} + 1 ))
-  st_set "$d" "${key}_WALLS" "$walls"
-  sid=$(jq -r 'if type == "object" then (.session_id // empty) else empty end' "$d/$stem.json" 2>/dev/null)
-  [ -n "$sid" ] && st_set "$d" "${key}_SESSION" "$sid"
-  if [ "$walls" -gt "$PQ_QUOTA_MAX_TRIES" ]; then
-    st_set "$d" "${key}_RESULT" quota; st_set "$d" "$key" "$final"
-    warn "$slug: the $noun is still walled after $PQ_QUOTA_MAX_TRIES tries - the implementer will be asked to self-review instead"
-    return 0
-  fi
-  hint=$(reset_hint "$text")
-  e=$(parse_reset "$hint" 2>/dev/null) || e=""
-  if [ -n "$e" ]; then
-    case "$hint" in
-      *,*) ;;
-      *) at=$(stat -f %m "$d/$stem.rc" 2>/dev/null) || at=$nowsec
-         [ $(( e - 86400 )) -ge $(( at - 300 )) ] && e=$(( e - 86400 )) ;;
-    esac
-  fi
-  if [ -n "$e" ] && [ $(( e + 60 )) -gt "$nowsec" ]; then
-    due=$(( e + 60 ))                   # a minute past it, so clock skew cannot land early
-    st_set "$d" "${key}_RESETS_AT" "$e"
-    plan="resuming it at $(clock_of "$due")"
-  elif [ -n "$e" ]; then
-    due=$nowsec
-    st_set "$d" "${key}_RESETS_AT" ""
-    plan="its reset has already come round, so resuming it now"
-  else
-    due=$(( nowsec + PQ_QUOTA_RETRY ))
-    st_set "$d" "${key}_RESETS_AT" ""
-    plan="no reset time in its reply, so trying again every $(( PQ_QUOTA_RETRY / 60 ))m"
-  fi
-  st_set "$d" "${key}_WALL" 1
-  st_set "$d" "${key}_RETRY_AT" "$due"
-  st_set "$d" "$key" pending
-  warn "$slug: the $noun hit the usage limit - $plan"
-}
-
-# A session that has gone - pruned, or never written - cannot be resumed, and
-# `--resume` says so on stderr and exits 1 having done nothing. That is no try
-# at all: the review starts afresh at once rather than spending half its tries
-# on an id that will never work.
-reviewer_session_gone() {               # task_dir stem -> 0 when a resume found nothing to resume
-  [ -n "$(st "$1" "$(reviewer_key "$2")_SESSION")" ] || return 1
-  grep -q 'No conversation found with session ID' "$1/$2.err" 2>/dev/null
-}
-reviewer_session_lost() {               # task_dir stem
-  local d=$1 stem=$2 key noun tries
-  key=$(reviewer_key "$stem")
-  case "$stem" in review) noun=reviewer ;; *) noun="security reviewer" ;; esac
-  tries=$(st "$d" "${key}_TRIES"); tries=${tries:-0}
-  [ "$tries" -gt 0 ] && st_set "$d" "${key}_TRIES" "$(( tries - 1 ))"
-  st_set "$d" "${key}_SESSION" ""; st_set "$d" "${key}_RETRY_AT" ""
-  st_set "$d" "$key" pending
-  warn "$(slug_of "$d"): the session of the walled $noun is gone - starting it afresh"
-}
-
-# Is a reviewer of this task waiting out the usage limit, and until when? Read off
-# the ladder itself - `pending`, with a wall recorded - so every way a ladder ends
-# (skipped, settled, lapsed, removed) ends this too, and a freeze built on it
-# (see walled_slot) cannot outlive the wait it stands for.
-#
-# And only until its retry is due, which is the other half of that. The wall is
-# cleared by the relaunch, and a relaunch waits for its agent to be idle - which
-# it need not be once the reset comes round: on a permission prompt, typed into by
-# hand, behind a wall of its own that pq has given up on. None of that is the
-# account's wall. Read off the ladder alone, the freeze held the whole queue on a
-# reset hours gone, for as long as the agent stayed busy, and `pq ls` went on
-# naming the reset; past its retry the reviewer is simply due.
-review_wall_until() {                       # task_dir -> resets_at, maybe empty; 0 while waiting
-  local k at
-  for k in PQ_REVIEW PQ_SECURITY; do
-    [ "$(st "$1" "$k")" = pending ] && [ "$(st "$1" "${k}_WALL")" = 1 ] || continue
-    at=$(st "$1" "${k}_RETRY_AT")
-    [ -n "$at" ] && [ "$(epoch)" -lt "$at" ] 2>/dev/null || continue
-    printf '%s' "$(st "$1" "${k}_RESETS_AT")"
-    return 0
-  done
-  return 1
 }
 
 # The report goes on the pull request as one comment, so it is read beside the
@@ -5788,7 +5236,7 @@ review_prompt() {                       # pr result split lines base [security_r
     *)
       case "$sec" in
         timeout) swhy="the security reviewer ran out of time" ;;
-        quota)   swhy="the security reviewer kept hitting the usage limit" ;;
+        limit)   swhy="the security reviewer hit the usage limit" ;;
         *)       swhy="the security reviewer exited with an error" ;;
       esac
       secc="The security review the plan asked for did not happen - $swhy. \
@@ -5816,7 +5264,7 @@ Leave no comment unanswered. ${secc}${splitc}${tail}" ;;
     *)
       case "$result" in
         timeout) why="the reviewer ran out of time" ;;
-        quota)   why="the reviewer kept hitting the usage limit" ;;
+        limit)   why="the reviewer hit the usage limit" ;;
         denied)  why="the reviewer was denied permission to post" ;;
         empty)   why="the reviewer finished without posting anything on it" ;;
         *)       why="the reviewer exited with an error" ;;
@@ -5964,9 +5412,9 @@ review_step() {                         # task_dir dry pr pstate
   case "$state" in
     pending)
       [ -n "$pr" ] || return 0
-      # Not while the agent is still going or blocked; not behind a wall pq has
-      # dismissed, which reads idle to herdr and only PQ_BLOCKED says otherwise;
-      # not while herdr is silent; not inside a retry backoff.
+      # Not while the agent is still going or blocked - on a prompt pq has
+      # recorded, too, whatever herdr makes of the pane; not while herdr is
+      # silent; not inside a retry backoff.
       [ -n "$(st "$d" PQ_BLOCKED)" ] && return 0
       case "$pstate" in working|blocked|"") return 0 ;; esac
       local at; at=$(st "$d" PQ_REVIEW_RETRY_AT)
@@ -6003,26 +5451,17 @@ review_step() {                         # task_dir dry pr pstate
       local cwd; cwd=$(st "$d" PQ_WORKTREE)
       [ -n "$cwd" ] && [ -d "$cwd" ] || cwd=$repo
       st_set "$d" PQ_REVIEW_TRIES "$((tries + 1))"
-      # The count a resumed session is judged against is the one from before it
-      # first ran: whatever it posted ahead of the wall is its work too.
-      local sid; sid=$(st "$d" PQ_REVIEW_SESSION)
-      [ -n "$sid" ] || st_set "$d" PQ_REVIEW_COMMENTS "$(review_comments "$repo" "$pr")"
-      reviewer_launch "$d" review "$cwd" review_cmd "$pr" "$(task_home "$d")" "$sid"
-      if [ -n "$sid" ]; then msg "$slug: resuming the review of #$pr after the usage limit"
-      else msg "$slug: reviewing #$pr with $PQ_REVIEWER_MODEL in the background"; fi
+      st_set "$d" PQ_REVIEW_COMMENTS "$(review_comments "$repo" "$pr")"
+      reviewer_launch "$d" review "$cwd" review_cmd "$pr" "$(task_home "$d")"
+      msg "$slug: reviewing #$pr with $PQ_REVIEWER_MODEL in the background"
       ;;
     running)
       local pid; pid=$(st "$d" PQ_REVIEW_PID)
       if [ -f "$d/review.rc" ]; then
-        local wall
-        if wall=$(reviewer_wall_text "$d" review); then
-          [ "$dry" = 1 ] && { msg "would hold $slug's review for the usage limit"; return 0; }
-          reviewer_walled "$d" review "$wall"
-          return 0
-        fi
-        if reviewer_session_gone "$d" review; then
-          [ "$dry" = 1 ] && { msg "would start $slug's walled review afresh - its session is gone"; return 0; }
-          reviewer_session_lost "$d" review
+        local limit
+        if limit=$(reviewer_limit_text "$d" review); then
+          [ "$dry" = 1 ] && { msg "would count $slug's review as a failed try - it hit the usage limit"; return 0; }
+          reviewer_try_failed "$d" review limit "the reviewer hit the usage limit ($limit)"
           return 0
         fi
         local verdict result landed; verdict=$(review_collect "$d")
@@ -6100,22 +5539,15 @@ security_step() {                       # task_dir dry pr pstate
       [ "$dry" = 1 ] && { msg "would launch a security review of $slug"; return 0; }
       tries=$(st "$d" PQ_SECURITY_TRIES); tries=${tries:-0}
       st_set "$d" PQ_SECURITY_TRIES "$((tries + 1))"
-      local sid; sid=$(st "$d" PQ_SECURITY_SESSION)
-      reviewer_launch "$d" security "$cwd" security_cmd "$pr" "$(task_home "$d")" "$(task_base "$d")" "$sid"
-      if [ -n "$sid" ]; then msg "$slug: resuming the security review of #$pr after the usage limit"
-      else msg "$slug: security-reviewing #$pr with $PQ_REVIEWER_MODEL in the background"; fi
+      reviewer_launch "$d" security "$cwd" security_cmd "$pr" "$(task_home "$d")" "$(task_base "$d")"
+      msg "$slug: security-reviewing #$pr with $PQ_REVIEWER_MODEL in the background"
       ;;
     running)
       if [ -f "$d/security.rc" ]; then
-        local wall
-        if wall=$(reviewer_wall_text "$d" security); then
-          [ "$dry" = 1 ] && { msg "would hold $slug's security review for the usage limit"; return 0; }
-          reviewer_walled "$d" security "$wall"
-          return 0
-        fi
-        if reviewer_session_gone "$d" security; then
-          [ "$dry" = 1 ] && { msg "would start $slug's walled security review afresh - its session is gone"; return 0; }
-          reviewer_session_lost "$d" security
+        local limit
+        if limit=$(reviewer_limit_text "$d" security); then
+          [ "$dry" = 1 ] && { msg "would count $slug's security review as a failed try - it hit the usage limit"; return 0; }
+          reviewer_try_failed "$d" security limit "the security reviewer hit the usage limit ($limit)"
           return 0
         fi
         case "$(security_collect "$d")" in
@@ -6164,14 +5596,7 @@ security_step() {                       # task_dir dry pr pstate
 # A gate at `posted` that is waiting on the security reviewer says so: `reviewed`
 # would read as about to move on, when the follow-up is held for the other review.
 review_cell() {                         # task_dir
-  local d=$1 sec resets at; sec=$(st "$d" PQ_SECURITY)
-  # A reviewer waiting out the usage limit reads as a walled pane does in
-  # block_cell: `review quota 7pm`, or bare when its reply named no time.
-  if resets=$(review_wall_until "$d"); then
-    at=$(clock_of "$resets")
-    printf 'review quota%s' "${at:+ $at}"
-    return
-  fi
+  local d=$1 sec; sec=$(st "$d" PQ_SECURITY)
   case "$(st "$d" PQ_REVIEW)" in
     pending)  printf 'review due' ;;
     running)  printf 'reviewing %s' "$(age_since "$(st "$d" PQ_REVIEW_AT)")" ;;
@@ -6230,9 +5655,9 @@ review_cell() {                         # task_dir
 # the agent is gone. Feedback has no such bound, since a person is on the other
 # end of it; the watermark moves past each batch once it has been handed over.
 #
-# The agent is only ever prompted idle, never behind a wall or a dialog, and on
-# the tick it is prompted its wrap-up clock is cleared as the review follow-up's
-# is. An agent whose slot the grace had already released takes one back while it
+# The agent is only ever prompted idle, never on a dialog, and on the tick it
+# is prompted its wrap-up clock is cleared as the review follow-up's is. An
+# agent whose slot the grace had already released takes one back while it
 # works, so the cap can be passed by one for as long as a fix takes: the soft
 # overshoot the review follow-up already accepts, since a fix to a pull request
 # about to merge is worth more than starting the next task a turn sooner.
@@ -6928,37 +6353,27 @@ tick_body() {                           # cap dry
         fi
         continue
       fi
-      # The wall check runs for every state but `missing`, deliberately including
-      # `noagent`. Whether herdr currently has an agent bound to the pane is the
-      # same kind of dependency the detection itself avoids - a walled session that
-      # momentarily reads as `noagent` would otherwise be written off as exited and
-      # never knocked on.
+      # The pane is read for every state but `missing`, `noagent` included: a
+      # binding that lapsed for a moment still has a pane worth reading, and
+      # pane_tail answers for one.
       local pstate; pstate=$(pane_state "$(task_pane "$d")")
       [ "$dry" = 1 ] || [ "$pstate" = missing ] || check_stall "$d"
       case "$pstate" in
         missing) warn "$slug: its workspace is gone and no PR exists - look at it, then: pq rm $slug" ;;
-        noagent) [ "$(st "$d" PQ_BLOCKED)" = quota ] \
-                   || warn "$slug: the agent exited without opening a PR - look at the pane, or: pq rm $slug" ;;
+        noagent) warn "$slug: the agent exited without opening a PR - look at the pane, or: pq rm $slug" ;;
       esac
     done
   fi
 
-  # 1.2 The wall, for tasks that have already opened their pull request. An agent
+  # 1.2 The pane, for tasks that have already opened their pull request. An agent
   # does not stop when it opens one - it answers review, fixes CI, pushes again -
   # so `done/` is where an unattended agent spends most of the night, and it can
-  # hit the wall there exactly as easily as in `running/`. For a long time nothing
-  # knocked on those panes at all, which made the whole section useless for the
-  # case it was written for: three agents wrapping up at midnight, all three
-  # walled, none of them touched by morning.
-  #
-  # No new authority comes with this. check_stall only ever answers the wall; a
-  # permission prompt in `done/` is recorded and left for you, the same as
-  # anywhere else. Only reaped tasks are skipped, because their pane is gone: a
-  # task whose PR closed is knocked on like any other, since its teardown is
-  # waiting on that agent to stop and a walled agent never stops on its own.
-  # It runs BEFORE reap and before active_slots
-  # so the block it sets is visible to the teardown gate, to the slot arithmetic
-  # and to the freeze below, all on the tick that set it.
+  # land on a prompt or stop on an error there exactly as easily as in `running/`.
+  # A permission prompt in `done/` is recorded and left for you, the same as
+  # anywhere else, and an error is knocked on (see check_quiet). Only reaped tasks
+  # are skipped, because their pane is gone. It runs BEFORE the review gate, the
+  # watch and reap, so the block it records is visible to each of them on the
+  # tick that recorded it.
   if [ "$dry" != 1 ]; then
     for d in "$PQ_HOME/done"/*/; do
       [ -d "$d" ] || continue
@@ -6971,8 +6386,8 @@ tick_body() {                           # cap dry
 
   # 1.22 The review gate, one step per task - see the `review gate` section.
   # After reconcile, so a task that finished this tick is examined this tick;
-  # after check_stall, because a dismissed wall reads `idle` to herdr and only
-  # PQ_BLOCKED says otherwise; before reap, so a settled PR stops its reviewer
+  # after check_stall, because an agent on a prompt may read `idle` to herdr and
+  # only PQ_BLOCKED says otherwise; before reap, so a settled PR stops its reviewer
   # before `wt rm` closes the workspace it runs in; before active_slots, so the
   # hold it puts on a slot is counted on the same tick. Reaped tasks have no pane
   # and no worktree left, and nothing here applies to them.
@@ -7061,12 +6476,6 @@ tick_body() {                           # cap dry
   active=$(( n_run + n_wrap ))
   local free=$(( cap - active ))
 
-  # ...and a wall stops fill outright, whatever the arithmetic says, because every
-  # agent pq runs draws on the same window. See walled_slot.
-  local walled_by walled_at
-  IFS=$'\t' read -r walled_by walled_at <<<"$(walled_slot)"
-  [ -n "$walled_by" ] && free=0
-
   # Build the queue ONCE, in stamp order, then walk it - skipping whatever
   # is not eligible - rather than re-globbing and taking the first entry every
   # pass, which only worked because a claimed task leaves queue/. --dry-run
@@ -7079,13 +6488,7 @@ tick_body() {                           # cap dry
       [ -n "$d" ] || continue
       slug=$(slug_of "$d")
       if [ "$free" -le 0 ]; then
-        # Name the wall rather than the cap when the wall is what closed it: the two
-        # want completely different things from you, and "cap reached" reads as
-        # healthy.
-        if [ "$dry" = 1 ]; then
-          if [ -n "$walled_by" ]; then msg "would skip $slug - $(walled_note "$walled_at")"
-          else msg "would skip $slug - cap reached"; fi
-        fi
+        [ "$dry" = 1 ] && msg "would skip $slug - cap reached"
         continue
       fi
       verdict=$(awk -F'\t' -v d="$d" '$1 == d { print $2; exit }' "$afterpass")
@@ -7136,12 +6539,7 @@ tick_body() {                           # cap dry
   # Name the two halves separately. A cap of 3 reading "3 running" while three
   # more agents were still wrapping up in done/ is precisely what made six live
   # agents look like a healthy tick for as long as this bug lasted.
-  #
-  # The wall gets said out loud for the same reason: `pq run` suppresses a summary
-  # identical to the last one, so a frozen queue would otherwise leave a log that
-  # goes quiet at 2am and says nothing about why.
   summary "$n_run running$([ "$n_wrap" -gt 0 ] && printf ' + %s wrapping up' "$n_wrap") (cap $cap), $queued queued\
-$([ -n "$walled_by" ] && printf ', %s - starting nothing' "$(walled_note "$walled_at")")\
 $([ "$started" -gt 0 ] && printf ', %s started' "$started")\
 $([ "$would" -gt 0 ] && printf ', %s would start' "$would")\
 $([ "$waiting" -gt 0 ] && printf ', %s waiting on a merge' "$waiting")\

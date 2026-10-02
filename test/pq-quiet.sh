@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# test/pq-quiet.sh - an agent that stops with no wall and no prompt on screen.
+# test/pq-quiet.sh - an agent that stops with no prompt on screen.
 #
 # tap-to-reveal sat idle 56 minutes, then 52 more, with no pull request, until Tom
 # asked "has this stalled?". tiptap sat 18 minutes on "Login expired · Please run
@@ -8,7 +8,7 @@
 # "continue", and an agent idle and still for QUIET_AFTER with no pull request gets
 # nudged back to its contract - each bounded, and handed to you past the bound.
 #
-# The harness is test/pq-quota.sh's `pane read` stub and test/pq-review.sh's
+# The harness is test/pq-pane.sh's `pane read` stub and test/pq-review.sh's
 # recording `agent prompt`, with the clock pinned.
 #
 # SC2034: the pane index set here is read by the pq sourced below.
@@ -164,7 +164,7 @@ check_stall "$E" >/dev/null 2>&1
 eq "$(prompts)" "0" "not off one glimpse"
 later 120; out=$(check_stall "$E" 2>&1)
 eq "$(prompts)" "1" "a tick later, it is knocked on"
-eq "$(prompt_text)" "Continue with what you were doing." "with the knock the wall gets"
+eq "$(prompt_text)" "Continue with what you were doing." "with a plain continue"
 has "$out" "stopped on \"API Error: 500" "naming the error"
 has "$out" "knocked (attempt 1)" "and the attempt"
 screen w4:p1 $'Running the specs now.\n  ⎿  API Error: 500 again\n\n> '

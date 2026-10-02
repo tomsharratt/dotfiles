@@ -275,7 +275,7 @@ has "$out" "CI is failing on it and its agent is gone" "said"
 eq "$(agent_cell "$G" "done")" "ci failed" "and it is yours"
 eq "$(watch_task "$G" 0 2>&1)" "" "once"
 
-echo "== the agent busy, blocked, walled or on a dialog: it waits ==" >&2
+echo "== the agent busy, blocked, on a prompt or on a dialog: it waits ==" >&2
 reset_caches; reset_logs
 B=$(mk_ready 15 busy w6:p1)
 view sha1 base1 MERGEABLE UNSTABLE "build:FAILURE"
@@ -284,10 +284,10 @@ for s in working blocked; do
   watch_task "$B" 0 >/dev/null 2>&1
 done
 set_panes "$(printf 'w6:p1\tclaude\tidle')"
-st_set "$B" PQ_BLOCKED quota
+st_set "$B" PQ_BLOCKED permission
 watch_task "$B" 0 >/dev/null 2>&1
 st_set "$B" PQ_BLOCKED ""
-eq "$(prompts)" "0" "not while it is working, blocked or behind the wall"
+eq "$(prompts)" "0" "not while it is working, blocked or on a prompt pq has recorded"
 printf 'agent_blocked' > "$STUBBIN/.prompt-fail"
 out=$(watch_task "$B" 0 2>&1)
 has "$out" "waits for you to answer it" "a dialog is said once"

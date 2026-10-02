@@ -311,19 +311,11 @@ Five minutes is that timer: once an agent has not been working for that long, it
 It governs the tasks whose PR is still open or in draft; a task whose PR has *settled* - merged or closed - gets torn down by the reap pass as soon as its agent stops, and a torn-down task releases its slot at once with no grace at all.
 A settled task still holds its slot until then, exactly as an open one does: the teardown is waiting on that agent, so handing the slot away on the verdict alone would start a second agent beside one still running.
 The grace applies to `idle` and to herdr's `done` alike, because both are per-turn rather than per-task: an agent that opens a PR and then goes back in to fix CI passes through them between every turn, and releasing on the first sighting would be the same bug in a subtler form.
-A `blocked` agent - a permission prompt, a quota wall - holds its slot too, the same trade `running/` already makes, since it will resume rather than having finished.
-That row reads as **permission** or **quota 8:30pm** rather than "wrapping up", and a permission prompt counts into "needs you": it is holding a slot until you answer it.
-A quota wall does not, because `pq` answers that one itself, on a `done/` pane as readily as on a running one.
-Note that a dismissed wall reads as `idle` to herdr - dismissing the dialog is what stops the spinner - so `pq`'s own verdict is what holds that slot, or the grace below would hand it away while the agent waits for its window and then take it back on the tick the agent resumes.
+A `blocked` agent - one on a permission prompt, say - holds its slot too, the same trade `running/` already makes, since it will resume rather than having finished.
+That row reads as **permission** or **blocked** rather than "wrapping up", and counts into "needs you": it is holding a slot until you answer it.
 An exited agent or a vanished workspace releases immediately, with no grace at all, and while herdr is unreachable the slot is held rather than guessed at.
 A task whose review gate is in flight - waiting for the reviewer, or for the follow-up to be delivered - holds its slot with no clock at all, for the same reason a blocked one does: the implementer is idle because it is waiting, and it is about to be handed more work.
 That hold is bounded by the gate's own bounds (see "The review gate" below), and ends the moment the follow-up is delivered, after which the ordinary grace applies.
-
-The other reason the queue can sit still with slots apparently free is that **a wall anywhere stops dispatch entirely**.
-Every agent `pq` runs draws on one account-wide usage window, so a second agent started behind the wall does not get an allowance of its own: it walls on its first request, having spent a minute of `wt new`, a database, a port and a puma-dev entry to get there, and it arrives with its own knock cycle to run.
-So fill starts nothing at all until whoever is walled is moving again, and both the tick summary and `pq cap` say so rather than reporting room that will not be used.
-It takes a *live* agent to freeze anything: a task whose Claude has exited, or whose workspace is gone, holds nothing up, however much of the wall is still legible on its pane.
-Nor does one `pq` has given up knocking on - see the session limit section for why that bound matters.
 
 Ctrl-C is a graceful shutdown: during the sleep it stops immediately, and during a tick it lets the work in flight finish first.
 That needs a little care, because a terminal signals the whole foreground process group - so by default a `wt new` halfway through copying a database would die alongside the tick.
@@ -367,72 +359,24 @@ Running `pq add --split` from `~/projects` itself - a directory that holds sever
 There is no primary in that case, deliberately: nothing among a container's children is privileged as a default the splitter can fall back into, so every part's repository assignment becomes required rather than optional, and a part left unassigned fails validation instead of silently landing wherever the primary would have been.
 The same `--repo PATH` naming a directory instead of a checkout triggers this from anywhere, not only from inside the container itself.
 
-#### Hitting the session limit
+#### Reading the pane
 
-When a Claude session runs out of its usage window it says so on the pane - "You've hit your session limit · resets 3pm (PDT)" - and puts up a dialog whose every option only dismisses it.
-Nothing resumes by itself, so an agent that hits the wall at 2am would otherwise sit there until morning holding a slot.
-Each tick reads the last lines of every dispatched agent's pane, and when it finds the wall it dismisses the dialog, waits for the time the message names, and then knocks with "Continue with what you were doing" until the agent picks its work back up.
-Agents wrapping up in `done/` are read the same way as running ones: that is where an unattended agent spends most of the night, answering review and fixing CI, and it can hit the wall there just as easily.
+Each tick reads the last lines of every dispatched agent's pane, running and wrapping up alike, for the ways an unattended agent stops without exiting.
+`done/` is read as well as `running/` because that is where an unattended agent spends most of the night, answering review and fixing CI.
+The read is `herdr pane read` rather than `herdr agent read`, because only the first answers for a pane whose agent binding has lapsed.
 
-Four details make that safe to leave running unattended.
-
-**Detection is the pane's text, not Herdr's status.**
-Herdr derives agent status from its own regexes over the terminal, and its highest-priority rule reads a spinner in the window title as `working` - which is exactly what is on screen while the request that hit the wall is still in flight.
-Waiting for Herdr to say `blocked` would risk never firing at all.
-The read is `herdr pane read` rather than `herdr agent read`, because the wall has to stay detectable on a pane whose agent binding has lapsed, and only the first of those answers for one.
-
-**Only a screen that has stopped moving counts as stuck.**
-`pq` hashes the tail each tick and acts only when the wall is showing *and* the hash is unchanged since last time.
-A working agent's tail moves every few seconds, so this cannot interrupt one.
-
-**Once the wall has been seen, the schedule is `pq`'s own.**
-That message is live UI, not transcript text: Claude Code derives it from the reset time it is waiting for, so it clears *itself* at the reset - which is the exact moment the knock comes due.
-Treating "the wall is no longer on screen" as recovery therefore threw the plan away at the one moment it mattered.
-So the text only ever puts the block *on*; from there the stored reset time decides, and what is on screen decides nothing until the knock is due.
-
-What takes the block off is evidence the agent is moving again, and that needs two things rather than one: a tail that has changed **and** Herdr calling the pane `working`.
-A changed tail alone is not enough, because a statusline reporting rate limits sits inside the tail and turns over at the reset all by itself - a one-tick change landing at precisely the moment the knock is due, indistinguishable from the agent resuming, and believing it would clear the block on an idle agent and strand it.
-That is not a retreat from the first rule above: that one governs detection, where the spinner makes `working` unreliable; by the time a knock is due the dialog is long dismissed and nothing is in flight.
-An agent you rescue yourself is believed straight away, clock or no clock, since a block still on file is a block that freezes the queue.
-
-**It waits for the time the message names, and polls only when it cannot read one.**
-The wall's own line carries "resets 3pm", and that hint beats any other source of the same fact, because it comes from the error that walled us and so already refers to the right window - the account has both a five-hour and a weekly limit, and nothing else on hand would say which one you are behind.
-A statusline that reports rate limits carries a "resets" of its own, and it is only ever the fallback, since it always names the five-hour window even when the weekly one is what walled you.
-Either can arrive wrapped, because the pane is only so wide and the wall line that turns up most nights is a background agent's failure with the whole API error quoted inside it.
-Claude Code breaks on word boundaries, and almost every break point is harmless, but one is not: a break straight after `resets` puts the time on a row that no longer looks like the wall and leaves a wall row trimmed back to end at `resets` with nothing after it, so a pane showing the reset in plain sight reads as having none.
-Those two rows are rejoined before anything looks at them, and the lines are then tried in order - the wall's own, newest first, then everyone else's - until one yields a hint that actually parses, rather than a single unreadable line hiding a good one below it.
-Two habits of Claude Code's formatter are worth knowing, since both will catch out anything that assumes otherwise: minutes are dropped when they are zero, so it reads `8pm` rather than `8:00pm`, and no date is printed for a reset less than 24 hours out, so a bare `1am` seen at 11pm means tomorrow.
-Beyond 24 hours it becomes `Jul 28, 8:30pm`, gaining a year only when the year differs.
-What is *stored* is the epoch, and `pq ls` formats it back on the way out - state files are read by sourcing them, so a value like `3pm (PDT)` is a syntax error that silently truncates everything written after it.
-
-A hint that cannot be read is not a failure: ten-minute polling is the fallback, and it also takes over if the knock at the named time turns out to be too early.
-The one outcome ruled out is waiting on a guess, because that strands a task silently, where an early knock costs a single instantly-failing call.
-
-Nor is it final, which matters more than it sounds.
-What walls a task is usually a background agent, and its failure reaches the transcript seconds before the session's own next request fails and puts the same time in the statusline - so the tick that catches the wall can honestly have nothing to read, on a pane that names the time plainly a moment later.
-`pq` keeps looking, and takes the first reset the screen offers.
-Only until the first knock, though, because a knock is precisely what demoted it to polling - the named time came and went with the wall still up - while the line that named it stays in the scrollback for ever.
-Re-reading that line afterwards would not even give back a stale time: a bare clock time is read as the next time the clock comes round to it, so `resets 4:20pm` read at 4:30 is tomorrow, and a ten-minute cycle would quietly become a day-long one.
-The same rollover is why a second look never accepts a reset further out than `pq` would keep knocking for anyway - a hint that has rolled sits a clear day away, well past a bound that a five-hour window's reset is nowhere near.
-
-The namer and the splitter can meet the wall too, and they say so: `pq add` stops with "behind the usage limit - pq add again once it resets" rather than reading the wall's one line as a reply that named nothing.
+A permission prompt is recorded as `permission` and deliberately left alone - that is the trade for running everything in auto mode - so `pq ls` separates the agents waiting on you from the ones that have simply stopped.
+`pq` never answers a dialog of any kind: the knocks below go through `herdr agent prompt`, which refuses a pane that is on one.
 
 A pane id is only an id, and herdr handed workspace ids out again after a restart, so an id `pq` recorded can come to name a pane in somebody else's workspace.
 A pane is only ever read, knocked on or prompted while Herdr places it inside the task's own worktree; otherwise it reads as missing, which is the truth about the task's own pane.
 `wt` checks the same thing before it closes a workspace by a recorded id, since closing one is `worktree remove --force` on whatever it holds.
 
-The wall is the only dialog `pq` ever answers.
-A permission prompt is recorded as `permission` and deliberately left alone - that is the trade for running everything in auto mode - so `pq ls` separates the agents waiting on the clock from the ones waiting on you.
-One appearing where a wall was is taken as recovery, because a session asking for something is a session running again, and the alternative is a knock sending Escape at the prompt - refusing it - every ten minutes.
-After forty unanswered knocks a task is marked `walled` and left, rather than knocking all night - and at that point it stops freezing dispatch, which is the only bound on how long a freeze can last.
-It wants one, because detection is a regex over a terminal and so can be wrong: any pane showing the words is a candidate, including one showing a diff of `pq` itself, and one that goes idle rather than resuming can never prove it recovered.
-Releasing the freeze there costs a single worktree if the wall was real - the next agent walls, is detected, and the freeze comes back - which is the right way round, since a misread pane should cost a worktree rather than a night.
-
 #### An agent that goes quiet
 
-The wall is not the only way an unattended agent stops.
+A prompt is not the only way an unattended agent stops.
 One sat idle for 56 minutes and then 52 more with no pull request and nothing on screen asking for anything, until Tom asked "has this stalled?"; another sat 18 minutes on "Login expired · Please run /login" until he typed "continue", which was all it took.
-Both are an idle agent whose screen has stopped, and each tick reads that screen anyway, so the same read covers them, for every pane that is neither walled nor on a prompt.
+Both are an idle agent whose screen has stopped, and each tick reads that screen anyway, so the same read covers them, for every pane that is not on a prompt.
 
 A stretch is Herdr calling the pane idle **and** its tail unchanged since the tick that first saw it idle - nothing is judged off one glimpse.
 An error near the bottom of the pane - `API Error`, or a login that expired, on a line of its own the way Claude Code prints them rather than mid-line in a diff or a command - is the last thing the session said rather than something scrolled past, and it is knocked on with "Continue with what you were doing" once the stretch has lasted a tick, then every five minutes, six times at most; a turn that ends without the error at the bottom is the recovery, and resets the count.
@@ -442,7 +386,21 @@ An agent resting idle in `done/` is finished, not quiet, and is never nudged.
 Past either bound it is handed to you: `pq ls` reads `error` or `quiet` while the pane is idle, counted into "needs you", and the tick warns once.
 
 Both knocks go through `herdr agent prompt`, which refuses a pane that is on a dialog, so neither can answer one.
-Neither freezes the queue the way the wall does: a regex over a terminal can be wrong, and a real account-wide failure - a login that will not refresh - shows itself at the next dispatch's agent start, which costs a worktree rather than a night.
+Neither holds up the queue: a regex over a terminal can be wrong, and a real account-wide failure - a login that will not refresh, the usage limit - shows itself at the next dispatch, which costs a worktree, and the cap bounds how many.
+
+#### The usage limit
+
+The account's limit is a monthly spend budget, and hitting it is a hard stop: there is no reset an hour or two out worth waiting for.
+So `pq` does nothing clever about it.
+It does not dismiss Claude Code's dialog, knock on the agent, read a reset time, or freeze the queue.
+An agent that hits the limit stops like any other: on the dialog it reads as `blocked`, a running one left idle is nudged and then handed to you as `quiet`, and one wrapping up in `done/` simply sits.
+It stays yours to set going again once the limit lifts.
+The cap is what bounds the damage, since a task in `running/` holds its slot until it opens a pull request, so no more than the cap can be dispatched into the limit before fill stops on its own.
+
+The headless sessions are the exception, because in `claude -p` the limit is not an error: the session exits 0 with the limit's one line as its whole reply.
+A reply that is exactly one line and reads as the limit (`PQ_LIMIT_RE`) is caught before anything else is read off it.
+`pq add` stops with "behind the usage limit - pq add again once it lifts" rather than reading that line as a reply that named nothing, and the splitter stops the same way.
+The reviewers are covered under "The review gate" below.
 
 #### The review gate
 
@@ -476,16 +434,12 @@ The one cost is a review that genuinely finds nothing, which posts nothing too: 
 The reviewer's reply is kept as `<task>/review.md` for that fallback to point at, since it may list findings GitHub refused inline - a file outside the diff, a line outside a hunk.
 There is no off switch; `PQ_REVIEW_MAX_TRIES=0` is the honest degraded mode, which skips every reviewer and sends every task straight to the self-review fallback.
 
-A reviewer that hits the usage limit has not failed, and is not treated as if it had.
-In `claude -p` the wall is not an error: the first reviewer to hit it had spent fifteen minutes and $5.52 on a review, then exited 0, with `is_error: false` and nothing in its reply but "You've hit your session limit · resets 7pm (America/Toronto)" - and the gate read that as a review that had posted, and told the implementer to resolve comments that did not exist.
-So a reply that is one line and reads as the wall (`PQ_QUOTA_RE`, as on a pane) is caught before anything else is read off a finished reviewer, code or security, whatever its exit code says; a reply that is not JSON has the last line of its stderr put to the same test.
+A reviewer that hits the usage limit has failed, but it must never be read as a review.
+In `claude -p` the limit is not an error: the first reviewer to hit one had spent fifteen minutes and $5.52 on a review, then exited 0, with `is_error: false` and nothing in its reply but "You've hit your session limit · resets 7pm (America/Toronto)" - and the gate read that as a review that had posted, and told the implementer to resolve comments that did not exist.
+So a reply that is one line and reads as the limit (`PQ_LIMIT_RE`) is caught before anything else is read off a finished reviewer, code or security, whatever its exit code says; a reply that is not JSON has the last line of its stderr put to the same test.
 One line, because a real review is never that short, while a review of rate-limiting code can say "hit your API limit" somewhere in a longer one.
-The reviewer then waits out the wall the way a walled pane does: it goes back to `pending` with its retry a minute past the reset its line names, or every ten minutes when it names none, and spends none of its `PQ_REVIEW_MAX_TRIES` - walls are counted apart, up to forty, after which the follow-up asks for a self-review and says why.
-At the reset it resumes its own session, with every flag again and a plain "carry on" rather than the skill, which would start the review over - so the work done before the wall is not paid for twice.
-A session that has gone since is started afresh, at once, with no try spent.
-While it waits, `pq ls` reads `review quota 7pm`, the slot stays held, and the queue is frozen on it exactly as on a walled pane, since the wall is the account's; the freeze is read off the reviewer's own ladder, so it lets go the moment the ladder ends, however it ends.
-It also lets go once the retry is due, even when the reviewer cannot relaunch yet because its agent is on a permission prompt, being typed into, or behind a wall of its own that pq has given up on: the reviewer's wall is behind it by then, and it reads `review due` until its agent is idle again.
-An agent on a wall of its own that pq is still knocking on keeps the queue frozen, as any walled pane does.
+What follows is an ordinary failed try with `limit` for its result: it is retried after ten minutes, then given up on, and the follow-up says the reviewer hit the usage limit and asks for a self-review.
+A security reviewer's limit line is never posted on the pull request as its report.
 
 A gate that nobody is going to close is `lapsed`: the agent has exited, or has sat idle past the wrap-up grace with the draft still open.
 That is warned about once, counts into "needs you", and reads `review lapsed` in `pq ls` - the comments are there, and resolving them is yours.
@@ -529,7 +483,7 @@ So a task whose gate reached `ready` is still watched while its pull request is 
 Every comment `pq`'s own agents post is made from the account that opened the pull request, and so is anything you write yourself, so the author alone cannot tell a person from an agent.
 Time and shape can: only what arrived after the watch began counts, bots never do, and from the author only a new inline thread counts, which an implementer answering review never starts - so your own inline comments are picked up, and your conversation comments are not.
 
-Each condition is asked about once, and only of an idle agent that is not behind a wall or a dialog.
+Each condition is asked about once, and only of an idle agent that is not on a dialog.
 A CI failure's fingerprint is the head commit and the failed jobs, so a push or a rerun that fails again is a new failure and a new prompt, while the same failure sitting there is not.
 An agent that comes back from a failure without a new commit or a rerun, one that has had three goes at a fix, or one that is gone hands the condition to you instead: `pq ls` reads `ci failed`, `conflict` or `new review`, counted into "needs you", and the tick warns once.
 While the agent is on it, the row reads `fixing ci`, `fixing conflict` or `answering review`.

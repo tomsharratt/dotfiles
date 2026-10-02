@@ -3,7 +3,7 @@
 # longer dropped, the contract is written once, and the agent is started and
 # prompted through herdr's agent API rather than typed into the pane.
 #
-# Merges test/pq-base.sh's JSON-returning `wt` stub with test/pq-quota.sh's
+# Merges test/pq-base.sh's JSON-returning `wt` stub with test/pq-pane.sh's
 # recording `herdr` stub, plus `agent start` / `agent prompt` arms that answer
 # the way herdr really does: JSON on stdout and exit 0 either way, an error
 # being an {"error":{"code":...}} body.
