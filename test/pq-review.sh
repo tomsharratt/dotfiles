@@ -118,7 +118,7 @@ PQ_REVIEW_TIMEOUT=1500
 PQ_REVIEW_MAX_TRIES=2
 PQ_REVIEW_RETRY=600
 PQ_REVIEW_SPLIT_LINES=150
-PQ_REVIEW_EFFORT=high                   # deliberately not the default (xhigh), so the assertions below prove the knob is passed through
+PQ_REVIEW_EFFORT=low                    # deliberately not the default (high), so the assertions below prove the knob is passed through
 
 # The clock is pinned, as in test/pq-slots.sh: the gate's timeout, retry and
 # grace comparisons all sit on boundaries, and `epoch` is what review_task reads.
@@ -306,7 +306,7 @@ has "$line" "	--add-dir	$PQ_HOME/tasks/$(basename "$G")	" "with the task's own d
 # The level must come FIRST and the target last: the skill reads the first
 # non-flag token as the level and everything after it as the target, so the
 # other order loses both - see the comment above review_cmd.
-has "$line" "	/code-review high --comment 42	" "the skill, the level FIRST, --comment, then the PR as the target"
+has "$line" "	/code-review low --comment 42	" "the skill, the level FIRST, --comment, then the PR as the target"
 PID=$(st "$G" PQ_REVIEW_PID)
 [ -n "$PID" ] && review_alive "$PID" && ok || bad "the process group is recorded and alive"
 [ -f "$G/review.rc" ] && bad "no exit code yet while it runs" || ok

@@ -147,7 +147,10 @@ PQ_REVIEW_TIMEOUT=1500
 PQ_REVIEW_MAX_TRIES=2
 PQ_REVIEW_RETRY=600
 PQ_REVIEW_SPLIT_LINES=150
-PQ_REVIEW_EFFORT=high                   # not the default, so the argv assertions prove it is passed through
+# Neither is its default, and they differ, so the argv assertions prove each
+# reviewer runs at its own.
+PQ_REVIEW_EFFORT=low
+PQ_SECURITY_EFFORT=max
 
 FAKE_NOW=$(date -u '+%s')
 epoch() { printf '%s' "$FAKE_NOW"; }
@@ -339,7 +342,8 @@ grep -q "pane=unset tab=unset workspace=unset" "$CLAUDE_ENV" && [ "$(grep -c "pa
   && ok || bad "neither reviewer inherits the launching pane's identity: $(cat "$CLAUDE_ENV")"
 has "$line" "	-p	" "in print mode"
 has "$line" "	--model	opus	" "with the reviewer model"
-has "$line" "	--effort	high	" "at the review effort"
+has "$line" "	--effort	max	" "at PQ_SECURITY_EFFORT"
+hasnt "$line" "	--effort	low	" "not the code review's effort"
 has "$line" "	--permission-mode	auto	" "in auto mode"
 hasnt "$line" "--allowedTools" "with nothing allowed by rule - it posts nothing"
 has "$line" "	--disallowedTools	Edit(/$HOME/**)	Bash(gh:*)	Bash(git checkout:*)	Bash(git switch:*)	Bash(git restore:*)	Bash(git reset:*)	Bash(git stash:*)	Bash(git clean:*)	Bash(git commit:*)	Bash(git push:*)	--append-system-prompt	" \

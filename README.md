@@ -189,7 +189,7 @@ That `n` is "no", not "next page" - the two prompts read the key differently, an
 Once you confirm, it asks the things that actually shape how a task runs: which model should run it and which of the tasks already queued or running it should wait on.
 The model question offers `sonnet`, `opus` and `fable`, and Enter takes `sonnet`; an initial and any case will do.
 Only what is typed at the prompt is held to those three - `--model` itself still takes any id `claude --model` accepts.
-`--effort` stays a flag, with no question of its own.
+`--effort` stays a flag, with no question of its own; without it a task runs at `medium`.
 
 Passing a flag the wizard would otherwise ask about skips just that one question and leaves the rest standing - `pq add --model opus` skips the model question, `pq add --after some-task` skips the blocker question, and any combination of them skips exactly the questions it has already answered.
 
@@ -365,10 +365,10 @@ The reviewers are covered under "The review gate" below.
 Every pull request a task opens gets one independent review before the implementer may call it ready - run by `pq`, not asked of the agent.
 The agent could run `/code-review` itself, and a repository's conventions often ask it to - supercast's CLAUDE.md wants one before every pull request, and one task was reviewed three times - but a review by the session that wrote the change is not independent.
 So its contract says `pq`'s review stands in for the repository's and that it runs none of its own, and `pq` runs `claude -p "/code-review <level> --comment N"` itself, in the task's worktree, with the task's own directory opened to it so it can read the plan and the design files, and the skill posts its findings as inline review comments on the pull request.
-`PQ_REVIEWER_MODEL` (default `opus`) is what it runs on, at `xhigh`, passed both as the session's `--effort` and as the skill's own level argument.
+`PQ_REVIEWER_MODEL` (default `opus`) is what it runs on, at `high`, passed both as the session's `--effort` and as the skill's own level argument.
 The order of that prompt is load-bearing, and was wrong for the gate's first few runs.
 The skill reads the first non-flag token as the level and everything after it as the target, so sending the pull request first (`/code-review N <level> --comment`) meant the level was ignored - silently falling back to `codeReviewLastEffort` in `~/.claude.json`, the level last typed at an interactive prompt, which is what "Reusing xhigh effort (the level you typed last)" at the top of those transcripts was reporting - and the target became the string `N <level>` rather than the pull request number.
-It read as harmless only because the level last typed on this machine happened to be `xhigh` as well.
+It read as harmless only because the level last typed on this machine happened to be `xhigh` as well, the level the gate ran at then.
 Then `pq` prompts the implementer, through herdr's agent API, to read every comment and resolve each - fix it and push, or reply on the thread with the reasoning for leaving it - and to mark the draft ready with `gh pr ready`.
 Nobody reviews the review.
 The point is that a second pair of eyes has been over the diff, and the first pair has had to answer them, before you read either.
@@ -410,7 +410,7 @@ It has to be read rather than matched: plans name the skill as often to waive it
 The wording was checked against ten real plans, four runs each, and came back right all forty times, including one that asks for it inside an aside about CSRF and `pq`'s own plan, which names it only as follow-up work.
 
 The implementer's contract says `pq` runs the review, and not to run one itself.
-Once the draft is open, `pq` runs `claude -p "/security-review"` in the task's worktree beside the code reviewer, launched on the same tick, on the same `PQ_REVIEWER_MODEL`, effort, timeout, `PQ_REVIEW_MAX_TRIES` and retry, and under the same read-only deny rules, with `gh` denied outright.
+Once the draft is open, `pq` runs `claude -p "/security-review"` in the task's worktree beside the code reviewer, launched on the same tick, on the same `PQ_REVIEWER_MODEL`, timeout, `PQ_REVIEW_MAX_TRIES` and retry but at `xhigh` rather than the code review's `high`, and under the same read-only deny rules, with `gh` denied outright.
 The skill takes no target and posts nothing: it reviews `git diff origin/HEAD...` of wherever it runs and replies with a markdown report.
 So its brief names the diff to go by - `git diff origin/<base>...HEAD`, since `origin/HEAD` is the default branch whatever the pull request is aimed at - and points it at the plan, which says why it asked and what to look at.
 Then `pq` delivers the report itself: it is saved as `<task>/security.md` and posted on the pull request as one comment, next to the code review's inline ones.

@@ -152,7 +152,10 @@ STATES="queue running done archive"
 # three that ARE knobs - read from the environment, and documented - are
 # PQ_REVIEWER_MODEL, PQ_REVIEW_MAX_TRIES and PQ_REVIEW_TOOLS below.
 PQ_DEFAULT_MODEL=sonnet                 # what the wizard's Enter takes
-PQ_DEFAULT_EFFORT=xhigh
+# Medium, not the xhigh it was: nine of the last eleven tasks before it changed
+# were queued with `--effort medium` typed by hand, and a plan already carries
+# the thinking - the implementer is turning it into code.
+PQ_DEFAULT_EFFORT=medium
 PQ_DEFAULT_CAP=1                        # the cap before `pq cap` has ever been run - see "the cap"
 PQ_NAMER_MODEL=haiku
 PQ_PICK_LIMIT=10                        # plans per page in pick_plan; `n`/`p` walk the rest
@@ -189,13 +192,16 @@ PQ_AGENT_START_MS=60000
 # gets one independent `/code-review` run by pq itself, in the background, and the
 # implementer is then told to resolve what it posted and mark the draft ready.
 # A plan that asks for a security review gets a `/security-review` beside it, run
-# on these same settings - the model, effort, timeout, tries and retry below -
-# since it is the same job for a different eye. There is no off switch:
+# on these same settings - the model, timeout, tries and retry below - since it
+# is the same job for a different eye, but at an effort of its own: a plan asks
+# for one when its change comes near a trust boundary, which is where the depth
+# is worth paying for. There is no off switch:
 # PQ_REVIEW_MAX_TRIES=0 is the honest degraded mode, where no reviewer is ever
 # launched and the implementer is sent straight to the self-review fallback - the
 # reason that one is a knob.
 PQ_REVIEWER_MODEL="${PQ_REVIEWER_MODEL:-opus}"
-PQ_REVIEW_EFFORT=xhigh
+PQ_REVIEW_EFFORT=high
+PQ_SECURITY_EFFORT=xhigh
 # An hour. Reviews ran 747s, 822s, then 1083s against the 1500 this used to be,
 # and a reviewer killed at the ceiling throws the whole review away for the
 # self-review fallback - the one outcome the gate exists to avoid.
@@ -3484,8 +3490,9 @@ dispatch_gaveup() { [ "$(st "$1" PQ_DISPATCH_GAVEUP)" = 1 ]; }
 # "run /security-review" in so many words, and say what it should focus on - and
 # name_plan reads that into a `security: yes` header at add time. Such a task gets
 # a second reviewer beside the first: `claude -p "/security-review"`, in the same
-# worktree, on the same settings and the same read-only rules. The implementer's
-# contract tells it not to run one itself, as it does for /code-review. The
+# worktree, on the same settings bar its effort, PQ_SECURITY_EFFORT, and the
+# same read-only rules. The implementer's contract tells it not to run one
+# itself, as it does for /code-review. The
 # skill takes no target and posts nothing - it reviews `git diff origin/HEAD...`
 # of wherever it runs and replies with a markdown report - so pq delivers: the
 # report is saved as security.md, posted on the pull request as one comment to be
@@ -3558,10 +3565,11 @@ REVIEWER_GIT_DENY=("Bash(git checkout:*)" "Bash(git switch:*)" "Bash(git restore
 # the string before the level is read, so only the level and the target are
 # order-sensitive.
 #
-# It asks for `xhigh`, which is what the implementer already runs at
-# (PQ_DEFAULT_EFFORT). The reviewer reads a diff it
-# did not write, against a plan and a design it has to go and find, and is the
-# only pass before Tom - it is the last place to economise.
+# It asks for `high`, a step above the implementer's medium (PQ_DEFAULT_EFFORT):
+# the reviewer reads a diff it did not write, against a plan and a design it has
+# to go and find, and is the only pass before Tom. Not the xhigh every review ran
+# at until 2026-10-02: on opus, high is the depth Tom wants from every review,
+# and xhigh is kept for the security reviews (PQ_SECURITY_EFFORT).
 #
 # The reviewer is read-only apart from what it posts, and that is enforced by
 # deny rules, not by the permission mode, because no mode means it. acceptEdits,
@@ -3645,8 +3653,8 @@ review_brief() {                        # pr
 # posting is pq's job here (see security_post). No --allowedTools: auto mode
 # judges the reads, and the skill's own frontmatter allows the `git diff`, `git
 # log` and `git show` it opens with. The skill takes no level and no target, so
-# `--effort` is the only way PQ_REVIEW_EFFORT reaches it, and the brief the only
-# way the pull request's base does.
+# `--effort` is the only way PQ_SECURITY_EFFORT reaches it, and the brief the
+# only way the pull request's base does.
 #
 # Run against scratch repositories before it shipped, exactly as below. A change
 # with a SQL injection and two cross-tenant reads came back with all three, at
@@ -3656,7 +3664,7 @@ review_brief() {                        # pr
 # `git diff origin/<base>...HEAD` instead, and left the base's injection out of
 # scope. None was denied anything, and none touched its worktree.
 security_cmd() {                        # pr task_home base
-  headless_claude -p --model "$PQ_REVIEWER_MODEL" --effort "$PQ_REVIEW_EFFORT" \
+  headless_claude -p --model "$PQ_REVIEWER_MODEL" --effort "$PQ_SECURITY_EFFORT" \
     --permission-mode auto \
     --disallowedTools "Edit(/$HOME/**)" "Bash(gh:*)" "${REVIEWER_GIT_DENY[@]}" \
     --append-system-prompt "$(security_brief "$1" "$2" "$3")" \
@@ -3784,10 +3792,11 @@ review_kill() {                         # task_dir
 # That rule has one cost, stated rather than hidden: a review that genuinely finds
 # nothing posts nothing too, so it is retried and then answered by the self-review
 # fallback, which is where a clean pull request would have ended up anyway. None of
-# the reviews run so far was one - the skill's own floor asks for about seven
-# findings at xhigh - and the reviewer's reply is kept as review.md for that
-# fallback to point at, which also covers findings it printed because GitHub
-# refused them inline (a file outside the diff, a line outside a hunk).
+# the reviews run so far was one - the skill's own floor asked for about seven
+# findings at xhigh, the level they all ran at until 2026-10-02 - and the
+# reviewer's reply is kept as review.md for that fallback to point at, which
+# also covers findings it printed because GitHub refused them inline (a file
+# outside the diff, a line outside a hunk).
 #
 # `denied` means the review could not post: a `gh` command was refused and
 # nothing landed - the one failure a retry cannot fix, since it will be refused
