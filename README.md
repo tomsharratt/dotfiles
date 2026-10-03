@@ -317,29 +317,34 @@ That needs a little care, because a terminal signals the whole foreground proces
 A second Ctrl-C abandons the work in flight, killing that child too, so "force" does not leave a `wt new` running with nobody to record what it produced.
 Either way nothing is lost - a task caught mid-dispatch keeps its claim without a launch record, which the next reconcile recognises and resumes.
 
-#### Reading the pane
+#### Reading the agent's hooks
 
-Each tick reads the last lines of every dispatched agent's pane, running and wrapping up alike, for the ways an unattended agent stops without exiting.
+Every implementer is started with `--settings <task>/hooks.json`, written once at dispatch, and each of those hooks overwrites `<task>/agent.json` with the agent's latest lifecycle event: `working` (a prompt was submitted, or a tool ran), `permission` (the dialog is up), `idle` (the turn ended) or `error` (the turn ended on an API error, with its type and first line).
+Each tick reads that file for every dispatched agent, running and wrapping up alike, for the ways an unattended agent stops without exiting; `pq` never reads the screen.
 `done/` is read as well as `running/` because that is where an unattended agent spends most of the night, answering review and fixing CI.
-The read is `herdr pane read` rather than `herdr agent read`, because only the first answers for a pane whose agent binding has lapsed.
+An agent with no `agent.json` - a task dispatched before this existed, or an agent you restarted by hand without `--settings` - gives `pq` no signal: no `permission`, no knocks, no nudges.
+Herdr's own `blocked` and `idle` still show in `pq ls`.
 
 A permission prompt is recorded as `permission` and deliberately left alone - that is the trade for running everything in auto mode - so `pq ls` separates the agents waiting on you from the ones that have simply stopped.
+The hook that records it prints nothing, so it never answers the dialog.
 `pq` never answers a dialog of any kind: the knocks below go through `herdr agent prompt`, which refuses a pane that is on one.
 
 A pane id is only an id, and herdr handed workspace ids out again after a restart, so an id `pq` recorded can come to name a pane in somebody else's workspace.
-A pane is only ever read, knocked on or prompted while Herdr places it inside the task's own worktree; otherwise it reads as missing, which is the truth about the task's own pane.
+A pane is only ever knocked on or prompted while Herdr places it inside the task's own worktree; otherwise it reads as missing, which is the truth about the task's own pane.
 `wt` checks the same thing before it closes a workspace by a recorded id, since closing one is `worktree remove --force` on whatever it holds.
 
 #### An agent that goes quiet
 
 A prompt is not the only way an unattended agent stops.
 One sat idle for 56 minutes and then 52 more with no pull request and nothing on screen asking for anything, until Tom asked "has this stalled?"; another sat 18 minutes on "Login expired · Please run /login" until he typed "continue", which was all it took.
-Both are an idle agent whose screen has stopped, and each tick reads that screen anyway, so the same read covers them, for every pane that is not on a prompt.
+Both are an idle agent, which the hooks record, so the same file covers them, for every agent that is not on a prompt.
 
-A stretch is Herdr calling the pane idle **and** its tail unchanged since the tick that first saw it idle - nothing is judged off one glimpse.
-An error near the bottom of the pane - `API Error`, or a login that expired, on a line of its own the way Claude Code prints them rather than mid-line in a diff or a command - is the last thing the session said rather than something scrolled past, and it is knocked on with "Continue with what you were doing" once the stretch has lasted a tick, then every five minutes, six times at most; a turn that ends without the error at the bottom is the recovery, and resets the count.
+A stretch is Herdr calling the pane idle **and** the agent's own record.
+A turn that ended on an API error is knocked on with "Continue with what you were doing", then every five minutes, six times at most; a turn that ends in `idle` is the recovery, and resets the count.
+The account's own limit (`rate_limit`, `billing_error`) is a hard stop that "Continue" cannot clear, so it is handed to you at once.
 An agent in `running/` that stays idle for fifteen minutes with no pull request is nudged back to its contract instead: deliver it, or open a `STUCK:` draft saying what blocked it.
-That happens three times at most, and the pane moving never buys it more - a nudged agent always moves a little and then stops again - since only its pull request ends the count.
+The fifteen minutes run from the later of the agent's latest record - whatever it was, since a turn interrupted with Esc never records a stop - and `pq`'s own last knock or nudge.
+That happens three times at most, and the agent moving never buys it more - a nudged agent always moves a little and then stops again - since only its pull request ends the count.
 An agent resting idle in `done/` is finished, not quiet, and is never nudged.
 Past either bound it is handed to you: `pq ls` reads `error` or `quiet` while the pane is idle, counted into "needs you", and the tick warns once.
 

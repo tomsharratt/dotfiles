@@ -61,6 +61,9 @@ source "$HERE/../.local/bin/pq"
 
 pr_load_all() { :; }
 
+# A permission record, where the agent's PermissionRequest hook would write it.
+perm_on()  { mkdir -p "$PQ_HOME/tasks"; task_link "$1"; printf '{"event":"permission","at":1}' > "$(task_home "$1")/agent.json"; }
+perm_off() { rm -f "$(task_home "$1")/agent.json"; }
 pass=0 fail=0
 ok()  { pass=$((pass + 1)); }
 bad() { fail=$((fail + 1)); printf 'FAIL: %s\n' "$1" >&2; }
@@ -284,9 +287,9 @@ for s in working blocked; do
   watch_task "$B" 0 >/dev/null 2>&1
 done
 set_panes "$(printf 'w6:p1\tclaude\tidle')"
-st_set "$B" PQ_BLOCKED permission
+perm_on "$B"
 watch_task "$B" 0 >/dev/null 2>&1
-st_set "$B" PQ_BLOCKED ""
+perm_off "$B"
 eq "$(prompts)" "0" "not while it is working, blocked or on a prompt pq has recorded"
 printf 'agent_blocked' > "$STUBBIN/.prompt-fail"
 out=$(watch_task "$B" 0 2>&1)

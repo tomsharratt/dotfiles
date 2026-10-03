@@ -88,6 +88,9 @@ source "$HERE/../.local/bin/pq"
 
 pr_load_all() { :; }
 
+# A permission record, where the agent's PermissionRequest hook would write it.
+perm_on()  { mkdir -p "$PQ_HOME/tasks"; task_link "$1"; printf '{"event":"permission","at":1}' > "$(task_home "$1")/agent.json"; }
+perm_off() { rm -f "$(task_home "$1")/agent.json"; }
 pass=0 fail=0
 ok()  { pass=$((pass + 1)); }
 bad() { fail=$((fail + 1)); printf 'FAIL: %s\n' "$1" >&2; }
@@ -241,10 +244,10 @@ for s in working blocked; do
   eq "$(st "$G" PQ_REVIEW)" "pending" "a $s agent is left alone"
 done
 set_panes "$(printf 'w1:p1\tclaude\tidle')"
-st_set "$G" PQ_BLOCKED permission
+perm_on "$G"
 review_task "$G" 0
-eq "$(st "$G" PQ_REVIEW)" "pending" "a prompt herdr reads as idle - PQ_BLOCKED holds it back"
-st_set "$G" PQ_BLOCKED ""
+eq "$(st "$G" PQ_REVIEW)" "pending" "a prompt herdr reads as idle - the agent's permission record holds it back"
+perm_off "$G"
 PIDX=""; PIDX_OK=0
 review_task "$G" 0
 eq "$(st "$G" PQ_REVIEW)" "pending" "herdr silent is no verdict"
@@ -427,9 +430,9 @@ st_set "$G" PQ_REVIEW posted; st_set "$G" PQ_REVIEW_RESULT failed
 eq "$(agent_cell "$G" "done")" "review failed" "cell for a failed review"
 st_set "$G" PQ_REVIEW running; st_set "$G" PQ_REVIEW_AT "$(( $(date -u +%s) - 420 ))"
 eq "$(agent_cell "$G" "done")" "reviewing 7m" "cell for a running review"
-st_set "$G" PQ_BLOCKED permission
+perm_on "$G"
 eq "$(agent_cell "$G" "done")" "permission" "a block word keeps precedence"
-st_set "$G" PQ_BLOCKED ""
+perm_off "$G"
 st_set "$G" PQ_REVIEW lapsed
 LS=$(PQ_WIDTH=200 main ls 2>&1)
 has "$LS" "review lapsed" "pq ls shows the lapsed gate"

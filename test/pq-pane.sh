@@ -1,15 +1,14 @@
 #!/usr/bin/env bash
-# test/pq-pane.sh - reading a dispatched agent's pane: pane_tail and check_stall,
-# directly and through tick_body, the same way test/pq-slots.sh does for the cap
-# arithmetic.
+# test/pq-pane.sh - what pq makes of a dispatched agent's pane and its hook record:
+# block_cell and agent_cell, directly and through tick_body, the same way
+# test/pq-slots.sh does for the cap arithmetic.
 #
-# Two things are pinned here. pane_tail used to pipe `herdr ... --format text` -
-# which is text - through `jq '.result.read.text'`, so it returned the empty
-# string on every tick of every task and nothing below it ever ran. And the
-# account's usage limit is a monthly hard stop, not a five-hour window to wait
-# out: a pane showing it is not dismissed, knocked on or frozen on, the cap is
-# what bounds how many tasks are dispatched into it, and a `quota` block left on
-# file by the pq that did all of that holds nothing.
+# Two things are pinned here. A permission dialog is read from the agent's own
+# agent.json, never the screen, recorded and left alone. And the account's usage
+# limit is a monthly hard stop, not a five-hour window to wait out: it is not
+# dismissed, knocked on or frozen on, the cap is what bounds how many tasks are
+# dispatched into it, and a `quota` block left on file by the pq that did all of
+# that holds nothing.
 #
 # SC2034: the knobs and caches set here are read by the pq sourced below.
 # SC2015: `ok` never fails, so `[ ... ] && ok || bad` is an if/else.
@@ -171,44 +170,7 @@ working_text() {                        # pane n
 EOF
 }
 
-permission_text() {                     # pane
-  set_text "$1" <<'EOF'
-⏺ Bash(rm -rf build/)
-
-  Do you want to proceed?
-  1. Yes
-  2. Yes, and don't ask again
-  3. No
-EOF
-}
-
-# ── pane_tail ────────────────────────────────────────────────────────────────
-
-echo "== pane_tail returns the pane's text, not the empty string ==" >&2
-# The only pin that matters here: `herdr pane read --format text` prints raw
-# terminal text, so anything that tries to unwrap a JSON envelope around it gets
-# nothing, silently, for ever.
-permission_text w9:p1
-T=$(pane_tail w9:p1)
-[ -n "$T" ] && ok || bad "pane_tail must return the pane's text (it returned nothing)"
-has "$T" "Do you want to proceed?" "pane_tail must return the text verbatim"
-
-echo "== pane_tail: no pane, no text, and an error envelope is not text ==" >&2
-eq "$(pane_tail '')" "" "no pane id means no text"
-eq "$(pane_tail wZ:p9)" "" "a pane herdr knows nothing about yields nothing"
-# `pane read` answers for a pane with no agent bound - but it can still fail, and
-# an error object must not be mistaken for something an agent printed.
-set_text wE:p1 <<'EOF'
-{"error":{"code":"pane_not_found","message":"pane target wE:p1 not found"},"id":"cli:pane:read"}
-EOF
-eq "$(pane_tail wE:p1)" "" "an error envelope is dropped rather than read"
-
-echo "== pane_tail honours PQ_TAIL_LINES ==" >&2
-{ for i in $(seq 1 60); do printf 'line %s\n' "$i"; done; } > "$(pane_file wT:p1)"
-eq "$(pane_tail wT:p1 | wc -l | tr -d ' ')" "$PQ_TAIL_LINES" "only the last PQ_TAIL_LINES lines are read"
-eq "$(pane_tail wT:p1 | tail -1)" "line 60" "and they are the ones at the bottom"
-
-# ── check_stall ──────────────────────────────────────────────────────────────
+# ── the agent's record ──────────────────────────────────────────────────────────────
 
 # Deliberately does NOT call set_panes: this runs in a command substitution, so the
 # PIDX globals it sets would be left behind in the subshell while PANES_JSON changed
@@ -220,47 +182,50 @@ new_case() {                            # -> task_dir, in running/, pane w1:p1
   printf '%s' "$d"
 }
 
-echo "== check_stall: a working pane is never touched ==" >&2
+# Where the agent's hooks write: the stable task_home path.
+rec() {                                 # task_dir event
+  mkdir -p "$PQ_HOME/tasks"; task_link "$1"
+  printf '{"event":"%s","at":1}' "$2" > "$(task_home "$1")/agent.json"
+}
+
+echo "== a working agent is not blocked, and nothing is typed at it ==" >&2
 D=$(new_case)
 set_panes "$(printf 'w1:p1\tclaude\tworking')"
-working_text w1:p1 1; check_stall "$D"
-working_text w1:p1 2; check_stall "$D"
-eq "$(st "$D" PQ_BLOCKED)" "" "nothing is recorded about a healthy pane"
-eq "$(sent)" "" "and nothing is typed at it"
+rec "$D" working; check_quiet "$D"
+agent_blocked "$D" && bad "a working record is not a block" || ok
+eq "$(block_cell "$D")" "" "and the cell says nothing"
+eq "$(sent)" "" "nothing is typed at it"
 
-echo "== check_stall: a permission prompt is recorded and never answered ==" >&2
+echo "== a permission record is shown and never answered ==" >&2
 D=$(new_case)
 set_panes "$(printf 'w1:p1\tclaude\tblocked')"
-permission_text w1:p1
-check_stall "$D"
-eq "$(st "$D" PQ_BLOCKED)" permission "the prompt is recorded"
+rec "$D" permission
+check_quiet "$D"
+agent_blocked "$D" && ok || bad "the record is a block"
 eq "$(sent)" "" "and left strictly alone"
 eq "$(block_cell "$D")" permission "which is what pq ls says about it"
 eq "$(agent_cell "$D" running)" permission "on the running row, ahead of herdr's own word"
-check_stall "$D"
-eq "$(sent)" "" "a second read changes nothing"
+check_quiet "$D"
+eq "$(sent)" "" "a second tick changes nothing"
 set_panes "$(printf 'w1:p1\tclaude\tworking')"
-working_text w1:p1 3; check_stall "$D"
-eq "$(st "$D" PQ_BLOCKED)" "" "answered, the prompt is cleared"
-eq "$(block_cell "$D")" "" "and the cell with it"
+rec "$D" working
+eq "$(block_cell "$D")" "" "answered, the next record clears it"
 
-echo "== check_stall: a pane herdr cannot show us is left entirely alone ==" >&2
+echo "== no record is no verdict ==" >&2
 D=$(new_case)
-set_panes "$(printf 'w1:p1\tclaude\tidle')"
-st_set "$D" PQ_PANE wGONE:p1
-st_set "$D" PQ_BLOCKED permission
-check_stall "$D"
-eq "$(st "$D" PQ_BLOCKED)" permission "no text means no verdict - nothing is decided on a blind read"
+set_panes "$(printf 'w1:p1\tclaude\tblocked')"
+agent_blocked "$D" && bad "no agent.json is not a block" || ok
+eq "$(agent_cell "$D" running)" blocked "herdr's own word is the row"
 eq "$(sent)" "" "and nothing is typed into the dark"
 
-echo "== check_stall: the usage limit is a hard stop, not something to knock on ==" >&2
+echo "== the usage limit is a hard stop, not something to knock on ==" >&2
 # There is no reset an hour or two out to wait for, so nothing is dismissed, timed
 # or knocked on: the agent stops like any other, and is yours when the limit lifts.
 D=$(new_case)
 set_panes "$(printf 'w1:p1\tclaude\tblocked')"
 limit_text w1:p1
-check_stall "$D"; check_stall "$D"; check_stall "$D"
-eq "$(st "$D" PQ_BLOCKED)" "" "the limit is not recorded as a block of pq's own"
+check_quiet "$D"; check_quiet "$D"; check_quiet "$D"
+eq "$(block_cell "$D")" "" "the limit is not recorded as a block of pq's own"
 eq "$(sent)" "" "nothing is dismissed or typed"
 eq "$(agent_cell "$D" running)" blocked "herdr's word is the row - it wants you"
 
@@ -306,17 +271,17 @@ eq "$(agent_cell "$S" "done")" "-" "and pq ls reads no quota off it"
 tick 1 1
 has "$OUT" "would dispatch after" "the queue moves"
 has "$PQ_SUMMARY" "0 running (cap 1)" "with the slot free"
-tick 0 0                                # cap 0: the real tick reads panes and starts nothing
-eq "$(st "$S" PQ_BLOCKED)" "" "the first real tick that reads its pane clears the old block"
+tick 0 0                                # cap 0: the real tick starts nothing
+eq "$(agent_cell "$S" "done")" "-" "and a real tick still reads no quota off it"
 
 echo "== pq ls: a done row reports a prompt ahead of 'wrapping up' ==" >&2
 reset_tasks; reset_caches
 DN=$(mk_task 'done' 040 dprompt tom/dprompt w5:p1)
 st_set "$DN" PQ_LAUNCHED "$(now)"; st_set "$DN" PQ_PR 700; st_set "$DN" PQ_FINISHED "$(now)"
 set_panes "$(printf 'w5:p1\tclaude\tidle')"
-st_set "$DN" PQ_BLOCKED permission
+rec "$DN" permission
 eq "$(agent_cell "$DN" "done")" permission "a permission prompt on a done row reads as one"
-st_set "$DN" PQ_BLOCKED ""
+rec "$DN" working
 eq "$(agent_cell "$DN" "done")" "wrapping up" "with nothing blocking it, it is just wrapping up"
 
 printf '\n%d passed, %d failed\n' "$pass" "$fail"

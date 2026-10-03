@@ -116,6 +116,10 @@
 #          contract.md how the plan is to be delivered - written once, at dispatch, from
 #                      pq's own template (see `contract_write`); the plan carries the work,
 #                      this carries the rules for turning it into a reviewable pull request
+#          hooks.json  the agent's hooks, handed to it with `--settings` - written once, at
+#                      dispatch, by `hooks_write` (see "reading the agent's hooks")
+#          agent.json  the agent's latest lifecycle event, overwritten by those hooks and
+#                      read by pq instead of the pane
 #          design/     the design files the plan was built from, copied in at add time
 #          evidence/   the implementer's screenshots, published by `pq evidence`
 #          review.json the review gate's own `claude -p` output, plus review.err and
@@ -167,16 +171,14 @@ PQ_DONE_KEEP=3                          # newest archivable done/ tasks archive_
 PQ_WRAPUP_GRACE=300
 RUN_INTERVAL=120                        # seconds between `pq run`'s ticks
 
-# What pq reads off a session's screen or its reply. These are Claude Code UI
+# What pq reads off a headless session's reply. These are Claude Code UI
 # strings, so they will change - hence up here rather than buried in the logic
 # that uses them. PQ_LIMIT_RE is what a session says when the account has run
 # out: the monthly spend limit, in whichever words the plan uses - "You've hit
 # your individual spend limit", "...your org's monthly spend limit", "You're out
 # of usage credits". It is only ever matched against a headless session's WHOLE
-# reply (see limit_reply), never against a pane.
+# reply (see limit_reply), never against a pane - pq does not read panes at all.
 PQ_LIMIT_RE='hit your .*limit|usage limit reached|out of usage'
-PQ_PERM_RE='Do you want to |Yes, and don.t ask again|Allow once'
-PQ_TAIL_LINES=30
 
 # The one branch every task's screenshots are published to (`pq evidence`), in
 # the task's own repo. Never deleted: a merged pull request's description keeps
@@ -1698,55 +1700,78 @@ slot_state() {                          # task_dir -> "wrapping up" | ""
   return 0
 }
 
-# ── reading the pane ────────────────────────────────────────────────────────
-# Every tick reads the bottom of each dispatched agent's pane, for the two ways an
-# unattended agent stops without exiting: a permission prompt, which is recorded
-# and left for you, and going quiet, which check_quiet below knocks on.
+# ── reading the agent's hooks ────────────────────────────────────────────────
+# Every dispatched implementer is started with `--settings <task>/hooks.json`
+# (`hooks_write`), and each of those hooks overwrites <task>/agent.json with the
+# agent's latest lifecycle event. pq reads that file, never the screen, for the
+# three ways an unattended agent stops without exiting: a permission prompt, which
+# is recorded and left for you; an API error that ended its turn, which
+# check_quiet knocks on; and going quiet, which check_quiet nudges.
 #
-# The account's usage limit is deliberately not a third. It is a monthly spend
-# limit - a hard stop, with no reset an hour or two out to wait for - so pq does
-# not knock on it, time it or hold the queue for it. An agent that hits it stops
-# like any other: on Claude Code's dialog it reads as `blocked`, a running one left
-# idle is nudged and then handed to you as `quiet`, and one wrapping up in done/
-# simply sits until you see to it. The cap bounds the damage: a task in running/
-# holds its slot until it opens a pull request, so no more than the cap can be
-# dispatched into it.
+#   UserPromptSubmit, PostToolUse   working     a turn began, or work resumed after a prompt
+#   PermissionRequest               permission  the dialog is up (the hook never answers it)
+#   Stop                            idle        the turn ended
+#   StopFailure                     error       the turn ended on an API error: error + message
 #
-# `pane read`, not `agent read`, and `--format text` is already text - it is not a
-# JSON envelope with the terminal inside it. Piping it through jq is how an early
-# version of this returned the empty string on every tick of every task, which
-# check_stall reads as "could not see the pane" and returns on.
+# Every record carries `at`, epoch seconds. A task with no agent.json - dispatched
+# before this existed, or an agent restarted by hand without `--settings` - gives no
+# signal at all: no permission word, no knocks, no nudges. herdr's own blocked/idle
+# still show in `pq ls`. There is deliberately no fallback to reading the pane.
 #
-# `pane read` is also the only one of the two that answers for a pane whose agent
-# binding has lapsed - `agent read` returns an `agent_not_found` error object - and
-# answering for exactly that pane is the point of the `noagent` case reconcile goes
-# out of its way to include. An error object is still possible (a dead socket, a
-# pane id that is gone), so drop one: it is not terminal text, and letting it
-# through would have check_stall reading somebody's error message.
-pane_tail() {                           # pane_id -> the last lines on screen
-  [ -n "${1:-}" ] || return 0
-  herdr pane read "$1" --source visible --format text 2>/dev/null \
-    | grep -v '^{"error":' | tail -n "$PQ_TAIL_LINES"
+# The account's usage limit is a monthly spend limit - a hard stop, with no reset
+# an hour or two out to wait for - so pq does not knock on it, time it or hold the
+# queue for it: `rate_limit` and `billing_error` are handed over at once, and an
+# agent that stops any other way is nudged and then handed over as `quiet`. A task
+# in running/ holds its slot until it opens a pull request, so the cap bounds how
+# many can be dispatched into it.
+
+# The hooks' own shell, one per event. They run on every tool call, so they are
+# inline jq and never source pq. `file` is shell-quoted by the caller; the record
+# is written to a sibling and moved into place, so a reader never sees half of one.
+hook_command() {                        # quoted_file event -> a shell command
+  local f=$1 ev=$2
+  # The single quotes are the hook's own shell: $at, $f and $$ expand there, not here.
+  # shellcheck disable=SC2016
+  case "$ev" in
+    error) printf 'f=%s; jq -c --argjson at "$(date +%%s)" %s >"$f.$$" && mv "$f.$$" "$f" || true' "$f" \
+             "'{event:\"error\",at:\$at,error:(.error // \"unknown\"),message:((.last_assistant_message // \"\") | (split(\"\\n\")[0] // \"\") | gsub(\"\\t\";\" \") | .[0:120])}'" ;;
+    *)     printf 'cat >/dev/null; f=%s; jq -nc --argjson at "$(date +%%s)" %s >"$f.$$" && mv "$f.$$" "$f" || true' "$f" \
+             "'{event:\"$ev\",at:\$at}'" ;;
+  esac
 }
 
-# One task, one tick: record whether its pane is on a permission prompt, and hand
-# anything else to check_quiet on the same read. A prompt is recorded and
-# deliberately never answered. That is the trade for running everything in auto
-# mode - answering a dialog nobody has identified is how an unattended system
-# approves something it shouldn't - and it is the distinction `pq ls` draws in the
-# morning between an agent waiting on you and one that has simply stopped.
-check_stall() {                         # task_dir
-  local d=$1 pane text
-  pane=$(task_pane "$d"); [ -n "$pane" ] || return 0
-  text=$(pane_tail "$pane"); [ -n "$text" ] || return 0
-  if grep -qiE "$PQ_PERM_RE" <<<"$text"; then
-    [ "$(st "$d" PQ_BLOCKED)" = permission ] || st_set "$d" PQ_BLOCKED permission
-    return 0
-  fi
-  # Only when there is something to clear: this is the overwhelmingly common
-  # branch, and a clear is a rewrite of state.env for no change at all.
-  [ -z "$(st "$d" PQ_BLOCKED)" ] || st_set "$d" PQ_BLOCKED ""
-  check_quiet "$d" "$pane" "$text" "$(cksum <<<"$text" | awk '{ print $1 }')" "$(epoch)"
+# Once, at dispatch, beside contract.md and as immutable as it. Every path is the
+# stable task_home one, since the task moves from running/ to done/ while the agent
+# is still going.
+hooks_write() {                         # task_dir
+  local d=$1 f tmp
+  f=$(printf '%q' "$(task_home "$d")/agent.json")
+  tmp="$d/hooks.json.$$"
+  jq -n \
+    --arg working "$(hook_command "$f" working)" \
+    --arg permission "$(hook_command "$f" permission)" \
+    --arg idle "$(hook_command "$f" idle)" \
+    --arg error "$(hook_command "$f" error)" \
+    'def h($c): [{hooks: [{type: "command", command: $c}]}];
+     {hooks: {UserPromptSubmit: h($working), PostToolUse: h($working),
+              PermissionRequest: h($permission), Stop: h($idle), StopFailure: h($error)}}' \
+    >"$tmp" && mv "$tmp" "$d/hooks.json"
+}
+
+# The one reader: event<TAB>at<TAB>error<TAB>message, empty when there is no usable
+# agent.json. Nothing else opens the file.
+agent_event() {                         # task_dir
+  jq -r '[(.event // ""), ((.at // 0) | tostring), (.error // ""), ((.message // "") | gsub("[\t\n]"; " "))] | join("\t")' \
+    "$(task_home "$1")/agent.json" 2>/dev/null
+}
+
+# Is the agent on a permission dialog? A prompt is recorded and deliberately never
+# answered. That is the trade for running everything in auto mode - answering a
+# dialog nobody has identified is how an unattended system approves something it
+# shouldn't - and it is the distinction `pq ls` draws in the morning between an
+# agent waiting on you and one that has simply stopped.
+agent_blocked() {                       # task_dir
+  [ "$(agent_event "$1" | cut -f1)" = permission ]
 }
 
 # ── an agent that has gone quiet ─────────────────────────────────────────────
@@ -1754,44 +1779,37 @@ check_stall() {                         # task_dir
 # for 56 minutes and then 52 more before Tom asked "has this stalled?", with no
 # pull request and nothing on screen asking for anything. tiptap sat 18 minutes on
 # "Login expired · Please run /login" until he typed "continue" - which was all it
-# took. Both are an idle agent whose screen has stopped, which check_stall already
-# reads every tick, so this runs on the same read, for every pane that is not on
-# a prompt.
+# took. Both are an idle agent, which the hooks record, so this runs every tick
+# for every dispatched task that is not on a prompt.
 #
-# The stretch is the evidence: herdr calling the pane idle, AND its tail unchanged
-# since the tick that first saw it idle (PQ_QUIET_SINCE, PQ_QUIET_HASH). Nothing is
-# judged off one glimpse. Two things end a stretch early:
+# The evidence is herdr calling the pane idle AND the agent's own record. Two
+# things end a stretch early:
 #
-#   an error    a line matching PQ_ERROR_RE near the bottom of the pane - the last
-#               thing the session printed, not something scrolled past - is knocked
-#               on with "continue" once the stretch has lasted a tick, then every
-#               ERROR_RETRY, up to ERROR_KNOCKS times. A finished turn with no error
-#               at the bottom is the recovery, and resets the count
+#   an error    the latest record is a StopFailure: the turn ended on an API error,
+#               and it is knocked on with "continue", then again every ERROR_RETRY,
+#               up to ERROR_KNOCKS times. A turn that ends in `idle` is the recovery,
+#               and resets the count. `rate_limit` and `billing_error` are the
+#               account's hard stop, which "continue" cannot clear: handed over at once
 #   quiet       an agent in running/ - dispatched, no pull request yet - idle and
 #               still for QUIET_AFTER is nudged back to its contract: deliver, or say
-#               it is stuck. Up to QUIET_NUDGES times, and the count is never reset by
-#               the pane moving - a nudged agent always moves a little and then stops
-#               again - only by the task leaving running/
+#               it is stuck. The stretch runs from the later of the latest record's
+#               `at` - whatever its event, since a turn interrupted with Esc ends with
+#               no Stop and its last record stays `working` - and pq's own last knock
+#               or nudge (PQ_QUIET_SINCE). Up to QUIET_NUDGES times, and the count is
+#               only reset by the task leaving running/
 #
 # Past either bound it is handed to you, once: `pq ls` reads `error` or `quiet` on an
 # idle pane, counted into "needs you". The nudge is running/ only, since a done/
 # agent resting idle is simply finished; an error is knocked on in either.
 #
 # Both go through `herdr agent prompt`, which refuses a pane sitting on a dialog, so
-# a knock can never answer one. And neither holds up the queue: a regex over a
-# terminal can be wrong, and a real account-wide failure - a login that will not
-# refresh, the usage limit - shows itself at the next dispatch, which costs one
-# worktree, and the cap bounds how many.
-# Anchored to where Claude Code prints them - a line of their own, after the
-# transcript's `⎿` - because the words themselves turn up mid-line in plenty of
-# panes: a diff of error-handling code, a command that greps for them. The first
-# live read of every agent pane matched exactly one, and it was a command line.
-PQ_ERROR_RE='^[[:space:]]*(⎿[[:space:]]*)?(API Error|Login expired)'
+# a knock can never answer one. And neither holds up the queue: a real account-wide
+# failure shows itself at the next dispatch, which costs one worktree, and the cap
+# bounds how many.
 ERROR_RETRY=300
 ERROR_KNOCKS=6
 QUIET_AFTER=900
 QUIET_NUDGES=3
-ERROR_LINES=12
 
 quiet_prompt() {                        # task_home minutes
   printf '%s' "You have been idle for $2 minutes without opening a pull request. \
@@ -1800,42 +1818,44 @@ If you are stuck, or the plan does not fit the code, commit what you have, push,
 whose title begins with STUCK: saying what blocked you. Never wait for input - there is nobody watching."
 }
 
-check_quiet() {                         # task_dir pane text hash now
-  local d=$1 pane=$2 text=$3 hash=$4 nowsec=$5 slug since seen
-  case "$(pane_state "$pane")" in
-    idle|done) ;;
-    *) [ -z "$(st "$d" PQ_QUIET_SINCE)" ] || st_set "$d" PQ_QUIET_SINCE ""
-       return 0 ;;
-  esac
-  seen=$(st "$d" PQ_QUIET_HASH); since=$(st "$d" PQ_QUIET_SINCE)
-  if [ -z "$since" ] || [ "$seen" != "$hash" ]; then
-    st_set "$d" PQ_QUIET_HASH "$hash"; st_set "$d" PQ_QUIET_SINCE "$nowsec"
-    return 0
-  fi
-  slug=$(slug_of "$d")
-  local err knocks at code
-  err=$(tail -n "$ERROR_LINES" <<<"$text" | grep -E "$PQ_ERROR_RE" | tail -1 | sed 's/^[^A-Za-z]*//')
-  if [ -n "$err" ]; then
+check_quiet() {                         # task_dir
+  local d=$1 pane slug nowsec ev at err msg since mark
+  pane=$(task_pane "$d"); [ -n "$pane" ] || return 0
+  IFS=$'\t' read -r ev at err msg <<<"$(agent_event "$d")"
+  [ -n "$ev" ] || return 0                       # no agent.json: no signal
+  [ "$ev" = permission ] && return 0             # recorded, and left for you
+  case "$(pane_state "$pane")" in idle|done) ;; *) return 0 ;; esac
+  nowsec=$(epoch); slug=$(slug_of "$d")
+  local knocks code
+  if [ "$ev" = error ]; then
+    case "$err" in
+      rate_limit|billing_error)
+        [ "$(st "$d" PQ_QUIET)" = error ] || { st_set "$d" PQ_QUIET error
+          warn "$slug: stopped on $err (\"$msg\") - the account limit, look at it"; }
+        return 0 ;;
+    esac
     knocks=$(st "$d" PQ_ERR_KNOCKS); knocks=${knocks:-0}
     if [ "$knocks" -ge "$ERROR_KNOCKS" ]; then
       [ "$(st "$d" PQ_QUIET)" = error ] || { st_set "$d" PQ_QUIET error
-        warn "$slug: still stopped on \"$err\" after $knocks knocks - look at it"; }
+        warn "$slug: still stopped on $err (\"$msg\") after $knocks knocks - look at it"; }
       return 0
     fi
-    at=$(st "$d" PQ_ERR_AT)
-    [ -n "$at" ] && [ $(( nowsec - at )) -lt "$ERROR_RETRY" ] && return 0
+    mark=$(st "$d" PQ_ERR_AT)
+    [ -n "$mark" ] && [ $(( nowsec - mark )) -lt "$ERROR_RETRY" ] && return 0
     code=$(agent_prompt "$pane" "Continue with what you were doing.") || {
-      warn "$slug: stopped on \"$err\" - could not knock ($code)"; return 0; }
+      warn "$slug: stopped on $err (\"$msg\") - could not knock ($code)"; return 0; }
     knocks=$(( knocks + 1 ))
-    st_set "$d" PQ_ERR_KNOCKS "$knocks"; st_set "$d" PQ_ERR_AT "$nowsec"; st_set "$d" PQ_QUIET_SINCE ""
-    msg "$slug: stopped on \"$err\" - knocked (attempt $knocks)"
+    st_set "$d" PQ_ERR_KNOCKS "$knocks"; st_set "$d" PQ_ERR_AT "$nowsec"; st_set "$d" PQ_QUIET_SINCE "$nowsec"
+    msg "$slug: stopped on $err (\"$msg\") - knocked (attempt $knocks)"
     return 0
   fi
-  # A turn that ended without an error at the bottom is the recovery.
+  # A turn that ended without an error is the recovery.
   [ -z "$(st "$d" PQ_ERR_KNOCKS)" ] || { st_set "$d" PQ_ERR_KNOCKS ""; st_set "$d" PQ_ERR_AT ""; }
   [ "$(st "$d" PQ_QUIET)" = error ] && st_set "$d" PQ_QUIET ""
 
   [ "$(state_of "$d")" = running ] && [ -n "$(st "$d" PQ_LAUNCHED)" ] || return 0
+  since=${at:-0}; mark=$(st "$d" PQ_QUIET_SINCE)
+  [ -n "$mark" ] && [ "$mark" -gt "$since" ] && since=$mark
   [ $(( nowsec - since )) -ge "$QUIET_AFTER" ] || return 0
   local nudges; nudges=$(st "$d" PQ_NUDGES); nudges=${nudges:-0}
   if [ "$nudges" -ge "$QUIET_NUDGES" ]; then
@@ -1846,7 +1866,7 @@ check_quiet() {                         # task_dir pane text hash now
   code=$(agent_prompt "$pane" "$(quiet_prompt "$(task_home "$d")" $(( (nowsec - since) / 60 )))") || {
     warn "$slug: gone quiet with no pull request - could not nudge it ($code)"; return 0; }
   nudges=$(( nudges + 1 ))
-  st_set "$d" PQ_NUDGES "$nudges"; st_set "$d" PQ_QUIET_SINCE ""
+  st_set "$d" PQ_NUDGES "$nudges"; st_set "$d" PQ_QUIET_SINCE "$nowsec"
   msg "$slug: idle $(( (nowsec - since) / 60 ))m with no pull request - nudged it (nudge $nudges of $QUIET_NUDGES)"
 }
 
@@ -2489,12 +2509,11 @@ age_of() {                              # iso8601
   age_since "$at"
 }
 
-# What check_stall recorded about a pane, as a cell: `permission`, or nothing at
-# all when the task is not blocked. Shared by the running and the done branches
-# below, because check_stall reads both, and a wrapping-up agent on a prompt has
-# exactly as much to say about it as a running one.
+# What the agent's hooks recorded, as a cell: `permission`, or nothing at all when
+# the task is not blocked. Shared by the running and the done branches below, since
+# a wrapping-up agent on a prompt has exactly as much to say about it as a running one.
 block_cell() {                          # task_dir
-  [ "$(st "$1" PQ_BLOCKED)" = permission ] && printf 'permission'
+  agent_blocked "$1" && printf 'permission'
   return 0
 }
 
@@ -2515,7 +2534,7 @@ agent_cell() {                          # task_dir state
       # A base that has gone missing outranks any blocker verdict: the task cannot
       # start either way, and this is the one that needs YOU rather than time.
       # Read from the stamp, never probed here - `base_check` in the tick is the
-      # writer, exactly as `block_cell` reads PQ_BLOCKED rather than inspecting a
+      # writer, exactly as `block_cell` reads the agent's record rather than inspecting a
       # pane. A listing must not touch git or write to state.env.
       #
       # Without this a task whose base was merged and deleted would show `-` and
@@ -2567,7 +2586,7 @@ agent_cell() {                          # task_dir state
       # running row does, and counts into "needs you" through the case cmd_ls
       # already has for that word.
       #
-      # What pq read off the pane comes first, exactly as it does for a running
+      # What the agent's hooks recorded comes first, exactly as it does for a running
       # row: `permission` says what the agent is waiting on, where herdr's bare
       # `blocked` cannot.
       blocked=$(block_cell "$d")
@@ -2604,7 +2623,7 @@ agent_cell() {                          # task_dir state
     "")        printf '?';    return ;;       # herdr did not answer
     missing)   printf 'gone'; return ;;       # workspace is gone, so nothing else applies
   esac
-  # What pq itself read off the pane outranks whatever herdr makes of it: a prompt
+  # What the agent's own hooks recorded outranks whatever herdr makes of it: a prompt
   # on screen is what the agent is waiting on, whatever herdr's own regexes call
   # the pane. Same ordering as reconcile, for the same reason.
   blocked=$(block_cell "$d")
@@ -3215,7 +3234,7 @@ agent_start() {                         # task_dir pane model effort -> 0 an age
     # Shielded like `wt new`: a Ctrl-C mid-start would otherwise leave a Claude
     # half-launched with nobody to record it.
     shielded herdr agent start "$name" --kind claude --pane "$pane" --timeout "$PQ_AGENT_START_MS" \
-      -- --model "$model" --effort "$effort"
+      -- --model "$model" --effort "$effort" --settings "$(task_home "$d")/hooks.json"
     rc=$?
     code=$(herdr_err "$SHIELDED_OUT")
     if [ -z "$code" ] && { [ "$rc" != 0 ] || [ -z "$SHIELDED_OUT" ]; }; then code="herdr exited $rc with no answer"; fi
@@ -3349,6 +3368,12 @@ dispatch_task() {                       # task_dir  -> 0 launched, 1 failed, 2 w
   # and leaves it, so a running agent's contract is as immutable as its plan.
   if [ ! -f "$d/contract.md" ]; then
     contract_write "$d" || { warn "$(slug_of "$d"): could not write contract.md"; return 1; }
+  fi
+
+  # The agent's hooks, once, for the same reason: `agent_start` passes the file, and
+  # pq reads what they write (see "reading the agent's hooks").
+  if [ ! -f "$d/hooks.json" ]; then
+    hooks_write "$d" || { warn "$(slug_of "$d"): could not write hooks.json"; return 1; }
   fi
 
   # Start the agent, unless one is already there. `PQ_STARTED` is the record;
@@ -4058,7 +4083,7 @@ review_task() {                         # task_dir dry
         idle|done|unknown) ;;
         *) return 0 ;;                  # working, blocked, or herdr silent
       esac
-      [ -n "$(st "$d" PQ_BLOCKED)" ] && return 0
+      agent_blocked "$d" && return 0
       # One follow-up, about both reviews - so not while the security reviewer
       # the plan asked for is yet to launch, or still running.
       case "$(st "$d" PQ_SECURITY)" in pending|running) return 0 ;; esac
@@ -4144,7 +4169,7 @@ review_step() {                         # task_dir dry pr pstate
       # Not while the agent is still going or blocked - on a prompt pq has
       # recorded, too, whatever herdr makes of the pane; not while herdr is
       # silent; not inside a retry backoff.
-      [ -n "$(st "$d" PQ_BLOCKED)" ] && return 0
+      agent_blocked "$d" && return 0
       case "$pstate" in working|blocked|"") return 0 ;; esac
       local at; at=$(st "$d" PQ_REVIEW_RETRY_AT)
       [ -n "$at" ] && [ "$nowsec" -lt "$at" ] && return 0
@@ -4246,7 +4271,7 @@ security_step() {                       # task_dir dry pr pstate
   case "$sec" in
     pending)
       case "$(st "$d" PQ_REVIEW)" in running|posted) ;; *) return 0 ;; esac
-      [ -n "$(st "$d" PQ_BLOCKED)" ] && return 0
+      agent_blocked "$d" && return 0
       case "$pstate" in working|blocked|"") return 0 ;; esac
       local at; at=$(st "$d" PQ_SECURITY_RETRY_AT)
       [ -n "$at" ] && [ "$nowsec" -lt "$at" ] && return 0
@@ -4547,7 +4572,7 @@ watch_task() {                          # task_dir dry
   fi
 
   case "$pstate" in idle|done|unknown) ;; *) return 0 ;; esac   # working, blocked, or herdr silent
-  [ -n "$(st "$d" PQ_BLOCKED)" ] && return 0
+  agent_blocked "$d" && return 0
   [ "$dry" = 1 ] && { msg "would prompt $slug about #$pr - $word"; return 0; }
   local code rc
   code=$(agent_prompt "$(task_pane "$d")" "$(watch_prompt "$need" "$pr" "$base" "$what")"); rc=$?
@@ -5081,11 +5106,8 @@ tick_body() {                           # cap dry
         fi
         continue
       fi
-      # The pane is read for every state but `missing`, `noagent` included: a
-      # binding that lapsed for a moment still has a pane worth reading, and
-      # pane_tail answers for one.
       local pstate; pstate=$(pane_state "$(task_pane "$d")")
-      [ "$dry" = 1 ] || [ "$pstate" = missing ] || check_stall "$d"
+      [ "$dry" = 1 ] || [ "$pstate" = missing ] || check_quiet "$d"
       case "$pstate" in
         missing) warn "$slug: its workspace is gone and no PR exists - look at it, then: pq rm $slug" ;;
         noagent) warn "$slug: the agent exited without opening a PR - look at the pane, or: pq rm $slug" ;;
@@ -5093,29 +5115,26 @@ tick_body() {                           # cap dry
     done
   fi
 
-  # 1.2 The pane, for tasks that have already opened their pull request. An agent
+  # 1.2 The agent's hooks, for tasks that have already opened their pull request. An agent
   # does not stop when it opens one - it answers review, fixes CI, pushes again -
   # so `done/` is where an unattended agent spends most of the night, and it can
   # land on a prompt or stop on an error there exactly as easily as in `running/`.
   # A permission prompt in `done/` is recorded and left for you, the same as
   # anywhere else, and an error is knocked on (see check_quiet). Only reaped tasks
-  # are skipped, because their pane is gone. It runs BEFORE the review gate, the
-  # watch and reap, so the block it records is visible to each of them on the
-  # tick that recorded it.
+  # are skipped, because their pane is gone.
   if [ "$dry" != 1 ]; then
     for d in "$PQ_HOME/done"/*/; do
       [ -d "$d" ] || continue
       d=${d%/}
       [ -n "$(st "$d" PQ_REAPED)" ] && continue
       [ "$(pane_state "$(task_pane "$d")")" = missing ] && continue
-      check_stall "$d"
+      check_quiet "$d"
     done
   fi
 
   # 1.22 The review gate, one step per task - see the `review gate` section.
   # After reconcile, so a task that finished this tick is examined this tick;
-  # after check_stall, because an agent on a prompt may read `idle` to herdr and
-  # only PQ_BLOCKED says otherwise; before reap, so a settled PR stops its reviewer
+  # before reap, so a settled PR stops its reviewer
   # before `wt rm` closes the workspace it runs in; before active_slots, so the
   # hold it puts on a slot is counted on the same tick. Reaped tasks have no pane
   # and no worktree left, and nothing here applies to them.
@@ -5129,8 +5148,8 @@ tick_body() {                           # cap dry
   done
 
   # 1.23 The watch on a pull request marked ready - see its section. After the
-  # gate, so a pull request marked ready this tick is watched from this tick; after
-  # check_stall, for the same PQ_BLOCKED reason; before reap, which it does not
+  # gate, so a pull request marked ready this tick is watched from this tick; before
+  # reap, which it does not
   # hold up - a pull request that settles is simply not watched any more.
   for d in "$PQ_HOME/done"/*/; do
     [ -d "$d" ] || continue

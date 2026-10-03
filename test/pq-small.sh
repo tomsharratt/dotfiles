@@ -235,9 +235,10 @@ st_set "$T" PQ_PANE w5:p1; st_set "$T" PQ_WORKTREE "$WT_A"; st_set "$T" PQ_LAUNC
 set_panes "$(printf 'w5:p1\tclaude\tidle\t%s' "$WT_B")"
 eq "$(task_pane "$T")" "" "a pane sitting in another worktree is not this task's"
 eq "$(pane_state "$(task_pane "$T")")" "missing" "so the task's own pane reads as missing"
-printf "  Do you want to proceed?\n" > "$STUBBIN/pane.w5_p1"
+mkdir -p "$PQ_HOME/tasks"; task_link "$T"
+printf '{"event":"error","at":1,"error":"server_error","message":"x"}' > "$(task_home "$T")/agent.json"
 : > "$HERDR_LOG"                        # set_panes' own snapshot read is not the question
-check_stall "$T" >/dev/null 2>&1
+check_quiet "$T" >/dev/null 2>&1
 grep -q "w5:p1" "$HERDR_LOG" && bad "and nothing reads or knocks on somebody else's pane" || ok
 set_panes "$(printf 'w5:p1\tclaude\tidle\t%s/app' "$WT_A")"
 eq "$(task_pane "$T")" "w5:p1" "a pane inside the task's own worktree is its pane"

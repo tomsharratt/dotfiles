@@ -3,13 +3,13 @@
 #
 # tap-to-reveal sat idle 56 minutes, then 52 more, with no pull request, until Tom
 # asked "has this stalled?". tiptap sat 18 minutes on "Login expired · Please run
-# /login" until he typed "continue". check_quiet reads the same pane check_stall
-# does and knocks on both: an error line at the bottom of the pane gets
+# /login" until he typed "continue". check_quiet reads the agent's own hook record
+# (agent.json) and knocks on both: a turn that ended on an API error gets
 # "continue", and an agent idle and still for QUIET_AFTER with no pull request gets
 # nudged back to its contract - each bounded, and handed to you past the bound.
 #
-# The harness is test/pq-pane.sh's `pane read` stub and test/pq-review.sh's
-# recording `agent prompt`, with the clock pinned.
+# The harness is test/pq-review.sh's recording `agent prompt`, with the clock pinned
+# and agent.json written by hand where the hooks would write it.
 #
 # SC2034: the pane index set here is read by the pq sourced below.
 # SC2015: `ok` never fails, so `[ ... ] && ok || bad` is an if/else.
@@ -33,7 +33,6 @@ cat > "$STUBBIN/herdr" <<EOF
 key=\$(printf '%s' "\$3" | tr ':' '_')
 case "\$1 \$2" in
   "api snapshot") cat "$PANES_JSON"; exit 0 ;;
-  "pane read")    [ -f "$STUBBIN/pane.\$key" ] && cat "$STUBBIN/pane.\$key"; exit 0 ;;
   "agent prompt")
     { for a in "\$@"; do printf '%s\t' "\$a"; done; printf '\n'; } >> "$HERDR_LOG"
     if [ -f "$STUBBIN/.prompt-fail" ]; then
@@ -84,7 +83,11 @@ set_panes() {                           # "pane<TAB>agent<TAB>status" lines
                 agent_status: (if (.[2] // "") == "" then null else .[2] end) })
           | { result: { snapshot: { panes: . } } }' <<<"$1" > "$PANES_JSON"
 }
-screen() { printf '%s\n' "$2" > "$STUBBIN/pane.$(tr ':' '_' <<<"$1")"; }   # pane text
+rec() {                                 # task_dir event [error message] - what a hook writes, stamped now
+  jq -nc --arg e "$2" --argjson at "$FAKE_NOW" --arg err "${3:-}" --arg m "${4:-}" \
+    '{event:$e,at:$at} + (if $err == "" then {} else {error:$err,message:$m} end)' \
+    > "$(task_home "$1")/agent.json"
+}
 prompts() { grep -c "^agent	prompt	" "$HERDR_LOG" 2>/dev/null || true; }
 prompt_text() { grep "^agent	prompt	" "$HERDR_LOG" | tail -1 | cut -f4; }
 reset_logs() { : > "$HERDR_LOG"; rm -f "$STUBBIN/.prompt-fail"; }
@@ -95,22 +98,21 @@ mk_task() {                             # state prio slug pane -> task_dir
   mkdir -p "$d"
   printf -- '---\nrepo:     %s\nbranch:   tom/%s\nmodel:    sonnet\neffort:   xhigh\nintent:   t\nadded:    2026-01-01T00:00:00Z\n---\n\nplan\n' \
     "$REPO" "$3" > "$d/plan.md"
+  mkdir -p "$PQ_HOME/tasks"; task_link "$d"
   st_set "$d" PQ_PANE "$4"; st_set "$d" PQ_LAUNCHED 2026-01-01T00:00:00Z
   printf '%s' "$d"
 }
-IDLE_SCREEN=$'I have read the plan and made a start on the model.\n\n> \n  opus 5.5 | ctx 41%'
 
 echo "== an agent idle and still with no pull request is nudged after QUIET_AFTER ==" >&2
 R=$(mk_task running 10 tapreveal w1:p1)
 set_panes "$(printf 'w1:p1\tclaude\tidle')"
-screen w1:p1 "$IDLE_SCREEN"
-check_stall "$R" >/dev/null 2>&1
-eq "$(prompts)" "0" "one glimpse starts the stretch and judges nothing"
-[ -n "$(st "$R" PQ_QUIET_SINCE)" ] && ok || bad "the stretch is on file"
-later $(( QUIET_AFTER - 60 )); check_stall "$R" >/dev/null 2>&1
+rec "$R" idle
+check_quiet "$R" >/dev/null 2>&1
+eq "$(prompts)" "0" "a fresh record is not quiet yet"
+later $(( QUIET_AFTER - 60 )); check_quiet "$R" >/dev/null 2>&1
 eq "$(prompts)" "0" "not before QUIET_AFTER"
-later 60; out=$(check_stall "$R" 2>&1)
-eq "$(prompts)" "1" "at QUIET_AFTER it is nudged"
+later 60; out=$(check_quiet "$R" 2>&1)
+eq "$(prompts)" "1" "at QUIET_AFTER, timed from the record's own stamp, it is nudged"
 P=$(prompt_text)
 has "$P" "idle for 15 minutes without opening a pull request" "saying how long"
 has "$P" "$PQ_HOME/tasks/$(basename "$R")/contract.md" "pointing at its contract, through the stable path"
@@ -120,103 +122,132 @@ has "$out" "idle 15m with no pull request - nudged it (nudge 1 of 3)" "said in t
 eq "$(st "$R" PQ_NUDGES)" "1" "counted"
 eq "$(agent_cell "$R" running)" "idle" "a nudged agent still reads as what it is"
 
-echo "== the pane moving after a nudge does not buy it more nudges ==" >&2
-screen w1:p1 $'Understood - I will carry on.\n\n> '
-check_stall "$R" >/dev/null 2>&1          # the reply: a new screen starts a new stretch
-later "$QUIET_AFTER"; check_stall "$R" >/dev/null 2>&1
+echo "== the agent moving after a nudge does not buy it more nudges ==" >&2
+rec "$R" working; rec "$R" idle                # it replied, and stopped again
+later "$QUIET_AFTER"; check_quiet "$R" >/dev/null 2>&1
 eq "$(st "$R" PQ_NUDGES)" "2" "quiet again: the second nudge"
-screen w1:p1 $'Carrying on.\n\n> '
-check_stall "$R" >/dev/null 2>&1
-later "$QUIET_AFTER"; check_stall "$R" >/dev/null 2>&1
+rec "$R" idle
+later "$QUIET_AFTER"; check_quiet "$R" >/dev/null 2>&1
 eq "$(st "$R" PQ_NUDGES)" "3" "the third"
-screen w1:p1 $'Still carrying on.\n\n> '
-check_stall "$R" >/dev/null 2>&1
-later "$QUIET_AFTER"; out=$(check_stall "$R" 2>&1)
+rec "$R" idle
+later "$QUIET_AFTER"; out=$(check_quiet "$R" 2>&1)
 eq "$(prompts)" "3" "and no fourth"
 has "$out" "idle with no pull request after 3 nudges - look at it" "it is handed to you"
 eq "$(agent_cell "$R" running)" "quiet" "pq ls says so"
 LS=$(PQ_WIDTH=200 main ls 2>&1)
 has "$LS" "(1 needs you)" "and counts it as needing you"
-later "$QUIET_AFTER"; eq "$(check_stall "$R" 2>&1)" "" "once"
+later "$QUIET_AFTER"; eq "$(check_quiet "$R" 2>&1)" "" "once"
 set_panes "$(printf 'w1:p1\tclaude\tworking')"
 eq "$(agent_cell "$R" running)" "working" "set going again, it simply reads as working"
+
+echo "== pq's own nudge restarts the stretch, not the record ==" >&2
+reset_logs
+N=$(mk_task running 19 nudgeclock w1:p2)
+set_panes "$(printf 'w1:p2\tclaude\tidle')"
+rec "$N" idle
+later "$QUIET_AFTER"; check_quiet "$N" >/dev/null 2>&1
+eq "$(prompts)" "1" "nudged"
+later $(( QUIET_AFTER - 1 )); check_quiet "$N" >/dev/null 2>&1
+eq "$(prompts)" "1" "not again until a full QUIET_AFTER after the nudge"
+later 1; check_quiet "$N" >/dev/null 2>&1
+eq "$(prompts)" "2" "then it is"
+
+echo "== an interrupted turn (last record still working, herdr idle) is nudged ==" >&2
+reset_logs
+X=$(mk_task running 20 esc w1:p3)
+set_panes "$(printf 'w1:p3\tclaude\tidle')"
+rec "$X" working
+later "$QUIET_AFTER"; check_quiet "$X" >/dev/null 2>&1
+eq "$(prompts)" "1" "a turn ended with Esc has no Stop, and is still nudged"
 
 echo "== a working agent is never quiet, and a done one is never nudged ==" >&2
 reset_logs
 W=$(mk_task running 11 busy w2:p1)
 set_panes "$(printf 'w2:p1\tclaude\tworking')"
-screen w2:p1 "$IDLE_SCREEN"
-check_stall "$W" >/dev/null 2>&1; later $(( QUIET_AFTER * 2 )); check_stall "$W" >/dev/null 2>&1
-eq "$(prompts)" "0" "a working pane has no stretch at all"
-eq "$(st "$W" PQ_QUIET_SINCE)" "" "and none on file"
+rec "$W" working
+later $(( QUIET_AFTER * 2 )); check_quiet "$W" >/dev/null 2>&1
+eq "$(prompts)" "0" "herdr says working: no nudge, however old the record"
 D=$(mk_task "done" 12 finished w3:p1)
 set_panes "$(printf 'w3:p1\tclaude\tidle')"
-screen w3:p1 "$IDLE_SCREEN"
-check_stall "$D" >/dev/null 2>&1; later $(( QUIET_AFTER * 2 )); check_stall "$D" >/dev/null 2>&1
+rec "$D" idle
+later $(( QUIET_AFTER * 2 )); check_quiet "$D" >/dev/null 2>&1
 eq "$(prompts)" "0" "a done agent resting idle is finished, not quiet"
 
-echo "== an error at the bottom of the pane is knocked on with continue ==" >&2
+echo "== no agent.json: no signal, no knocks, no nudges ==" >&2
+reset_logs
+Z=$(mk_task running 21 nohooks w1:p4)
+set_panes "$(printf 'w1:p4\tclaude\tidle')"
+later $(( QUIET_AFTER * 3 )); check_quiet "$Z" >/dev/null 2>&1
+eq "$(prompts)" "0" "nothing to read, nothing done"
+eq "$(agent_cell "$Z" running)" "idle" "and it reads as herdr says"
+printf 'not json' > "$(task_home "$Z")/agent.json"
+check_quiet "$Z" >/dev/null 2>&1
+eq "$(prompts)" "0" "an unreadable record is no signal either"
+
+echo "== a turn that ended on an API error is knocked on with continue ==" >&2
 reset_logs
 E=$(mk_task running 13 apierror w4:p1)
 set_panes "$(printf 'w4:p1\tclaude\tidle')"
-screen w4:p1 $'Running the specs now.\n  ⎿  API Error: 500 {"type":"error","error":{"type":"api_error","message":"Internal server error"}}\n\n> \n  opus 5.5 | ctx 41%'
-check_stall "$E" >/dev/null 2>&1
-eq "$(prompts)" "0" "not off one glimpse"
-later 120; out=$(check_stall "$E" 2>&1)
-eq "$(prompts)" "1" "a tick later, it is knocked on"
+rec "$E" error server_error "API Error: 500 Internal server error"
+out=$(check_quiet "$E" 2>&1)
+eq "$(prompts)" "1" "knocked on"
 eq "$(prompt_text)" "Continue with what you were doing." "with a plain continue"
-has "$out" "stopped on \"API Error: 500" "naming the error"
+has "$out" "stopped on server_error (\"API Error: 500 Internal server error\")" "naming the error"
 has "$out" "knocked (attempt 1)" "and the attempt"
-screen w4:p1 $'Running the specs now.\n  ⎿  API Error: 500 again\n\n> '
-check_stall "$E" >/dev/null 2>&1; later 120; check_stall "$E" >/dev/null 2>&1
+rec "$E" error server_error "API Error: 500 again"
+later 120; check_quiet "$E" >/dev/null 2>&1
 eq "$(prompts)" "1" "not again inside ERROR_RETRY"
-later "$ERROR_RETRY"; check_stall "$E" >/dev/null 2>&1
+later "$ERROR_RETRY"; check_quiet "$E" >/dev/null 2>&1
 eq "$(prompts)" "2" "and again once it is due"
-for n in 3 4 5 6; do screen w4:p1 "  ⎿  API Error: 529 overloaded ($n)"; check_stall "$E" >/dev/null 2>&1; later "$ERROR_RETRY"; check_stall "$E" >/dev/null 2>&1; done
+for n in 3 4 5 6; do rec "$E" error overloaded "API Error: 529 ($n)"; later "$ERROR_RETRY"; check_quiet "$E" >/dev/null 2>&1; done
 eq "$(st "$E" PQ_ERR_KNOCKS)" "6" "up to ERROR_KNOCKS"
-screen w4:p1 "API Error: 529 overloaded - still"
-check_stall "$E" >/dev/null 2>&1; later "$ERROR_RETRY"; out=$(check_stall "$E" 2>&1)
+later "$ERROR_RETRY"; out=$(check_quiet "$E" 2>&1)
 eq "$(prompts)" "6" "and no further"
 has "$out" "after 6 knocks - look at it" "handed to you"
 eq "$(agent_cell "$E" running)" "error" "pq ls says so"
 
-echo "== a turn that ends without the error is the recovery ==" >&2
-screen w4:p1 $'All green.\n\n> '
-check_stall "$E" >/dev/null 2>&1; later 120; check_stall "$E" >/dev/null 2>&1
+echo "== a turn that ends in idle is the recovery ==" >&2
+rec "$E" idle
+check_quiet "$E" >/dev/null 2>&1
 eq "$(st "$E" PQ_ERR_KNOCKS)" "" "the count resets"
 eq "$(agent_cell "$E" running)" "idle" "and it reads as idle again"
+
+echo "== the account limit is handed over at once, never knocked on ==" >&2
+reset_logs
+for kind in rate_limit billing_error; do
+  A=$(mk_task running 2$RANDOM "limit-$kind" w1:p5)
+  set_panes "$(printf 'w1:p5\tclaude\tidle')"
+  rec "$A" error "$kind" "You've hit your session limit"
+  out=$(check_quiet "$A" 2>&1)
+  eq "$(prompts)" "0" "$kind: no knock"
+  has "$out" "stopped on $kind" "$kind: said"
+  eq "$(agent_cell "$A" running)" "error" "$kind: pq ls says so at once"
+done
 
 echo "== a login that expired, in a done task too ==" >&2
 reset_logs
 L=$(mk_task "done" 14 tiptap w5:p1)
 set_panes "$(printf 'w5:p1\tclaude\tidle')"
-screen w5:p1 $'Pushed the fix.\n  ⎿  Login expired · Please run /login\n\n> '
-check_stall "$L" >/dev/null 2>&1; later 120; check_stall "$L" >/dev/null 2>&1
+rec "$L" error authentication_failed "Login expired · Please run /login"
+check_quiet "$L" >/dev/null 2>&1
 eq "$(prompts)" "1" "a done agent stopped on an error is knocked on as well"
 
-echo "== an error scrolled up out of the bottom lines is not the last thing it said ==" >&2
+echo "== a permission record is left alone, and never knocked on ==" >&2
 reset_logs
-O=$(mk_task running 15 scrolled w6:p1)
-set_panes "$(printf 'w6:p1\tclaude\tidle')"
-screen w6:p1 "$(printf 'API Error: 500 an hour ago\n'; for i in $(seq 1 15); do printf 'line %s of what came after\n' "$i"; done)"
-check_stall "$O" >/dev/null 2>&1; later 120; check_stall "$O" >/dev/null 2>&1
-eq "$(prompts)" "0" "no knock for an old error"
-
-echo "== ...and the words mid-line are not the error: a diff, a command ==" >&2
-reset_logs
-M=$(mk_task running 18 midline w9:p1)
-set_panes "$(printf 'w9:p1\tclaude\tidle')"
-screen w9:p1 $'  +    # retry once on an API Error from the upstream\n  $ grep -n "Login expired" app/auth.rb\n\n> '
-check_stall "$M" >/dev/null 2>&1; later 120; check_stall "$M" >/dev/null 2>&1
-eq "$(prompts)" "0" "no knock for code that mentions them"
+G=$(mk_task running 22 perm w1:p6)
+set_panes "$(printf 'w1:p6\tclaude\tidle')"
+rec "$G" permission
+later $(( QUIET_AFTER * 2 )); check_quiet "$G" >/dev/null 2>&1
+eq "$(prompts)" "0" "no nudge for an agent on a dialog"
+eq "$(agent_cell "$G" running)" "permission" "and it reads as permission"
 
 echo "== a knock the pane refuses is said, not counted ==" >&2
 reset_logs
 K=$(mk_task running 16 dialog w7:p1)
 set_panes "$(printf 'w7:p1\tclaude\tidle')"
-screen w7:p1 $'API Error: 500\n\n> '
+rec "$K" error server_error "API Error: 500"
 printf 'agent_blocked' > "$STUBBIN/.prompt-fail"
-check_stall "$K" >/dev/null 2>&1; later 120; out=$(check_stall "$K" 2>&1)
+out=$(check_quiet "$K" 2>&1)
 has "$out" "could not knock (agent_blocked)" "said"
 eq "$(st "$K" PQ_ERR_KNOCKS)" "" "and not counted"
 
@@ -226,8 +257,7 @@ rm -rf "$PQ_HOME/running" "$PQ_HOME/done"; mkdir -p "$PQ_HOME/running" "$PQ_HOME
 PR_CACHE="$PQ_HOME/.test.pr"; PR_ANS="$PQ_HOME/.test.ans"; : > "$PR_CACHE"; : > "$PR_ANS"
 T=$(mk_task running 17 ticked w8:p1)
 set_panes "$(printf 'w8:p1\tclaude\tidle')"
-screen w8:p1 "$IDLE_SCREEN"
-tick_body 0 0 >/dev/null 2>&1
+rec "$T" idle
 later "$QUIET_AFTER"
 : > "$PR_CACHE"; : > "$PR_ANS"
 tick_body 0 0 >/dev/null 2>&1
