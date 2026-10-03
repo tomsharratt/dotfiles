@@ -829,15 +829,28 @@ slug_taken_in() {                       # slug -> the state name, or nothing
 # `pq add` with no plan, at a terminal, shows what it is about to queue rather
 # than guessing silently - see cmd_add's own gate for exactly when this fires.
 
-# The first line with real content, leading blanks skipped, a leading `#`
-# marker stripped whether it is one or several. H1 for every plan Claude Code
-# writes today; the first non-blank line is the fallback for anything without
-# one.
-plan_title() {                          # plan_file -> its title
-  awk '
-    /^[[:space:]]*$/ { next }
-    { sub(/^#+[ \t]*/, ""); print; exit }
-  ' "$1"
+# One picker line per plan, from `epoch<TAB>path` rows on stdin: age, title.
+# The title is the first line with real content, leading blanks skipped, a leading
+# `#` marker stripped whether it is one or several - H1 for every plan Claude Code
+# writes today; the first non-blank line is the fallback for anything without one.
+#
+# A single awk, deliberately: this runs once per plan before the picker can draw,
+# and a fork per plan (age, title) made `pq add` wait most of a second
+# on a few dozen plans. The age rule is age_since's, spelled again here.
+plan_rows() {                           # epoch<TAB>path on stdin -> picker lines
+  awk -F'\t' -v now="$(date -u '+%s')" '
+    {
+      d = now - $1; if (d < 0) d = 0
+      age = d < 3600 ? int(d / 60) "m" : d < 86400 ? int(d / 3600) "h" : int(d / 86400) "d"
+      title = ""
+      while ((getline line < $2) > 0) {
+        if (line ~ /^[ \t\r]*$/) continue
+        sub(/^#+[ \t]*/, "", line); title = line; break
+      }
+      close($2)
+      gsub(/[\t\r]/, " ", title)
+      printf "%-8s  %s\n", age, title
+    }'
 }
 
 # A string made safe for render_table, which requires plain ASCII: macOS
@@ -951,15 +964,10 @@ ui_spin() {                             # title cmd args...
 # plan was about. Choosing one opens it in the pager to read, then asks. Declining
 # goes back to the list; Esc there is what quits.
 pick_plan() {
-  local rows disp sel idx path epoch title
+  local rows disp sel idx path
   rows=$(recent_plans)
   [ -n "$rows" ] || return 2
-  disp=$(while IFS=$'\t' read -r epoch path; do
-    [ -n "$path" ] || continue
-    title=$(plan_title "$path")
-    printf '%-8s  %-30s  %s\n' "$(age_since "$epoch")" "$(basename "$path" .md)" \
-      "$(tr '\t\n\r' '   ' <<<"$title")"
-  done <<<"$rows")
+  disp=$(plan_rows <<<"$rows")
   while :; do
     sel=$(ui_filter --header "pick a plan" --placeholder "search plans" --height 15 <<<"$disp") || return 1
     [ -n "$sel" ] || return 1

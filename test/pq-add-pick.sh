@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # test/pq-add-pick.sh - the interactive plan picker: recent_plans
-# ordering, plan_title, cell, age_since, pick_plan, pick_after, add_wizard,
+# ordering, plan_rows, cell, age_since, pick_plan, pick_after, add_wizard,
 # and the wiring into cmd_add. The prompts are gum's, so a PATH-stubbed `gum`
 # (test/lib.sh) answers them and logs what it was asked.
 #
@@ -132,16 +132,17 @@ sleep 1.1
 touch "$PQ_PLANS_DIR/a.md"
 eq "$(order)" "a.md c.md b.md " "touching a should move it back to the front, ahead of c and b"
 
-echo "== plan_title ==" >&2
+echo "== plan_rows: the title ==" >&2
+title_of() { printf '0\t%s\n' "$1" | plan_rows | cut -c 11-; }
 printf '# Real Title\n\nBody.\n' > "$PQ_HOME/.t1.md"
-eq "$(plan_title "$PQ_HOME/.t1.md")" "Real Title" "an H1 has its marker stripped"
+eq "$(title_of "$PQ_HOME/.t1.md")" "Real Title" "an H1 has its marker stripped"
 
 printf '\n\n  \nJust text, no heading.\nMore.\n' > "$PQ_HOME/.t2.md"
-eq "$(plan_title "$PQ_HOME/.t2.md")" "Just text, no heading." \
+eq "$(title_of "$PQ_HOME/.t2.md")" "Just text, no heading." \
   "no H1: the first non-blank line is the fallback, leading blanks skipped"
 
 printf '## Sub Title\n\nBody.\n' > "$PQ_HOME/.t3.md"
-eq "$(plan_title "$PQ_HOME/.t3.md")" "Sub Title" "## is stripped too, not just a single #"
+eq "$(title_of "$PQ_HOME/.t3.md")" "Sub Title" "## is stripped too, not just a single #"
 
 echo "== cell ==" >&2
 eq "$(cell "$(printf 'a\tb')" 10)" "a b" "a tab becomes a space rather than a column break"
@@ -170,10 +171,10 @@ eq "$out" "$PQ_PLANS_DIR/1-first.md" "row 2 (the older plan) returns exactly its
 gum_reset; gum_answer "@1"; gum_answer ""; gum_answer ""
 eq "$(pick_plan 2>/dev/null)" "$PQ_PLANS_DIR/2-second.md" "row 1 is the newest plan"
 
-echo "== pick_plan: the list shows age, name and title, newest first ==" >&2
+echo "== pick_plan: the list shows age and title, newest first ==" >&2
 disp=$(gum_stdin 1)
 eq "$(wc -l <<<"$disp" | tr -d ' ')" "2" "one line per plan"
-case "$(sed -n 1p <<<"$disp")" in *2-second*"Second plan"*) ok ;; *) bad "the newest plan leads, with its name and title (got: $disp)" ;; esac
+case "$(sed -n 1p <<<"$disp")" in *"Second plan"*) ok ;; *) bad "the newest plan leads, with its title (got: $disp)" ;; esac
 
 echo "== pick_plan: the chosen plan is paged to read, then confirmed ==" >&2
 case "$(gum_calls)" in
