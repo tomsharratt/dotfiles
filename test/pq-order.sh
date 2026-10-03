@@ -31,6 +31,8 @@ export PATH="$STUBBIN:$PATH"
 
 # shellcheck source=/dev/null
 source "$HERE/../.local/bin/pq"
+# shellcheck source=test/lib.sh
+source "$HERE/lib.sh"
 
 pass=0 fail=0
 ok()  { pass=$((pass + 1)); }
@@ -59,15 +61,8 @@ printf '# Test plan\n\nDo the thing.\n' > "$PLAN"
 # The picker and the namer are stood in for: the claude stub above fails
 # closed, so name_plan would never derive a name, and cmd_add would otherwise
 # die before it ever allocates a stamp. Prints the slug the branch reduces to.
-add_task() {                             # branch [extra cmd_add args...] -> slug
-  # A name cmd_add never declares: name_plan's stand-in reads it through
-  # dynamic scope at call time, under cmd_add's own `branch`.
-  local as_branch=$1; shift
-  # shellcheck disable=SC2329  # called by cmd_add, not here
-  ( at_terminal() { return 0; }
-    pick_plan() { printf '%s' "$PLAN"; }
-    name_plan() { printf '%s\t\t\n' "$as_branch"; }
-    cmd_add --repo "$REPO" "$@" </dev/null 2>/dev/null ) && branch_to_slug "$as_branch"
+add_task() {                             # branch -> slug
+  add_as "$PLAN" "$1" --repo "$REPO" 2>/dev/null && branch_to_slug "$1"
 }
 
 queue_slugs() {

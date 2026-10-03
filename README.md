@@ -144,9 +144,9 @@ A task is a directory, and the directory it sits in is its state - `queue/`, `ru
 Every transition is a `mv`, which is atomic within a filesystem, so two dispatchers cannot claim the same task.
 Each task holds an immutable `plan.md` (a settings header prepended to whatever Claude Code wrote) and a `state.env` of runtime facts, so an agent can re-read its plan at any point and never see it change underneath it.
 
-`pq add` with no plan, at a terminal, shows the ten most recently touched plans in `~/.claude/plans` - `n` and `p` page back through the older ones - and lets you pick one rather than silently guessing.
+`pq add`, at a terminal, lists the plans in `~/.claude/plans` - newest first, searchable by typing - and lets you pick one rather than silently guessing.
 See "Picking a plan" below.
-Either way, it then asks Haiku for a branch name and a one-line statement of intent (Claude Code auto-names plan files, so the filename is never a usable branch), and refuses a branch that is already spoken for - `wt new` checks out an existing branch rather than failing, so two tasks sharing a name would quietly land in the same worktree.
+It then asks Haiku for a branch name and a one-line statement of intent (Claude Code auto-names plan files, so the filename is never a usable branch), and refuses a branch that is already spoken for - `wt new` checks out an existing branch rather than failing, so two tasks sharing a name would quietly land in the same worktree.
 Spoken for means any task `pq` has ever run under that name, archived ones included, a branch git knows of, or a name that has ever had a pull request: the forge answers by branch *name*, so a task reusing one would inherit its predecessor's pull requests.
 When the name Haiku chose is taken, it is asked once more with that name to avoid, before `pq add` gives up.
 
@@ -158,9 +158,7 @@ Dispatch runs `wt new` in that repo, which picks up its profile, and everything 
 Branch *lookups* are keyed on the repo as well as the name, but a task's slug is a single global namespace, so two live tasks can never share a branch leaf even across two different projects - `tom/fix-timezone` cannot be queued in both at once.
 
 ```
-pq add                   pick a plan and add it to the queue
-pq add --after T         repeatable, at add time: don't dispatch until T's PR has merged
-pq add --design PATH     repeatable: a design file the implementer builds to (auto-detected from the plan too)
+pq add                   pick a plan and add it to the queue; asks model, effort, what to wait on and, for a design plan, the design file
 pq after <task>          list a task's blockers and what each is waiting on
 pq after <task> T...     add blockers to a task still in queue/
 pq after <task> --clear  drop them all
@@ -176,24 +174,29 @@ The fourteen-digit prefix on a task directory is a UTC timestamp and nothing els
 
 #### Picking a plan
 
-`pq add` at a terminal shows the ten most recently touched plans in `~/.claude/plans`, each with its age and its title - the first `# H1` in the file, since Claude Code names the file itself from your opening prompt and that name is rarely what the plan is actually about.
-"Most recently touched" means whichever is newer, mtime or birth time, so a plan edited this morning outranks one merely created today, and a plan restored by `cp -p`, `rsync -a`, or a git checkout doesn't fall to the bottom on a stale mtime.
+`pq add` takes no arguments: it asks.
+Its questions are gum's (`brew install gum`), and `pq add` and `pq rm` are the only commands that need it - `ls`, `tick`, `run`, `cap` and `evidence` stay free of it, so scripts and agents never meet a prompt.
 
-Ten is a page, not a limit.
-`n` pages back to older plans and `p` pages forward again, and the header says where you are - `11-20 of 47 (page 2/5)`.
-The keys are offered only when there is more than one page, and paging past either end says so rather than doing nothing.
+At a terminal it opens a fuzzy-searchable list of the plans in `~/.claude/plans`, newest first, each with its age, its file name and its title - the first `# H1` in the file, since Claude Code names the file itself from your opening prompt and that name is rarely what the plan is actually about.
+"Newest" means whichever is newer, mtime or birth time, so a plan edited this morning outranks one merely created today, and a plan restored by `cp -p`, `rsync -a`, or a git checkout doesn't fall to the bottom on a stale mtime.
+Type a word from what the plan was about to narrow the list, then Enter.
 
-Row numbers are absolute: row 11 is the eleventh-newest plan whichever page you are looking at, so a number always means the same plan and any listed row can be picked from any page.
-Pick a number - Enter takes the top row of the page you are on, which is the most recent plan on page one - and it previews the plan before asking `use this plan? [y/N]`; answering `n` returns to the number prompt, on the page you were reading, rather than aborting the whole command.
-That `n` is "no", not "next page" - the two prompts read the key differently, and each one's hint says which is in force.
-Once you confirm, it asks the things that actually shape how a task runs: which model should run it and which of the tasks already queued or running it should wait on.
-The model question offers `sonnet`, `opus` and `fable`, and Enter takes `sonnet`; an initial and any case will do.
-Only what is typed at the prompt is held to those three - `--model` itself still takes any id `claude --model` accepts.
-`--effort` stays a flag, with no question of its own; without it a task runs at `medium`.
+The chosen plan opens in a pager to read (`q` or Esc closes it), and then it asks `use this plan?`.
+Declining returns to the list rather than aborting the whole command, and Esc at the list quits.
+Once you confirm, Haiku names the task while a spinner runs, and then it asks the things that actually shape how a task runs:
 
-Passing a flag the wizard would otherwise ask about skips just that one question and leaves the rest standing - `pq add --model opus` skips the model question, `pq add --after some-task` skips the blocker question, and any combination of them skips exactly the questions it has already answered.
+- which model should run it - `sonnet`, `opus` or `fable`, starting on `sonnet`;
+- what effort - `low`, `medium`, `high`, `xhigh` or `max`, starting on `medium`;
+- when the plan was built from a design but names no file that exists, the design file, from a file picker that starts in `~/.claude/plans/designs` - Esc goes without it, loudly;
+- which of the tasks already queued or running it should wait on - x ticks one, Enter confirms, and Enter with nothing ticked means none.
+
+The repo is the one you are standing in.
+Outside any repo it asks which of the repos pq already knows.
+Esc or Ctrl-C at any question stops the add, and nothing is written.
 
 There is no unattended add: with no terminal to ask at, `pq add` stops rather than guessing which plan you meant.
+
+`pq rm <task>` asks `remove task ...?` the same way, and with no terminal to ask at the answer is no.
 
 #### Delivering a reviewable pull request
 
@@ -225,11 +228,11 @@ An agent that gets stuck, or finds the plan does not fit, commits what it has an
 
 A plan written from a Claude Design file describes the design in prose, and an implementer that only ever sees the prose builds to its memory of a picture it never saw - one pull request's own description admitted as much.
 So the file travels with the task.
-`pq add --design PATH` attaches one (repeatable), and every absolute or `~`-prefixed path to a `.dc.html`, `.html`, `.png`, `.jpg`, `.jpeg` or `.pdf` that the plan's text mentions is picked up on its own; a mention that does not exist on disk is warned about by name, and a `.html.erb` or a `claude.ai` url is never mistaken for one.
+The wizard asks for one when a plan built from a design names none, and every absolute or `~`-prefixed path to a `.dc.html`, `.html`, `.png`, `.jpg`, `.jpeg` or `.pdf` that the plan's text mentions is picked up on its own; a mention that does not exist on disk is warned about by name, and a `.html.erb` or a `claude.ai` url is never mistaken for one.
 The rule in `AGENTS.md` closes the loop from the planning side: a plan built from a Claude Design file saves that file to `~/.claude/plans/designs/` and cites the absolute path on its own line, so `pq add` finds it.
 
 The files are copied into `<task>/design/` inside the same staging step that writes `plan.md`, so a task lands with its design or not at all, and the `design:` header lists them - absent, like `base:`, when there are none.
-A plan that reads as built from a design (it cites `claude.ai/design` or a `.dc.html`) with no file found gets one question at the wizard - the path, or Enter to go without, loudly.
+A plan that reads as built from a design (it cites `claude.ai/design` or a `.dc.html`) with no file found gets one question at the wizard - the file, or Esc to go without, loudly.
 The contract then tells the implementer exactly what to do with them.
 
 #### Evidence
@@ -252,7 +255,7 @@ The fourteen-digit prefix is a fixed-width UTC timestamp, which is what makes ba
 #### Blockers
 
 Some work is several pull requests where the second cannot start until the first has shipped - a client change waiting on the endpoint it calls, say.
-The wizard's blocker question, `pq add --after A`, or `pq after B A` once both are queued, says exactly that: B is not eligible for dispatch until A's PR has merged into A's repo's default branch.
+The wizard's blocker question, or `pq after B A` once both are queued, says exactly that: B is not eligible for dispatch until A's PR has merged into A's repo's default branch.
 
 Blocked is derived, not stored - a blocked task sits in `queue/` like any other and fill just skips it, the same way the cap is soft arithmetic rather than a drain state.
 A task's blockers live in a third file, `after`, alongside `plan.md` and `state.env`: one blocker per line, `label<TAB>repo<TAB>branch`.
@@ -533,7 +536,7 @@ It previews what it would reclaim first, since - unlike the other two passes - i
 Neovim 0.12+, plus a few CLI tools the config shells out to. Install with Homebrew:
 
 ```sh
-brew install neovim ghostty tree-sitter-cli ripgrep fd asdf
+brew install neovim ghostty tree-sitter-cli ripgrep fd asdf gum
 ```
 
 - `neovim` - editor.
@@ -541,6 +544,7 @@ brew install neovim ghostty tree-sitter-cli ripgrep fd asdf
 - `tree-sitter-cli` - required by `nvim-treesitter` (main branch) to build parsers. The plain `tree-sitter` formula is the library only.
 - `ripgrep`, `fd` - used by Telescope for find/grep.
 - `asdf` - manages Ruby and Node runtimes; Mason needs both to install LSP servers.
+- `gum` - the prompts of `pq add` and `pq rm`.
 
 ### asdf: set user-level defaults
 

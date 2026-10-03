@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # test/pq-add-pick.sh - the interactive plan picker: recent_plans
 # ordering, plan_title, cell, age_since, pick_plan, pick_after, add_wizard,
-# and the wiring into cmd_add.
+# and the wiring into cmd_add. The prompts are gum's, so a PATH-stubbed `gum`
+# (test/lib.sh) answers them and logs what it was asked.
 #
 # Plain bash, no framework, a temp PQ_HOME exported BEFORE sourcing pq, a PATH-stubbed `claude` and `gh` so
 # nothing here ever reaches the network, ok/bad/eq, trap cleanup EXIT, and a
@@ -55,6 +56,12 @@ export PATH="$STUBBIN:$PATH"
 
 # shellcheck source=/dev/null
 source "$HERE/../.local/bin/pq"
+# shellcheck source=test/lib.sh
+source "$HERE/lib.sh"
+gum_stub "$STUBBIN" "$PQ_HOME/.gum"
+# The terminal is stood in for; the no-terminal case turns it off.
+FAKE_TTY=1
+at_terminal() { [ "$FAKE_TTY" = 1 ]; }
 
 pass=0 fail=0
 ok()  { pass=$((pass + 1)); }
@@ -109,20 +116,6 @@ mk_task() {                             # state prio slug repo branch -> task_di
 }
 
 
-# cmd_add with the picker and the namer stood in for, in a subshell: the plan
-# is $1 and Haiku's answer is the branch $2; the rest are cmd_add's own flags.
-# stdin is /dev/null, so every wizard question takes its default.
-add_as() {                              # plan branch [flags...]
-  # Names cmd_add never declares: the stand-ins read them through dynamic
-  # scope at call time, under cmd_add's own locals.
-  local as_plan=$1 as_branch=$2; shift 2
-  # shellcheck disable=SC2329  # called by cmd_add, not here
-  ( at_terminal() { return 0; }
-    pick_plan() { printf '%s' "$as_plan"; }
-    name_plan() { printf '%s\t\t\n' "$as_branch"; }
-    cmd_add "$@" </dev/null )
-}
-
 echo "== recent_plans: ordering by max(mtime, birth) ==" >&2
 # stat's %m and %B are whole seconds, so fixtures must be spaced out for real,
 # not merely touch -t'd - touch cannot age a file anyway, since birth time is
@@ -169,133 +162,41 @@ echo "== pick_plan: stdout is exactly the path, nothing else ==" >&2
 reset_plans
 mkplan 1-first.md "First plan"; sleep 1.1
 mkplan 2-second.md "Second plan"
-p_first="$PQ_PLANS_DIR/1-first.md"
-p_second="$PQ_PLANS_DIR/2-second.md"
+# filter, pager, confirm. Row 1 is the newest.
+gum_reset; gum_answer "@2"; gum_answer ""; gum_answer ""
+out=$(pick_plan 2>/dev/null); rc=$?
+eq "$rc" "0" "choosing and confirming a plan succeeds"
+eq "$out" "$PQ_PLANS_DIR/1-first.md" "row 2 (the older plan) returns exactly its path on stdout"
+gum_reset; gum_answer "@1"; gum_answer ""; gum_answer ""
+eq "$(pick_plan 2>/dev/null)" "$PQ_PLANS_DIR/2-second.md" "row 1 is the newest plan"
 
-out=$(pick_plan 2>/dev/null <<<$'2\ny')
-eq "$out" "$p_first" "picking row 2 (the older plan) returns exactly its path on stdout"
+echo "== pick_plan: the list shows age, name and title, newest first ==" >&2
+disp=$(gum_stdin 1)
+eq "$(wc -l <<<"$disp" | tr -d ' ')" "2" "one line per plan"
+case "$(sed -n 1p <<<"$disp")" in *2-second*"Second plan"*) ok ;; *) bad "the newest plan leads, with its name and title (got: $disp)" ;; esac
 
-echo "== pick_plan: Enter defaults to row 1, the newest ==" >&2
-out=$(pick_plan 2>/dev/null <<<$'\ny')
-eq "$out" "$p_second" "Enter should pick row 1"
+echo "== pick_plan: the chosen plan is paged to read, then confirmed ==" >&2
+case "$(gum_calls)" in
+  *"filter"*$'\n'*"pager"*$'\n'*"confirm"*"use this plan?"*) ok ;;
+  *) bad "filter, then pager, then confirm should be asked in that order (got: $(gum_calls))" ;;
+esac
 
-echo "== pick_plan: q quits, returns 1, prints nothing to stdout ==" >&2
-out=$(pick_plan 2>/dev/null <<<'q'); rc=$?
-eq "$rc" "1" "q should return 1"
-eq "$out" "" "q should print nothing to stdout"
-
-echo "== pick_plan: EOF declines, returns 1 ==" >&2
-out=$(pick_plan 2>/dev/null </dev/null); rc=$?
-eq "$rc" "1" "EOF at the number prompt should return 1"
-eq "$out" "" "EOF should print nothing to stdout"
-
-echo "== pick_plan: declining a preview returns to the number prompt, not aborted ==" >&2
-out=$(pick_plan 2>/dev/null <<<$'1\nn\n2\ny')
-eq "$out" "$p_first" "decline plan 1, then pick 2 - should return plan 2's path"
-
-echo "== pick_plan: an out-of-range number re-prompts and recovers ==" >&2
-out=$(pick_plan 2>/dev/null <<<$'9\n1\ny')
-eq "$out" "$p_second" "9 is out of range with 2 plans; recovers on 1"
-
-echo "== pick_plan: a non-numeric answer re-prompts and recovers ==" >&2
-out=$(pick_plan 2>/dev/null <<<$'foo\n1\ny')
-eq "$out" "$p_second" "foo is non-numeric; recovers on 1"
+echo "== pick_plan: declining goes back to the list, Esc there quits ==" >&2
+gum_reset; gum_answer "@1"; gum_answer ""; gum_answer "" 1; gum_answer "@2"; gum_answer ""; gum_answer ""
+eq "$(pick_plan 2>/dev/null)" "$PQ_PLANS_DIR/1-first.md" "decline plan 1, then pick 2 - should return plan 2's path"
+gum_reset; gum_answer "" 130
+out=$(pick_plan 2>/dev/null); rc=$?
+eq "$rc" "1" "cancelling the list returns 1"
+eq "$out" "" "and prints nothing to stdout"
 
 echo "== pick_plan: an empty plans directory returns 2 ==" >&2
 reset_plans
+gum_reset
 pick_plan >/dev/null 2>&1; rc=$?
 eq "$rc" "2" "nothing in PLANS_DIR should return 2, not 1"
+eq "$(gum_calls)" "" "and gum is never asked"
 
-echo "== pick_plan: PQ_PICK_LIMIT is a page, and n/p walk the pages ==" >&2
-# Five plans at a limit of 2 is three pages, the last of them short - which is
-# the only fixture shape that exercises a middle page and a partial one at once.
-# Spaced with real sleeps, like the ordering fixtures at the top of this file:
-# recent_plans breaks an epoch tie on the path, so five plans written inside one
-# second would order by name, and a second boundary landing mid-loop would
-# reorder them halfway. That is a flaky test, not a fast one.
-reset_plans
-mkplan p1-oldest.md "Plan One"; sleep 1.1
-mkplan p2.md "Plan Two"; sleep 1.1
-mkplan p3-middle.md "Plan Three"; sleep 1.1
-mkplan p4.md "Plan Four"; sleep 1.1
-mkplan p5-newest.md "Plan Five"
-p1="$PQ_PLANS_DIR/p1-oldest.md"
-p3="$PQ_PLANS_DIR/p3-middle.md"
-# Rows, newest first: 1 p5-newest, 2 p4, 3 p3-middle, 4 p2, 5 p1-oldest.
-# Which page a header reports is the one thing every case below asserts on, so
-# it is read off stderr rather than inferred from what got picked: accepting any
-# number in 1-$total means a paging key that did nothing at all would leave most
-# stdout assertions passing anyway.
-last_page() { grep -o 'page [0-9]/3' <<<"$1" | tail -1; }
-
-err=$(PQ_PICK_LIMIT=2 pick_plan <<<'q' 2>&1 >/dev/null)
-case "$err" in *"1-2 of 5 (page 1/3)"*) ok ;; *) bad "header should read '1-2 of 5 (page 1/3)' (got: $err)" ;; esac
-case "$err" in *"p5-newest"*) ok ;; *) bad "the newest plan should render on page 1" ;; esac
-case "$err" in *"p4"*) ok ;; *) bad "the second-newest plan should render on page 1 too" ;; esac
-case "$err" in *"p3-middle"*) bad "page 1 must not render page 2's rows" ;; *) ok ;; esac
-case "$err" in *"n older, p newer"*) ok ;; *) bad "more than one page should offer the paging keys" ;; esac
-
-echo "== pick_plan: n pages back to older plans ==" >&2
-err=$(PQ_PICK_LIMIT=2 pick_plan <<<$'n\nq' 2>&1 >/dev/null)
-case "$err" in *"3-4 of 5 (page 2/3)"*) ok ;; *) bad "n should render page 2 as '3-4 of 5' (got: $err)" ;; esac
-case "$err" in *"p3-middle"*) ok ;; *) bad "n should bring the third-newest plan into view" ;; esac
-
-echo "== pick_plan: Enter takes the top of the CURRENT page ==" >&2
-# The one case that cannot pass with paging broken: if n had been ignored, Enter
-# would take row 1 (p5-newest) instead of row 3.
-out=$(PQ_PICK_LIMIT=2 pick_plan <<<$'n\n\ny' 2>/dev/null)
-eq "$out" "$p3" "Enter on page 2 should take that page's first row, not the newest plan"
-
-echo "== pick_plan: p pages back towards newer plans ==" >&2
-err=$(PQ_PICK_LIMIT=2 pick_plan <<<$'n\np\nq' 2>&1 >/dev/null)
-eq "$(last_page "$err")" "page 1/3" "p from page 2 should land back on page 1"
-case "$err" in *"page 2/3"*) ok ;; *) bad "page 2 should have been rendered on the way out" ;; esac
-
-echo "== pick_plan: the last page is short, and n cannot go past it ==" >&2
-err=$(PQ_PICK_LIMIT=2 pick_plan <<<$'n\nn\nn\nq' 2>&1 >/dev/null)
-eq "$(last_page "$err")" "page 3/3" "n past the last page should stay on it"
-case "$err" in *"5-5 of 5 (page 3/3)"*) ok ;; *) bad "a short final page should report its real range (got: $err)" ;; esac
-case "$err" in *"p1-oldest"*) ok ;; *) bad "the last page should render the oldest plan" ;; esac
-case "$err" in *"already at the oldest"*) ok ;; *) bad "n past the end should say so rather than no-op silently" ;; esac
-
-echo "== pick_plan: p cannot go past the first page ==" >&2
-err=$(PQ_PICK_LIMIT=2 pick_plan <<<$'p\nq' 2>&1 >/dev/null)
-eq "$(last_page "$err")" "page 1/3" "p on page 1 should stay on page 1"
-case "$err" in *"already at the newest"*) ok ;; *) bad "p at the front should say so rather than no-op silently" ;; esac
-
-echo "== pick_plan: the numbering is absolute, so an off-page row is still selectable ==" >&2
-out=$(PQ_PICK_LIMIT=2 pick_plan <<<$'5\ny' 2>/dev/null)
-eq "$out" "$p1" "row 5 should be selectable from page 1"
-err=$(PQ_PICK_LIMIT=2 pick_plan <<<$'6\nq' 2>&1 >/dev/null)
-case "$err" in *"not a number from 1 to 5"*) ok ;; *) bad "past the last row is still out of range (got: $err)" ;; esac
-
-echo "== pick_plan: declining a preview returns to the page you were reading ==" >&2
-err=$(PQ_PICK_LIMIT=2 pick_plan <<<$'n\n3\nn\nq' 2>&1 >/dev/null)
-eq "$(last_page "$err")" "page 2/3" "declining should re-render page 2, not the first page"
-
-echo "== pick_plan: one page renders exactly as it did before paging existed ==" >&2
-err=$(PQ_PICK_LIMIT=10 pick_plan <<<'q' 2>&1 >/dev/null)
-case "$err" in *"5 most recent of 5"*) ok ;; *) bad "a single page keeps the old header (got: $err)" ;; esac
-case "$err" in *"[1-5, Enter for 1, q to quit]"*) ok ;; *) bad "a single page keeps the old prompt (got: $err)" ;; esac
-case "$err" in *"n older"*) bad "a single page should not offer keys that can only refuse" ;; *) ok ;; esac
-
-echo "== pick_page: a rendered page reports success, and numbers rows absolutely ==" >&2
-pp_rows=$(recent_plans)
-pp="$PQ_HOME/.pp.tsv"
-pick_page "$pp_rows" 1 2 "$pp"; rc=$?
-eq "$rc" "0" "pick_page should report success on the first page"
-eq "$(wc -l < "$pp" | tr -d ' ')" "3" "a two-row page is a header plus two rows"
-eq "$(awk -F'\t' 'NR == 2 { print $1 }' "$pp")" "1" "page 1's first row is numbered 1"
-pick_page "$pp_rows" 3 4 "$pp"; rc=$?
-eq "$rc" "0" "pick_page should report success on a later page too"
-eq "$(awk -F'\t' 'NR == 2 { print $1 }' "$pp")" "3" "page 2's first row keeps its absolute number 3"
-eq "$(awk -F'\t' 'NR == 2 { print $3 }' "$pp")" "p3-middle" "page 2's first row is the third-newest plan"
-pick_page "$pp_rows" 5 6 "$pp"; rc=$?
-eq "$rc" "0" "a page whose upper bound runs past the last row is still a success"
-eq "$(wc -l < "$pp" | tr -d ' ')" "2" "that page holds the one row that exists"
-rm -f "$pp"
-
-echo "== pick_after: 1,3 selects the right slugs; space/comma forms agree; duplicates collapse ==" >&2
+echo "== pick_after: ticked tasks come back as slugs; duplicates collapse ==" >&2
 reset_tasks
 mk_task queue 010 task-a "$REPO" tom/task-a >/dev/null
 mk_task queue 020 task-b "$REPO" tom/task-b >/dev/null
@@ -303,138 +204,108 @@ mk_task queue 030 task-c "$REPO" tom/task-c >/dev/null
 
 # `after_vals` and friends are cmd_add's own locals, reached through bash's
 # dynamic scope - this wrapper stands in for cmd_add so pick_after can mutate
-# them the same way it would there. Run inside a command substitution: that
-# forks a subshell, but the mutation only needs to survive long enough for
-# this wrapper's own final printf, which happens before the subshell exits.
-run_pick_after() {                      # repo -> echoes the resulting after_vals
-  local after_vals="" after_explicit=0 repo=$1
+# them the same way it would there.
+run_pick_after() {                      # -> echoes the resulting after_vals
+  local after_vals="" repo=$REPO
   pick_after
   printf '%s' "$after_vals"
 }
+gum_reset; gum_answer $'task-a  queue   \ntask-c  queue   '
+out=$(run_pick_after 2>/dev/null)
+eq "$out" $'task-a\ntask-c' "ticking a and c selects task-a and task-c, in that order"
+eq "$(gum_stdin 1 | wc -l | tr -d ' ')" "3" "all three queued tasks are offered"
 
-want=$(printf 'task-a\ntask-c\n')
-out=$(run_pick_after "$REPO" <<<$'1,3\n' 2>/dev/null)
-eq "$out" "$want" "1,3 should select task-a and task-c, in that order"
-out=$(run_pick_after "$REPO" <<<$'1 3\n' 2>/dev/null)
-eq "$out" "$want" "space-separated '1 3' should agree with '1,3'"
-out=$(run_pick_after "$REPO" <<<$'1, 3\n' 2>/dev/null)
-eq "$out" "$want" "'1, 3' (comma then space) should also agree"
-out=$(run_pick_after "$REPO" <<<$'1,1,3\n' 2>/dev/null)
-eq "$out" "$want" "a repeated '1,1,3' should collapse to the same result as '1,3'"
-
-echo "== pick_after: Enter selects none ==" >&2
-out=$(run_pick_after "$REPO" <<<$'\n' 2>/dev/null)
-eq "$out" "" "Enter should leave after_vals empty"
-
-echo "== pick_after: out-of-range or non-numeric rejects the whole line and re-prompts ==" >&2
-out=$(run_pick_after "$REPO" <<<$'9\n1\n' 2>/dev/null)
-eq "$out" "task-a" "an out-of-range line is rejected outright; the retry (1) picks task-a"
-out=$(run_pick_after "$REPO" <<<$'foo\n2\n' 2>/dev/null)
-eq "$out" "task-b" "a non-numeric line is rejected outright; the retry (2) picks task-b"
+echo "== pick_after: nothing ticked selects none, Esc stops ==" >&2
+gum_reset; gum_answer ""
+eq "$(run_pick_after 2>/dev/null)" "" "Enter with nothing ticked means no blockers"
+gum_reset; gum_answer "" 130
+( run_pick_after ) >/dev/null 2>&1 && bad "Esc at the blocker question should stop the add" || ok
 
 echo "== pick_after: a done task is never offered ==" >&2
-mk_task "done" 040 task-d "$REPO" tom/task-d >/dev/null
-err=$(run_pick_after "$REPO" <<<$'\n' 2>&1 >/dev/null)
-case "$err" in *"3 tasks"*) ok ;; *) bad "a done task must not count as a candidate (got: $err)" ;; esac
-case "$err" in *"task-d"*) bad "a done task must never be listed" ;; *) ok ;; esac
+mk_task "done" 040 task-done "$REPO" tom/task-done >/dev/null
+gum_reset; gum_answer ""
+run_pick_after >/dev/null 2>&1
+case "$(gum_stdin 1)" in *task-done*) bad "a done task must not count as a candidate" ;; *) ok ;; esac
 
 echo "== pick_after: a running task IS offered - work in flight is a real blocker ==" >&2
-reset_tasks
-mk_task queue   010 task-a "$REPO" tom/task-a >/dev/null
-mk_task running 020 task-r "$REPO" tom/task-r >/dev/null
-err=$(run_pick_after "$REPO" <<<$'\n' 2>&1 >/dev/null)
-case "$err" in *"2 tasks"*) ok ;; *) bad "a running task should count as a candidate (got: $err)" ;; esac
-case "$err" in *task-r*) ok ;; *) bad "a running task should be listed (got: $err)" ;; esac
+mk_task running 050 task-run "$REPO" tom/task-run >/dev/null
+gum_reset; gum_answer ""
+run_pick_after >/dev/null 2>&1
+case "$(gum_stdin 1)" in *task-run*running*) ok ;; *) bad "a running task should be listed with its state" ;; esac
 
-echo "== pick_after: no candidates at all - the prompt is skipped silently ==" >&2
+echo "== pick_after: no candidates at all - gum is not asked ==" >&2
 reset_tasks
-out=$(run_pick_after "$REPO" 2>"$PQ_HOME/.noneerr" </dev/null)
-eq "$out" "" "no candidates: after_vals stays empty"
-eq "$(cat "$PQ_HOME/.noneerr")" "" "no candidates: nothing is printed, not even an empty table"
+gum_reset
+out=$(run_pick_after 2>/dev/null)
+eq "$out" "" "no candidates, no blockers"
+eq "$(gum_calls)" "" "and no prompt"
 
-echo "== pick_after: a PROJECT column appears only once candidates span two repos ==" >&2
-reset_tasks
+echo "== pick_after: a project appears only once candidates span two repos ==" >&2
 mk_task queue 010 task-a "$REPO" tom/task-a >/dev/null
-mk_task queue 020 task-b "$REPO" tom/task-b >/dev/null
-err=$(run_pick_after "$REPO" <<<$'\n' 2>&1 >/dev/null)
-case "$err" in *PROJECT*) bad "a single-repo candidate list should not show a PROJECT column" ;; *) ok ;; esac
-
+gum_reset; gum_answer ""
+run_pick_after >/dev/null 2>&1
+case "$(gum_stdin 1)" in *"$(basename "$REPO")"*) bad "one repo needs no project column" ;; *) ok ;; esac
 REPO2=$(mktemp -d)
 git init -q -b master "$REPO2"
-git -C "$REPO2" -c user.email=test@test -c user.name=test commit -q --allow-empty -m init
 mk_task queue 030 task-e "$REPO2" tom/task-e >/dev/null
-err=$(run_pick_after "$REPO" <<<$'\n' 2>&1 >/dev/null)
-case "$err" in *PROJECT*) ok ;; *) bad "candidates spanning two repos should show a PROJECT column" ;; esac
+gum_reset; gum_answer ""
+run_pick_after >/dev/null 2>&1
+case "$(gum_stdin 1)" in *"$(basename "$REPO2")"*) ok ;; *) bad "candidates spanning two repos should name their project" ;; esac
 
-echo "== add_wizard: every question already decided asks nothing at all ==" >&2
+echo "== add_wizard: model and effort are asked, starting on their defaults ==" >&2
 reset_tasks
-# `model_explicit` defaults to 1 so the cases that are about the OTHER questions
-# stay about them - the model cases below pass 0 explicitly.
-run_wizard() {                          # after_explicit [model_explicit] -> "model=M after_vals=[Y]"
-  local after_vals="" after_explicit=$1 repo=$REPO
-  local model=$PQ_DEFAULT_MODEL model_explicit=${2:-1}
+# shellcheck disable=SC2034  # add_wizard reads and sets these through bash's dynamic scope
+run_wizard() {                          # -> "model=M effort=E after_vals=[Y]"
+  local after_vals="" repo=$REPO model=$PQ_DEFAULT_MODEL effort=$PQ_DEFAULT_EFFORT
+  local design_hinted=${1:-0} design_vals=""
   add_wizard
-  printf 'model=%s after_vals=[%s]' "$model" "$after_vals"
+  printf 'model=%s effort=%s after_vals=[%s] design=[%s]' "$model" "$effort" "$after_vals" "$design_vals"
 }
-out=$(run_wizard 1 </dev/null)
-eq "$out" "model=sonnet after_vals=[]" "all already decided: no prompt should even try to read stdin"
+gum_reset; gum_answer "opus"; gum_answer "high"
+out=$(run_wizard 2>/dev/null)
+eq "$out" "model=opus effort=high after_vals=[] design=[]" "the model and effort chosen are the ones taken"
+case "$(gum_calls)" in
+  *"choose"*"--selected sonnet"*"sonnet opus fable"*$'\n'*"choose"*"--selected medium"*"low medium high xhigh max"*) ok ;;
+  *) bad "each choice should start on its default (got: $(gum_calls))" ;;
+esac
+gum_reset; gum_answer "fable"; gum_answer "xhigh"
+out=$(PQ_DEFAULT_MODEL=opus run_wizard 2>/dev/null)
+eq "$out" "model=fable effort=xhigh after_vals=[] design=[]" "an overridden default is still only where the choice starts"
+case "$(gum_calls)" in *"--selected sonnet"*) bad "the default is read when asked, not baked in" ;; *) ok ;; esac
 
-echo "== add_wizard: the blocker prompt runs when no --after was given ==" >&2
+echo "== add_wizard: Esc at a question stops the add ==" >&2
+gum_reset; gum_answer "" 130
+( run_wizard ) >/dev/null 2>"$PQ_HOME/.esc.err" && bad "Esc at the model question should stop" || ok
+case "$(cat "$PQ_HOME/.esc.err")" in *cancelled*) ok ;; *) bad "and say so" ;; esac
+gum_reset; gum_answer "opus"; gum_answer "" 130
+( run_wizard ) >/dev/null 2>&1 && bad "Esc at the effort question should stop" || ok
+
+echo "== add_wizard: the blocker question runs last ==" >&2
 mk_task queue 010 task-a "$REPO" tom/task-a >/dev/null
-# 2>/dev/null like every run_pick_after call above: the command substitution
-# captures stdout, but pick_after's prompt goes to stderr, so without this the
-# "block on which?" line leaks into the suite's own output.
-out=$(run_wizard 0 <<<$'1\n' 2>/dev/null)
-eq "$out" "model=sonnet after_vals=[task-a"$'\n'"]" \
-  "picking 1 at the blocker prompt selects task-a"
+gum_reset; gum_answer "sonnet"; gum_answer "medium"; gum_answer "task-a  queue"
+out=$(run_wizard 2>/dev/null)
+eq "$out" "model=sonnet effort=medium after_vals=[task-a"$'\n'"] design=[]" "picking task-a selects it"
 
-echo "== add_wizard: the model question - Enter takes PQ_DEFAULT_MODEL ==" >&2
+echo "== add_wizard: a design plan with no file found asks for one; Esc goes without ==" >&2
 reset_tasks
-out=$(run_wizard 1 0 <<<$'\n' 2>/dev/null)
-eq "$out" "model=sonnet after_vals=[]" "Enter should take the default, sonnet"
-
-echo "== add_wizard: each of the three names is taken ==" >&2
-for m in sonnet opus fable; do
-  out=$(run_wizard 1 0 <<<"$m" 2>/dev/null)
-  eq "$out" "model=$m after_vals=[]" "'$m' should be taken as the model"
-done
-
-echo "== add_wizard: an initial and any case are taken too ==" >&2
-out=$(run_wizard 1 0 <<<$'o\n' 2>/dev/null)
-eq "$out" "model=opus after_vals=[]" "a bare 'o' should mean opus"
-out=$(run_wizard 1 0 <<<$'Fable\n' 2>/dev/null)
-eq "$out" "model=fable after_vals=[]" "'Fable' should mean fable"
-
-echo "== add_wizard: an unknown answer re-prompts and recovers ==" >&2
-err=$(run_wizard 1 0 <<<$'haiku\nopus\n' 2>&1 >/dev/null)
-case "$err" in *"pick one of sonnet, opus or fable"*) ok ;; *) bad "an unknown model should say what is on offer (got: $err)" ;; esac
-out=$(run_wizard 1 0 <<<$'haiku\nopus\n' 2>/dev/null)
-eq "$out" "model=opus after_vals=[]" "the retry after an unknown answer should stick"
-
-echo "== add_wizard: EOF at the model question is Enter, not a hang ==" >&2
-out=$(run_wizard 1 0 </dev/null 2>/dev/null)
-eq "$out" "model=sonnet after_vals=[]" "EOF should take the default rather than spin"
-
-echo "== add_wizard: PQ_DEFAULT_MODEL is what Enter takes, not a hardcoded sonnet ==" >&2
-out=$(PQ_DEFAULT_MODEL=opus run_wizard 1 0 <<<$'\n' 2>/dev/null)
-eq "$out" "model=opus after_vals=[]" "an overridden default should be what Enter takes"
-
-echo "== add_wizard: --model given explicitly skips the question ==" >&2
-# shellcheck disable=SC2034  # add_wizard reads these locals through bash's dynamic scope
-skip_wizard() {                         # model -> the model add_wizard leaves behind
-  local after_vals="" after_explicit=1 repo=$REPO
-  local model=$1 model_explicit=1
-  add_wizard
-  printf '%s' "$model"
-}
-out=$(skip_wizard haiku </dev/null 2>/dev/null)
-eq "$out" "haiku" "--model is not held to the three, and its value survives the wizard untouched"
+printf 'x' > "$PQ_HOME/shot.png"
+gum_reset; gum_answer "sonnet"; gum_answer "medium"; gum_answer "$PQ_HOME/shot.png"
+out=$(run_wizard 1 2>/dev/null)
+eq "$out" "model=sonnet effort=medium after_vals=[] design=[$PQ_HOME/shot.png"$'\n'"]" "the picked file is the design"
+gum_reset; gum_answer "sonnet"; gum_answer "medium"; gum_answer "" 1
+out=$(run_wizard 1 2>"$PQ_HOME/.nod.err")
+eq "$out" "model=sonnet effort=medium after_vals=[] design=[]" "Esc means none"
+case "$(cat "$PQ_HOME/.nod.err")" in *"no design file"*) ok ;; *) bad "and it says so loudly" ;; esac
+gum_reset; gum_answer "sonnet"; gum_answer "medium"
+run_wizard 0 >/dev/null 2>&1
+eq "$(gum_calls | grep -c ' file')" "0" "a plan that is not about a design is never asked for one"
 
 echo "== wiring: with no terminal, pq add stops and queues nothing ==" >&2
 reset_plans
 reset_tasks
 printf 'MARKER: wiring-fixture\n\nDo the wiring thing.\n' > "$PQ_PLANS_DIR/wiring.md"
-if ( main add --repo "$REPO" < /dev/null ) >/dev/null 2>"$PQ_HOME/.wire.err"; then
+gum_reset; FAKE_TTY=0
+if ( cd "$REPO" && main add < /dev/null ) >/dev/null 2>"$PQ_HOME/.wire.err"; then
   bad "pq add with no terminal should stop"
 else
   ok
@@ -444,49 +315,59 @@ case "$(cat "$PQ_HOME/.wire.err")" in
   *) bad "and say it needs a terminal (got: $(cat "$PQ_HOME/.wire.err"))" ;;
 esac
 eq "$(find "$PQ_HOME/queue" -mindepth 1 -maxdepth 1 | wc -l | tr -d ' ')" "0" "nothing is queued"
+eq "$(gum_calls)" "" "and nothing is asked"
+FAKE_TTY=1
 
-echo "== wiring: at a terminal, main add runs the picker, names the plan and asks the wizard ==" >&2
-# at_terminal stood in for, in the subshell only: pick row 1, confirm it, and
-# Enter at the model question. An empty queue leaves no blocker to ask about.
-# shellcheck disable=SC2329  # at_terminal is called by main add, not here
-out=$( ( at_terminal() { return 0; }; main add --repo "$REPO" ) <<<$'1\ny\n\n' 2>"$PQ_HOME/.wire2.err")
+echo "== wiring: at a terminal, main add picks, names, asks and queues ==" >&2
+# The answers, in order: the plan
+# list, the pager, the confirm, the model, the effort. An empty queue leaves no
+# blocker to ask about.
+gum_reset; gum_answer "@1"; gum_answer ""; gum_answer ""; gum_answer "opus"; gum_answer "high"
+out=$( ( cd "$REPO" && main add ) 2>"$PQ_HOME/.wire2.err")
 rc=$?
 [ "$rc" -eq 0 ] && ok || bad "main add through the wizard should succeed: $(cat "$PQ_HOME/.wire2.err")"
 eq "$out" "" "nothing goes to stdout - everything a human reads is on stderr"
 t=$(find_task wiring-fixture-task)
 eq "$(hdr "$t/plan.md" source)" "$PQ_PLANS_DIR/wiring.md" "the picked plan is the one queued"
 eq "$(hdr "$t/plan.md" branch)" "tom/wiring-fixture-task" "named by Haiku"
-eq "$(hdr "$t/plan.md" model)" "$PQ_DEFAULT_MODEL" "Enter at the model question takes the default"
-case "$(cat "$PQ_HOME/.wire2.err")" in
-  *"pick a plan"*"use this plan?"*"which model?"*) ok ;;
-  *) bad "the picker and the wizard should each have asked, in order (got: $(cat "$PQ_HOME/.wire2.err"))" ;;
-esac
+eq "$(hdr "$t/plan.md" model)" "opus" "the model chosen"
+eq "$(hdr "$t/plan.md" effort)" "high" "the effort chosen"
 
-echo "== wiring: a task queued with pick_after's blockers matches an equivalent --after ==" >&2
+echo "== wiring: Esc at the effort question queues nothing ==" >&2
+reset_tasks
+gum_reset; gum_answer "@1"; gum_answer ""; gum_answer ""; gum_answer "opus"; gum_answer "" 130
+( cd "$REPO" && main add ) >/dev/null 2>&1 && bad "a cancelled wizard should fail" || ok
+eq "$(find "$PQ_HOME/queue" -mindepth 1 -maxdepth 1 | wc -l | tr -d ' ')" "0" "nothing is queued"
+eq "$(find "$PQ_HOME" -maxdepth 1 -name '.add.*' | wc -l | tr -d ' ')" "0" "and no staging is left behind"
+
+echo "== wiring: a blocker ticked in the wizard lands in the task's after file ==" >&2
 reset_tasks
 mk_task queue 005 blocker-cand "$REPO" tom/blocker-cand >/dev/null
-via_picker=$(run_pick_after "$REPO" <<<$'1\n' 2>/dev/null)
-eq "$via_picker" "blocker-cand" "pick_after should resolve to the candidate's own slug"
+gum_reset; gum_answer "@1"; gum_answer ""; gum_answer ""; gum_answer "sonnet"; gum_answer "medium"; gum_answer "blocker-cand  queue"
+( cd "$REPO" && main add ) >/dev/null 2>&1
+t=$(find_task wiring-fixture-task)
+case "$(cat "$t/after" 2>/dev/null)" in *tom/blocker-cand*) ok ;; *) bad "the blocker should gate the new task (after: $(cat "$t/after" 2>/dev/null))" ;; esac
 
-add_as "$PQ_PLANS_DIR/wiring.md" tom/task-x --repo "$REPO" --after blocker-cand 2>"$PQ_HOME/.x.err"
-t_x=$(find_task task-x)
-add_as "$PQ_PLANS_DIR/wiring.md" tom/task-y --repo "$REPO" --after "$via_picker" 2>"$PQ_HOME/.y.err"
-t_y=$(find_task task-y)
-eq "$(cat "$t_x/after")" "$(cat "$t_y/after")" \
-  "queuing via --after blocker-cand and via --after <pick_after's own output> must produce identical after files"
-
-echo "== wiring: pq add takes no plan path - the wizard is the way in ==" >&2
+echo "== wiring: pq add takes no arguments - the wizard is the way in ==" >&2
 reset_tasks
-if ( main add "$PQ_PLANS_DIR/wiring.md" --repo "$REPO" < /dev/null ) >/dev/null 2>"$PQ_HOME/.explicit.err"; then
-  bad "pq add with a plan path should be refused"
-else
-  ok
-fi
-case "$(cat "$PQ_HOME/.explicit.err")" in
-  *"pq add takes no plan path"*) ok ;;
-  *) bad "the refusal should say why (got: $(cat "$PQ_HOME/.explicit.err"))" ;;
-esac
-eq "$(find "$PQ_HOME/queue" -mindepth 1 -maxdepth 1 | wc -l | tr -d ' ')" "0" "nothing is queued"
+for arg in "$PQ_PLANS_DIR/wiring.md" --model; do
+  if ( cd "$REPO" && main add "$arg" < /dev/null ) >/dev/null 2>"$PQ_HOME/.explicit.err"; then
+    bad "pq add '$arg' should be refused"
+  else
+    ok
+  fi
+  case "$(cat "$PQ_HOME/.explicit.err")" in
+    *"pq add takes no arguments"*) ok ;;
+    *) bad "the refusal should say why (got: $(cat "$PQ_HOME/.explicit.err"))" ;;
+  esac
+done
+
+echo "== wiring: without gum, pq add and pq rm say what to install ==" >&2
+for c in add rm; do
+  # shellcheck disable=SC2086  # $c is one word
+  out=$( ( PATH=/usr/bin:/bin; command -v gum >/dev/null && exit 9; cd "$REPO" && main $c </dev/null ) 2>&1 )
+  case "$out" in *"brew install gum"*) ok ;; *) bad "pq $c without gum should say how to get it (got: $out)" ;; esac
+done
 
 printf '\n%d passed, %d failed\n' "$pass" "$fail" >&2
 [ "$fail" -eq 0 ]

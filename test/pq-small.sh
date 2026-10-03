@@ -57,6 +57,12 @@ export PQ_WT="$STUBBIN/wt-stub"
 
 # shellcheck source=/dev/null
 source "$HERE/../.local/bin/pq"
+# shellcheck source=test/lib.sh
+source "$HERE/lib.sh"
+gum_stub "$STUBBIN" "$PQ_HOME/.gum"
+# pq rm asks through gum, at a terminal: the terminal is stood in for.
+# shellcheck disable=SC2329  # called by pq rm, not here
+at_terminal() { return 0; }
 
 # shellcheck disable=SC2329  # called by the pq sourced above
 pr_load_all() { :; }
@@ -110,9 +116,17 @@ Q=$(mk_task queue 10 claimed)
 # The answer goes down a fifo held open read-write, so pq rm finds the task and
 # asks at once, and only then does the tick move it and the answer arrive.
 FIFO="$STUBBIN/.answer"; mkfifo "$FIFO"; exec 3<>"$FIFO"
+# A gum that logs its question and waits for the answer on the fifo.
+cat > "$STUBBIN/gum" <<GUMEOF
+#!/bin/sh
+printf 'asked: %s\\n' "\$*" >> "$STUBBIN/.rm.out"
+read -r ans <&3
+[ "\$ans" = y ]
+GUMEOF
+chmod +x "$STUBBIN/gum"
 ( main rm claimed <&3 > "$STUBBIN/.rm.out" 2>&1 ) &
 RMPID=$!
-for _ in $(seq 1 50); do grep -q 'remove task' "$STUBBIN/.rm.out" 2>/dev/null && break; sleep 0.1; done
+for _ in $(seq 1 50); do grep -q 'asked: confirm' "$STUBBIN/.rm.out" 2>/dev/null && break; sleep 0.1; done
 has "$(cat "$STUBBIN/.rm.out")" 'remove task "claimed" (queue)?' "the question is about the queued task"
 mv "$Q" "$PQ_HOME/running/"             # ...and a tick claims it
 echo y >&3
@@ -127,7 +141,9 @@ eq "$rmrc" "1" "and fails"
 echo "== ...and one that stayed put is removed, under the lock ==" >&2
 reset_tasks
 Q=$(mk_task queue 11 stayed)
-out=$( (main rm stayed <<<y) 2>&1)
+gum_stub "$STUBBIN" "$PQ_HOME/.gum"
+gum_answer ""
+out=$( (main rm stayed) 2>&1)
 [ -d "$Q" ] && bad "a task nothing moved is removed" || ok
 has "$out" "removed stayed" "and says so"
 [ -e "$PQ_HOME/.tick.lock" ] && bad "the lock is released" || ok
@@ -162,8 +178,7 @@ out=$(name_plan "$PLANF" 2>&1); rc=$?
 eq "$rc" "3" "the namer's limit is its own answer"
 has "$out" "naming hit the usage limit: You've hit your individual spend limit" "and says so, in the limit's own words"
 reset_tasks
-# shellcheck disable=SC2329  # called by cmd_add, not here
-out=$( (at_terminal() { return 0; }; pick_plan() { printf '%s' "$PLANF"; }; cmd_add --repo "$REPO" </dev/null) 2>&1); rc=$?
+out=$(add_as "$PLANF" "" --repo "$REPO" 2>&1); rc=$?
 eq "$rc" "1" "pq add stops"
 has "$out" "behind the usage limit - pq add again once it lifts" "saying when trying again can work"
 hasnt "$out" "Haiku gave no usable branch" "not that the reply was unusable"

@@ -64,6 +64,8 @@ export PQ_WT="$STUBBIN/wt-stub"
 
 # shellcheck source=/dev/null
 source "$HERE/../.local/bin/pq"
+# shellcheck source=test/lib.sh
+source "$HERE/lib.sh"
 
 pass=0 fail=0
 ok()  { pass=$((pass + 1)); }
@@ -205,8 +207,7 @@ esac
 EOF
 PLAN="$PQ_HOME/plan-src.md"; printf '# A plan\n\nDo it.\n' > "$PLAN"
 # The picker stood in for; Haiku's stub names the plan, twice.
-# shellcheck disable=SC2329  # called by cmd_add, not here
-( at_terminal() { return 0; }; pick_plan() { printf '%s' "$PLAN"; }; cmd_add --repo "$REPO" </dev/null ) 2>"$PQ_HOME/.err"; rc=$?
+add_as "$PLAN" "" --repo "$REPO" 2>"$PQ_HOME/.err"; rc=$?
 eq "$rc" 0 "the add goes through on the second name ($(cat "$PQ_HOME/.err"))"
 t=$(find_task fresh-name)
 [ -n "$t" ] && ok || bad "under the name Haiku gave when told the first was taken"

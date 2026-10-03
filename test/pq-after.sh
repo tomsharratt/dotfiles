@@ -63,6 +63,8 @@ export PATH="$STUBBIN:$PATH"
 
 # shellcheck source=/dev/null
 source "$HERE/../.local/bin/pq"
+# shellcheck source=test/lib.sh
+source "$HERE/lib.sh"
 
 pass=0 fail=0
 ok()  { pass=$((pass + 1)); }
@@ -123,20 +125,6 @@ mk_task() {                              # state prio slug repo branch -> task_d
   printf '%s' "$dir"
 }
 
-
-# cmd_add with the picker and the namer stood in for, in a subshell: the plan
-# is $1 and Haiku's answer is the branch $2; the rest are cmd_add's own flags.
-# stdin is /dev/null, so every wizard question takes its default.
-add_as() {                              # plan branch [flags...]
-  # Names cmd_add never declares: the stand-ins read them through dynamic
-  # scope at call time, under cmd_add's own locals.
-  local as_plan=$1 as_branch=$2; shift 2
-  # shellcheck disable=SC2329  # called by cmd_add, not here
-  ( at_terminal() { return 0; }
-    pick_plan() { printf '%s' "$as_plan"; }
-    name_plan() { printf '%s\t\t\n' "$as_branch"; }
-    cmd_add "$@" </dev/null )
-}
 
 echo "== pure predicates (no task directories at all) ==" >&2
 

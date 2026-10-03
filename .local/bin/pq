@@ -14,9 +14,10 @@
 # --json`).
 #
 #   pq add               pick a plan and add it to the queue; it forks from the
-#                        branch the repo is on, when that is not the default
-#   pq add --after T     repeatable: don't dispatch until T's PR has merged
-#   pq add --design P    repeatable: a design file the implementer builds to (auto-detected from the plan too)
+#                        branch the repo is on, when that is not the default;
+#                        it then asks the model, the effort, what it should wait on (its
+#                        PR must merge first) and, for a plan built from a design that
+#                        names no file on disk, the design file the implementer builds to
 #   pq evidence [task]   publish a task's screenshots to the pq-evidence branch; prints the markdown to paste
 #   pq after <task>      list a task's blockers and what each is waiting on
 #   pq after <task> T... add blockers to a task already in the queue
@@ -82,7 +83,7 @@
 # Every implementer is dispatched with a delivery CONTRACT (`contract_write`):
 # small logical commits in reading order, screenshots of every screen touched,
 # a side-by-side comparison against the design files the task carries
-# (`pq add --design`, or detected from the plan's text), and a DRAFT pull request
+# (picked at `pq add`, or detected from the plan's text), and a DRAFT pull request
 # with a review guide. Then the REVIEW GATE runs one independent `/code-review`
 # against the draft in the background - and a `/security-review` beside it when
 # the plan asks for one - and prompts the implementer to resolve what they found
@@ -162,8 +163,6 @@ PQ_DEFAULT_MODEL=sonnet                 # what the wizard's Enter takes
 PQ_DEFAULT_EFFORT=medium
 PQ_DEFAULT_CAP=1                        # the cap before `pq cap` has ever been run - see "the cap"
 PQ_NAMER_MODEL=haiku
-PQ_PICK_LIMIT=10                        # plans per page in pick_plan; `n`/`p` walk the rest
-PQ_PICK_PREVIEW=12                      # lines of a plan pick_plan previews
 PQ_LABEL_MAX=16                         # max chars of a blocker label in AGENT's cell, before the +N count
 PQ_DONE_KEEP=3                          # newest archivable done/ tasks archive_pass leaves behind
 # How long a done/ task's agent must have stopped working before its slot is
@@ -235,8 +234,9 @@ PQ_SUMMARY=""; PQ_RUN=0
 
 summary() { PQ_SUMMARY=$*; [ "$PQ_RUN" = 1 ] || printf 'pq: %s\n' "$*" >&2; }
 msg()  { printf 'pq: %s\n' "$*" >&2; }
-warn() { printf '\033[38;2;246;193;119mpq: %s\033[0m\n' "$*" >&2; }
-die()  { printf '\033[38;2;235;111;146mpq: %s\033[0m\n' "$*" >&2; exit 1; }
+# Amber and rose, unless NO_COLOR is set (https://no-color.org).
+warn() { if [ -n "${NO_COLOR:-}" ]; then msg "$*"; else printf '\033[38;2;246;193;119mpq: %s\033[0m\n' "$*" >&2; fi; }
+die()  { if [ -n "${NO_COLOR:-}" ]; then msg "$*"; else printf '\033[38;2;235;111;146mpq: %s\033[0m\n' "$*" >&2; fi; exit 1; }
 
 # `tasks` is not a state and nothing walks it - see task_link.
 for d in $STATES tasks; do mkdir -p "$PQ_HOME/$d"; done
@@ -597,7 +597,7 @@ retitle() {                             # task_dir new_state [new_stamp]
 
 # ── after: blockers ─────────────────────────────────────────────────────────
 # A blocker is a resolved (label, repo, branch) triple, not a task reference -
-# `pq add --after A` or `pq after B A` resolves A to its repo and branch at the
+# `pq add` picking A, or `pq after B A`, resolves A to its repo and branch at the
 # moment you type it. That is what makes the dependency survive `pq rm A`,
 # survive A ageing out of `done/`, and survive a slug being reused; it is also
 # what makes a cross-repo blocker work for free, and what lets a blocker name a
@@ -855,127 +855,119 @@ cell() {                                # text width -> ASCII-safe, truncated
   printf '%s' "$out"
 }
 
-# One page of `recent_plans`, as a table numbered ABSOLUTELY: row 11 is the
-# eleventh-newest plan whichever page it happens to be shown on. That is what
-# keeps `sed -n "${ans}p"` below a direct index into the full list, with no
-# per-page arithmetic to get wrong, and what makes a number mean one fixed plan
-# rather than "the third one I can currently see".
-pick_page() {                           # rows lo hi out_tsv
-  local lo=$2 hi=$3 out=$4 n=0 epoch path title
-  printf '#\tAGE\tPLAN\tSUMMARY\n' > "$out"
-  while IFS=$'\t' read -r epoch path; do
-    [ -n "$path" ] || continue
-    n=$((n + 1))
-    [ "$n" -lt "$lo" ] && continue
-    [ "$n" -gt "$hi" ] && break
-    title=$(plan_title "$path")
-    printf '%s\t%s\t%s\t%s\n' "$n" "$(age_since "$epoch")" \
-      "$(cell "$(basename "$path" .md)" 30)" "$(cell "$title" 60)" >> "$out"
-  done <<<"$1"
-  # A `while read` loop returns whatever its body last ran, and this body can
-  # end on a short-circuited test - so a perfectly good page would otherwise
-  # report failure. Exit codes carry meaning in this file (see pick_plan's own
-  # contract below); say the happy path out loud.
-  return 0
-}
+# ── interactive prompts ──────────────────────────────────────────────────────
+# Every question pq asks a person goes through gum, one function per intent, so
+# no call site spells a gum flag. gum draws its UI on stderr and prints only the
+# answer on stdout, which is what lets a prompt sit inside a command
+# substitution - pick_plan and name_plan are captured with $(...), and a stray
+# byte on stdout would corrupt the `source:` header and the staged plan.md.
+#
+# Only `pq add` and `pq rm` ask anything, so only they need gum (need_gum);
+# `ls`, `tick`, `run`, `evidence` and `cap` stay free of it, for scripts and
+# agents. The theme is amber and rose, the same two as warn and die, set once
+# here through gum's own environment.
+AMBER=#f6c177 ROSE=#eb6f92
+export GUM_CHOOSE_CURSOR_FOREGROUND=$AMBER GUM_CHOOSE_SELECTED_FOREGROUND=$AMBER
+export GUM_CHOOSE_HEADER_FOREGROUND=$AMBER
+export GUM_FILTER_INDICATOR_FOREGROUND=$AMBER GUM_FILTER_MATCH_FOREGROUND=$AMBER
+export GUM_FILTER_HEADER_FOREGROUND=$AMBER GUM_FILTER_PROMPT_FOREGROUND=$AMBER
+export GUM_CONFIRM_PROMPT_FOREGROUND=$AMBER GUM_CONFIRM_SELECTED_BACKGROUND=$ROSE
+export GUM_SPIN_SPINNER_FOREGROUND=$AMBER
+export GUM_FILE_CURSOR_FOREGROUND=$AMBER GUM_FILE_HEADER_FOREGROUND=$AMBER
+export GUM_PAGER_MATCH_HIGH_BACKGROUND=$AMBER
 
 # Whether there is someone at a terminal to ask. A function rather than a bare
-# `[ -t 0 ]` at the one place pq add asks it, so a test can stand in for the
-# terminal and drive the picker and the wizard with scripted answers.
+# `[ -t 0 ]` where pq add asks it, so a test can stand in for the terminal.
 at_terminal() { [ -t 0 ]; }
 
+need_gum() {                            # command that asks
+  command -v gum >/dev/null 2>&1 || die "pq $1 asks questions with gum - install it: brew install gum"
+}
+
+# Exit status is the answer. Anything but a yes - a no, Esc, Ctrl-C, or no
+# terminal to ask at - is a no, so a prompt that cannot be answered never
+# destroys anything.
+ui_confirm() {                          # question
+  at_terminal || return 1
+  gum confirm --default=false "$1"
+}
+
+# The picked item(s), one per line, on stdout; 1 when cancelled.
+ui_choose() {                           # [gum choose flags...] item...
+  gum choose "$@"
+}
+
+# Items on stdin, the picked one on stdout.
+ui_filter() {                           # [gum filter flags...]
+  gum filter "$@"
+}
+
+ui_input() {                            # prompt placeholder
+  gum input --prompt "$1 " --placeholder "${2:-}"
+}
+
+# A file you can read through before deciding. The pager draws on STDOUT, unlike
+# the rest, so it is sent to stderr here - pick_plan runs inside a command
+# substitution. The content goes as an argument rather than on stdin so the
+# pager keeps the terminal for its keys.
+ui_page() {                             # file
+  gum pager --soft-wrap --show-line-numbers=false "$(cat "$1")" >&2
+}
+
+# A file picked from a directory; 1 when none is.
+ui_file() {                             # directory
+  gum file --height 15 "$1"
+}
+
+# gum spin cannot run a shell function, so the work runs here, in the
+# background, and gum spins until it is done. stdout and the return status come
+# back as if it had been called directly; its stderr is held back and replayed
+# after, so a warning does not tear through the spinner. With no terminal it just
+# runs. Ctrl-C stops the work and returns 130.
+ui_spin() {                             # title cmd args...
+  local title=$1 out err pid rc; shift
+  if ! at_terminal; then "$@"; return; fi
+  out=$(mktemp "$PQ_HOME/.spin.XXXXXX"); err="$out.err"
+  "$@" >"$out" 2>"$err" & pid=$!
+  gum spin --title "$title" -- sh -c "while kill -0 $pid 2>/dev/null; do sleep 0.1; done"
+  rc=$?
+  if [ "$rc" -ge 130 ]; then
+    kill "$pid" 2>/dev/null; wait "$pid" 2>/dev/null
+    rm -f "$out" "$err"; return 130
+  fi
+  wait "$pid"; rc=$?
+  cat "$out"; cat "$err" >&2
+  rm -f "$out" "$err"
+  return "$rc"
+}
+
 # Exit codes carry meaning, the way reap_task's already do: 0 chose one (its
-# path on stdout), 1 declined/`q`/EOF, 2 nothing in $PLANS_DIR to pick from -
-# the caller stops on that one, with nothing to add.
-# Everything a human reads goes to stderr: pick_plan is consumed by a command
-# substitution, and any leakage on stdout would silently corrupt $plan, the
-# `source:` header, and the staged plan.md.
+# path on stdout), 1 cancelled or declined, 2 nothing in $PLANS_DIR to pick from
+# - the caller stops on that one, with nothing to add.
 #
-# $PLANS_DIR is every plan ever written, so this shows PQ_PICK_LIMIT of them at
-# a time - the newest page answers it most days - and `n`/`p` walk back through
-# the rest. Paging beats simply raising the limit because the plans you want
-# are named by the prompt that started their session
-# ("floofy-hugging-dragonfly.md"), so digging back is reading titles, not
-# recalling a filename, and a hundred-row table is not a thing you read.
+# $PLANS_DIR is every plan ever written, named by the prompt that started its
+# session ("floofy-hugging-dragonfly.md"), so the list shows each plan's title -
+# its first `# H1` - and fuzzy search replaces paging: type a word from what the
+# plan was about. Choosing one opens it in the pager to read, then asks. Declining
+# goes back to the list; Esc there is what quits.
 pick_plan() {
-  local rows total
+  local rows disp sel idx path epoch title
   rows=$(recent_plans)
   [ -n "$rows" ] || return 2
-  total=$(wc -l <<<"$rows" | tr -d ' ')
-
-  # `lo`, the 1-based index of the page's first row, is the whole of the paging
-  # state - the stride cannot change mid-picker, so every other bound is
-  # arithmetic on it. It survives a declined preview, which is what returns you
-  # to the page you were reading rather than to the top.
-  local per=$PQ_PICK_LIMIT lo=1 hi pages
-  pages=$(( (total + per - 1) / per ))
-
-  local tbl="$PQ_HOME/.pick.$$.tsv"
-  local ans row sel_path total_lines ans2 rule
-  rule=$(printf -- '─%.0s' $(seq 1 60))
+  disp=$(while IFS=$'\t' read -r epoch path; do
+    [ -n "$path" ] || continue
+    title=$(plan_title "$path")
+    printf '%-8s  %-30s  %s\n' "$(age_since "$epoch")" "$(basename "$path" .md)" \
+      "$(tr '\t\n\r' '   ' <<<"$title")"
+  done <<<"$rows")
   while :; do
-    hi=$(( lo + per - 1 )); [ "$hi" -gt "$total" ] && hi=$total
-    pick_page "$rows" "$lo" "$hi" "$tbl"
-
-    if [ "$pages" -gt 1 ]; then
-      msg "$lo-$hi of $total (page $(( (lo - 1) / per + 1 ))/$pages)"
-    else
-      msg "$total most recent of $total"
-    fi
-    printf '\n' >&2
-    render_table "$tbl" >&2
-    printf '\n' >&2
-    # One page is the whole list, so there is nowhere to page to - don't offer
-    # keys that can only answer "already at the oldest".
-    if [ "$pages" -gt 1 ]; then
-      printf 'pq: pick a plan [%s-%s, n older, p newer, Enter for %s, q to quit] ' "$lo" "$hi" "$lo" >&2
-    else
-      printf 'pq: pick a plan [1-%s, Enter for 1, q to quit] ' "$total" >&2
-    fi
-    read -r ans || { rm -f "$tbl"; return 1; }
-    # The top of what you are looking at, which is row 1 on the first page -
-    # so a plain `pq add`, Enter, still takes the newest plan.
-    [ -z "$ans" ] && ans=$lo
-    # `n` here is "next page, older"; `n` at the `use this plan? [y/N]` prompt
-    # a few lines down is "no". Two prompts, two vocabularies - each one's own
-    # hint says which is in force, and neither key is ever ambiguous within the
-    # prompt that reads it.
-    case "$ans" in
-      q|Q) rm -f "$tbl"; return 1 ;;
-      n|N) if [ "$hi" -lt "$total" ]; then lo=$(( lo + per )); else warn "already at the oldest"; fi
-           continue ;;
-      p|P) if [ "$lo" -gt 1 ]; then lo=$(( lo - per )); else warn "already at the newest"; fi
-           continue ;;
-    esac
-    # Any listed plan, on this page or not: the numbering is absolute, so
-    # rejecting a number that names a real plan just because it scrolled off
-    # would be a lie about what that number means.
-    #
-    # Capped at 9 digits so a huge number never reaches the arithmetic tests
-    # below: bash's [ -lt ]/[ -gt ] error out (a false "false") on an integer
-    # past its native range, which would flip this whole OR-chain to skip the
-    # reject instead of triggering it.
-    if ! [[ "$ans" =~ ^[0-9]{1,9}$ ]] || [ "$ans" -lt 1 ] || [ "$ans" -gt "$total" ]; then
-      warn "not a number from 1 to $total"
-      continue
-    fi
-
-    row=$(sed -n "${ans}p" <<<"$rows")
-    IFS=$'\t' read -r _ sel_path <<<"$row"
-
-    total_lines=$(wc -l < "$sel_path" | tr -d ' ')
-    printf '%s\n' "$rule" >&2
-    head -n "$PQ_PICK_PREVIEW" "$sel_path" >&2
-    printf '%s\n' "$rule" >&2
-    [ "$total_lines" -gt "$PQ_PICK_PREVIEW" ] && msg "showing first $PQ_PICK_PREVIEW of $total_lines lines"
-
-    printf 'pq: use this plan? [y/N] ' >&2
-    read -r ans2 || { rm -f "$tbl"; return 1; }
-    if [[ "$ans2" =~ ^[Yy]$ ]]; then
-      rm -f "$tbl"
-      printf '%s' "$sel_path"
-      return 0
-    fi
+    sel=$(ui_filter --header "pick a plan" --placeholder "search plans" --height 15 <<<"$disp") || return 1
+    [ -n "$sel" ] || return 1
+    idx=$(grep -nFx -- "$sel" <<<"$disp" | head -1 | cut -d: -f1)
+    [ -n "$idx" ] || return 1
+    path=$(sed -n "${idx}p" <<<"$rows" | cut -f2)
+    ui_page "$path"
+    if ui_confirm "use this plan?"; then printf '%s' "$path"; return 0; fi
   done
 }
 
@@ -984,85 +976,39 @@ pick_plan() {
 # `local`. A stray `local` here would shadow the caller's variable: every
 # answer would appear to work and be silently discarded. Called as a bare
 # statement for the same reason - `x=$(pick_after)` forks a subshell and
-# throws the mutation away. Writes nothing to stdout; its prompts and table,
-# like pick_plan's, go to stderr.
+# throws the mutation away. Writes nothing to stdout. Esc stops the add, like
+# every other question; Enter with nothing ticked is how to say none.
 pick_after() {
-  local d st slug branch repo n=0 full
-  full="$PQ_HOME/.pickafter.$$.tsv"
-  : > "$full"
+  local d st rows="" lines picked s
   while IFS= read -r d; do
     [ -n "$d" ] || continue
     st=$(state_of "$d")
     case "$st" in queue|running) ;; *) continue ;; esac
-    n=$((n + 1))
-    slug=$(slug_of "$d"); branch=$(hdr "$d/plan.md" branch); repo=$(hdr "$d/plan.md" repo)
-    printf '%s\t%s\t%s\t%s\t%s\n' "$n" "$st" "$slug" "${repo:--}" "${branch:--}" >> "$full"
+    rows="${rows}$(slug_of "$d")"$'\t'"$st"$'\t'"$(basename "$(hdr "$d/plan.md" repo)")"$'\n'
   done <<<"$(all_tasks)"
-  [ "$n" -gt 0 ] || { rm -f "$full"; return 0; }
-
-  # A PROJECT column only once the candidates actually span more than one
-  # repo - same rule and idiom cmd_ls uses. PROJECT is the only column here
-  # that needs `cell`: slugs are [a-z0-9-], branches have passed
-  # check-ref-format, and state names are literals, so those three are ASCII
-  # by construction - a repo path is arbitrary and the one column where the
-  # byte-counting skew documented on `cell` would actually land.
-  local multi tbl i
-  multi=$(cut -f4 "$full" | sort -u | awk 'END { print (NR > 1) }')
-  tbl="$PQ_HOME/.pickafterdisp.$$.tsv"
-  if [ "$multi" = 1 ]; then
-    printf '#\tSTATE\tTASK\tPROJECT\tBRANCH\n' > "$tbl"
-    while IFS=$'\t' read -r i st slug repo branch; do
-      printf '%s\t%s\t%s\t%s\t%s\n' "$i" "$st" "$slug" "$(cell "$(basename "$repo")" 20)" "$branch" >> "$tbl"
-    done < "$full"
-  else
-    printf '#\tSTATE\tTASK\tBRANCH\n' > "$tbl"
-    awk -F'\t' '{ print $1"\t"$2"\t"$3"\t"$5 }' "$full" >> "$tbl"
-  fi
-
-  msg "$n tasks this could wait on"
-  printf '\n' >&2
-  render_table "$tbl" >&2
-  printf '\n' >&2
-  rm -f "$tbl"
-
-  local ans norm entry bad valid
-  while :; do
-    printf 'pq: block on which? [1-%s, comma separated, Enter for none] ' "$n" >&2
-    read -r ans || { rm -f "$full"; return 0; }
-    [ -z "$ans" ] && { rm -f "$full"; return 0; }
-    norm=$(tr ',' ' ' <<<"$ans")
-    bad=0; valid=""
-    # shellcheck disable=SC2086  # word-splitting $norm on whitespace is the point
-    for entry in $norm; do
-      if [[ "$entry" =~ ^[0-9]{1,9}$ ]] && [ "$entry" -ge 1 ] && [ "$entry" -le "$n" ]; then
-        valid="$valid $entry"
-      else
-        bad=1; break
-      fi
-    done
-    if [ "$bad" = 1 ] || [ -z "${valid// /}" ]; then
-      warn "each entry must be a number from 1 to $n"
-      continue
-    fi
-    break
-  done
-
-  local seen="" num s
-  # shellcheck disable=SC2086  # word-splitting $valid on whitespace is the point
-  for num in $valid; do
-    s=$(awk -F'\t' -v i="$num" '$1 == i { print $3; exit }' "$full")
-    case " $seen " in *" $s "*) continue ;; esac
-    seen="$seen $s"
-    after_vals="${after_vals}${s}"$'\n'
-  done
-  rm -f "$full"
+  [ -n "$rows" ] || return 0
+  # The slug leads and has no spaces, so it is what comes back out of a chosen
+  # line. A project column only once the candidates span more than one repo -
+  # the same rule cmd_ls uses.
+  lines=$(awk -F'\t' '
+    $1 == "" { next }
+    { n++; slug[n] = $1; st[n] = $2; repo[n] = $3; if (!($3 in seen)) { seen[$3] = 1; nrepo++ } }
+    END { for (i = 1; i <= n; i++) printf "%-40s  %-8s%s\n", slug[i], st[i], (nrepo > 1 ? "  " repo[i] : "") }
+  ' <<<"$rows")
+  picked=$(ui_choose --no-limit --height 12 \
+    --header "wait on which? x ticks, Enter confirms, none is fine" <<<"$lines") || die "cancelled"
+  while IFS= read -r s; do
+    [ -n "$s" ] || continue
+    after_vals="${after_vals}${s%% *}"$'\n'
+  done <<<"$picked"
+  return 0
 }
 
 # ── design files ─────────────────────────────────────────────────────────────
 # A plan written from a Claude Design file describes the design in prose, and an
 # implementer that only ever sees the prose builds to its memory of a picture it
 # never saw - PR #6706 said as much in its own description. So the file travels
-# with the task: `--design PATH` attaches one, and every absolute or ~-prefixed
+# with the task: the wizard asks for one, and every absolute or ~-prefixed
 # path to a .dc.html/.html/.png/.jpg/.jpeg/.pdf that the plan's text mentions is
 # picked up on its own (AGENTS.md asks the planning session to save the file and
 # cite that path). The files are copied into <task>/design/ inside the staging
@@ -1140,63 +1086,43 @@ design_hinted() {                       # plan_file -> 0 when it cites Claude De
 }
 
 # The questions that shape how a task runs, asked once pick_plan has chosen a
-# plan. `model`, `after_vals` and the `design_*` variables are cmd_add's own
-# locals, reached the same way pick_after reaches `after_vals`, through bash's
-# dynamic scope - so this function must never declare any of them `local`. The
-# `${x:-}` defaults are for test/pq-add-pick.sh's wrapper, which declares only
-# the ones it drives, and under `set -u` would otherwise abort.
+# plan. `model`, `effort`, `after_vals` and the `design_*` variables are
+# cmd_add's own locals, reached the same way pick_after reaches `after_vals`,
+# through bash's dynamic scope - so this function must never declare any of them
+# `local`. The `${x:-}` defaults are for the tests' wrappers, which declare only
+# the ones they drive, and under `set -u` would otherwise abort.
+#
+# Esc or Ctrl-C at any question stops the add: nothing has been written yet, so
+# nothing is left behind.
 add_wizard() {
-  # Which model runs it. The three offered are the ones worth choosing between
-  # for a queued task; Enter takes PQ_DEFAULT_MODEL. `--model`
-  # given explicitly skips the question, like every other *_explicit - and the
-  # flag itself deliberately stays unvalidated, since it is passed straight to
-  # `claude --model` and any id that tool accepts is a legitimate answer. Only
-  # what is TYPED here is held to the three, because a typo at a prompt is a
-  # slip rather than a choice. A bare initial is taken too (s, o, f are
-  # unambiguous), as is any case - the same forgiveness pick_after shows "1, 3".
-  # EOF is Enter: a wizard reached with stdin already spent must not spin.
-  if [ "${model_explicit:-0}" != 1 ]; then
-    local mans mdef=${model:-$PQ_DEFAULT_MODEL}
-    while :; do
-      printf 'pq: which model? [sonnet/opus/fable, Enter for %s] ' "$mdef" >&2
-      read -r mans || mans=""
-      if [ -z "$mans" ]; then model=$mdef; break; fi
-      case "$(tr '[:upper:]' '[:lower:]' <<<"$mans")" in
-        sonnet|s) model=sonnet; break ;;
-        opus|o)   model=opus;   break ;;
-        fable|f)  model=fable;  break ;;
-        *)        warn "pick one of sonnet, opus or fable - or Enter for $mdef" ;;
-      esac
-    done
-  fi
-  # A plan that reads as built from a design, with no design file found or given,
-  # is the one input the implementer cannot do without - so it is asked for once,
-  # here, where the person who has the file is at the keyboard. Blank goes without,
-  # loudly. `--design` given explicitly skips the question, like every *_explicit.
-  if [ "${design_hinted:-0}" = 1 ] && [ "${design_explicit:-0}" != 1 ] && [ -z "${design_vals:-}" ]; then
-    local dp
-    printf 'pq: this plan was built from a design, but no design file was found on disk - path to it? [Enter for none] ' >&2
-    read -r dp || dp=""
-    dp=$(design_expand "$dp")
-    if [ -n "$dp" ]; then
-      [ -f "$dp" ] || die "no such design file: $dp"
+  # Which model and how hard it thinks. The three models are the ones worth
+  # choosing between for a queued task, and the effort levels are the ones
+  # `claude --effort` takes; each starts on its default, so Enter takes it.
+  model=$(ui_choose --header "which model?" --selected "$PQ_DEFAULT_MODEL" sonnet opus fable) || die "cancelled"
+  effort=$(ui_choose --header "what effort?" --selected "$PQ_DEFAULT_EFFORT" low medium high xhigh max) || die "cancelled"
+  # A plan that reads as built from a design, with no design file found, is the
+  # one input the implementer cannot do without - so it is asked for once, here,
+  # where the person who has the file is at the keyboard. Esc goes without,
+  # loudly.
+  if [ "${design_hinted:-0}" = 1 ] && [ -z "${design_vals:-}" ]; then
+    local dp ddir="$HOME/.claude/plans/designs"
+    [ -d "$ddir" ] || ddir=$HOME
+    msg "this plan was built from a design, but no design file was found on disk"
+    if dp=$(ui_file "$ddir") && [ -n "$dp" ]; then
       design_vals="${design_vals:-}${dp}"$'\n'
     else
       warn "no design file - the implementer will build from the plan's prose alone"
     fi
   fi
-  [ "$after_explicit" = 1 ] || pick_after
+  pick_after
 }
 
-# The plan and the name the task goes by are never flags: the plan is picked at
-# the wizard and Haiku names it. The wizard is the way in, so a plan path typed on
-# the command line is refused.
-cmd_add() {                             # [flags...]
-  # `model_explicit` is the *_explicit pattern again, and it is needed rather
-  # than a `[ "$model" != "$PQ_DEFAULT_MODEL" ]` test: `--model sonnet` and no
-  # flag at all leave `model` identical, and only one of the two should still
-  # be asked about by add_wizard.
-  local plan="" branch="" intent="" security="" model=$PQ_DEFAULT_MODEL model_explicit=0 effort=$PQ_DEFAULT_EFFORT
+# `pq add` takes no arguments at all: the plan is picked, Haiku names it, and
+# the model, effort, blockers and design are questions. The wizard is the way in.
+cmd_add() {
+  [ $# -eq 0 ] || die "pq add takes no arguments - it asks: '$1'"
+  need_gum add
+  local plan="" branch="" intent="" security="" model=$PQ_DEFAULT_MODEL effort=$PQ_DEFAULT_EFFORT
   # `basebr` rather than `base`: the blocker-hint loop at the end of this
   # function already declares a `local base`.
   local repo="" basebr=""
@@ -1204,49 +1130,26 @@ cmd_add() {                             # [flags...]
   # portability trap (fixed only in bash 4.4+), so every repeatable option in
   # this script accumulates into a newline-joined string instead. See `repos`
   # in cmd_ls for the same idiom.
-  local after_vals="" after_explicit=0
+  local after_vals=""
   # The design set: paths, newline-joined like every other repeatable option,
-  # gathered from --design, from the plan's own text (design_mentions) and from
-  # the wizard, then validated and copied in one place below. `design_explicit`
-  # follows the *_explicit pattern: given on the command line, the wizard does
-  # not ask. `design_hinted` is whether the plan reads as built from a design at
-  # all - what decides whether an empty set earns a question.
-  local design_vals="" design_explicit=0 design_hinted=0
-  # A flag that takes a value, given last, has none to take: `shift 2` then
-  # fails without shifting anything, and this loop spun on the same argument at
-  # 100% CPU. So each one checks for its value first.
-  while [ $# -gt 0 ]; do
-    case "$1" in
-      --model|--effort|--repo|--after|--design)
-        [ $# -ge 2 ] || die "$1 needs a value" ;;
-    esac
-    case "$1" in
-      --model)     model=${2:-}; model_explicit=1; shift 2 ;;
-      --effort)    effort=${2:-}; shift 2 ;;
-      --repo)      [ -z "$repo" ] || die "--repo takes one repo - a task lands in exactly one"
-                   repo=${2:-}; shift 2 ;;
-      --after)     after_vals="${after_vals}${2:-}"$'\n'; after_explicit=1; shift 2 ;;
-      --design)    design_vals="${design_vals}${2:-}"$'\n'; design_explicit=1; shift 2 ;;
-      -h|--help)   die "usage: pq add [--model M] [--effort E] [--repo PATH] [--after task|branch]... [--design PATH]..." ;;
-      -*)          die "unknown option '$1'" ;;
-      *)           die "pq add takes no plan path - it asks which plan: '$1'" ;;
-    esac
-  done
-
-  # An explicit design path that does not exist is a typo worth catching before
-  # anything else is paid for - the same reasoning as the branch checks below.
-  local dv
-  while IFS= read -r dv; do
-    [ -n "$dv" ] || continue
-    [ -f "$(design_expand "$dv")" ] || die "no such design file: $dv"
-  done <<<"$design_vals"
+  # gathered from the plan's own text (design_mentions) and from the wizard,
+  # then validated and copied in one place below. `design_hinted` is whether the
+  # plan reads as built from a design at all - what decides whether an empty set
+  # earns a question.
+  local design_vals="" design_hinted=0
 
   # The repo is wherever you are standing when you add the plan - you planned the
   # work in it. Resolve to the MAIN checkout, so adding from inside a worktree
   # still queues against the repo the new worktree will be forked from. Before
   # the picker, so an add from outside any repo stops before asking anything.
-  [ -n "$repo" ] || repo=$(git -C "$PWD" worktree list --porcelain 2>/dev/null | awk '/^worktree /{print substr($0,10); exit}')
-  [ -n "$repo" ] || die "not inside a git repo - run this from the project, or pass --repo"
+  repo=$(git -C "$PWD" worktree list --porcelain 2>/dev/null | awk '/^worktree /{print substr($0,10); exit}')
+  # Outside any repo, the one place to ask: which of the repos pq already knows.
+  if [ -z "$repo" ]; then
+    at_terminal || die "pq add asks which plan to add - run it at a terminal"
+    local known; known=$(all_tasks all | while IFS= read -r d; do [ -n "$d" ] && hdr "$d/plan.md" repo; done | sort -u)
+    [ -n "$known" ] || die "not inside a git repo - run this from the project"
+    repo=$(ui_choose --header "which repo?" <<<"$known") || die "cancelled"
+  fi
 
   # The plan is picked at the wizard. There is no unattended add: with no
   # terminal to ask at, `pq add` stops.
@@ -1295,7 +1198,7 @@ cmd_add() {                             # [flags...]
   fi
 
   # The design set, before the wizard: what the plan's text names and exists on
-  # disk joins whatever --design gave, and whether the plan reads as built from a
+  # disk, and whether the plan reads as built from a
   # design at all is what the wizard's question turns on.
   design_hinted "$plan" && design_hinted=1
   local detected; detected=$(design_mentions "$plan")
@@ -1303,7 +1206,8 @@ cmd_add() {                             # [flags...]
 
   # Named before the wizard, so a plan that cannot be named behind a usage limit
   # stops the add before any question is asked.
-  local named nrc; named=$(name_plan "$plan"); nrc=$?
+  local named nrc; named=$(ui_spin "naming the task" name_plan "$plan"); nrc=$?
+  [ "$nrc" = 130 ] && die "cancelled"
   [ "$nrc" = 3 ] && die "could not name the plan behind the usage limit - pq add again once it lifts"
 
   add_wizard
@@ -1340,7 +1244,8 @@ cmd_add() {                             # [flags...]
   # pq has ever used, and every one with a pull request behind it, is taken.
   if why=$(branch_taken "$branch" "$repo"); then
     warn "branch '$branch' is already $why - asking for another name"
-    named=$(name_plan "$plan" "$branch") || { [ $? = 3 ] && die "could not rename the plan behind the usage limit - pq add again once it lifts"; }
+    named=$(ui_spin "naming the task again" name_plan "$plan" "$branch") || {
+      case $? in 130) die "cancelled" ;; 3) die "could not rename the plan behind the usage limit - pq add again once it lifts" ;; esac; }
     branch=$(cut -f1 <<<"$named"); intent=$(cut -f2 <<<"$named"); security=$(cut -f3 <<<"$named")
     [ -n "$branch" ] || die "could not name the plan - Haiku gave no usable branch; try pq add again"
     git check-ref-format "refs/heads/$branch" || die "invalid branch name: '$branch'"
@@ -1350,7 +1255,7 @@ cmd_add() {                             # [flags...]
   local slug; slug=$(branch_to_slug "$branch")
   [ -n "$slug" ] || die "branch '$branch' does not reduce to a usable name"
 
-  # Resolve every --after value to a (label, repo, branch) triple NOW, before
+  # Resolve every chosen blocker to a (label, repo, branch) triple NOW, before
   # anything is written - a bad blocker should fail the whole add, not leave a
   # task queued with only some of what it was told to wait on. Self-reference
   # and cycles are rejected here for the same reason `find_task` resolves the
@@ -2898,15 +2803,15 @@ cmd_after() {
 # and possibly a database behind it, and those belong to `wt` - reclaiming them
 # here would make `pq rm` far more destructive than its name suggests.
 cmd_rm() {
+  need_gum rm
   local d; d=$(find_task "${1:-}") || exit 1
   # Read everything we will want to say BEFORE deleting the directory that holds it.
-  local slug st branch repo ans deps reaped
+  local slug st branch repo deps reaped
   slug=$(slug_of "$d"); st=$(state_of "$d")
   branch=$(hdr "$d/plan.md" branch); repo=$(hdr "$d/plan.md" repo)
   deps=$(dependents_of "$repo" "$branch" | tr '\n' ' ')
   reaped=$(st "$d" PQ_REAPED)
-  printf 'pq: remove task "%s" (%s)? [y/N] ' "$slug" "$st" >&2; read -r ans || ans=n
-  [[ "${ans:-}" =~ ^[Yy]$ ]] || { msg "cancelled"; return 0; }
+  ui_confirm "remove task \"$slug\" ($st)?" || { msg "cancelled"; return 0; }
   # The answer was about the task as it was when the question was asked. A tick
   # that claimed it meanwhile has it in running/ with a worktree on its way, and
   # removing the old path then removed nothing, said "removed", and the task
@@ -5394,7 +5299,7 @@ main() {
     ls)         shift; cmd_ls "$@" ;;
     rm)         shift; cmd_rm "$@" ;;
     evidence)   shift; cmd_evidence "$@" ;;
-    *) die "usage: pq {add [--after task|branch]... [--design PATH]... | after <task> [<task|branch>... | --clear] | ls [--all] [--json] | tick [--dry-run] | run | cap [N] | rm <task> | evidence [task]}" ;;
+    *) die "usage: pq {add | after <task> [<task|branch>... | --clear] | ls [--all] [--json] | tick [--dry-run] | run | cap [N] | rm <task> | evidence [task]}" ;;
   esac
 }
 if [ "${BASH_SOURCE[0]}" = "$0" ]; then main "$@"; fi

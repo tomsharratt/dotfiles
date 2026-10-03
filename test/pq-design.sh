@@ -69,6 +69,9 @@ export PATH="$STUBBIN:$PATH"
 
 # shellcheck source=/dev/null
 source "$HERE/../.local/bin/pq"
+# shellcheck source=test/lib.sh
+source "$HERE/lib.sh"
+gum_stub "$STUBBIN" "$PQ_HOME/.gum"
 
 pass=0 fail=0
 ok()  { pass=$((pass + 1)); }
@@ -109,21 +112,6 @@ mkplan() {                              # file marker [extra lines...]
   local f=$1 m=$2; shift 2
   { printf '# A plan\n\nMARKER: %s\n\n' "$m"; for l in "$@"; do printf '%s\n' "$l"; done; } > "$f"
 }
-# cmd_add with the picker stood in for, in a subshell: the plan is $1, and a
-# branch given as $2 stands in for the namer too - empty leaves Haiku's stub to
-# name it. The rest are cmd_add's own flags. stdin is /dev/null, so every wizard
-# question takes its default.
-add_as() {                              # plan branch [flags...]
-  # Names cmd_add never declares: the stand-ins read them through dynamic
-  # scope at call time, under cmd_add's own locals.
-  local as_plan=$1 as_branch=$2; shift 2
-  # shellcheck disable=SC2329  # called by cmd_add, not here
-  ( at_terminal() { return 0; }
-    pick_plan() { printf '%s' "$as_plan"; }
-    if [ -n "$as_branch" ]; then name_plan() { printf '%s\t\t\n' "$as_branch"; }; fi
-    cmd_add "$@" </dev/null )
-}
-
 echo "== --design copies the files into design/ and writes the header ==" >&2
 PLAN="$PQ_HOME/.p1.md"; mkplan "$PLAN" plain "Body."
 add_as "$PLAN" tom/d1 --repo "$REPO" --design "$DC" --design "$DES/shot.png" 2>"$PQ_HOME/.err"
@@ -175,10 +163,8 @@ add_as "$PLAN3" tom/d4 --repo "$REPO" 2>"$PQ_HOME/.err"
 t=$(find_task d4)
 eq "$(hdr "$t/plan.md" design)" "" "a claude.ai url is not a design path"
 hasnt "$(cat "$PQ_HOME/.err")" "not on disk" "and is not warned about as a dangling one either"
-# ...but a plan that only cites a design by url IS a design plan with no file,
-# so the wizard asks for one, and going without is said out loud.
-has "$(cat "$PQ_HOME/.err")" "built from a design, but no design file was found on disk" "a design cited with no file on disk is asked about"
-has "$(cat "$PQ_HOME/.err")" "build from the plan's prose alone" "and going without is warned about"
+# (A plan that only cites a design by url is still design-built, so the wizard
+# asks for a file - see the add_wizard cases below.)
 
 echo "== auto-detection: a dangling path warns by name and does not block the add ==" >&2
 PLAN4="$PQ_HOME/.p4.md"
@@ -209,31 +195,28 @@ design_hinted "$PLAN" && bad "a plain plan is not design-built" || ok
 
 echo "== add_wizard: the design question, asked only when it should be ==" >&2
 # The wizard reaches cmd_add's locals through dynamic scope; this wrapper
-# stands in for cmd_add exactly as test/pq-add-pick.sh's run_wizard does.
-run_wizard() {                          # hinted explicit -> "design=[Y]"
-  local after_vals="" after_explicit=1 repo=$REPO
-  local design_hinted=$1 design_explicit=$2 design_vals=""
-  # model_explicit=1 so the wizard's model question never fires here: every
-  # case below feeds it exactly the line the DESIGN question should read, and a
-  # question in front of it would eat that line. The model question's own cases
-  # live in test/pq-add-pick.sh.
-  local model=$PQ_DEFAULT_MODEL model_explicit=1
+# stands in for cmd_add exactly as test/pq-add-pick.sh's run_wizard does. The
+# model and effort questions come first, so each case answers them too.
+run_wizard() {                          # hinted -> "design=[Y]"
+  local after_vals="" repo=$REPO
+  local design_hinted=$1 design_vals=""
+  local model=$PQ_DEFAULT_MODEL effort=$PQ_DEFAULT_EFFORT
   add_wizard
   printf 'design=[%s]' "$design_vals"
 }
-out=$(run_wizard 1 0 <<<"$DES/shot.png" 2>"$PQ_HOME/.err")
-eq "$out" "design=[$DES/shot.png"$'\n'"]" "a path typed at the question joins the design set"
+reset_tasks                             # nothing queued, so no blocker question follows
+gum_reset; gum_answer sonnet; gum_answer medium; gum_answer "$DES/shot.png"
+out=$(run_wizard 1 2>"$PQ_HOME/.err")
+eq "$out" "design=[$DES/shot.png"$'\n'"]" "a file picked at the question joins the design set"
 has "$(cat "$PQ_HOME/.err")" "built from a design, but no design file was found" "the question says why it is asked"
-out=$(run_wizard 1 0 <<<"" 2>"$PQ_HOME/.err")
-eq "$out" "design=[]" "Enter goes without"
+has "$(gum_calls)" "file --height 15 $HOME" "and starts the picker in a directory that exists"
+gum_reset; gum_answer sonnet; gum_answer medium; gum_answer "" 1
+out=$(run_wizard 1 2>"$PQ_HOME/.err")
+eq "$out" "design=[]" "Esc goes without"
 has "$(cat "$PQ_HOME/.err")" "build from the plan's prose alone" "and says so, loudly"
-out=$(run_wizard 0 0 </dev/null 2>"$PQ_HOME/.err")
-hasnt "$(cat "$PQ_HOME/.err")" "path to it" "a plan that is not design-built is not asked"
-out=$(run_wizard 1 1 </dev/null 2>"$PQ_HOME/.err")
-hasnt "$(cat "$PQ_HOME/.err")" "path to it" "--design given explicitly skips the question"
-( run_wizard 1 0 <<<"/nonexistent/x.png" ) >/dev/null 2>"$PQ_HOME/.err" \
-  && bad "a typed path that does not exist must die" || ok
-has "$(cat "$PQ_HOME/.err")" "no such design file" "and say so"
+gum_reset; gum_answer sonnet; gum_answer medium
+out=$(run_wizard 0 2>"$PQ_HOME/.err")
+hasnt "$(gum_calls)" "file" "a plan that is not design-built is not asked"
 
 echo "== name_plan: one line, branch then intent then the security verdict ==" >&2
 PP="$PQ_HOME/.plain.md"; mkplan "$PP" plain

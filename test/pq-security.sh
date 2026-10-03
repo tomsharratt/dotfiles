@@ -113,6 +113,12 @@ export PQ_WT="$STUBBIN/wt-stub"
 
 # shellcheck source=/dev/null
 source "$HERE/../.local/bin/pq"
+# shellcheck source=test/lib.sh
+source "$HERE/lib.sh"
+gum_stub "$STUBBIN" "$PQ_HOME/.gum"
+# pq rm asks through gum, at a terminal: the terminal is stood in for.
+# shellcheck disable=SC2329  # called by pq rm, not here
+at_terminal() { return 0; }
 
 pr_load_all() { :; }
 
@@ -255,27 +261,18 @@ grep -q 'security is true only when the plan asks for a security review' "$CLAUD
   && ok || bad "the namer is told what a yes means"
 
 echo "== cmd_add: the verdict becomes the header ==" >&2
-# The picker stood in for, in a subshell; Haiku's stub names the plan. stdin is
-# /dev/null, so every wizard question takes its default.
-add_picked() {                          # plan [flags...]
-  local as_plan=$1; shift
-  # shellcheck disable=SC2329  # called by cmd_add, not here
-  ( at_terminal() { return 0; }
-    pick_plan() { printf '%s' "$as_plan"; }
-    cmd_add "$@" </dev/null )
-}
 reset_tasks
-add_picked "$PSEC" --repo "$REPO" 2>"$PQ_HOME/.err"
+add_as "$PSEC" "" --repo "$REPO" 2>"$PQ_HOME/.err"
 t=$(find_task secure-it)
 eq "$(hdr "$t/plan.md" security)" "yes" "a plan that asks carries security: yes"
 has "$(cat "$PQ_HOME/.err")" "review: code and security - the plan asks for a /security-review" "and the add says so"
-add_picked "$PWAIVE" --repo "$REPO" 2>"$PQ_HOME/.err"
+add_as "$PWAIVE" "" --repo "$REPO" 2>"$PQ_HOME/.err"
 t=$(find_task waived-it)
 grep -q '^security:' "$t/plan.md" && bad "a waived review writes no header at all" || ok
 hasnt "$(cat "$PQ_HOME/.err")" "review: code and security" "and the add says nothing about it"
 # The verdict is the third field of line 1: an empty intent before it must not
 # let it slide into the intent's place, as a tab-split `read` would.
-add_picked "$PNOINT" --repo "$REPO" 2>"$PQ_HOME/.err"
+add_as "$PNOINT" "" --repo "$REPO" 2>"$PQ_HOME/.err"
 t=$(find_task no-intent)
 eq "$(hdr "$t/plan.md" security)" "yes" "an empty intent does not swallow the verdict"
 eq "$(hdr "$t/plan.md" intent)" "" "nor does the verdict become the intent"
@@ -583,7 +580,8 @@ review_task "$K" 0 >/dev/null 2>&1
 eq "$(st "$K" PQ_REVIEW)" "posted" "the gate is past running"
 SPID=$(st "$K" PQ_SECURITY_PID)
 review_alive "$SPID" && ok || bad "while the security reviewer runs"
-( main rm removed <<<"y" ) >/dev/null 2>&1
+gum_reset; gum_answer ""
+( main rm removed ) >/dev/null 2>&1
 sleep 0.3
 review_alive "$SPID" && bad "pq rm must kill the security reviewer too" || ok
 [ -d "$K" ] && bad "and the task is gone" || ok

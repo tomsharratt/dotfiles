@@ -85,6 +85,12 @@ export PQ_WT="$STUBBIN/wt-stub"
 
 # shellcheck source=/dev/null
 source "$HERE/../.local/bin/pq"
+# shellcheck source=test/lib.sh
+source "$HERE/lib.sh"
+gum_stub "$STUBBIN" "$PQ_HOME/.gum"
+# pq rm asks through gum, at a terminal: the terminal is stood in for.
+# shellcheck disable=SC2329  # called by pq rm, not here
+at_terminal() { return 0; }
 
 pr_load_all() { :; }
 
@@ -685,7 +691,8 @@ review_task "$K" 0 >/dev/null 2>&1
 PID=$(st "$K" PQ_REVIEW_PID)
 review_alive "$PID" && ok || bad "the reviewer is running"
 task_link "$K"
-( main rm removed <<<"y" ) >/dev/null 2>&1
+gum_reset; gum_answer ""
+( main rm removed ) >/dev/null 2>&1
 sleep 0.3
 review_alive "$PID" && bad "pq rm must kill the reviewer before deleting its directory" || ok
 [ -d "$K" ] && bad "and the task is gone" || ok
