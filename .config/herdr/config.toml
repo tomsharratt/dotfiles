@@ -7,10 +7,17 @@ auto_switch = false
 [ui]
 agent_panel_sort = "spaces"
 
-# prefix+t  new task: prompt for a name, create an isolated worktree (own db /
-# redis / url / port), provision it, and start the dev server + Claude on it.
-# Backed by ~/.local/bin/wt; per-project steps live in ~/.config/wt/profiles/.
 [[keys.command]]
 key = "prefix+t"
-type = "pane"
-command = "wt new"
+type = "popup"
+command = "pq add"
+description = "queue a plan"
+width = "80%"
+height = "80%"
+
+[[keys.command]]
+key = "prefix+o"
+type = "popup"
+command = "wt open"
+description = "open an environment"
+
