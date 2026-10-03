@@ -23,7 +23,8 @@
 #                        (e.g. `wt run bin/rails console`); no cmd -> a shell
 #   wt open [subdomain]  open this worktree's dev url in the browser - at a
 #                        subdomain of it, when the profile serves several; any
-#                        args go to the profile's wt_open / wt_open_url
+#                        args go to the profile's wt_open / wt_open_url. Outside
+#                        a worktree it asks which one, with gum, from any repo
 #   wt provision <path>  (re)run the project's provisioning for a worktree (idempotent)
 #   wt rm  [name]        tear the worktree down (drop db, free port, remove worktree)
 #        -y, --yes       answer both prompts yes (needed to run unattended); a worktree
@@ -1378,11 +1379,51 @@ cmd_restart() {
   dev_autostart
 }
 
-# Always this worktree, the one you are standing in: every argument is the
-# profile's - a subdomain for a web app, `--launch-only` for a device build.
+# gum draws its UI on stderr and prints only the answer, so a pick can sit in a
+# command substitution. Same amber as pq's prompts; the one place wt asks a person
+# anything.
+ui_filter() {                           # [gum filter flags...]; items on stdin
+  GUM_FILTER_INDICATOR_FOREGROUND='#f6c177' GUM_FILTER_MATCH_FOREGROUND='#f6c177' \
+  GUM_FILTER_PROMPT_FOREGROUND='#f6c177' GUM_FILTER_HEADER_FOREGROUND='#f6c177' \
+    gum filter "$@"
+}
+
+# The path of a worktree picked from every one wt knows about, across all repos.
+# Nothing is printed, and 1 returned, when the pick is cancelled.
+pick_worktree() {
+  at_terminal || die "not inside a worktree - run it from one, or from a terminal to pick one"
+  command -v gum >/dev/null 2>&1 || die "not inside a worktree, and picking one needs gum - install it: brew install gum"
+  local repo wts path branch rows="" label picked
+  while IFS= read -r repo; do
+    [ -n "$repo" ] || continue
+    wts=$(repo_worktrees "$repo")
+    while IFS=$'\t' read -r path branch; do
+      [ -n "$path" ] || continue
+      [ "$branch" = - ] && branch=$(basename "$path")
+      rows+=$(printf '%s\t%s\t%s' "$(basename "$repo")" "$branch" "$path")$'\n'
+    done <<<"$wts"
+  done <<<"$(known_repos)"
+  [ -n "$rows" ] || die "no worktrees to open - create one with: wt new"
+  # Only repo and branch are shown, aligned; the path rides along as a third field
+  # to look the pick up by, since a branch name alone says nothing of where it lives.
+  label=$(awk -F'\t' '{ if (length($1) > w) w = length($1); r[NR] = $1; b[NR] = $2 }
+    END { for (i = 1; i <= NR; i++) printf "%-" w "s  %s\n", r[i], b[i] }' <<<"$rows")
+  picked=$(ui_filter --header "open which worktree?" --placeholder "type to filter" <<<"$label") || return 1
+  [ -n "$picked" ] || return 1
+  awk -F'\t' -v n="$(grep -nxF -- "$picked" <<<"$label" | head -1 | cut -d: -f1)" 'NR == n { print $3 }' <<<"$rows"
+}
+
+# The worktree you are standing in, or - from anywhere else, the main checkout, a
+# repo with no worktrees, a directory that is no repo at all - one picked from a list.
+# Every argument is the profile's: a subdomain for a web app, `--launch-only` for a
+# device build.
 cmd_open() {
   local path repo repo_name name url=""
-  path=$(git -C "$PWD" rev-parse --show-toplevel 2>/dev/null) || die "not inside a git worktree: $PWD"
+  path=$(git -C "$PWD" rev-parse --show-toplevel 2>/dev/null) || path=""
+  if [ -z "$path" ] || [ "$(realpath_p "$(main_worktree "$path")")" = "$(realpath_p "$path")" ]; then
+    path=$(pick_worktree) || exit 1
+    cd "$path" || die "cannot enter $path"
+  fi
   repo=$(main_worktree "$path"); repo_name=$(basename "$repo"); name=$(cur_branch "$path")
   load_profile "$repo_name"
   load_state_for_path "$path" "$repo_name" "$name" \

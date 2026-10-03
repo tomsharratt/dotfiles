@@ -72,9 +72,12 @@ wt open [subdomain]  open this worktree's dev url in the browser, starting the
                      command to the profile's own open action (build, install
                      and launch on a device) when it defines one instead of a url;
                      its arguments are the profile's: supercast takes a subdomain
-                     to open its login on, with the seed admin pre-filled (app by
-                     default, or a podcast's own), and the mobile profiles take
-                     --launch-only/-l to skip the build and just relaunch
+                     to open its login on, with the seed admin pre-filled (the
+                     example podcast by default, or app, or another podcast's
+                     own), and the mobile profiles take
+                     --launch-only/-l to skip the build and just relaunch;
+                     run from anywhere but inside a worktree, it asks which
+                     worktree (of any repo) with a gum filter, then carries on
 wt provision <path>  re-run provisioning for a worktree (idempotent)
 wt rm  [-y] [name]   tear a worktree down (drop db, free port, remove worktree);
                      one holding work that is not pushed is refused under -y

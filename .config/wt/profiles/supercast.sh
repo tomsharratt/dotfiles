@@ -330,12 +330,13 @@ EOF
 # email pre-filled, so a fresh worktree drops you onto a session in one click.
 # puma-dev routes any *.<slug>.test host through this worktree's entry, and the
 # login is served on every subdomain, so the one argument picks where that
-# session starts - app by default, or a podcast's own site.
+# session starts - the example podcast by default, or any other subdomain (app
+# included).
 wt_open_url() {
-  local sub=${1:-app}
+  local sub=${1:-example}
   [ $# -le 1 ] || { warn "wt open takes one subdomain, not $#"; return 1; }
   [[ "$sub" =~ ^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?$ ]] \
-    || { warn "wt open takes a subdomain - app, or a podcast's - not '$sub'; run it from inside the worktree"; return 1; }
+    || { warn "wt open takes a subdomain - example, app, or a podcast's - not '$sub'; run it from inside the worktree"; return 1; }
   printf 'https://%s.%s/login?user[email]=admin@supercast.tech' "$sub" "$WT_DOMAIN"
 }
 

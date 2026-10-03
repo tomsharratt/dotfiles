@@ -5,7 +5,7 @@
 # unchanged when a profile defines only that, every argument is the profile's -
 # wt open always opens the worktree it is run from - and load_profile never lets
 # wt_open leak from one repo's profile into the next repo sourced in the same
-# process. Then supercast's own wt_open_url: the login, on app by default or
+# process. Then supercast's own wt_open_url: the login, on example by default or
 # on the subdomain given. `wt open` needs no herdr socket, which is what makes it testable as
 # a subprocess - same reasoning as test/pq-reap.sh for `wt`.
 #
@@ -123,11 +123,6 @@ eq "$rc" "1" "a refusal fails wt open"
 case "$out" in *"not that one"*) ok ;; *) bad "and the profile's reason is what is shown (got '$out')" ;; esac
 [ ! -s "$OPEN_LOG" ] && ok || bad "'open' must not be called after a refusal (log: $(cat "$OPEN_LOG"))"
 
-echo "== from the main checkout, there is no worktree to open ==" >&2
-out=$(cd "$REPO" && "$WT" open 2>&1); rc=$?
-eq "$rc" "1" "wt open outside a provisioned worktree fails"
-case "$out" in *"no saved state for this worktree"*) ok ;; *) bad "and says why (got '$out')" ;; esac
-
 echo "== load_profile: wt_open defined by one repo's profile must not leak into the next ==" >&2
 REPO2=$(mktemp -d)
 git init -q -b master "$REPO2"
@@ -154,7 +149,7 @@ result=$(
 case "$result" in *"sanity=ok"*) ok ;; *) bad "sanity: wt_open should be defined right after loading $REPO_NAME's profile (got: $result)" ;; esac
 case "$result" in *"leaked=no"*) ok ;; *) bad "wt_open leaked into a profile load for a repo that defines no wt_open (got: $result)" ;; esac
 
-echo "== supercast's wt_open_url: the login on app by default, or on the subdomain given ==" >&2
+echo "== supercast's wt_open_url: the login on example by default, or on the subdomain given ==" >&2
 supercast_url() {                       # args... -> the real profile's url, its reason on stderr
   (
     # shellcheck source=/dev/null
@@ -166,13 +161,52 @@ supercast_url() {                       # args... -> the real profile's url, its
   )
 }
 url_of() { local u rc; u=$(supercast_url "$@" 2>/dev/null); rc=$?; printf '%s %s' "$rc" "$u"; }
-eq "$(url_of)" "0 https://app.tom-x.test/login?user[email]=admin@supercast.tech" "bare: the app login, the seed admin pre-filled"
-eq "$(url_of app)" "0 https://app.tom-x.test/login?user[email]=admin@supercast.tech" "app named outright is the same"
+eq "$(url_of)" "0 https://example.tom-x.test/login?user[email]=admin@supercast.tech" "bare: the example login, the seed admin pre-filled"
+eq "$(url_of example)" "0 https://example.tom-x.test/login?user[email]=admin@supercast.tech" "example named outright is the same"
+eq "$(url_of app)" "0 https://app.tom-x.test/login?user[email]=admin@supercast.tech" "app is still one argument away"
 eq "$(url_of mypodcast)" "0 https://mypodcast.tom-x.test/login?user[email]=admin@supercast.tech" "any other subdomain opens the same login there"
 eq "$(url_of "$WT1")" "1 " "a path is refused - wt open no longer takes one"
 eq "$(url_of a b)" "1 " "and so is a second argument"
 err=$(supercast_url "$WT1" 2>&1 >/dev/null)
 case "$err" in *"wt open takes a subdomain"*"run it from inside the worktree"*) ok ;; *) bad "the refusal says what it takes (got '$err')" ;; esac
+
+echo "== outside a worktree, wt open asks which one - from the main checkout or from nowhere ==" >&2
+# gum stands in for a person: it records the list it was shown and answers with
+# the row named in PICK. The terminal is stood in for too, by sourcing wt, since
+# a test has no tty on stdin.
+cat > "$STUBBIN/gum" <<GUM
+#!/bin/sh
+cat > "$STUBBIN/.gum-items"
+grep -F -- "\$PICK" "$STUBBIN/.gum-items" | head -1
+GUM
+chmod +x "$STUBBIN/gum"
+cat > "$PROFILE_DIR/$REPO_NAME.sh" <<'EOF'
+wt_open() { printf 'opened %s on %s with: %s\n' "$WT_NAME" "$(pwd -P)" "$*"; }
+EOF
+pick_open() {                           # dir pick args...
+  local dir=$1 pick=$2; shift 2
+  ( cd "$dir" && PICK=$pick bash -c 'wt=$1; shift; source "$wt"; at_terminal() { return 0; }; cmd_open "$@"' _ "$WT" "$@" 2>&1 )
+}
+want_pick="opened task/one on $(cd "$WT1" && pwd -P) with:"
+out=$(pick_open "$REPO" "task/one")
+case "$out" in *"$want_pick"*) ok ;; *) bad "from the main checkout, the picked worktree should open (got '$out')" ;; esac
+grep -q "task/one" "$STUBBIN/.gum-items" && grep -q "$REPO_NAME" "$STUBBIN/.gum-items" && ok \
+  || bad "the list should show repo and branch (got '$(cat "$STUBBIN/.gum-items")')"
+nowhere=$(mktemp -d)
+out=$(pick_open "$nowhere" "task/one" mypodcast)
+rmdir "$nowhere"
+case "$out" in *"$want_pick mypodcast"*) ok ;; *) bad "from outside any repo it should still pick, and pass args on (got '$out')" ;; esac
+out=$(cd "$REPO" && "$WT" open </dev/null 2>&1); rc=$?
+eq "$rc" "1" "with no terminal to ask at, it refuses rather than guess"
+case "$out" in *"not inside a worktree"*) ok ;; *) bad "the refusal should say why (got '$out')" ;; esac
+cat > "$STUBBIN/gum" <<'EOF'
+#!/bin/sh
+cat > /dev/null
+exit 130
+EOF
+out=$(pick_open "$REPO" "")
+case "$out" in *"opened"*) bad "cancelling the pick must open nothing (got '$out')" ;; *) ok ;; esac
+rm -f "$STUBBIN/gum"
 
 printf '\n%d passed, %d failed\n' "$pass" "$fail" >&2
 [ "$fail" -eq 0 ]
