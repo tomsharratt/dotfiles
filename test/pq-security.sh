@@ -170,8 +170,8 @@ reset_tasks() {
   touch "$STUBBIN/.release-code" "$STUBBIN/.release-security"
   for d in "$PQ_HOME"/done/*/ "$PQ_HOME"/running/*/; do [ -d "$d" ] && review_kill "${d%/}"; done
   rm -f "$STUBBIN/.release-code" "$STUBBIN/.release-security"
-  rm -rf "$PQ_HOME/queue" "$PQ_HOME/running" "$PQ_HOME/done" "$PQ_HOME/archive"
-  mkdir -p "$PQ_HOME/queue" "$PQ_HOME/running" "$PQ_HOME/done" "$PQ_HOME/archive"
+  rm -rf "$PQ_HOME/new" "$PQ_HOME/queue" "$PQ_HOME/running" "$PQ_HOME/done" "$PQ_HOME/archive"
+  mkdir -p "$PQ_HOME/new" "$PQ_HOME/queue" "$PQ_HOME/running" "$PQ_HOME/done" "$PQ_HOME/archive"
 }
 reset_tasks
 reset_logs() {
@@ -265,7 +265,7 @@ reset_tasks
 add_as "$PSEC" "" --repo "$REPO" 2>"$PQ_HOME/.err"
 t=$(find_task secure-it)
 eq "$(hdr "$t/plan.md" security)" "yes" "a plan that asks carries security: yes"
-has "$(cat "$PQ_HOME/.err")" "review: code and security - the plan asks for a /security-review" "and the add says so"
+has "$(cat "$PQ_HOME/.err")" "queued secure-it - tom/secure-it, with a security review" "and naming says so"
 add_as "$PWAIVE" "" --repo "$REPO" 2>"$PQ_HOME/.err"
 t=$(find_task waived-it)
 grep -q '^security:' "$t/plan.md" && bad "a waived review writes no header at all" || ok

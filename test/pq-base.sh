@@ -104,8 +104,8 @@ cache_row_v1() { printf '%s\t%s\t%s\t%s\t%s\t%s\n'     "$@" >> "$PR_CACHE"; }  #
 ans_row()      { printf '%s\t%s\n' "$@" >> "$PR_ANS"; }
 
 reset_tasks() {
-  rm -rf "$PQ_HOME/queue" "$PQ_HOME/running" "$PQ_HOME/done"
-  mkdir -p "$PQ_HOME/queue" "$PQ_HOME/running" "$PQ_HOME/done"
+  rm -rf "$PQ_HOME/new" "$PQ_HOME/queue" "$PQ_HOME/running" "$PQ_HOME/done"
+  mkdir -p "$PQ_HOME/new" "$PQ_HOME/queue" "$PQ_HOME/running" "$PQ_HOME/done"
 }
 reset_tasks
 

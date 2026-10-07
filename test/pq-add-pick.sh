@@ -42,6 +42,7 @@ case "$model" in
     content=$(cat)
     case "$content" in
       *"MARKER: wiring-fixture"*)
+        : > "$(dirname "$0")/.haiku-called"
         printf '{"branch":"tom/wiring-fixture-task","intent":"Do the wiring thing."}\n' ;;
       *) printf '{}\n' ;;
     esac
@@ -85,8 +86,8 @@ reset_plans() { rm -rf "$PQ_PLANS_DIR"; mkdir -p "$PQ_PLANS_DIR"; }
 mkplan() { printf '# %s\n\nBody.\n' "$2" > "$PQ_PLANS_DIR/$1"; }        # filename title
 
 reset_tasks() {
-  rm -rf "$PQ_HOME/queue" "$PQ_HOME/running" "$PQ_HOME/done"
-  mkdir -p "$PQ_HOME/queue" "$PQ_HOME/running" "$PQ_HOME/done"
+  rm -rf "$PQ_HOME/new" "$PQ_HOME/queue" "$PQ_HOME/running" "$PQ_HOME/done"
+  mkdir -p "$PQ_HOME/new" "$PQ_HOME/queue" "$PQ_HOME/running" "$PQ_HOME/done"
 }
 reset_tasks
 
@@ -197,11 +198,11 @@ pick_plan >/dev/null 2>&1; rc=$?
 eq "$rc" "2" "nothing in PLANS_DIR should return 2, not 1"
 eq "$(gum_calls)" "" "and gum is never asked"
 
-echo "== pick_after: ticked tasks come back as slugs; duplicates collapse ==" >&2
+echo "== pick_after: ticked tasks come back as stamps, in order ==" >&2
 reset_tasks
-mk_task queue 010 task-a "$REPO" tom/task-a >/dev/null
+A=$(mk_task queue 010 task-a "$REPO" tom/task-a)
 mk_task queue 020 task-b "$REPO" tom/task-b >/dev/null
-mk_task queue 030 task-c "$REPO" tom/task-c >/dev/null
+C=$(mk_task queue 030 task-c "$REPO" tom/task-c)
 
 # `after_vals` and friends are cmd_add's own locals, reached through bash's
 # dynamic scope - this wrapper stands in for cmd_add so pick_after can mutate
@@ -211,10 +212,11 @@ run_pick_after() {                      # -> echoes the resulting after_vals
   pick_after
   printf '%s' "$after_vals"
 }
-gum_reset; gum_answer $'task-a  queue   \ntask-c  queue   '
+gum_reset; gum_answer "@1,3"
 out=$(run_pick_after 2>/dev/null)
-eq "$out" $'task-a\ntask-c' "ticking a and c selects task-a and task-c, in that order"
+eq "$out" "$(stamp_of "$A")"$'\n'"$(stamp_of "$C")" "ticking a and c selects their stamps, in that order"
 eq "$(gum_stdin 1 | wc -l | tr -d ' ')" "3" "all three queued tasks are offered"
+eq "$(gum_stdin 1 | grep -c ' $')" "0" "with no trailing padding on any line"
 
 echo "== pick_after: nothing ticked selects none, Esc stops ==" >&2
 gum_reset; gum_answer ""
@@ -222,11 +224,29 @@ eq "$(run_pick_after 2>/dev/null)" "" "Enter with nothing ticked means no blocke
 gum_reset; gum_answer "" 130
 ( run_pick_after ) >/dev/null 2>&1 && bad "Esc at the blocker question should stop the add" || ok
 
-echo "== pick_after: a done task is never offered ==" >&2
-mk_task "done" 040 task-done "$REPO" tom/task-done >/dev/null
+echo "== pick_after: a done task is offered until its pull request merges or closes ==" >&2
+# Done is where a task waits on its reviewers, and on you - work that has not
+# landed, and a real thing to wait on. Only the verdict pq has recorded is read.
+D=$(mk_task "done" 040 task-review "$REPO" tom/task-review)
 gum_reset; gum_answer ""
 run_pick_after >/dev/null 2>&1
-case "$(gum_stdin 1)" in *task-done*) bad "a done task must not count as a candidate" ;; *) ok ;; esac
+case "$(gum_stdin 1)" in *task-review*done*) ok ;; *) bad "a done task still in review should be offered (got: $(gum_stdin 1))" ;; esac
+st_set "$D" PQ_MERGED 2026-01-02T00:00:00Z
+M=$(mk_task "done" 041 task-closed "$REPO" tom/task-closed)
+st_set "$M" PQ_CLOSED 2026-01-02T00:00:00Z
+gum_reset; gum_answer ""
+run_pick_after >/dev/null 2>&1
+case "$(gum_stdin 1)" in *task-review*) bad "a merged task has nothing left to wait on" ;; *) ok ;; esac
+case "$(gum_stdin 1)" in *task-closed*) bad "nor has a closed one" ;; *) ok ;; esac
+rm -rf "$D" "$M"
+
+echo "== pick_after: a task with no name yet is offered, under its plan's title ==" >&2
+N=$(mk_task new 045 step-1-pr-01a-schema "$REPO" "")
+gum_reset; gum_answer "@4"
+out=$(run_pick_after 2>/dev/null)
+case "$(gum_stdin 1)" in *step-1-pr-01a-schema*new*) ok ;; *) bad "a new task should be listed with its state (got: $(gum_stdin 1))" ;; esac
+eq "$out" "$(stamp_of "$N")" "and comes back as its stamp, the one name naming does not change"
+rm -rf "$N"
 
 echo "== pick_after: a running task IS offered - work in flight is a real blocker ==" >&2
 mk_task running 050 task-run "$REPO" tom/task-run >/dev/null
@@ -282,10 +302,10 @@ gum_reset; gum_answer "opus"; gum_answer "" 130
 ( run_wizard ) >/dev/null 2>&1 && bad "Esc at the effort question should stop" || ok
 
 echo "== add_wizard: the blocker question runs last ==" >&2
-mk_task queue 010 task-a "$REPO" tom/task-a >/dev/null
-gum_reset; gum_answer "sonnet"; gum_answer "medium"; gum_answer "task-a  queue"
+A=$(mk_task queue 010 task-a "$REPO" tom/task-a)
+gum_reset; gum_answer "sonnet"; gum_answer "medium"; gum_answer "@1"
 out=$(run_wizard 2>/dev/null)
-eq "$out" "model=sonnet effort=medium after_vals=[task-a"$'\n'"] design=[]" "picking task-a selects it"
+eq "$out" "model=sonnet effort=medium after_vals=[$(stamp_of "$A")"$'\n'"] design=[]" "picking task-a selects it"
 
 echo "== add_wizard: a design plan with no file found asks for one; Esc goes without ==" >&2
 reset_tasks
@@ -319,34 +339,43 @@ eq "$(find "$PQ_HOME/queue" -mindepth 1 -maxdepth 1 | wc -l | tr -d ' ')" "0" "n
 eq "$(gum_calls)" "" "and nothing is asked"
 FAKE_TTY=1
 
-echo "== wiring: at a terminal, main add picks, names, asks and queues ==" >&2
+echo "== wiring: at a terminal, main add picks and asks, and leaves the naming to the tick ==" >&2
 # The answers, in order: the plan
 # list, the pager, the confirm, the model, the effort. An empty queue leaves no
 # blocker to ask about.
+rm -f "$STUBBIN/.haiku-called"
 gum_reset; gum_answer "@1"; gum_answer ""; gum_answer ""; gum_answer "opus"; gum_answer "high"
 out=$( ( cd "$REPO" && main add ) 2>"$PQ_HOME/.wire2.err")
 rc=$?
 [ "$rc" -eq 0 ] && ok || bad "main add through the wizard should succeed: $(cat "$PQ_HOME/.wire2.err")"
 eq "$out" "" "nothing goes to stdout - everything a human reads is on stderr"
-t=$(find_task wiring-fixture-task)
-eq "$(hdr "$t/plan.md" source)" "$PQ_PLANS_DIR/wiring.md" "the picked plan is the one queued"
-eq "$(hdr "$t/plan.md" branch)" "tom/wiring-fixture-task" "named by Haiku"
+[ -e "$STUBBIN/.haiku-called" ] && bad "pq add must not wait on Haiku - naming is the tick's" || ok
+t=$(find_task marker-wiring-fixture)
+eq "$(state_of "$t")" "new" "it lands in new/, under its plan's title"
+eq "$(hdr "$t/plan.md" source)" "$PQ_PLANS_DIR/wiring.md" "the picked plan is the one added"
+eq "$(hdr "$t/plan.md" branch)" "" "with no branch yet"
 eq "$(hdr "$t/plan.md" model)" "opus" "the model chosen"
 eq "$(hdr "$t/plan.md" effort)" "high" "the effort chosen"
+case "$(cat "$PQ_HOME/.wire2.err")" in *"added:  new/"*"the next tick names it"*) ok ;; *) bad "and it says the tick names it (got: $(cat "$PQ_HOME/.wire2.err"))" ;; esac
+name_task "$t" 0 2>/dev/null && ok || bad "the tick's naming should queue it"
+t=$(find_task wiring-fixture-task)
+eq "$(state_of "$t")" "queue" "named by Haiku, and queued"
+eq "$(hdr "$t/plan.md" branch)" "tom/wiring-fixture-task" "under Haiku's branch"
+eq "$(hdr "$t/plan.md" model)" "opus" "keeping the model chosen"
 
 echo "== wiring: Esc at the effort question queues nothing ==" >&2
 reset_tasks
 gum_reset; gum_answer "@1"; gum_answer ""; gum_answer ""; gum_answer "opus"; gum_answer "" 130
 ( cd "$REPO" && main add ) >/dev/null 2>&1 && bad "a cancelled wizard should fail" || ok
-eq "$(find "$PQ_HOME/queue" -mindepth 1 -maxdepth 1 | wc -l | tr -d ' ')" "0" "nothing is queued"
+eq "$(find "$PQ_HOME/queue" "$PQ_HOME/new" -mindepth 1 -maxdepth 1 | wc -l | tr -d ' ')" "0" "nothing is added"
 eq "$(find "$PQ_HOME" -maxdepth 1 -name '.add.*' | wc -l | tr -d ' ')" "0" "and no staging is left behind"
 
 echo "== wiring: a blocker ticked in the wizard lands in the task's after file ==" >&2
 reset_tasks
 mk_task queue 005 blocker-cand "$REPO" tom/blocker-cand >/dev/null
-gum_reset; gum_answer "@1"; gum_answer ""; gum_answer ""; gum_answer "sonnet"; gum_answer "medium"; gum_answer "blocker-cand  queue"
+gum_reset; gum_answer "@1"; gum_answer ""; gum_answer ""; gum_answer "sonnet"; gum_answer "medium"; gum_answer "@1"
 ( cd "$REPO" && main add ) >/dev/null 2>&1
-t=$(find_task wiring-fixture-task)
+t=$(find_task marker-wiring-fixture)
 case "$(cat "$t/after" 2>/dev/null)" in *tom/blocker-cand*) ok ;; *) bad "the blocker should gate the new task (after: $(cat "$t/after" 2>/dev/null))" ;; esac
 
 echo "== wiring: pq add takes no arguments - the wizard is the way in ==" >&2

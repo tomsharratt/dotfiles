@@ -92,8 +92,8 @@ unset HERDR_ENV HERDR_SOCKET_PATH HERDR_WORKSPACE_ID
 PQ_DONE_KEEP=99
 
 reset_tasks() {
-  rm -rf "$PQ_HOME/queue" "$PQ_HOME/running" "$PQ_HOME/done"
-  mkdir -p "$PQ_HOME/queue" "$PQ_HOME/running" "$PQ_HOME/done"
+  rm -rf "$PQ_HOME/new" "$PQ_HOME/queue" "$PQ_HOME/running" "$PQ_HOME/done"
+  mkdir -p "$PQ_HOME/new" "$PQ_HOME/queue" "$PQ_HOME/running" "$PQ_HOME/done"
 }
 reset_tasks
 reset_logs() { : > "$HERDR_LOG"; : > "$WT_LOG"; rm -f "$STUBBIN/.start-fail" "$STUBBIN/.start-fail-once" "$STUBBIN/.prompt-fail"; }

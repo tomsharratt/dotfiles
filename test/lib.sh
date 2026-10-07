@@ -7,11 +7,12 @@
 #
 #   gum_stub, gum_answer, gum_calls   a PATH `gum` that answers from a queue and
 #       logs what it was asked, for the tests OF the prompts
-#   add_as                            cmd_add with the picker, the namer and the
-#       wizard stood in for, for the tests that only need a task queued
+#   add_as                            cmd_add with the picker and the wizard stood
+#       in for, then the tick's naming of what it added, for the tests that only
+#       need a task queued
 
 # A `gum` in $1 answering from a queue kept in $2. The Nth call it receives
-# prints answer N (a.N, or the Nth stdin line for "@N") and exits with a.N.rc, or 0; with none queued it exits
+# prints answer N (a.N, or stdin lines for "@N" or "@N,M") and exits with a.N.rc, or 0; with none queued it exits
 # 130, as gum does on Ctrl-C. Every call's argv is appended to $2/calls, one
 # line each, and what it was given on stdin goes to $2/stdin.N.
 gum_stub() {                            # bindir statedir
@@ -20,9 +21,6 @@ gum_stub() {                            # bindir statedir
   cat > "$1/gum" <<'STUB'
 #!/usr/bin/env bash
 printf '%s\n' "$*" >> "$GUM_STATE/calls"
-# A spinner just returns: ui_spin waits on the work itself, not on gum, and it is
-# not an answer in the queue.
-[ "$1" = spin ] && exit 0
 n=$(cat "$GUM_STATE/n" 2>/dev/null || echo 0); n=$((n + 1)); echo "$n" > "$GUM_STATE/n"
 # Only the prompts that take their items on stdin read it - confirm and pager
 # never do, and reading a pipe nobody closes would hang the test.
@@ -34,8 +32,12 @@ esac
 [ -f "$GUM_STATE/a.$n" ] || exit 130
 a=$(cat "$GUM_STATE/a.$n")
 # "@N" answers with the Nth line the call was handed on stdin, which is how a test
-# picks a row without knowing how it is laid out.
-case "$a" in @*) sed -n "${a#@}p" "$GUM_STATE/stdin.$n" ;; *) printf '%s' "$a" ;; esac
+# picks a row without knowing how it is laid out; "@N,M" with several, one per
+# line, as `gum choose --no-limit` hands back what was ticked.
+case "$a" in
+  @*) for i in $(tr ',' ' ' <<<"${a#@}"); do sed -n "${i}p" "$GUM_STATE/stdin.$n"; done ;;
+  *) printf '%s' "$a" ;;
+esac
 exit "$(cat "$GUM_STATE/a.$n.rc" 2>/dev/null || echo 0)"
 STUB
   chmod +x "$1/gum"
@@ -52,26 +54,26 @@ gum_answer() {                          # text [rc]
 gum_calls() { cat "$GUM_STATE/calls"; }
 gum_stdin() { cat "$GUM_STATE/stdin.$1"; }     # what call N was handed on stdin
 
-# cmd_add run from inside $repo with the picker, the namer and the wizard stood
-# in for, in a subshell: the plan is $1 and a branch given as $2 stands in for
-# the namer too - empty leaves the test's own `claude` stub to name it. What the
-# wizard would have answered comes as options, so one test reads like the add it
-# stands for:
+# cmd_add run from inside $repo with the picker and the wizard stood in for, in a
+# subshell, leaving the task in new/ as a real `pq add` does: the plan is $1.
+# What the wizard would have answered comes as options, so one test reads like
+# the add it stands for:
 #   --repo R  --model M  --effort E  --after T (repeatable)  --design P (repeatable)
-# The names the stand-ins set are cmd_add's own locals, reached through bash's
-# dynamic scope at call time.
-add_as() {                              # plan branch [options...]
-  local as_plan=$1 as_branch=$2 as_repo=${REPO:-$PWD} as_model=$PQ_DEFAULT_MODEL as_effort=$PQ_DEFAULT_EFFORT
+# --after takes a task's slug, and hands the wizard its stamp, as pick_after
+# does. The names the stand-ins set are cmd_add's own locals, reached through
+# bash's dynamic scope at call time.
+add_new() {                             # plan [options...]
+  local as_plan=$1 as_repo=${REPO:-$PWD} as_model=$PQ_DEFAULT_MODEL as_effort=$PQ_DEFAULT_EFFORT
   local as_after="" as_design=""
-  shift 2
+  shift
   while [ $# -gt 0 ]; do
     case "$1" in
       --repo)   as_repo=$2 ;;
       --model)  as_model=$2 ;;
       --effort) as_effort=$2 ;;
-      --after)  as_after="${as_after}$2"$'\n' ;;
+      --after)  as_after="${as_after}$(stamp_of "$(find_task "$2")")"$'\n' ;;
       --design) as_design="${as_design}$2"$'\n' ;;
-      *) echo "add_as: unknown option $1" >&2; return 2 ;;
+      *) echo "add_new: unknown option $1" >&2; return 2 ;;
     esac
     shift 2
   done
@@ -79,9 +81,20 @@ add_as() {                              # plan branch [options...]
   ( cd "$as_repo" || exit 1
     at_terminal() { return 0; }
     pick_plan() { printf '%s' "$as_plan"; }
-    if [ -n "$as_branch" ]; then name_plan() { printf '%s\t\t\n' "$as_branch"; }; fi
     need_gum() { :; }
-    ui_spin() { shift; "$@"; }
     add_wizard() { model=$as_model; effort=$as_effort; after_vals=$as_after; design_vals="${design_vals:-}$as_design"; }
     cmd_add </dev/null )
+}
+
+# add_new, and then the task it left in new/ named as the next tick would name
+# it - for the tests that only need a task queued. A branch given as $2 stands in
+# for the namer; empty leaves the test's own `claude` stub to name it. 0 only
+# once the task is queued. `as_branch`, not `branch`: the stand-in reads it when
+# name_task calls it, where a plain `branch` is name_task's own local.
+add_as() {                              # plan branch [add_new options...]
+  local as_plan=$1 as_branch=$2; shift 2
+  add_new "$as_plan" "$@" || return
+  # shellcheck disable=SC2329  # called by name_task, not here
+  ( if [ -n "$as_branch" ]; then name_plan() { printf '%s\t\t\n' "$as_branch"; }; fi
+    name_task "$(queue_ordered new | tail -1)" 0 </dev/null )
 }

@@ -89,8 +89,8 @@ unset HERDR_ENV HERDR_SOCKET_PATH HERDR_WORKSPACE_ID
 LOCK_WAIT=2
 
 reset_tasks() {
-  rm -rf "$PQ_HOME/queue" "$PQ_HOME/running" "$PQ_HOME/done" "$PQ_HOME/archive" "$PQ_HOME/.tick.lock"
-  mkdir -p "$PQ_HOME/queue" "$PQ_HOME/running" "$PQ_HOME/done" "$PQ_HOME/archive"
+  rm -rf "$PQ_HOME/new" "$PQ_HOME/queue" "$PQ_HOME/running" "$PQ_HOME/done" "$PQ_HOME/archive" "$PQ_HOME/.tick.lock"
+  mkdir -p "$PQ_HOME/new" "$PQ_HOME/queue" "$PQ_HOME/running" "$PQ_HOME/done" "$PQ_HOME/archive"
 }
 mk_task() {                             # state prio slug -> task_dir
   local d
@@ -174,26 +174,28 @@ eq "$(name_plan "$PLANF" | head -1 | cut -f1)" "tom/fenced" "a fenced reply stil
 
 echo "== the namer knows the usage limit when it sees it ==" >&2
 printf "You've hit your individual spend limit · visit claude.ai/admin-settings/usage to raise it\n" > "$REPLY"
-out=$(name_plan "$PLANF" 2>&1); rc=$?
+out=$(name_plan "$PLANF" 2>/dev/null); rc=$?
 eq "$rc" "3" "the namer's limit is its own answer"
-has "$out" "naming hit the usage limit: You've hit your individual spend limit" "and says so, in the limit's own words"
+eq "$out" "You've hit your individual spend limit · visit claude.ai/admin-settings/usage to raise it" "and it hands back the limit's own words"
 reset_tasks
 out=$(add_as "$PLANF" "" --repo "$REPO" 2>&1); rc=$?
-eq "$rc" "1" "pq add stops"
-has "$out" "behind the usage limit - pq add again once it lifts" "saying when trying again can work"
+eq "$rc" "1" "the task is not queued"
+has "$out" "naming hit the usage limit (You've hit your individual spend limit" "naming says so, in the limit's own words"
+has "$out" "it is named once the limit lifts" "and when it can work"
 hasnt "$out" "Haiku gave no usable branch" "not that the reply was unusable"
+eq "$(st "$(queue_ordered new | tail -1)" PQ_NAME_FAILS)" "" "nor is it counted as a failed try"
 # What the real one sends under --output-format json: a clean, successful
 # envelope whose whole result is the limit's line - the shape that once had a
 # reviewer read as having posted.
 jq -nc '{type: "result", subtype: "success", is_error: false, total_cost_usd: 0, session_id: "s-limit",
          result: "You'"'"'ve hit your org'"'"'s monthly spend limit"}' > "$REPLY"
-out=$(name_plan "$PLANF" 2>&1); rc=$?
+out=$(name_plan "$PLANF" 2>/dev/null); rc=$?
 eq "$rc" "3" "the limit inside the result envelope is the limit too"
-has "$out" "naming hit the usage limit: You've hit your org's monthly spend limit" "in its own words"
+eq "$out" "You've hit your org's monthly spend limit" "in its own words"
 reset_tasks
 out=$(add_as "$PLANF" "" --repo "$REPO" 2>&1); rc=$?
-eq "$rc" "1" "and pq add stops on it"
-has "$out" "behind the usage limit - pq add again once it lifts" "saying so"
+eq "$rc" "1" "and naming waits on it"
+has "$out" "naming hit the usage limit (You've hit your org's monthly spend limit)" "saying so"
 # The namer's own answer is one line too, and a plan about running out of
 # credits puts the limit's very words in it.
 printf '%s\n' '{"branch":"tom/usage-banner","intent":"Warn members before they run out of usage credits or hit your plan limit.","security":false}' > "$REPLY"

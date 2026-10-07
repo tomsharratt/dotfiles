@@ -13,11 +13,12 @@
 # `pq`, and `pq` reaches it through one narrow seam (`wt new --no-agent --no-focus
 # --json`).
 #
-#   pq add               pick a plan and add it to the queue; it forks from the
-#                        branch the repo is on, when that is not the default;
-#                        it then asks the model, the effort, what it should wait on (its
-#                        PR must merge first) and, for a plan built from a design that
-#                        names no file on disk, the design file the implementer builds to
+#   pq add               pick a plan and add it; it forks from the branch the repo is
+#                        on, when that is not the default; it asks the model, the
+#                        effort, what it should wait on (its PR must merge first) and,
+#                        for a plan built from a design that names no file on disk,
+#                        the design file the implementer builds to - and then it is
+#                        done. The next tick names it and queues it (see "naming")
 #   pq evidence [task]   publish a task's screenshots to the pq-evidence branch; prints the markdown to paste
 #   pq after <task>      list a task's blockers and what each is waiting on
 #   pq after <task> T... add blockers to a task already in the queue
@@ -101,18 +102,23 @@
 # LAYOUT ─────────────────────────────────────────────────────────────────────
 # A task is a DIRECTORY, and the directory it sits in is its state:
 #
-#   $PQ_HOME/queue/20260729143022-live-chat-mentions/    waiting to be picked up
+#   $PQ_HOME/new/20260729143511-step-1-pr-02-live-chat/  added, waiting for a tick to name it -
+#                                                        named for its plan's title until then
+#            queue/20260729143022-live-chat-mentions/    waiting to be picked up
 #            running/20260729121005-spotify-scope-fix/   dispatched
 #            done/20260728091500-live-chat-links/        a PR exists; still spending a slot until its agent stops
 #            archive/20260727080000-live-chat-onboarding/  settled history - `pq ls` hides it, tick never walks it
 #            tasks/20260729121005-spotify-scope-fix        a symlink to wherever the task is NOW - the one path
 #                                                          the implementer is ever told, since the real one moves
 #
-#   <task>/plan.md     the settings header + Claude's plan, immutable once added
+#   <task>/plan.md     the settings header + Claude's plan, immutable once queued
 #                     (`base:` is optional and absent on most tasks - see `task_base`;
 #                      `design:` likewise, a comma-separated list of the files in design/;
-#                      `security: yes` likewise, when the plan asks for a security review - see name_plan)
+#                      `security: yes` likewise, when the plan asks for a security review - see name_plan;
+#                      `branch:`, `intent:` and `security:` are absent until it is named)
 #          after       blockers: one per line, TSV  label <TAB> repo <TAB> branch
+#          after.new   only in new/: blockers that had no name yet when it was added,
+#                      one task stamp per line - see "naming"
 #          state.env   KEY=VALUE runtime facts, written as dispatch progresses
 #          contract.md how the plan is to be delivered - written once, at dispatch, from
 #                      pq's own template (see `contract_write`); the plan carries the work,
@@ -153,7 +159,7 @@ set -uo pipefail
 PQ_HOME="${PQ_HOME:-${XDG_STATE_HOME:-$HOME/.local/state}/pq}"
 PLANS_DIR="${PQ_PLANS_DIR:-$HOME/.claude/plans}"
 WT="${PQ_WT:-$HOME/.local/bin/wt}"
-STATES="queue running done archive"
+STATES="new queue running done archive"
 
 # Fixed values, not knobs: nothing has ever set one of these but a test, and a
 # test assigns them after sourcing this file, which a plain assignment allows. The
@@ -365,7 +371,7 @@ fmt_cost() {                            # cost_usd duration_ms
 
 # ── cost ────────────────────────────────────────────────────────────────────
 # What a task has cost, in Claude Code's own dollars. Four kinds of session spend
-# on a task: Haiku naming it at `pq add`, the implementer - every prompt its pane
+# on a task: Haiku naming it, the implementer - every prompt its pane
 # ever takes, pq's nudges and follow-ups and whatever you type into it after
 # reading the pull request - and the code and security reviewers, once per try.
 #
@@ -564,7 +570,9 @@ all_tasks() {                           # [scope: live|all]
   # unquoted `$states` word-splits on that inherited IFS, and a tab-only IFS
   # has no space in it - `for s in $states` collapses to one bogus iteration
   # and every task vanishes. `"${states[@]}"` never depends on IFS at all.
-  local scope=${1:-live} s d states=(running queue "done")
+  # `new` after `queue`: added after everything queued, and queued itself on the
+  # next tick.
+  local scope=${1:-live} s d states=(running queue new "done")
   [ "$scope" = all ] && states+=(archive)
   for s in "${states[@]}"; do
     for d in "$PQ_HOME/$s"/*/; do
@@ -586,10 +594,11 @@ dir_count() {                           # dir -> n
 # trusting glob order. Glob order and numeric order agree by construction now
 # (task_name's fixed width, see above), but this sort is the guard that keeps
 # it that way rather than an assumption resting on every writer doing the right
-# thing - test/pq-order.sh is what holds it.
-queue_ordered() {
+# thing - test/pq-order.sh is what holds it. Naming walks new/ the same way,
+# which is what names a blocker before whatever was added to wait on it.
+queue_ordered() {                       # [state, default queue]
   local d
-  for d in "$PQ_HOME/queue"/*/; do
+  for d in "$PQ_HOME/${1:-queue}"/*/; do
     [ -d "$d" ] || continue
     printf '%s\t%s\n' "$(stamp_of "${d%/}")" "${d%/}"
   done | sort -s -n -k1,1 | cut -f2-
@@ -626,16 +635,31 @@ find_task() {                           # needle
   esac
 }
 
-state_of() {                            # task_dir  -> queue|running|done
+state_of() {                            # task_dir  -> new|queue|running|done|archive
   local p=${1%/*}; basename "$p"
 }
 
-# Where a task directory is NOW, whatever state it has moved to since it was found
-# - a task keeps its name through every move - or nothing when it is gone.
+# The task with this stamp, in whichever state it is in now, or nothing. A stamp
+# is never reissued (next_stamp) and never changes, not even when naming gives a
+# task its slug - which is what lets a blocker with no name yet be held by its
+# stamp alone (see "naming").
+task_by_stamp() {                       # stamp -> task_dir, or nothing
+  local s d
+  for s in $STATES; do
+    for d in "$PQ_HOME/$s/$(printf '%014d' "$1")"-*/; do
+      [ -d "$d" ] && { printf '%s' "${d%/}"; return 0; }
+    done
+  done
+  return 1
+}
+
+# Where a task directory is NOW, whatever state it has moved to since it was found,
+# or nothing when it is gone. A task keeps its name through every move but one:
+# naming gives it its slug, so a task not found by name is looked for by stamp.
 task_now() {                            # task_dir -> task_dir, or nothing
   local name s; name=$(basename "$1")
   for s in $STATES; do [ -d "$PQ_HOME/$s/$name" ] && { printf '%s' "$PQ_HOME/$s/$name"; return 0; }; done
-  return 1
+  task_by_stamp "$(stamp_of "$1")"
 }
 # The lock, then the task found again under it: a command that asked a question, or
 # checked a state, before changing a task must not change one a tick has moved on
@@ -673,14 +697,17 @@ task_home() {                           # task_dir -> the stable path to hand ou
 
 # Move a task between states, keeping its stamp prefix. The `mv` is the state
 # transition; nothing else records it - except the stable link, which follows.
-retitle() {                             # task_dir new_state [new_stamp]
-  local src=$1 to=$2 stamp=${3:-} name
+# A new slug is naming's alone (see "naming"): the one move that renames a task,
+# and the one that drops a link, under the name it is leaving behind.
+retitle() {                             # task_dir new_state [new_slug]
+  local src=$1 to=$2 slug=${3:-} name
   name=$(basename "$src")
-  [ -n "$stamp" ] && name=$(task_name "$stamp" "$(slug_of "$src")")
+  [ -n "$slug" ] && name=$(task_name "$(stamp_of "$src")" "$slug")
   local dst="$PQ_HOME/$to/$name"
   [ "$src" = "$dst" ] && { printf '%s' "$dst"; return 0; }
   [ -e "$dst" ] && die "a task already exists at $to/$name"
   mv "$src" "$dst" || die "could not move $src -> $dst"
+  [ "$name" = "$(basename "$src")" ] || rm -f "$PQ_HOME/tasks/$(basename "$src")"
   task_link "$dst"
   printf '%s' "$dst"
 }
@@ -693,7 +720,7 @@ retitle() {                             # task_dir new_state [new_stamp]
 # what makes a cross-repo blocker work for free, and what lets a blocker name a
 # branch that is not in `pq` at all.
 
-# The branch a slug reduces to, same rule `cmd_add` uses for its own task names -
+# The branch a slug reduces to, same rule naming uses for a task's own name -
 # lowercased, non `[a-z0-9-]` squashed to `-`, runs collapsed, edges trimmed.
 branch_to_slug() {                      # branch -> a queue-safe slug
   local s=${1##*/}
@@ -737,7 +764,7 @@ task_by_branch() {                      # repo branch
 }
 
 # A value containing '/' is a branch in the OWNER's own repo - the repo of the
-# task being given the blocker. Slugs cannot contain '/' (cmd_add strips them),
+# task being given the blocker. Slugs cannot contain '/' (branch_to_slug strips them),
 # so the rule is unambiguous. Otherwise it is a task slug resolved through
 # find_task, which is what makes a cross-repo blocker free: the resolved task
 # carries its own repo along with it, whatever that repo is.
@@ -768,6 +795,16 @@ after_cycle() {                         # owner_repo owner_branch repo branch [v
     after_cycle "$owner_repo" "$owner_branch" "$r2" "$b2" "$t" "$@" && return 0
   done <<<"$(after_list "$t")"
   return 1
+}
+
+# The slugs of every task in new/ waiting on a task by this stamp - the blockers
+# that had no name yet when they were picked (see "naming").
+waiting_on_stamp() {                    # stamp
+  local d
+  for d in "$PQ_HOME/new"/*/; do
+    grep -qx -- "$1" "${d%/}/after.new" 2>/dev/null && printf '%s\n' "$(slug_of "${d%/}")"
+  done
+  return 0
 }
 
 # The slugs of every task, in any state, that lists (repo, branch) as a
@@ -806,12 +843,17 @@ recent_plans() {                        # -> epoch<TAB>path, newest first
 # the intent at the top of its description - and neither can be derived from the
 # filename, which is auto-generated ("floofy-hugging-dragonfly.md").
 #
+# It reads the task's own plan.md, never the plan it was copied from: Claude Code
+# prunes ~/.claude/plans, and a plan edited after it was added is not the plan
+# that was queued. The header pq put on top is left out (plan_body).
+#
 # Prints "branch<TAB>intent<TAB>security<TAB>usd<TAB>session", or nothing if the
-# model could not be reached or gave something unusable; the caller then stops
-# rather than inventing one. The last two are what the call cost and the session
-# it ran as, for the task's ledger (see the `cost` section) - handed back on
-# stdout because `ui_spin` runs this in a subshell of its own, and the task they
-# belong to does not exist yet. `security` is `yes` when the plan asks for a security review of its work,
+# model could not be reached or gave something unusable; the caller then tries
+# again later rather than inventing one. The last two are what the call cost and
+# the session it ran as, for the task's ledger (see the `cost` section) - handed
+# back on stdout because naming runs this `shielded`, in a subshell of its own.
+# A reply that is the usage limit's one line returns 3 with that line on stdout.
+# `security` is `yes` when the plan asks for a security review of its work,
 # and empty otherwise - it is what opens the security reviewer's ladder beside the
 # code reviewer's (see the `review gate` section). One more field in the same
 # reply rather than a call of its own: ten real plans, four runs each, came back
@@ -822,16 +864,17 @@ recent_plans() {                        # -> epoch<TAB>path, newest first
 # only mention one, all six right.
 #
 # The optional second argument is a branch to avoid, appended as one more
-# sentence rather than a second prompt - cmd_add asks once more with it when the
+# sentence rather than a second prompt - naming asks once more with it when the
 # first name turns out to be taken.
 name_plan() {                           # plan_file [avoid: a branch already taken]
-  local raw json avoid=${2:-} prompt
+  local raw json avoid=${2:-} prompt body
+  body=$(plan_body "$1")
   prompt='Read this plan and reply with ONLY a JSON object, no code fence, no commentary:
 {"branch":"tom/<3-5 dash-separated lowercase words naming the task>","intent":"<2-3 sentences, one line, saying what this sets out to achieve in the author'"'"'s terms - not a description of the diff>","security":<true or false>}
 security is true only when the plan asks for a security review of this change - a /security-review - to be run, including one it calls warranted or mandatory. It is false when the plan says one is not warranted or not needed, when it mentions one only as future or follow-up work, and when it never asks for one.'
   [ -n "$avoid" ] && prompt="$prompt
 The branch must differ from this one, which is already taken: $avoid"
-  raw=$(headless_claude -p --model "$PQ_NAMER_MODEL" --output-format json "$prompt" < "$1" 2>/dev/null) || return 0
+  raw=$(printf '%s\n' "$body" | headless_claude -p --model "$PQ_NAMER_MODEL" --output-format json "$prompt" 2>/dev/null) || return 0
   # The reply is the envelope's `result`; stdout that is not the envelope - no
   # `result` key, or not JSON at all - is taken as the reply itself, the same
   # tolerance reviewer_limit_text has.
@@ -842,11 +885,11 @@ The branch must differ from this one, which is already taken: $avoid"
     raw=$text
   fi
   # A usage-limit reply is the limit's one line where the JSON should be, and read
-  # as a reply with no JSON it said "Haiku gave no usable branch; try pq add
-  # again" - which cannot work until the limit lifts. Say that instead.
+  # as a reply with no JSON it said "Haiku gave no usable branch" - a failed try,
+  # when no try can work until the limit lifts. So it is told apart, and waited out.
   local limit
   if limit=$(limit_reply "$raw"); then
-    warn "naming hit the usage limit: $limit"
+    printf '%s' "$limit"
     return 3
   fi
   # Be forgiving about a fenced or chatty reply: take the span from the first `{`
@@ -868,14 +911,14 @@ The branch must differ from this one, which is already taken: $avoid"
   # can, but a yes for a plan that never mentions one is a guess, and it would
   # cost an hour of the reviewer model for nothing.
   local mentioned=false
-  grep -qiE 'security[- ]review' "$1" 2>/dev/null && mentioned=true
+  grep -qiE 'security[- ]review' <<<"$body" && mentioned=true
   jq -er --argjson mentioned "$mentioned" --arg usd "${usd:-}" --arg sid "${sid:-}" \
     '[(.branch // "" | sub("^tom/"; "") | gsub("/"; "-") | if . == "" then "" else "tom/" + . end), .intent,
       (if $mentioned and .security == true then "yes" else "" end), $usd, $sid] | @tsv' \
     2>/dev/null <<<"$json" || return 0
 }
 
-# A branch already spoken for is the one failure that must be caught at add time.
+# A branch already spoken for is the one failure naming must catch before it queues.
 # `wt new` on an existing branch deliberately CHECKS IT OUT rather than failing, so
 # two tasks sharing a name would quietly land in the same worktree and fight over
 # it. And a name that has ever had a pull request is spoken for too, even once its
@@ -918,13 +961,201 @@ branch_taken() {                        # branch repo
 # Which of $STATES already has a task directory ending in -$slug, or nothing.
 # `done` counts here, unlike `branch_taken`'s live-task check above: a slug is
 # the whole directory name rather than a branch, so a stale `done/NNN-foo`
-# still blocks a fresh `foo` from being created at all.
+# still blocks a fresh `foo` from being created at all. `new` does not: a name
+# there is a plan's title standing in until naming gives it one, not a slug.
 slug_taken_in() {                       # slug -> the state name, or nothing
   local slug=$1 d2
   for d2 in $STATES; do
+    [ "$d2" = new ] && continue
     ls -d "$PQ_HOME/$d2"/*-"$slug" >/dev/null 2>&1 && { printf '%s' "$d2"; return 0; }
   done
   return 1
+}
+
+# ── naming ──────────────────────────────────────────────────────────────────
+# `pq add` asks only what needs you - the plan, the model, the effort, the design
+# and the blockers - and leaves the task in new/, so the popup it runs in closes
+# on the last answer. Naming it is a Haiku call, and for a name that turns out to
+# be taken, git and forge lookups and a second call: seconds spent watching a
+# spinner for an answer no question depends on. So the tick names it instead,
+# first thing on every pass, and fill can dispatch it on that same pass - no
+# later than a task added straight to queue/ would have started.
+#
+# Until then a task goes by its plan's title (title_slug) - what you saw in the
+# picker, and what `pq ls` shows and `pq rm` takes. Naming gives it a branch, an
+# intent and the security verdict, writes them into the header, and moves it to
+# queue/ under the slug its branch reduces to, keeping its stamp: queue order is
+# still the order things were added in.
+#
+# A blocker can be a task with no name yet. A plan that lands as a chain of pull
+# requests is added one link at a time, a minute or so apart - quicker than a
+# tick - so the link before is usually still in new/ when the next one picks it.
+# With no branch to resolve it to, it is held by its STAMP, in after.new, and
+# resolved when the task waiting on it is named. new/ is named in stamp order, so
+# a blocker comes first on the same pass; one still unnamed holds its dependent
+# back with it, and one removed before it was ever named holds it for good, since
+# nothing can now say which branch it meant.
+#
+# Every outcome but success leaves the task in new/ and says so ONCE -
+# PQ_NAME_WHY remembers what was last said. The usage limit and an unnamed
+# blocker are waited out, however long they last; anything else is a failed try,
+# and NAME_TRIES of those in a row is where pq stops spending Haiku on it and
+# leaves it for you.
+NAME_TRIES=3
+
+# A plan's own text, without the header pq put on top: what the namer reads. A
+# file with no header is all body.
+plan_body() {                           # plan_file
+  awk 'NR == 1 && $0 == "---" { h = 1; next }
+       h == 1 && $0 == "---"  { h = 2; next }
+       h == 1                 { next }
+       h == 2                 { h = 3; if ($0 == "") next }
+       { print }' "$1"
+}
+
+# The plan's title - its first line with content, as the picker shows it - as a
+# slug of at most 40 characters, cut between words: the task's name in new/.
+title_slug() {                          # plan_file -> a slug, never empty
+  local s
+  s=$(awk 'NF { sub(/^#+[ \t]*/, ""); print tolower($0); exit }' "$1" | tr -c 'a-z0-9\n' '-' \
+      | awk -F- '{ out = ""; first = ""
+                   for (i = 1; i <= NF; i++) {
+                     if ($i == "") continue
+                     if (first == "") first = $i
+                     w = (out == "" ? $i : out "-" $i)
+                     if (length(w) > 40) break
+                     out = w
+                   }
+                   print (out != "" ? out : substr(first, 1, 40)) }')
+  printf '%s' "${s:-plan}"
+}
+
+# Said once per reason: the run log hears about a task that cannot be named when
+# the reason changes, not every two minutes.
+name_say() {                            # task_dir why message
+  [ "$(st "$1" PQ_NAME_WHY)" = "$2" ] && return 0
+  st_set "$1" PQ_NAME_WHY "$2"
+  warn "$3"
+}
+
+# One failed try, counted. The last one allowed gives up.
+name_failed() {                         # task_dir why message -> 1
+  local d=$1 n slug; slug=$(slug_of "$1")
+  n=$(st "$d" PQ_NAME_FAILS); n=$(( ${n:-0} + 1 ))
+  st_set "$d" PQ_NAME_FAILS "$n"
+  if [ "$n" -ge "$NAME_TRIES" ]; then
+    st_set "$d" PQ_NAME_WHY gaveup
+    warn "$slug: $3 - $n tries in a row, so it is left for you (pq rm $slug drops it)"
+  else
+    name_say "$d" "$2" "$slug: $3 - the next tick tries again"
+  fi
+  return 1
+}
+
+# Name one task in new/ and queue it: 0 when it was, 1 when it is still in new/.
+# Haiku and the forge are asked `shielded`, like every slow child of a tick, so a
+# Ctrl-C at `pq run` lets the answer arrive rather than reading the cut-off call
+# as no name, or as a name nothing has taken.
+name_task() {                           # task_dir dry -> 0 queued
+  local d=$1 dry=$2 slug s b blines=""
+  slug=$(slug_of "$d")
+  case "$(st "$d" PQ_NAME_WHY)" in gaveup|gone) return 1 ;; esac
+  # The blockers held by stamp, as they are now.
+  if [ -f "$d/after.new" ]; then
+    while IFS= read -r s; do
+      case "$s" in ""|*[!0-9]*) continue ;; esac
+      if ! b=$(task_by_stamp "$s"); then
+        [ "$dry" = 1 ] && { msg "would hold $slug - a task it waits on was removed before it was named"; return 1; }
+        st_set "$d" PQ_NAME_WHY gone
+        warn "$slug waits on a task that was removed before it was named, so nothing says which branch it meant - pq rm $slug, and add it again"
+        return 1
+      fi
+      # Not named yet, so this waits with it - and says nothing: the blocker's
+      # own line says why. A dry run reads it as named, as the real pass would.
+      [ "$(state_of "$b")" = new ] && [ "$dry" != 1 ] && return 1
+      blines="$blines$(slug_of "$b")"$'\t'"$(hdr "$b/plan.md" repo)"$'\t'"$(hdr "$b/plan.md" branch)"$'\n'
+    done < "$d/after.new"
+  fi
+  [ "$dry" = 1 ] && { msg "would name $slug"; return 1; }
+
+  local repo named nrc branch intent security newslug why avoid=""
+  repo=$(hdr "$d/plan.md" repo)
+  while :; do
+    shielded name_plan "$d/plan.md" "$avoid"; nrc=$?; named=$SHIELDED_OUT
+    if [ "$nrc" = 3 ]; then
+      name_say "$d" limit "$slug: naming hit the usage limit ($named) - it is named once the limit lifts"
+      return 1
+    fi
+    # Every call goes in the ledger, whatever came of it.
+    [ -n "$(cut -f4 <<<"$named")" ] && cost_record "$d" name "$(cut -f5 <<<"$named")" "$(cut -f4 <<<"$named")"
+    # `cut`, never `read`: a tab is IFS whitespace, so an empty intent would let
+    # the verdict slide into its place.
+    branch=$(cut -f1 <<<"$named"); intent=$(cut -f2 <<<"$named"); security=$(cut -f3 <<<"$named")
+    [ -n "$branch" ] || { name_failed "$d" nobranch "could not name it - Haiku gave no usable branch"; return 1; }
+    git check-ref-format "refs/heads/$branch" \
+      || { name_failed "$d" badref "could not name it - '$branch' is not a valid branch name"; return 1; }
+    newslug=$(branch_to_slug "$branch")
+    [ -n "$newslug" ] || { name_failed "$d" badslug "could not name it - '$branch' does not reduce to a usable name"; return 1; }
+    # A name Haiku chose that turns out to be taken is Haiku's to change, so it is
+    # asked once more with that name to avoid - far likelier than it sounds, now
+    # that every name pq has ever used, and every one with a pull request behind
+    # it, is taken.
+    if shielded branch_taken "$branch" "$repo"; then why=$SHIELDED_OUT
+    elif why=$(slug_taken_in "$newslug"); then why="the name of a task in $why/"
+    else break; fi
+    [ -z "$avoid" ] \
+      || { name_failed "$d" taken "could not name it - '$branch' is already $why, and so was the name Haiku chose first"; return 1; }
+    msg "$slug: branch '$branch' is already $why - asking for another name"
+    avoid=$branch
+  done
+
+  # Cycles are caught here rather than at `pq add`: it is the name that closes
+  # one, when the branch this task is about to own is one something it waits on
+  # is already waiting for.
+  local label arepo abranch
+  while IFS=$'\t' read -r label arepo abranch; do
+    [ -n "$arepo" ] || continue
+    after_cycle "$repo" "$branch" "$arepo" "$abranch" \
+      && { name_failed "$d" cycle "could not name it $branch - it waits on $label, which already leads back to that branch"; return 1; }
+  done <<<"$(cat "$d/after" 2>/dev/null; printf '%s' "$blines")"
+
+  # The header gains what only the name supplies, each key where pq add would
+  # once have written it. Any left by a pass that stopped part way are replaced,
+  # never repeated.
+  local tmp="$d/plan.md.$$"
+  if ! B=$branch I=$intent S=$security awk '
+         NR == 1 && $0 == "---"                     { h = 1; print; next }
+         h && $0 == "---"                           { h = 0 }
+         h && /^(branch|intent|security):/          { next }
+         h && /^model:/ && ENVIRON["S"] == "yes"    { print "security: yes" }
+                                                    { print }
+         h && /^repo:/                              { printf "branch:   %s\n", ENVIRON["B"] }
+         h && /^effort:/                            { printf "intent:   %s\n", ENVIRON["I"] }' \
+         "$d/plan.md" > "$tmp" || ! mv -f "$tmp" "$d/plan.md"; then
+    rm -f "$tmp"
+    name_failed "$d" write "could not write its plan.md"
+    return 1
+  fi
+  while IFS=$'\t' read -r label arepo abranch; do
+    [ -n "$label" ] && after_add "$d" "$label" "$arepo" "$abranch"
+  done <<<"$blines"
+  # What was only ever about naming goes with it: a queued task starts with no
+  # state.env, as one always has.
+  rm -f "$d/after.new" "$d/state.env"
+  retitle "$d" queue "$newslug" >/dev/null
+  msg "queued $newslug - $branch$([ "$security" = yes ] && printf ', with a security review')"
+  return 0
+}
+
+# Every task in new/, in stamp order. `n_named` is tick_body's own local, reached
+# through bash's dynamic scope and so never declared here: this runs in the
+# tick's own shell, where a Ctrl-C reaches the trap, not in a $(...) of its own.
+name_pass() {                           # dry
+  local d
+  while IFS= read -r d; do
+    [ -n "$d" ] || continue
+    name_task "$d" "$1" && n_named=$((n_named + 1))
+  done <<<"$(queue_ordered new)"
 }
 
 # ── picking a plan and its options ──────────────────────────────────────────
@@ -974,8 +1205,8 @@ cell() {                                # text width -> ASCII-safe, truncated
 # Every question pq asks a person goes through gum, one function per intent, so
 # no call site spells a gum flag. gum draws its UI on stderr and prints only the
 # answer on stdout, which is what lets a prompt sit inside a command
-# substitution - pick_plan and name_plan are captured with $(...), and a stray
-# byte on stdout would corrupt the `source:` header and the staged plan.md.
+# substitution - pick_plan is captured with $(...), and a stray byte on stdout
+# would corrupt the `source:` header and the staged plan.md.
 #
 # Only `pq add` and `pq rm` ask anything, so only they need gum (need_gum);
 # `ls`, `tick`, `run`, `evidence` and `cap` stay free of it, for scripts and
@@ -987,7 +1218,6 @@ export GUM_CHOOSE_HEADER_FOREGROUND=$AMBER
 export GUM_FILTER_INDICATOR_FOREGROUND=$AMBER GUM_FILTER_MATCH_FOREGROUND=$AMBER
 export GUM_FILTER_HEADER_FOREGROUND=$AMBER GUM_FILTER_PROMPT_FOREGROUND=$AMBER
 export GUM_CONFIRM_PROMPT_FOREGROUND=$AMBER GUM_CONFIRM_SELECTED_BACKGROUND=$ROSE
-export GUM_SPIN_SPINNER_FOREGROUND=$AMBER
 export GUM_FILE_CURSOR_FOREGROUND=$AMBER GUM_FILE_HEADER_FOREGROUND=$AMBER
 export GUM_PAGER_MATCH_HIGH_BACKGROUND=$AMBER
 
@@ -1034,28 +1264,6 @@ ui_file() {                             # directory
   gum file --height 15 "$1"
 }
 
-# gum spin cannot run a shell function, so the work runs here, in the
-# background, and gum spins until it is done. stdout and the return status come
-# back as if it had been called directly; its stderr is held back and replayed
-# after, so a warning does not tear through the spinner. With no terminal it just
-# runs. Ctrl-C stops the work and returns 130.
-ui_spin() {                             # title cmd args...
-  local title=$1 out err pid rc; shift
-  if ! at_terminal; then "$@"; return; fi
-  out=$(mktemp "$PQ_HOME/.spin.XXXXXX"); err="$out.err"
-  "$@" >"$out" 2>"$err" & pid=$!
-  gum spin --title "$title" -- sh -c "while kill -0 $pid 2>/dev/null; do sleep 0.1; done"
-  rc=$?
-  if [ "$rc" -ge 130 ]; then
-    kill "$pid" 2>/dev/null; wait "$pid" 2>/dev/null
-    rm -f "$out" "$err"; return 130
-  fi
-  wait "$pid"; rc=$?
-  cat "$out"; cat "$err" >&2
-  rm -f "$out" "$err"
-  return "$rc"
-}
-
 # Exit codes carry meaning, the way reap_task's already do: 0 chose one (its
 # path on stdout), 1 cancelled or declined, 2 nothing in $PLANS_DIR to pick from
 # - the caller stops on that one, with nothing to add.
@@ -1088,28 +1296,47 @@ pick_plan() {
 # statement for the same reason - `x=$(pick_after)` forks a subshell and
 # throws the mutation away. Writes nothing to stdout. Esc stops the add, like
 # every other question; Enter with nothing ticked is how to say none.
+#
+# Anything whose work has not landed can be waited on: a task in new/, queue/ or
+# running/, and one in done/ whose pull request has neither merged nor closed -
+# it can sit there for hours, in review or answering it. Only the verdict pq has
+# already recorded is read (reap_watching), never the forge, so the list costs
+# no round trip; a pull request that merged since the last tick is just a
+# blocker met the moment the task is queued.
+#
+# What it hands back is each pick's STAMP, not its slug: a task in new/ is renamed
+# when it is named, which a tick can do while this list is on screen, and only
+# the stamp survives that (see "naming").
 pick_after() {
-  local d st rows="" lines picked s
+  local d st rows="" lines picked s i
   while IFS= read -r d; do
     [ -n "$d" ] || continue
     st=$(state_of "$d")
-    case "$st" in queue|running) ;; *) continue ;; esac
-    rows="${rows}$(slug_of "$d")"$'\t'"$st"$'\t'"$(basename "$(hdr "$d/plan.md" repo)")"$'\n'
+    case "$st" in
+      new|queue|running) ;;
+      done) reap_watching "$d" || continue ;;
+      *) continue ;;
+    esac
+    rows="${rows}$(stamp_of "$d")"$'\t'"$(slug_of "$d")"$'\t'"$st"$'\t'"$(basename "$(hdr "$d/plan.md" repo)")"$'\n'
   done <<<"$(all_tasks)"
   [ -n "$rows" ] || return 0
-  # The slug leads and has no spaces, so it is what comes back out of a chosen
-  # line. A project column only once the candidates span more than one repo -
-  # the same rule cmd_ls uses.
+  # One line per row, in the same order, so a chosen line's number is its row's.
+  # A project column only once the candidates span more than one repo - the same
+  # rule cmd_ls uses - and no trailing padding to tell a chosen line apart by.
   lines=$(awk -F'\t' '
     $1 == "" { next }
-    { n++; slug[n] = $1; st[n] = $2; repo[n] = $3; if (!($3 in seen)) { seen[$3] = 1; nrepo++ } }
-    END { for (i = 1; i <= n; i++) printf "%-40s  %-8s%s\n", slug[i], st[i], (nrepo > 1 ? "  " repo[i] : "") }
+    { n++; slug[n] = $2; st[n] = $3; repo[n] = $4; if (!($4 in seen)) { seen[$4] = 1; nrepo++ } }
+    END { for (i = 1; i <= n; i++) {
+            if (nrepo > 1) printf "%-40s  %-8s  %s\n", slug[i], st[i], repo[i]
+            else           printf "%-40s  %s\n", slug[i], st[i] } }
   ' <<<"$rows")
   picked=$(ui_choose --no-limit --height 12 \
     --header "wait on which? x ticks, Enter confirms, none is fine" <<<"$lines") || die "cancelled"
   while IFS= read -r s; do
+    s=${s%"${s##*[![:space:]]}"}
     [ -n "$s" ] || continue
-    after_vals="${after_vals}${s%% *}"$'\n'
+    i=$(grep -nFx -- "$s" <<<"$lines" | head -1 | cut -d: -f1)
+    [ -n "$i" ] && after_vals="${after_vals}$(sed -n "${i}p" <<<"$rows" | cut -f1)"$'\n'
   done <<<"$picked"
   return 0
 }
@@ -1227,14 +1454,14 @@ add_wizard() {
   pick_after
 }
 
-# `pq add` takes no arguments at all: the plan is picked, Haiku names it, and
-# the model, effort, blockers and design are questions. The wizard is the way in.
+# `pq add` takes no arguments at all: the plan is picked, and the model, effort,
+# blockers and design are questions. The wizard is the way in, and once its last
+# question is answered the task is in new/ and `pq add` is done - the tick names
+# it (see "naming").
 cmd_add() {
   [ $# -eq 0 ] || die "pq add takes no arguments - it asks: '$1'"
   need_gum add
-  local plan="" branch="" intent="" security="" model=$PQ_DEFAULT_MODEL effort=$PQ_DEFAULT_EFFORT
-  # `basebr` rather than `base`: the blocker-hint loop at the end of this
-  # function already declares a `local base`.
+  local plan="" model=$PQ_DEFAULT_MODEL effort=$PQ_DEFAULT_EFFORT
   local repo="" basebr=""
   # A string, not an array: an empty bash array expanded under `set -u` is a
   # portability trap (fixed only in bash 4.4+), so every repeatable option in
@@ -1293,8 +1520,7 @@ cmd_add() {
   #   not on origin      `wt new --base origin/X` cannot fork it and no pull
   #                      request can target it, so it is not a usable base yet
   #
-  # Held, not printed here: it pairs with the `branch:` line, so it is emitted
-  # beside it once the task is queued.
+  # Held, not printed here: it is said beside the rest of what was added.
   local base_note="" cur def
   cur=$(git -C "$repo" rev-parse --abbrev-ref HEAD 2>/dev/null)
   def=$(repo_base "$repo")
@@ -1308,17 +1534,11 @@ cmd_add() {
   fi
 
   # The design set, before the wizard: what the plan's text names and exists on
-  # disk, and whether the plan reads as built from a
-  # design at all is what the wizard's question turns on.
+  # disk. Whether the plan reads as built from a design at all is what the
+  # wizard's question turns on.
   design_hinted "$plan" && design_hinted=1
   local detected; detected=$(design_mentions "$plan")
   [ -n "$detected" ] && design_vals="${design_vals}${detected}"$'\n'
-
-  # Named before the wizard, so a plan that cannot be named behind a usage limit
-  # stops the add before any question is asked.
-  local named nrc; named=$(ui_spin "naming the task" name_plan "$plan"); nrc=$?
-  [ "$nrc" = 130 ] && die "cancelled"
-  [ "$nrc" = 3 ] && die "could not name the plan behind the usage limit - pq add again once it lifts"
 
   add_wizard
 
@@ -1340,80 +1560,55 @@ cmd_add() {
     design_hdr="${design_hdr:+$design_hdr, }$dbase"
   done <<<"$design_vals"
 
-  msg "plan:   $plan"
-
-  # The name, taken apart, and checked before anything is written. `cut`, never
-  # `read`: a tab is IFS whitespace, so an empty intent would let the verdict
-  # slide into its place.
-  # What each naming call cost, `usd<TAB>session` per line, for the ledger the
-  # task is staged with below - the retry for a taken name is a call too.
-  local why named_cost
-  named_cost=$(cut -f4,5 <<<"$named")
-  branch=$(cut -f1 <<<"$named"); intent=$(cut -f2 <<<"$named"); security=$(cut -f3 <<<"$named")
-  [ -n "$branch" ] || die "could not name the plan - Haiku gave no usable branch; try pq add again"
-  git check-ref-format "refs/heads/$branch" || die "invalid branch name: '$branch'"
-  # A name Haiku chose that turns out to be taken is Haiku's to change, so it is
-  # asked once more with that name to avoid - far likelier now that every name
-  # pq has ever used, and every one with a pull request behind it, is taken.
-  if why=$(branch_taken "$branch" "$repo"); then
-    warn "branch '$branch' is already $why - asking for another name"
-    named=$(ui_spin "naming the task again" name_plan "$plan" "$branch") || {
-      case $? in 130) die "cancelled" ;; 3) die "could not rename the plan behind the usage limit - pq add again once it lifts" ;; esac; }
-    named_cost="$named_cost"$'\n'"$(cut -f4,5 <<<"$named")"
-    branch=$(cut -f1 <<<"$named"); intent=$(cut -f2 <<<"$named"); security=$(cut -f3 <<<"$named")
-    [ -n "$branch" ] || die "could not name the plan - Haiku gave no usable branch; try pq add again"
-    git check-ref-format "refs/heads/$branch" || die "invalid branch name: '$branch'"
-  fi
-  why=$(branch_taken "$branch" "$repo") && die "branch '$branch' is already $why"
-
-  local slug; slug=$(branch_to_slug "$branch")
-  [ -n "$slug" ] || die "branch '$branch' does not reduce to a usable name"
-
-  # Resolve every chosen blocker to a (label, repo, branch) triple NOW, before
-  # anything is written - a bad blocker should fail the whole add, not leave a
-  # task queued with only some of what it was told to wait on. Self-reference
-  # and cycles are rejected here for the same reason `find_task` resolves the
-  # slug side of it: adding is the one place a mistake is cheap to catch.
-  local after_lines="" av label arepo abranch resolved
+  # Every chosen blocker, as it is NOW, found by its stamp - a tick may have
+  # named it while the list was on screen. One with a branch resolves to its
+  # (label, repo, branch) here, before anything is written, so the dependency
+  # survives `pq rm` of it, its ageing out of done/, and its slug being reused
+  # (see "after: blockers"). One still in new/ has no branch to resolve to yet,
+  # and is held by its stamp in after.new until this task is named; so is the
+  # check for a cycle, which only the name can close (see "naming").
+  local after_lines="" after_new="" av b
   while IFS= read -r av; do
     [ -n "$av" ] || continue
-    resolved=$(resolve_after "$repo" "$av") || die "could not resolve '$av' to a task or branch"
-    IFS=$'\t' read -r label arepo abranch <<<"$resolved"
-    [ -n "$arepo" ] && [ -n "$abranch" ] || die "could not resolve '$av' to a repo and branch"
-    [ "$arepo" = "$repo" ] && [ "$abranch" = "$branch" ] && die "a task cannot block on itself"
-    after_cycle "$repo" "$branch" "$arepo" "$abranch" \
-      && die "'$av' would create a cycle - $branch already leads back to it"
-    # The explicit $'\n' matters: command substitution strips ALL trailing
-    # newlines, so without it a single-blocker add would write an `after` file
-    # with none - and `while read` silently skips a final line that has no
-    # trailing newline, so after_state would read the file as empty and the
-    # blocker would never gate anything.
-    after_lines="${after_lines}$(printf '%s\t%s\t%s' "$label" "$arepo" "$abranch")"$'\n'
+    b=$(task_by_stamp "$av") || die "a task you picked to wait on has been removed since - nothing was added"
+    if [ "$(state_of "$b")" = new ]; then
+      after_new="$after_new$av"$'\n'
+    else
+      # The explicit $'\n' matters: command substitution strips ALL trailing
+      # newlines, so without it a single-blocker add would write an `after` file
+      # with none - and `while read` silently skips a final line that has no
+      # trailing newline, so after_state would read the file as empty and the
+      # blocker would never gate anything.
+      after_lines="${after_lines}$(slug_of "$b")"$'\t'"$(hdr "$b/plan.md" repo)"$'\t'"$(hdr "$b/plan.md" branch)"$'\n'
+    fi
   done <<<"$after_vals"
 
-  local state=queue
   # Allocated here, immediately before the directory is built - not earlier,
   # alongside the rest of the parse - so the stamp records when the task
   # actually landed, not when the command started and the wizard began asking.
+  # Naming keeps it, so it is also where the task will sit in the queue.
   local stamp; stamp=$(next_stamp)
-  local dir; dir="$PQ_HOME/$state/$(task_name "$stamp" "$slug")"
-  [ -e "$dir" ] && die "a task already exists at $state/$(basename "$dir")"
-  local taken_in; taken_in=$(slug_taken_in "$slug") && die "a task named '$slug' already exists in $taken_in/"
+  local dir; dir="$PQ_HOME/new/$(task_name "$stamp" "$(title_slug "$plan")")"
+  [ -e "$dir" ] && die "a task already exists at new/$(basename "$dir")"
 
-  # Build the task somewhere the queue cannot see, then move it into place. A task
+  # Build the task somewhere no tick can see, then move it into place. A task
   # directory with no plan.md would be listed by `pq ls` as a blank row, matched by
-  # `find_task`, and - once tick exists - iterated unattended with an empty `repo`,
-  # which is a `cd ""` into the wrong place. Assembling out of sight means a failed
-  # or interrupted add leaves nothing behind rather than something half-formed.
+  # `find_task`, and named unattended with an empty `repo`. Assembling out of sight
+  # means a failed or interrupted add leaves nothing behind rather than something
+  # half-formed.
   PQ_STAGING="$PQ_HOME/.add.$$"
   rm -rf "$PQ_STAGING"; mkdir -p "$PQ_STAGING" || die "could not create $PQ_STAGING"
   trap 'rm -rf "$PQ_STAGING"' EXIT
   # COPY, never move: ~/.claude/plans is Claude Code's directory and it prunes it,
   # so the original is not ours to consume. `source` keeps the trail back.
+  #
+  # `branch:`, `intent:` and `security:` are naming's to write, each in its place
+  # among these: after `repo:`, after `effort:`, and before `model:` - where a
+  # plan that asks for a security review carries the key, which is what
+  # reconcile reads to open the security reviewer's ladder.
   {
     printf -- '---\n'
     printf 'repo:     %s\n'   "$repo"
-    printf 'branch:   %s\n'   "$branch"
     # Omitted entirely when unset rather than written empty: `task_base` reads
     # this key, and an absent one is what makes it fall through to the repo
     # default.
@@ -1421,12 +1616,8 @@ cmd_add() {
     # Same absent-means-none pattern as `base:` - written only when there is
     # a design set, so every task without one keeps the header it always had.
     [ -n "$design_hdr" ] && printf 'design:   %s\n' "$design_hdr"
-    # And again: only a plan that asks for a security review carries the key,
-    # and it is what reconcile reads to open the security reviewer's ladder.
-    [ "$security" = yes ] && printf 'security: yes\n'
     printf 'model:    %s\n'   "$model"
     printf 'effort:   %s\n'   "$effort"
-    printf 'intent:   %s\n'   "${intent:-}"
     printf 'source:   %s\n'   "$plan"
     printf 'added:    %s\n'   "$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
     printf -- '---\n\n'
@@ -1437,12 +1628,7 @@ cmd_add() {
   # built here: a task with a plan but no `after` is exactly the kind of
   # half-formed state this staging dance exists to rule out.
   [ -n "$after_lines" ] && printf '%s' "$after_lines" > "$PQ_STAGING/after"
-  # The naming calls' cost, so the ledger starts with the task rather than after it.
-  local nusd nsid
-  while IFS= read -r nusd; do
-    nsid=$(cut -f2 <<<"$nusd"); nusd=$(cut -f1 <<<"$nusd")
-    [ -n "$nusd" ] && cost_record "$PQ_STAGING" name "$nsid" "$nusd"
-  done <<<"$named_cost"
+  [ -n "$after_new" ] && printf '%s' "$after_new" > "$PQ_STAGING/after.new"
   # The design files too, and for the same reason: the header names them, so a
   # task must never land with a `design:` line and an empty design/.
   if [ -n "$design_files" ]; then
@@ -1452,32 +1638,13 @@ cmd_add() {
       cp "$dfile" "$PQ_STAGING/design/" || die "could not copy the design file $dfile"
     done <<<"$design_files"
   fi
-  mv "$PQ_STAGING" "$dir" || die "could not move the new task into $state/"
+  mv "$PQ_STAGING" "$dir" || die "could not move the new task into new/"
   trap - EXIT
-  task_link "$dir"
 
-  msg "branch: $branch"
+  msg "plan:   $plan"
   [ -n "$base_note" ] && msg "$base_note"
-  [ -n "$intent" ] && msg "intent: $intent"
   [ -n "$design_hdr" ] && msg "design: $design_hdr"
-  [ "$security" = yes ] && msg "review: code and security - the plan asks for a /security-review"
-  msg "added:  $state/$(basename "$dir")  ($model, effort $effort)"
-
-  if [ -n "$after_lines" ]; then
-    pr_load_all "$(awk -F'\t' '{print $2"\t"$3}' <<<"$after_lines")"
-    local base
-    while IFS=$'\t' read -r label arepo abranch; do
-      [ -n "$label" ] || continue
-      base=$(blocker_base "$dir" "$arepo")
-      if [ -n "$base" ] && merged_into "$arepo" "$abranch" "$base"; then
-        msg "after $label: already in $base - nothing to wait for"
-      else
-        msg "after $label ($abranch)"
-      fi
-    done <<<"$after_lines"
-  fi
-
-  rm -f "$PR_CACHE" "$PR_ANS"
+  msg "added:  new/$(basename "$dir")  ($model, effort $effort) - the next tick names it and queues it"
   repo_base_reset
 }
 
@@ -2599,6 +2766,23 @@ block_cell() {                          # task_dir
 agent_cell() {                          # task_dir state
   local d=$1 st=$2 pane status blocked
   case "$st" in
+    new)
+      # What naming last recorded, never asked again here - the same rule as a
+      # queued task's base below. `naming failed` and `blocker gone` want you;
+      # anything else is a tick away, or waits on the blocker it names.
+      case "$(st "$d" PQ_NAME_WHY)" in
+        gaveup) printf 'naming failed'; return ;;
+        gone)   printf 'blocker gone'; return ;;
+      esac
+      local s b
+      while IFS= read -r s; do
+        [ -n "$s" ] || continue
+        b=$(task_by_stamp "$s") && [ "$(state_of "$b")" = new ] \
+          && { printf 'after %s' "$(cell "$(slug_of "$b")" "$PQ_LABEL_MAX")"; return; }
+      done <<<"$(cat "$d/after.new" 2>/dev/null)"
+      printf 'naming'
+      return
+      ;;
     queue)
       # A base that has gone missing outranks any blocker verdict: the task cannot
       # start either way, and this is the one that needs YOU rather than time.
@@ -2784,6 +2968,7 @@ cmd_ls() {
     case "$agent" in
       permission|gone|exited|blocked|unknown|quiet|error|failed) needs=$((needs + 1)) ;;
       dead\ *|stalled\ *|held\ *|base\ *)             needs=$((needs + 1)) ;;
+      naming\ failed|blocker\ gone)                   needs=$((needs + 1)) ;;
       review\ lapsed|ci\ failed|conflict|new\ review)  needs=$((needs + 1)) ;;
     esac
     # Which rows are spending the cap. `running` unconditionally, the same way
@@ -2832,7 +3017,7 @@ cmd_ls() {
         def str: if . == "" then null else . end;
         def num: if . == "" or . == null then null else tonumber end;
         { task: $task, stamp: ($stamp|tonumber), state: $state, dir: $dir,
-          repo: $repo, branch: $branch, base: ($base|str), model: $model, effort: $effort,
+          repo: $repo, branch: ($branch|str), base: ($base|str), model: $model, effort: $effort,
           intent: ($intent|str), added: ($added|str),
           agent: ($agent | if . == "-" then null else . end),
           pr: ($pr|str|if . then tonumber else null end),
@@ -2865,8 +3050,9 @@ cmd_ls() {
     jq -s '.' "$tbl"
   else
     render_table "$tbl"
-    local nq nr narch
+    local nq nr narch nnew
     nq=$(dir_count "$PQ_HOME/queue")
+    nnew=$(dir_count "$PQ_HOME/new")
     nr=$(running_count)
     narch=$(dir_count "$PQ_HOME/archive")
     printf '\n' >&2
@@ -2875,6 +3061,7 @@ cmd_ls() {
     # unreached - so it names the cap alongside it rather than leaving you to
     # add the two numbers up yourself.
     msg "$nr running$([ "$nwrap" -gt 0 ] && printf ' + %s wrapping up (cap %s)' "$nwrap" "$(cap_get)"), $nq queued\
+$([ "$nnew" -gt 0 ] && printf ', %s new' "$nnew")\
 $([ "$needs" -gt 0 ] && printf ' (%s needs you)' "$needs")\
 $([ "$narch" -gt 0 ] && printf ', %s archived%s' "$narch" "$([ "$all" = 1 ] || printf ' (--all to see)')")"
   fi
@@ -2890,8 +3077,14 @@ $([ "$narch" -gt 0 ] && printf ', %s archived%s' "$narch" "$([ "$all" = 1 ] || p
 # `pq after <task> <task|branch>...` adds blockers; `--clear` drops them all.
 # Restricted to what has not been dispatched - blockers only gate what has not
 # started.
+#
+# And to what has a name, on both sides. A task in new/ may already wait on
+# something by stamp alone, where `after_cycle` cannot follow it, so adding to
+# one could close a cycle nothing would see - and one given AS a blocker has no
+# branch to wait on yet. Either is a tick away from having one.
 cmd_after() {
   local d; d=$(find_task "${1:-}") || exit 1; shift
+  [ "$(state_of "$d")" = new ] && die "$(slug_of "$d") has no name yet - the next tick names it and queues it; pq after it then"
 
   if [ $# -eq 0 ]; then
     if [ ! -f "$d/after" ]; then
@@ -2957,9 +3150,14 @@ cmd_after() {
     return 0
   fi
 
-  local owner_repo owner_branch value resolved label repo branch base
+  local owner_repo owner_branch value resolved label repo branch base b
   owner_repo=$(hdr "$d/plan.md" repo); owner_branch=$(hdr "$d/plan.md" branch)
   for value in "$@"; do
+    case "$value" in
+      */*) ;;
+      *) b=$(find_task "$value" 2>/dev/null) && [ "$(state_of "$b")" = new ] \
+           && { release_lock; die "$(slug_of "$b") has no name yet, so there is no branch to wait on - the next tick names it; pq after again then"; } ;;
+    esac
     resolved=$(resolve_after "$owner_repo" "$value") || { release_lock; die "could not resolve '$value' to a task or branch"; }
     IFS=$'\t' read -r label repo branch <<<"$resolved"
     [ -n "$repo" ] && [ -n "$branch" ] || { release_lock; die "could not resolve '$value' to a repo and branch"; }
@@ -2990,7 +3188,10 @@ cmd_rm() {
   local slug st branch repo deps reaped
   slug=$(slug_of "$d"); st=$(state_of "$d")
   branch=$(hdr "$d/plan.md" branch); repo=$(hdr "$d/plan.md" repo)
-  deps=$(dependents_of "$repo" "$branch" | tr '\n' ' ')
+  # A task in new/ has no branch for anything to wait on - only its stamp, in
+  # the after.new of whatever was added after it.
+  if [ "$st" = new ]; then deps=$(waiting_on_stamp "$(stamp_of "$d")" | tr '\n' ' ')
+  else deps=$(dependents_of "$repo" "$branch" | tr '\n' ' '); fi
   reaped=$(st "$d" PQ_REAPED)
   ui_confirm "remove task \"$slug\" ($st)?" || { msg "cancelled"; return 0; }
   # The answer was about the task as it was when the question was asked. A tick
@@ -3008,7 +3209,10 @@ cmd_rm() {
   msg "removed $slug"
   # Removing A is exactly how B gets orphaned - nothing will ever open a PR for
   # a branch pq no longer knows about, so that is the moment to say so.
-  [ -z "$deps" ] || warn "$slug was a blocker for: ${deps% } - they now wait on a branch nothing owns"
+  if [ -n "$deps" ]; then
+    if [ "$st" = new ]; then warn "$slug was a blocker for: ${deps% } - with no name ever, nothing says which branch they meant; they are held until you pq rm them too"
+    else warn "$slug was a blocker for: ${deps% } - they now wait on a branch nothing owns"; fi
+  fi
   case "$st" in
     running|done|archive)
       [ -n "$reaped" ] || warn "its worktree and branch are untouched - remove those with: wt rm $branch" ;;
@@ -3601,8 +3805,8 @@ dispatch_gaveup() { [ "$(st "$1" PQ_DISPATCH_GAVEUP)" = 1 ]; }
 #
 # THE SECURITY REVIEWER. A plan can ask for a security review too - plans say
 # "run /security-review" in so many words, and say what it should focus on - and
-# name_plan reads that into a `security: yes` header at add time. Such a task gets
-# a second reviewer beside the first: `claude -p "/security-review"`, in the same
+# name_plan reads that into a `security: yes` header as it names the task. One
+# that has it gets a second reviewer: `claude -p "/security-review"`, in the same
 # worktree, on the same settings bar its effort, PQ_SECURITY_EFFORT, and the
 # same read-only rules. The implementer's contract tells it not to run one
 # itself, as it does for /code-review. The
@@ -5145,6 +5349,12 @@ tick_body() {                           # cap dry
   # listing command never sets this and never reaches the network.
   PQ_FETCH_BASES=1
 
+  # 0. Name what `pq add` left in new/ - see "naming". First, so that a task
+  #    queued here has its blockers in the PR cache loaded next, and fill can
+  #    dispatch it on this same pass. `n_named` is name_pass's to count.
+  local n_named=0
+  name_pass "$dry"
+
   # PR state for the whole tick, loaded ONCE: every RUNNING task's branch (for
   # reconcile below), plus every blocker of a task that has not started (for
   # the eligibility check that follows fill). `done` is deliberately excluded -
@@ -5384,10 +5594,14 @@ tick_body() {                           # cap dry
   # second active_slots pass would re-walk done/ for the same answer.
   n_run=$(running_count)
   local queued; queued=$(dir_count "$PQ_HOME/queue")
+  # What naming left in new/ - waiting on the limit, on a blocker, or on you.
+  local unnamed; unnamed=$(dir_count "$PQ_HOME/new")
   # Name the two halves separately. A cap of 3 reading "3 running" while three
   # more agents were still wrapping up in done/ is precisely what made six live
   # agents look like a healthy tick for as long as this bug lasted.
   summary "$n_run running$([ "$n_wrap" -gt 0 ] && printf ' + %s wrapping up' "$n_wrap") (cap $cap), $queued queued\
+$([ "$unnamed" -gt 0 ] && printf ', %s new' "$unnamed")\
+$([ "$n_named" -gt 0 ] && printf ', %s named' "$n_named")\
 $([ "$started" -gt 0 ] && printf ', %s started' "$started")\
 $([ "$would" -gt 0 ] && printf ', %s would start' "$would")\
 $([ "$waiting" -gt 0 ] && printf ', %s waiting on a merge' "$waiting")\

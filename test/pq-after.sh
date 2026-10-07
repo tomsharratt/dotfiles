@@ -95,8 +95,8 @@ cache_row() { printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$@" >> "$PR_CACHE"; }   # repo 
 ans_row()   { printf '%s\t%s\n' "$@" >> "$PR_ANS"; }                    # repo branch
 
 reset_tasks() {
-  rm -rf "$PQ_HOME/queue" "$PQ_HOME/running" "$PQ_HOME/done"
-  mkdir -p "$PQ_HOME/queue" "$PQ_HOME/running" "$PQ_HOME/done"
+  rm -rf "$PQ_HOME/new" "$PQ_HOME/queue" "$PQ_HOME/running" "$PQ_HOME/done"
+  mkdir -p "$PQ_HOME/new" "$PQ_HOME/queue" "$PQ_HOME/running" "$PQ_HOME/done"
 }
 
 # A task directory built by hand, bypassing cmd_add (and the Haiku round trip
@@ -355,27 +355,6 @@ base_via_subshell=$(repo_base "$REPO")
 [ -f "$PQ_HOME/.base.$$" ] && ok || bad "repo_base should have created its memo file at \$PQ_HOME/.base.\$\$"
 repo_base_reset
 [ ! -f "$PQ_HOME/.base.$$" ] && ok || bad "repo_base_reset should have removed the memo file, not left it forever"
-
-echo "== cmd_add --after reports an already-merged blocker and leaves no PR cache behind ==" >&2
-# A real MERGED row, through the actual pr_load -> gh -> jq pipeline (via the
-# canned gh stub above) rather than a hand-primed cache. cmd_add runs in a
-# subshell here, so its $$ - and the cache it names after it - is this
-# script's.
-#
-# The blocker is a raw branch no task owns. A TASK on a branch that has already
-# merged is the reused-name shape pq now refuses (see test/pq-reuse.sh): its
-# owner would still be queued, and an unclaimed task owns no pull request yet.
-add_as "$PLAN_FILE" tom/depends-on-merged --repo "$REPO" --after tom/already-merged \
-  >/dev/null 2>"$PQ_HOME/.add.stderr"
-case "$(cat "$PQ_HOME/.add.stderr")" in
-  *"after already-merged: already in"*) ok ;;
-  *) bad "an already-merged blocker should be reported as nothing to wait for (got: $(cat "$PQ_HOME/.add.stderr"))" ;;
-esac
-if [ -e "$PQ_HOME/.pr.$$" ] || [ -e "$PQ_HOME/.pr.$$.ans" ]; then
-  bad "cmd_add --after should remove its PR cache once it is done with it"
-else
-  ok
-fi
 
 printf '\n%d passed, %d failed\n' "$pass" "$fail" >&2
 [ "$fail" -eq 0 ]

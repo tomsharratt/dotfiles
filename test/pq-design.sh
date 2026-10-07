@@ -112,8 +112,8 @@ mkdir -p "$DES/app/views"
 printf '<%%= yield %%>\n' > "$DES/app/views/show.html.erb"
 
 reset_tasks() {
-  rm -rf "$PQ_HOME/queue" "$PQ_HOME/running" "$PQ_HOME/done"
-  mkdir -p "$PQ_HOME/queue" "$PQ_HOME/running" "$PQ_HOME/done"
+  rm -rf "$PQ_HOME/new" "$PQ_HOME/queue" "$PQ_HOME/running" "$PQ_HOME/done"
+  mkdir -p "$PQ_HOME/new" "$PQ_HOME/queue" "$PQ_HOME/running" "$PQ_HOME/done"
 }
 reset_tasks
 queue_count() { dir_count "$PQ_HOME/queue"; }
@@ -267,7 +267,8 @@ eq "$(cat "$t/cost/4f1c2b9a-0d3e-4c5f-8a6b-7e9d0c1b2a3f.json" 2>/dev/null)" '{"w
 eq "$(cost_total "$t")" "\$0.00" "which is the whole of what it has cost so far"
 reset_tasks
 add_as "$PN" "" --repo "$REPO" >/dev/null 2>"$PQ_HOME/.err" && bad "a plan Haiku gave no words for must not queue" || ok
-has "$(cat "$PQ_HOME/.err")" "could not name the plan" "and says so"
+has "$(cat "$PQ_HOME/.err")" "could not name it - Haiku gave no usable branch" "and says so"
+eq "$(find "$PQ_HOME/new" -mindepth 1 -maxdepth 1 | wc -l | tr -d ' ')" "1" "leaving it in new/ for the next tick to try again"
 
 echo "== pq ls --json carries the design set ==" >&2
 reset_tasks

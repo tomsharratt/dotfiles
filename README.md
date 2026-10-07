@@ -143,25 +143,25 @@ Either way the browser opens at the end, and a server that never came up is name
 `pq` is a queue of Claude Code plans waiting to be run as implementer sessions, built on top of `wt` but separable from it.
 The split it exists to make: one long-lived session, in plan mode, does the thinking and produces a plan that has already answered every question; `pq` then runs those plans later, unattended, several at a time, as cheap implementer sessions that only have to execute.
 
-A task is a directory, and the directory it sits in is its state - `queue/`, `running/`, `done/`, `archive/` under `~/.local/state/pq`.
+A task is a directory, and the directory it sits in is its state - `new/`, `queue/`, `running/`, `done/`, `archive/` under `~/.local/state/pq`.
 Every transition is a `mv`, which is atomic within a filesystem, so two dispatchers cannot claim the same task.
 Each task holds an immutable `plan.md` (a settings header prepended to whatever Claude Code wrote) and a `state.env` of runtime facts, so an agent can re-read its plan at any point and never see it change underneath it.
 
 `pq add`, at a terminal, lists the plans in `~/.claude/plans` - newest first, searchable by typing - and lets you pick one rather than silently guessing.
-See "Picking a plan" below.
-It then asks Haiku for a branch name and a one-line statement of intent (Claude Code auto-names plan files, so the filename is never a usable branch), and refuses a branch that is already spoken for - `wt new` checks out an existing branch rather than failing, so two tasks sharing a name would quietly land in the same worktree.
+It asks the few things that need you, puts the task in `new/`, and is done; see "Picking a plan" below.
+The next tick then asks Haiku for a branch name and a one-line statement of intent (Claude Code auto-names plan files, so the filename is never a usable branch), and refuses a branch that is already spoken for - `wt new` checks out an existing branch rather than failing, so two tasks sharing a name would quietly land in the same worktree.
 Spoken for means any task `pq` has ever run under that name, archived ones included, a branch git knows of, or a name that has ever had a pull request: the forge answers by branch *name*, so a task reusing one would inherit its predecessor's pull requests.
-When the name Haiku chose is taken, it is asked once more with that name to avoid, before `pq add` gives up.
+When the name Haiku chose is taken, it is asked once more with that name to avoid; see "Naming" below for what happens when that fails too.
 
 Each task records its own project, so one queue serves all of them.
-The project is wherever you were standing when you added the plan, resolved to the main checkout so adding from inside a worktree still queues against the repo the new worktree gets forked from; `--repo PATH` sets it explicitly.
+The project is wherever you were standing when you added the plan, resolved to the main checkout so adding from inside a worktree still queues against the repo the new worktree gets forked from.
 So is the branch: when that checkout is on a branch other than the default, and the branch is on origin, the task forks from it and opens its pull request against it, recorded as a `base:` header.
 To queue against the default from a feature branch, check the default out first.
 Dispatch runs `wt new` in that repo, which picks up its profile, and everything downstream is per-task from there - `pq ls` grows a `PROJECT` column as soon as the queue holds more than one.
 Branch *lookups* are keyed on the repo as well as the name, but a task's slug is a single global namespace, so two live tasks can never share a branch leaf even across two different projects - `tom/fix-timezone` cannot be queued in both at once.
 
 ```
-pq add                   pick a plan and add it to the queue; asks model, effort, what to wait on and, for a design plan, the design file
+pq add                   pick a plan and add it; asks model, effort, what to wait on and, for a design plan, the design file - the next tick names it
 pq after <task>          list a task's blockers and what each is waiting on
 pq after <task> T...     add blockers to a task still in queue/
 pq after <task> --clear  drop them all
@@ -180,22 +180,46 @@ The fourteen-digit prefix on a task directory is a UTC timestamp and nothing els
 `pq add` takes no arguments: it asks.
 Its questions are gum's (`brew install gum`), and `pq add` and `pq rm` are the only commands that need it - `ls`, `tick`, `run`, `cap` and `evidence` stay free of it, so scripts and agents never meet a prompt.
 
-At a terminal it opens a fuzzy-searchable list of the plans in `~/.claude/plans`, newest first, each with its age, its file name and its title - the first `# H1` in the file, since Claude Code names the file itself from your opening prompt and that name is rarely what the plan is actually about.
+At a terminal it opens a fuzzy-searchable list of the plans in `~/.claude/plans`, newest first, each with its age and its title - the first `# H1` in the file, since Claude Code names the file itself from your opening prompt and that name is rarely what the plan is actually about.
 "Newest" means whichever is newer, mtime or birth time, so a plan edited this morning outranks one merely created today, and a plan restored by `cp -p`, `rsync -a`, or a git checkout doesn't fall to the bottom on a stale mtime.
 Type a word from what the plan was about to narrow the list, then Enter.
 
 The chosen plan opens in a pager to read (`q` or Esc closes it), and then it asks `use this plan?`.
 Declining returns to the list rather than aborting the whole command, and Esc at the list quits.
-Once you confirm, Haiku names the task while a spinner runs, and then it asks the things that actually shape how a task runs:
+Once you confirm, it asks the things that actually shape how a task runs:
 
 - which model should run it - `sonnet`, `opus` or `fable`, starting on `sonnet`;
 - what effort - `low`, `medium`, `high`, `xhigh` or `max`, starting on `medium`;
 - when the plan was built from a design but names no file that exists, the design file, from a file picker that starts in `~/.claude/plans/designs` - Esc goes without it, loudly;
-- which of the tasks already queued or running it should wait on - x ticks one, Enter confirms, and Enter with nothing ticked means none.
+- which tasks it should wait on - x ticks one, Enter confirms, and Enter with nothing ticked means none.
+
+Anything whose work has not landed can be waited on: a task in `new/`, `queue/` or `running/`, and one in `done/` whose pull request has neither merged nor closed, since that is where a task sits while it is reviewed.
+Only the verdict `pq` has already recorded is read, so the list costs no round trip to the forge.
 
 The repo is the one you are standing in.
 Outside any repo it asks which of the repos pq already knows.
 Esc or Ctrl-C at any question stops the add, and nothing is written.
+
+The last answer is the end of `pq add`: the task is written to `new/` and the command exits, so the herdr popup it runs in (`prefix+t`) closes at once.
+Naming takes a Haiku call and, when the name turns out to be taken, git and forge lookups and a second call - seconds of spinner for an answer none of the questions depends on - so it is the tick's job instead.
+
+#### Naming
+
+Every tick starts by naming what is in `new/`, oldest first, before it fills a slot - so a task is dispatched on the same tick it is named, no later than one added straight to the queue would have been.
+Until then it goes by its plan's title (`step-1-pr-01a-schema-models-and-deletion`), which is what `pq ls` shows and `pq rm` takes, and `pq ls` reads `naming` for it.
+Naming reads the task's own copy of the plan, never the file it was copied from, so a plan edited or pruned since it was added is named for what was queued.
+It writes the branch, intent and security verdict into the header and moves the task to `queue/` under the slug its branch reduces to, keeping its timestamp, so the queue is still in the order things were added.
+The run log says `queued <slug> - <branch>`.
+
+A plan that lands as a chain of pull requests is added one link at a time, about a minute apart - faster than a tick - so the link before is usually still in `new/` when the next one picks it.
+A blocker with no name yet has no branch to wait on, so it is held by its timestamp until the task waiting on it is named; `new/` is named oldest first, so both land on the same tick.
+A blocker that is still unnamed holds its dependent back with it, which reads `after <blocker>`.
+One removed before it was ever named holds its dependent for good, since nothing can now say which branch it meant: `pq rm` warns as it removes it, and `pq ls` reads `blocker gone`.
+`pq after` takes neither side of an unnamed task - it is a tick away from having a name.
+
+What naming cannot get through is said once in the run log, not every tick.
+The usage limit is waited out, and the task is named on the first tick after it lifts.
+Anything else - a reply with no usable branch, a second name that is taken too, a name that would close a cycle of blockers - is a failed try, and after three in a row `pq` stops spending Haiku on it: `pq ls` reads `naming failed`, and it counts as needing you.
 
 There is no unattended add: with no terminal to ask at, `pq add` stops rather than guessing which plan you meant.
 
@@ -368,7 +392,7 @@ The cap is what bounds the damage, since a task in `running/` holds its slot unt
 
 The headless sessions are the exception, because in `claude -p` the limit is not an error: the session exits 0 with the limit's one line as its whole reply.
 A reply that is exactly one line and reads as the limit (`PQ_LIMIT_RE`) is caught before anything else is read off it.
-`pq add` stops with "behind the usage limit - pq add again once it lifts" rather than reading that line as a reply that named nothing.
+Naming waits the limit out, saying so once, rather than reading that line as a reply that named nothing.
 The reviewers are covered under "The review gate" below.
 
 #### The review gate
@@ -416,7 +440,7 @@ That is warned about once, counts into "needs you", and reads `review lapsed` in
 #### The security review
 
 Some plans ask for a security review as well - "run `/security-review` as well as `/code-review`", with what it should look at - and those get one, run by `pq` the same way.
-The same Haiku call that names a task at add time reads whether its plan asks for one, and a plan that does gets a `security: yes` header (absent, like `base:` and `design:`, when it does not) and says `review: code and security` as it is queued.
+The same Haiku call that names a task reads whether its plan asks for one, and a plan that does gets a `security: yes` header (absent, like `base:` and `design:`, when it does not) and is queued `with a security review`.
 It has to be read rather than matched: plans name the skill as often to waive it as to ask for it - "`/security-review` is not warranted" - so a pattern cannot tell the two apart, and a yes stands only when the plan's text mentions a security review at all.
 The wording was checked against ten real plans, four runs each, and came back right all forty times, including one that asks for it inside an aside about CSRF and `pq`'s own plan, which names it only as follow-up work.
 
@@ -492,7 +516,7 @@ Once its verdict is in *and* the teardown has run, a done task is exactly what t
 
 #### What a task costs
 
-Every task keeps a ledger of what Claude has spent on it, in Claude Code's own dollars: Haiku naming it at `pq add`, the implementer, and each try of the code and security reviewers.
+Every task keeps a ledger of what Claude has spent on it, in Claude Code's own dollars: Haiku naming it, the implementer, and each try of the code and security reviewers.
 The implementer's cost is everything its session spends, so it takes in `pq`'s own nudges and follow-ups and whatever you type into its pane after reading the pull request.
 The ledger is `<task>/cost/`, one file per Claude session, holding that session's latest running total, and a task's cost is their sum.
 `/clear` starts a new session at $0 under a new id, so what came before it keeps its own file, and booking the same reviewer try twice just rewrites the same one.
