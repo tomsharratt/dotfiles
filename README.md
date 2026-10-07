@@ -165,7 +165,7 @@ pq add                   pick a plan and add it to the queue; asks model, effort
 pq after <task>          list a task's blockers and what each is waiting on
 pq after <task> T...     add blockers to a task still in queue/
 pq after <task> --clear  drop them all
-pq ls [--all] [--json]   every task, its state, and what it is waiting on
+pq ls [--all] [--json]   every task, its state, what it is waiting on, and what it has cost
 pq tick [--dry-run]      free finished slots, then fill them from the queue
 pq run                   tick every two minutes until you stop it
 pq cap [N]               how many may run at once; 0 pauses
@@ -325,7 +325,7 @@ Either way nothing is lost - a task caught mid-dispatch keeps its claim without 
 
 #### Reading the agent's hooks
 
-Every implementer is started with `--settings <task>/hooks.json`, written once at dispatch, and each of those hooks overwrites `<task>/agent.json` with the agent's latest lifecycle event: `working` (a prompt was submitted, or a tool ran), `permission` (the dialog is up), `idle` (the turn ended) or `error` (the turn ended on an API error, with its type and first line).
+Every implementer is started with `--settings <task>/settings.json`, written once at dispatch, which carries its hooks and its status line (see "What a task costs" below), and each of those hooks overwrites `<task>/agent.json` with the agent's latest lifecycle event: `working` (a prompt was submitted, or a tool ran), `permission` (the dialog is up), `idle` (the turn ended) or `error` (the turn ended on an API error, with its type and first line).
 Each tick reads that file for every dispatched agent, running and wrapping up alike, for the ways an unattended agent stops without exiting; `pq` never reads the screen.
 `done/` is read as well as `running/` because that is where an unattended agent spends most of the night, answering review and fixing CI.
 An agent with no `agent.json` - a task dispatched before this existed, or an agent you restarted by hand without `--settings` - gives `pq` no signal: no `permission`, no knocks, no nudges.
@@ -489,6 +489,24 @@ A task with nothing left to reclaim shows `-`, the same as any other task that n
 There is no off switch, for the same reason `pq` has none for dispatch-hours or the usage gate: one mechanism, not two.
 
 Once its verdict is in *and* the teardown has run, a done task is exactly what the next tick's archive pass files away; see below.
+
+#### What a task costs
+
+Every task keeps a ledger of what Claude has spent on it, in Claude Code's own dollars: Haiku naming it at `pq add`, the implementer, and each try of the code and security reviewers.
+The implementer's cost is everything its session spends, so it takes in `pq`'s own nudges and follow-ups and whatever you type into its pane after reading the pull request.
+The ledger is `<task>/cost/`, one file per Claude session, holding that session's latest running total, and a task's cost is their sum.
+`/clear` starts a new session at $0 under a new id, so what came before it keeps its own file, and booking the same reviewer try twice just rewrites the same one.
+
+Hooks are told nothing about cost, so the implementer's comes from its status line: the `settings.json` it is started with carries a status line that writes the session's `cost.total_cost_usd` after every message, then hands the same input to the status line that would otherwise have been in effect - the worktree's local settings, then its project settings, then yours - so the bar looks exactly as it did.
+A reviewer's cost is read off its own result when the try ends, whatever the try amounted to, before the next try deletes it.
+The namer's comes back with its reply.
+
+`pq ls` grows a `COST` column once any listed task has a ledger, and `--json` carries `cost_usd`, `cost_partial` and a `cost` object with the `name`, `implementer`, `review` and `security` parts.
+A total that is missing a part reads as a lower bound, `$4.12+`, rather than passing for the whole cost.
+That covers a reviewer killed at its timeout, which leaves no cost to read, and a task started with no implementer record - dispatched before this existed, or restarted by hand without its settings.
+`pq run`'s log says what a task has cost so far when its pull request opens, what each review try cost as it lands, and the total when the task is torn down and when it is archived.
+
+A session resumed by hand with `claude --resume` is not tracked unless it is given the task's `settings.json`, and one that is restores its earlier total, which can count that spend twice if the resumed session runs under a new id.
 
 #### Archiving history
 

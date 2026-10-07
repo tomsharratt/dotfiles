@@ -26,10 +26,11 @@ STUBBIN=$(mktemp -d)
 # .haiku-prompt next to itself, and answers off its marker line.
 cat > "$STUBBIN/claude" <<'STUBEOF'
 #!/usr/bin/env bash
-model="" prompt=""
+model="" prompt="" format=text
 while [ $# -gt 0 ]; do
   case "$1" in
     --model) model=$2; shift 2 ;;
+    --output-format) format=$2; shift 2 ;;
     -p) shift ;;
     *) prompt=$1; shift ;;
   esac
@@ -38,18 +39,26 @@ case "$model" in
   haiku)
     content=$(cat)
     printf '%s' "$prompt" > "$(dirname "$0")/.haiku-prompt"
+    # Asked for JSON, the reply comes inside Claude Code's result envelope, with
+    # what the call cost and the session it ran as - as the real one does.
+    reply() {
+      if [ "$format" = json ]; then
+        jq -nc --arg r "$1" '{type: "result", subtype: "success", is_error: false, result: $r,
+                               total_cost_usd: 0.0042, session_id: "4f1c2b9a-0d3e-4c5f-8a6b-7e9d0c1b2a3f"}'
+      else printf '%s\n' "$1"; fi
+    }
     case "$content" in
       *"MARKER: plain"*)
-        printf '{"branch":"tom/plain-plan","intent":"Just the one thing."}\n' ;;
+        reply '{"branch":"tom/plain-plan","intent":"Just the one thing."}' ;;
       *"MARKER: bare"*)
-        printf '{"branch":"fix-login-swallow","intent":"Bare."}\n' ;;
+        reply '{"branch":"fix-login-swallow","intent":"Bare."}' ;;
       *"MARKER: slashed"*)
-        printf '{"branch":"ios/tip-fee","intent":"Slashed."}\n' ;;
+        reply '{"branch":"ios/tip-fee","intent":"Slashed."}' ;;
       *"MARKER: tomslashed"*)
-        printf '{"branch":"tom/android/tip-fee","intent":"Slashed under tom."}\n' ;;
+        reply '{"branch":"tom/android/tip-fee","intent":"Slashed under tom."}' ;;
       *"MARKER: nobranch"*)
-        printf '{"branch":"tom/","intent":"No words."}\n' ;;
-      *) printf '{}\n' ;;
+        reply '{"branch":"tom/","intent":"No words."}' ;;
+      *) reply '{}' ;;
     esac
     ;;
   *) exit 1 ;;
@@ -222,9 +231,11 @@ echo "== name_plan: one line, branch then intent then the security verdict ==" >
 PP="$PQ_HOME/.plain.md"; mkplan "$PP" plain
 named=$(name_plan "$PP")
 eq "$(wc -l <<<"$named" | tr -d ' ')" "1" "the reply is one line"
-IFS=$'\t' read -r b i <<<"$named"
+IFS=$'\t' read -r b i _ <<<"$named"
 eq "$b" "tom/plain-plan" "IFS=tab read takes the branch"
 eq "$i" "Just the one thing." "...and the intent"
+eq "$(cut -f4 <<<"$named")" "0.0042" "then what the call cost, off the result envelope"
+eq "$(cut -f5 <<<"$named")" "4f1c2b9a-0d3e-4c5f-8a6b-7e9d0c1b2a3f" "and the session it ran as"
 hp=$(cat "$STUBBIN/.haiku-prompt")
 hasnt "$hp" "parts" "Haiku is no longer asked for the plan's pull requests"
 
@@ -251,6 +262,9 @@ reset_tasks
 add_as "$PB" "" --repo "$REPO" 2>"$PQ_HOME/.err"
 t=$(find_task fix-login-swallow)
 eq "$(hdr "$t/plan.md" branch)" "tom/fix-login-swallow" "the queued task carries the prefixed branch"
+eq "$(cat "$t/cost/4f1c2b9a-0d3e-4c5f-8a6b-7e9d0c1b2a3f.json" 2>/dev/null)" '{"what":"name","usd":0.0042}' \
+  "and lands with the naming call in its ledger, under the call's session"
+eq "$(cost_total "$t")" "\$0.00" "which is the whole of what it has cost so far"
 reset_tasks
 add_as "$PN" "" --repo "$REPO" >/dev/null 2>"$PQ_HOME/.err" && bad "a plan Haiku gave no words for must not queue" || ok
 has "$(cat "$PQ_HOME/.err")" "could not name the plan" "and says so"

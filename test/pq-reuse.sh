@@ -200,9 +200,11 @@ prs tom/shipped-once "$(pr_json 105 MERGED 2026-08-01T00:00:00Z)"
 cat > "$STUBBIN/claude" <<'EOF'
 #!/bin/sh
 cat >/dev/null
+# In Claude Code's result envelope, as `--output-format json` gives it.
 case "$*" in
-  *"already taken: tom/shipped-once"*) echo '{"branch":"tom/fresh-name","intent":"the retry","security":false}' ;;
-  *) echo '{"branch":"tom/shipped-once","intent":"the first","security":false}' ;;
+  *"already taken: tom/shipped-once"*)
+    jq -nc '{result: "{\"branch\":\"tom/fresh-name\",\"intent\":\"the retry\",\"security\":false}", total_cost_usd: 0.004, session_id: "retry-session"}' ;;
+  *) jq -nc '{result: "{\"branch\":\"tom/shipped-once\",\"intent\":\"the first\",\"security\":false}", total_cost_usd: 0.006, session_id: "first-session"}' ;;
 esac
 EOF
 PLAN="$PQ_HOME/plan-src.md"; printf '# A plan\n\nDo it.\n' > "$PLAN"
@@ -213,6 +215,8 @@ t=$(find_task fresh-name)
 [ -n "$t" ] && ok || bad "under the name Haiku gave when told the first was taken"
 eq "$(hdr "$t/plan.md" intent)" "the retry" "with that reply's intent"
 case "$(cat "$PQ_HOME/.err")" in *"tom/shipped-once"*"#105"*) ok ;; *) bad "and it says why it asked again (got '$(cat "$PQ_HOME/.err")')" ;; esac
+eq "$(cd "$t/cost" 2>/dev/null && ls)" "$(printf 'first-session.json\nretry-session.json')" "both naming calls are in the ledger"
+eq "$(cut -f1,3 <<<"$(cost_sum "$t")")" $'0.01\t0.01' "and their sum is what naming cost"
 
 printf '\n%d passed, %d failed\n' "$pass" "$fail" >&2
 [ "$fail" -eq 0 ]

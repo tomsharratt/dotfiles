@@ -43,8 +43,8 @@ printf 'pane=%s tab=%s workspace=%s env=%s socket=%s\n' "\${HERDR_PANE_ID-unset}
 posted() { echo \$(( \$(cat "$COMMENTS") + 2 )) > "$COMMENTS"; }
 case "\$(cat "$MODE")" in
   sleep)     sleep 30; exit 0 ;;
-  ok)        posted; printf '{"is_error":false,"total_cost_usd":1.2,"duration_ms":5000,"permission_denials":[]}\n'; exit 0 ;;
-  empty)     printf '{"is_error":false,"result":"Found 2 issues, both outside the diff, so printed here: a and b.","permission_denials":[]}\n'; exit 0 ;;
+  ok)        posted; printf '{"is_error":false,"total_cost_usd":1.2,"duration_ms":5000,"session_id":"ok-%s","permission_denials":[]}\n' "\$\$"; exit 0 ;;
+  empty)     printf '{"is_error":false,"total_cost_usd":0.8,"session_id":"empty-%s","result":"Found 2 issues, both outside the diff, so printed here: a and b.","permission_denials":[]}\n' "\$\$"; exit 0 ;;
   fail)      printf '{"is_error":true}\n'; exit 1 ;;
   malformed) printf 'not json at all\n'; exit 0 ;;
   denied)    printf '{"is_error":false,"permission_denials":[{"tool_name":"Bash","tool_input":{"command":"gh api repos/x/y/pulls/42/comments -f body=hi"}}]}\n'; exit 0 ;;
@@ -221,7 +221,9 @@ tick 3 1
 eq "$(st "$R" PQ_REVIEW)" "" "--dry-run stamps nothing"
 [ -d "$R" ] && ok || bad "--dry-run moves nothing either"
 reset_caches; cache_row "$REPO" tom/fresh 42 OPEN draft master
+st_set "$R" PQ_STARTED "$(now)"; cost_record "$R" implementer sess-1 3.4
 tick 3 0
+has "$OUT" "finished fresh - #42 draft (\$3.40 so far)" "the log line says what the task has cost so far"
 D=$(ls -d "$PQ_HOME"/done/*-fresh); D=${D%/}
 [ -d "$D" ] && ok || bad "the task reaches done/"
 eq "$(st "$D" PQ_REVIEW)" "pending" "and its gate is opened"
@@ -344,6 +346,7 @@ eq "$(st "$G" PQ_REVIEW)" "pending" "back to pending - one try left"
 eq "$(st "$G" PQ_REVIEW_RESULT)" "timeout" "with the reason"
 eq "$(st "$G" PQ_REVIEW_RETRY_AT)" "$(( FAKE_NOW + PQ_REVIEW_RETRY ))" "and a retry armed"
 has "$(cat "$PQ_HOME/.out")" "ran past ${PQ_REVIEW_TIMEOUT}s" "said out loud"
+eq "$(cat "$G/cost/review-try-1.json" 2>/dev/null)" '{"what":"review","usd":null}' "and the try is booked as unknown - a killed reviewer leaves no cost to read"
 
 echo "== RETRY_AT is honoured, then the second try runs ==" >&2
 reset_logs; mode ok
@@ -361,6 +364,8 @@ review_task "$G" 0 >"$PQ_HOME/.out" 2>&1
 eq "$(st "$G" PQ_REVIEW)" "posted" "collected as posted"
 eq "$(st "$G" PQ_REVIEW_RESULT)" "ok" "with an ok result"
 has "$(cat "$PQ_HOME/.out")" "review of #42 posted - 2 inline comments (\$1.20, 0m5s)" "what landed, cost and duration are reported"
+eq "$(cut -f1,2,5 <<<"$(cost_sum "$G")")" $'1.2\ttrue\t1.2' "the try is booked beside the unknown one, so the total is a lower bound"
+eq "$(cost_total "$G")" "\$1.20+" "and reads as one"
 eq "$(st "$G" PQ_REVIEW_POSTED)" "2" "the two comments that landed are recorded"
 eq "$(review_cell "$G")" "reviewed" "the cell says reviewed"
 review_inflight "$G" && ok || bad "posted is still in flight - the follow-up has not gone"
@@ -585,8 +590,11 @@ reset_tasks; reset_caches; reset_logs; mode empty; printf '4' > "$COMMENTS"
 E=$(mk_gated 053 silent w6:p1)
 set_panes "$(printf 'w6:p1\tclaude\tidle')"
 review_task "$E" 0 >/dev/null 2>&1; wait_rc "$E"
+review_task "$E" 1 >/dev/null 2>&1
+eq "$(compgen -G "$E/cost/*" | wc -l | tr -d ' ')" 0 "--dry-run books nothing"
 review_task "$E" 0 >"$PQ_HOME/.out" 2>&1
 eq "$(st "$E" PQ_REVIEW)" "pending" "nothing landed: back to pending for another try"
+eq "$(cut -f5 <<<"$(cost_sum "$E")")" 0.8 "a try that posted nothing cost just as much, and is booked"
 eq "$(st "$E" PQ_REVIEW_RESULT)" "empty" "recorded as empty"
 has "$(cat "$PQ_HOME/.out")" "posted no inline comments on #42" "and said"
 has "$(cat "$E/review.md")" "printed here" "its reply is kept, in case it printed what it could not post"
@@ -596,6 +604,8 @@ review_task "$E" 0 >"$PQ_HOME/.out" 2>&1
 eq "$(st "$E" PQ_REVIEW)" "posted" "the second empty try ends the ladder"
 eq "$(st "$E" PQ_REVIEW_RESULT)" "empty" "still as empty"
 eq "$(review_cell "$E")" "review failed" "and pq ls says the review did not happen"
+eq "$(compgen -G "$E/cost/*.json" | wc -l | tr -d ' ')" 2 "each try is a session of its own in the ledger"
+eq "$(cut -f1,2,5 <<<"$(cost_sum "$E")")" $'1.6\tfalse\t1.6' "summed"
 reset_logs
 review_task "$E" 0 >/dev/null 2>&1
 P=$(prompt_text)
@@ -675,6 +685,8 @@ reset_caches; cache_row "$REPO" tom/settled 42 MERGED "" master
 review_task "$V" 0 >"$PQ_HOME/.out" 2>&1
 sleep 0.3
 review_alive "$PID" && bad "a settled PR must kill its reviewer" || ok
+eq "$(jq -c . "$V/cost/review-try-1.json" 2>/dev/null)" '{"what":"review","usd":null}' "and the try it cut short is booked as unknown"
+eq "$(cost_total "$V")" "\$0.00+" "so the total is a lower bound"
 eq "$(st "$V" PQ_REVIEW)" "skipped" "and skip the gate"
 eq "$(st "$V" PQ_REVIEW_WHY)" "settled" "as settled"
 has "$(cat "$PQ_HOME/.out")" "review skipped - #42 has settled" "said"

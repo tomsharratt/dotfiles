@@ -128,8 +128,13 @@ old1=$(mk_task "done" 800 short-old "$REPO" tom/short-old PQ_CLOSED=2026-01-01T0
 old2=$(mk_task "done" 900 short-mid "$REPO" tom/short-mid PQ_CLOSED=2026-01-01T00:00:00Z PQ_REAPED=2026-01-01T00:00:01Z)
 new1=$(mk_task "done" 20260101000001 modern-1 "$REPO" tom/modern-1 PQ_CLOSED=2026-01-01T00:00:00Z PQ_REAPED=2026-01-01T00:00:01Z)
 new2=$(mk_task "done" 20260101000002 modern-2 "$REPO" tom/modern-2 PQ_CLOSED=2026-01-01T00:00:00Z PQ_REAPED=2026-01-01T00:00:01Z)
-n_arch=$(archive_pass 0 2>/dev/null)
+cost_record "$old1" name n-1 0.01
+n_arch=$(archive_pass 0 2>"$PQ_HOME/.arch.err")
 eq "$n_arch" "2" "with 4 archivable and a tail of 2, exactly 2 should be archived"
+grep -q "^pq: archived short-old - .* (\\\$0.01)\$" "$PQ_HOME/.arch.err" && ok \
+  || bad "the archive line carries the task's cost (got: $(cat "$PQ_HOME/.arch.err"))"
+grep -q '^pq: archived short-mid - .*[^)]$' "$PQ_HOME/.arch.err" && ok \
+  || bad "and a task with no ledger says nothing about cost (got: $(cat "$PQ_HOME/.arch.err"))"
 [ ! -d "$old1" ] && [ ! -d "$old2" ] && ok || bad "the two numerically-oldest (short-old, short-mid) should have left done/"
 [ -d "$new1" ] && [ -d "$new2" ] && ok || bad "the two numerically-newest (modern-1, modern-2) should stay in done/"
 [ -d "$PQ_HOME/archive/800-short-old" ] && ok || bad "short-old should now sit in archive/"

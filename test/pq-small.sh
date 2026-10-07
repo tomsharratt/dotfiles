@@ -182,6 +182,18 @@ out=$(add_as "$PLANF" "" --repo "$REPO" 2>&1); rc=$?
 eq "$rc" "1" "pq add stops"
 has "$out" "behind the usage limit - pq add again once it lifts" "saying when trying again can work"
 hasnt "$out" "Haiku gave no usable branch" "not that the reply was unusable"
+# What the real one sends under --output-format json: a clean, successful
+# envelope whose whole result is the limit's line - the shape that once had a
+# reviewer read as having posted.
+jq -nc '{type: "result", subtype: "success", is_error: false, total_cost_usd: 0, session_id: "s-limit",
+         result: "You'"'"'ve hit your org'"'"'s monthly spend limit"}' > "$REPLY"
+out=$(name_plan "$PLANF" 2>&1); rc=$?
+eq "$rc" "3" "the limit inside the result envelope is the limit too"
+has "$out" "naming hit the usage limit: You've hit your org's monthly spend limit" "in its own words"
+reset_tasks
+out=$(add_as "$PLANF" "" --repo "$REPO" 2>&1); rc=$?
+eq "$rc" "1" "and pq add stops on it"
+has "$out" "behind the usage limit - pq add again once it lifts" "saying so"
 # The namer's own answer is one line too, and a plan about running out of
 # credits puts the limit's very words in it.
 printf '%s\n' '{"branch":"tom/usage-banner","intent":"Warn members before they run out of usage credits or hit your plan limit.","security":false}' > "$REPLY"

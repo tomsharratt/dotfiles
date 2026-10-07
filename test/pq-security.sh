@@ -74,10 +74,10 @@ case "\$m" in
 esac
 if [ "\$kind" = code ]; then
   echo \$(( \$(cat "$COMMENTS") + 2 )) > "$COMMENTS"      # a review that lands posts inline comments
-  printf '{"is_error":false,"total_cost_usd":1.2,"duration_ms":5000,"permission_denials":[]}\n'; exit 0
+  printf '{"is_error":false,"total_cost_usd":1.2,"duration_ms":5000,"session_id":"code-1","permission_denials":[]}\n'; exit 0
 fi
 case "\$m" in
-  ok)        jq -nc --rawfile r "$REPORT" '{is_error:false,total_cost_usd:0.9,duration_ms:90000,permission_denials:[],result:\$r}' ;;
+  ok)        jq -nc --rawfile r "$REPORT" '{is_error:false,total_cost_usd:0.9,duration_ms:90000,session_id:"security-1",permission_denials:[],result:\$r}' ;;
   empty)     printf '{"is_error":false,"result":"  "}\n' ;;
   otherdeny) jq -nc --rawfile r "$REPORT" '{is_error:false,permission_denials:[{tool_name:"Bash",tool_input:{command:"gh pr view 42"}}],result:\$r}' ;;
 esac
@@ -384,6 +384,7 @@ eq "$(st "$G" PQ_SECURITY)" "done" "collected"
 eq "$(st "$G" PQ_SECURITY_RESULT)" "ok" "as ok"
 eq "$(st "$G" PQ_SECURITY_POSTED)" "1" "and posted"
 has "$(cat "$PQ_HOME/.out")" "security review of #42 posted (\$0.90, 1m30s)" "with its cost"
+eq "$(cut -f1,5,6 <<<"$(cost_sum "$G")")" $'2.1\t1.2\t0.9' "and both reviewers are in the task's ledger, each under its own kind"
 cmp -s "$G/security.md" "$REPORT" && ok || bad "security.md is the report the reviewer replied with"
 has "$(cat "$GH_LOG")" "pr comment 42 --body-file" "pq posted it on the pull request itself"
 body=$(cat "$STUBBIN/.comment-body" 2>/dev/null)

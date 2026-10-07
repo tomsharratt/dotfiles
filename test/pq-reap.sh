@@ -164,9 +164,12 @@ d1=$(mk_done 10 case1 "$REPO" tom/case1 "$wt1")
 st_set "$d1" PQ_PANE pane-1
 cache_row "$REPO" tom/case1 1 MERGED "" master
 PIDX_OK=1; PIDX=$'pane-1\tclaude\tidle'
-reap_task "$d1" 0
+cost_record "$d1" implementer sess-1 11.5; cost_record "$d1" review rev-1 0.9
+reap_task "$d1" 0 2>"$PQ_HOME/.reap.err"
 rc=$?
 [ "$rc" -eq 0 ] && ok || bad "a merged, idle task should report a teardown (rc=$rc)"
+grep -q "tore down tom/case1 (\\\$12.40 in all)" "$PQ_HOME/.reap.err" && ok \
+  || bad "the teardown line says what the task cost in all (got: $(cat "$PQ_HOME/.reap.err"))"
 grep -q "$(printf '%s\t' "$(cd "$REPO" && pwd)")" "$WT_LOG" \
   && ok || bad "wt should have run in the repo's cwd (log: $(cat "$WT_LOG"))"
 grep -q "$(printf 'rm\t--yes\ttom/case1\t')" "$WT_LOG" \

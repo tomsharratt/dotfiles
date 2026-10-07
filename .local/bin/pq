@@ -22,7 +22,7 @@
 #   pq after <task>      list a task's blockers and what each is waiting on
 #   pq after <task> T... add blockers to a task already in the queue
 #   pq after <task> --clear   drop them all
-#   pq ls                every task, its state, and what it is waiting on
+#   pq ls                every task, its state, what it is waiting on, and what it has cost
 #   pq ls --all           also show archive/ - settled history pq no longer walks
 #   pq rm <task>         drop a task (never touches a worktree or a branch)
 #   pq tick              free finished slots, then fill them from the queue
@@ -117,8 +117,9 @@
 #          contract.md how the plan is to be delivered - written once, at dispatch, from
 #                      pq's own template (see `contract_write`); the plan carries the work,
 #                      this carries the rules for turning it into a reviewable pull request
-#          hooks.json  the agent's hooks, handed to it with `--settings` - written once, at
-#                      dispatch, by `hooks_write` (see "reading the agent's hooks")
+#          settings.json  the agent's hooks and status line, handed to it with `--settings` -
+#                      written once, at dispatch, by `settings_write` (see "reading the
+#                      agent's hooks"); hooks.json on a task dispatched before the status line
 #          agent.json  the agent's latest lifecycle event, overwritten by those hooks and
 #                      read by pq instead of the pane
 #          design/     the design files the plan was built from, copied in at add time
@@ -127,6 +128,8 @@
 #          review.rc   its stderr and exit code - see the `review gate` section
 #          security.*  the same three for the security reviewer, when the plan asked for one,
 #                      and security.md, the report it wrote, which pq posts on the pull request
+#          cost/       what the task has cost: one file per Claude session that spent on it -
+#                      the namer, the implementer, each reviewer try - see the `cost` section
 #
 # `after` is neither of the other two: `plan.md` is immutable by contract so an
 # agent re-reading its own plan never sees it change, and `state.env` is runtime
@@ -346,15 +349,102 @@ headless_claude() {                     # claude args...
   env -u HERDR_PANE_ID -u HERDR_TAB_ID -u HERDR_WORKSPACE_ID claude "$@"
 }
 
+# usd -> "$0.71"; the one money format, shared by every log line and `pq ls`.
+fmt_usd() { printf '$%.2f' "$1" 2>/dev/null || printf '$%s' "$1"; }
+
 # total_cost_usd duration_ms -> " (\$0.71, 2m48s)", or "" if neither is known.
 fmt_cost() {                            # cost_usd duration_ms
   local cost=${1:-} dur=${2:-} out=""
-  [ -n "$cost" ] && out="\$$(printf '%.2f' "$cost" 2>/dev/null || printf '%s' "$cost")"
+  [ -n "$cost" ] && out=$(fmt_usd "$cost")
   if [ -n "$dur" ]; then
     local secs=$(( dur / 1000 ))
     out="${out:+$out, }$(( secs / 60 ))m$(( secs % 60 ))s"
   fi
   [ -n "$out" ] && printf ' (%s)' "$out"
+}
+
+# ── cost ────────────────────────────────────────────────────────────────────
+# What a task has cost, in Claude Code's own dollars. Four kinds of session spend
+# on a task: Haiku naming it at `pq add`, the implementer - every prompt its pane
+# ever takes, pq's nudges and follow-ups and whatever you type into it after
+# reading the pull request - and the code and security reviewers, once per try.
+#
+# The ledger is <task>/cost/, ONE FILE PER SESSION, named for its session id and
+# holding that session's latest running total:
+#
+#   {"what": "name" | "implementer" | "review" | "security", "usd": 0.71}
+#
+# A session's total only grows, so each file is overwritten in place rather than
+# appended to, and the task's cost is the sum across files. Keying by session is
+# what makes that sum right without any bookkeeping: `/clear` starts a new
+# session at $0 under a new id, so what came before keeps its own file; every
+# reviewer try is a session of its own; and booking the same try twice, after an
+# interrupted tick, rewrites the same file. And nothing ever read-modify-writes a
+# file another writer touches - the implementer's status line (see
+# statusline_command) writes only its own session's file, pq only the others.
+#
+# `usd: null` is a session whose cost cannot be known: a reviewer killed at the
+# timeout, or one that vanished, leaves no result to read it from - the file is
+# then named for the try. Such a task's total is a LOWER BOUND, and says so with a
+# trailing `+`, as does a task that was started with no implementer record at all
+# (dispatched before this existed, or restarted by hand without its settings).
+# A part that is unknown must never let a partial total read as the whole cost.
+#
+# Two gaps, stated rather than hidden. A session resumed by hand (`claude
+# --resume`) without the task's settings is not tracked; one resumed WITH them
+# restores its earlier total, which counts that spend twice if the resumed
+# session runs under a new id.
+cost_record() {                         # task_dir what id usd
+  local dir="$1/cost" what=$2 id usd=${4:-}
+  id=$(tr -cd 'A-Za-z0-9-' <<<"${3:-}")
+  [ -n "$id" ] || id="$what-$(epoch)-$$-$RANDOM"
+  [[ "$usd" =~ ^[0-9][0-9.eE+-]*$ ]] || usd=null
+  mkdir -p "$dir" 2>/dev/null || return 0
+  jq -nc --arg w "$what" --argjson u "$usd" '{what: $w, usd: $u}' > "$dir/$id.json.$$" 2>/dev/null \
+    && mv -f "$dir/$id.json.$$" "$dir/$id.json" 2>/dev/null
+  rm -f "$dir/$id.json.$$" 2>/dev/null
+  return 0
+}
+
+# A finished reviewer try, read off its own result file before the next launch
+# deletes it. A try with no usable result - killed, vanished, not JSON - is booked
+# as unknown under the try's number, so the total turns into a lower bound
+# instead of quietly leaving it out.
+cost_book() {                           # task_dir stem
+  local d=$1 stem=$2 f="$1/$2.json" sid usd
+  sid=$(jq -r 'if type == "object" then (.session_id // "") else "" end' "$f" 2>/dev/null)
+  usd=$(jq -r 'if type == "object" then (.total_cost_usd // "" | tostring) else "" end' "$f" 2>/dev/null)
+  [ -n "$sid" ] || sid="$stem-try-$(st "$d" "$(reviewer_key "$stem")_TRIES")"
+  cost_record "$d" "$stem" "$sid" "$usd"
+}
+
+# The ledger, summed: total<TAB>partial<TAB>name<TAB>implementer<TAB>review<TAB>security,
+# a part empty when nothing of that kind is known - none recorded, or only
+# unknown ones, which `partial` already says - or nothing at all for a task with
+# no ledger. Read with `cut`, never `read`: a tab is IFS whitespace, so
+# an empty part would let the next one slide into its place.
+cost_sum() {                            # task_dir
+  local d=$1 started=false
+  set -- "$d"/cost/*.json
+  [ -e "$1" ] || return 0
+  [ -n "$(st "$d" PQ_STARTED)" ] && started=true
+  jq -rs --argjson started "$started" '
+    map(select(type == "object" and (.what | type) == "string")) as $r
+    | def part($w): [$r[] | select(.what == $w) | .usd | numbers] | if length == 0 then "" else (add | tostring) end;
+    if ($r | length) == 0 then empty else
+      [ ($r | map(.usd // 0) | add | tostring),
+        (($r | any(.usd == null)) or ($started and ($r | all(.what != "implementer"))) | tostring),
+        part("name"), part("implementer"), part("review"), part("security") ] | @tsv
+    end' "$@" 2>/dev/null
+}
+
+# The total as it is shown: "$4.12", "$4.12+" for a lower bound, nothing with no ledger.
+cost_total() {                          # task_dir
+  local s; s=$(cost_sum "$1")
+  [ -n "$s" ] || return 0
+  fmt_usd "$(cut -f1 <<<"$s")"
+  [ "$(cut -f2 <<<"$s")" = true ] && printf '+'
+  return 0
 }
 
 # ── the cap ─────────────────────────────────────────────────────────────────
@@ -716,9 +806,12 @@ recent_plans() {                        # -> epoch<TAB>path, newest first
 # the intent at the top of its description - and neither can be derived from the
 # filename, which is auto-generated ("floofy-hugging-dragonfly.md").
 #
-# Prints "branch<TAB>intent<TAB>security", or nothing if the model could not be
-# reached or gave something unusable; the caller then stops rather than inventing
-# one. `security` is `yes` when the plan asks for a security review of its work,
+# Prints "branch<TAB>intent<TAB>security<TAB>usd<TAB>session", or nothing if the
+# model could not be reached or gave something unusable; the caller then stops
+# rather than inventing one. The last two are what the call cost and the session
+# it ran as, for the task's ledger (see the `cost` section) - handed back on
+# stdout because `ui_spin` runs this in a subshell of its own, and the task they
+# belong to does not exist yet. `security` is `yes` when the plan asks for a security review of its work,
 # and empty otherwise - it is what opens the security reviewer's ladder beside the
 # code reviewer's (see the `review gate` section). One more field in the same
 # reply rather than a call of its own: ten real plans, four runs each, came back
@@ -738,7 +831,16 @@ name_plan() {                           # plan_file [avoid: a branch already tak
 security is true only when the plan asks for a security review of this change - a /security-review - to be run, including one it calls warranted or mandatory. It is false when the plan says one is not warranted or not needed, when it mentions one only as future or follow-up work, and when it never asks for one.'
   [ -n "$avoid" ] && prompt="$prompt
 The branch must differ from this one, which is already taken: $avoid"
-  raw=$(headless_claude -p --model "$PQ_NAMER_MODEL" "$prompt" < "$1" 2>/dev/null) || return 0
+  raw=$(headless_claude -p --model "$PQ_NAMER_MODEL" --output-format json "$prompt" < "$1" 2>/dev/null) || return 0
+  # The reply is the envelope's `result`; stdout that is not the envelope - no
+  # `result` key, or not JSON at all - is taken as the reply itself, the same
+  # tolerance reviewer_limit_text has.
+  local usd sid text
+  if text=$(jq -er 'if type == "object" and has("result") then .result | tostring else error end' <<<"$raw" 2>/dev/null); then
+    usd=$(jq -r '.total_cost_usd // "" | tostring' <<<"$raw" 2>/dev/null)
+    sid=$(jq -r '.session_id // ""' <<<"$raw" 2>/dev/null)
+    raw=$text
+  fi
   # A usage-limit reply is the limit's one line where the JSON should be, and read
   # as a reply with no JSON it said "Haiku gave no usable branch; try pq add
   # again" - which cannot work until the limit lifts. Say that instead.
@@ -767,9 +869,9 @@ The branch must differ from this one, which is already taken: $avoid"
   # cost an hour of the reviewer model for nothing.
   local mentioned=false
   grep -qiE 'security[- ]review' "$1" 2>/dev/null && mentioned=true
-  jq -er --argjson mentioned "$mentioned" \
+  jq -er --argjson mentioned "$mentioned" --arg usd "${usd:-}" --arg sid "${sid:-}" \
     '[(.branch // "" | sub("^tom/"; "") | gsub("/"; "-") | if . == "" then "" else "tom/" + . end), .intent,
-      (if $mentioned and .security == true then "yes" else "" end)] | @tsv' \
+      (if $mentioned and .security == true then "yes" else "" end), $usd, $sid] | @tsv' \
     2>/dev/null <<<"$json" || return 0
 }
 
@@ -1243,7 +1345,10 @@ cmd_add() {
   # The name, taken apart, and checked before anything is written. `cut`, never
   # `read`: a tab is IFS whitespace, so an empty intent would let the verdict
   # slide into its place.
-  local why
+  # What each naming call cost, `usd<TAB>session` per line, for the ledger the
+  # task is staged with below - the retry for a taken name is a call too.
+  local why named_cost
+  named_cost=$(cut -f4,5 <<<"$named")
   branch=$(cut -f1 <<<"$named"); intent=$(cut -f2 <<<"$named"); security=$(cut -f3 <<<"$named")
   [ -n "$branch" ] || die "could not name the plan - Haiku gave no usable branch; try pq add again"
   git check-ref-format "refs/heads/$branch" || die "invalid branch name: '$branch'"
@@ -1254,6 +1359,7 @@ cmd_add() {
     warn "branch '$branch' is already $why - asking for another name"
     named=$(ui_spin "naming the task again" name_plan "$plan" "$branch") || {
       case $? in 130) die "cancelled" ;; 3) die "could not rename the plan behind the usage limit - pq add again once it lifts" ;; esac; }
+    named_cost="$named_cost"$'\n'"$(cut -f4,5 <<<"$named")"
     branch=$(cut -f1 <<<"$named"); intent=$(cut -f2 <<<"$named"); security=$(cut -f3 <<<"$named")
     [ -n "$branch" ] || die "could not name the plan - Haiku gave no usable branch; try pq add again"
     git check-ref-format "refs/heads/$branch" || die "invalid branch name: '$branch'"
@@ -1331,6 +1437,12 @@ cmd_add() {
   # built here: a task with a plan but no `after` is exactly the kind of
   # half-formed state this staging dance exists to rule out.
   [ -n "$after_lines" ] && printf '%s' "$after_lines" > "$PQ_STAGING/after"
+  # The naming calls' cost, so the ledger starts with the task rather than after it.
+  local nusd nsid
+  while IFS= read -r nusd; do
+    nsid=$(cut -f2 <<<"$nusd"); nusd=$(cut -f1 <<<"$nusd")
+    [ -n "$nusd" ] && cost_record "$PQ_STAGING" name "$nsid" "$nusd"
+  done <<<"$named_cost"
   # The design files too, and for the same reason: the header names them, so a
   # task must never land with a `design:` line and an empty design/.
   if [ -n "$design_files" ]; then
@@ -1614,8 +1726,8 @@ slot_state() {                          # task_dir -> "wrapping up" | ""
 }
 
 # ── reading the agent's hooks ────────────────────────────────────────────────
-# Every dispatched implementer is started with `--settings <task>/hooks.json`
-# (`hooks_write`), and each of those hooks overwrites <task>/agent.json with the
+# Every dispatched implementer is started with `--settings <task>/settings.json`
+# (`settings_write`), and each of those hooks overwrites <task>/agent.json with the
 # agent's latest lifecycle event. pq reads that file, never the screen, for the
 # three ways an unattended agent stops without exiting: a permission prompt, which
 # is recorded and left for you; an API error that ended its turn, which
@@ -1653,22 +1765,66 @@ hook_command() {                        # quoted_file event -> a shell command
   esac
 }
 
-# Once, at dispatch, beside contract.md and as immutable as it. Every path is the
-# stable task_home one, since the task moves from running/ to done/ while the agent
-# is still going.
-hooks_write() {                         # task_dir
-  local d=$1 f tmp
+# The status line, which is how the implementer's cost reaches the ledger (see the
+# `cost` section). Claude Code runs it after every assistant message - focused or
+# not, which a herdr pane mostly is not - with the session's id and its running
+# `cost.total_cost_usd`, subagents included, on stdin. Hooks get no cost at all,
+# so this is the one place an interactive session says what it has spent; and
+# because it lives as long as the session does, every later prompt counts: pq's
+# nudges and follow-ups, and whatever you type into the pane after reading the
+# pull request.
+#
+# A status line is shown, too, and the one in `--settings` replaces whichever
+# would otherwise have been in effect. So this records and then hands the same
+# stdin to that one (`chain`, resolved at dispatch by statusline_inherited): what
+# the bar shows is exactly what it showed before. Nothing the recording does may
+# reach the bar - every error goes to /dev/null - and a payload with no numeric
+# cost writes nothing rather than a null that would read as a lower bound. The
+# chained command goes on a line of its own inside the braces, so a trailing
+# comment in it cannot swallow the closing one.
+# The single quotes are the status line's own shell, as in hook_command.
+# shellcheck disable=SC2016
+statusline_command() {                  # quoted_cost_dir [chain] -> a shell command
+  local f=$1 chain=${2:-}
+  printf 'in=$(cat); { f=%s; sid=$(printf %%s "$in" | jq -r ".session_id // empty" | tr -cd A-Za-z0-9-); [ -z "$sid" ] || { printf %%s "$in" | jq -ce %s >"$f/$sid.json.$$" && mv -f "$f/$sid.json.$$" "$f/$sid.json"; rm -f "$f/$sid.json.$$"; }; } 2>/dev/null' \
+    "$f" "'select((.cost.total_cost_usd | type) == \"number\") | {what: \"implementer\", usd: .cost.total_cost_usd}'"
+  if [ -n "$chain" ]; then printf '; printf %%s "$in" | {\n%s\n}' "$chain"; else printf '; :'; fi
+}
+
+# The status line command that would be in effect in this worktree without pq's:
+# the first set of local, project and user settings, in Claude Code's own order.
+statusline_inherited() {                # worktree -> a command, or nothing
+  local f
+  for f in "${1:+$1/.claude/settings.local.json}" "${1:+$1/.claude/settings.json}" \
+           "${CLAUDE_CONFIG_DIR:-$HOME/.claude}/settings.json"; do
+    [ -n "$f" ] && [ -f "$f" ] || continue
+    jq -er '.statusLine.command // empty' "$f" 2>/dev/null && return 0
+  done
+  return 0
+}
+
+# Once, at dispatch, beside contract.md and as immutable as it: the hooks and the
+# status line, in the one file `agent_start` hands to `--settings`. Every path is
+# the stable task_home one, since the task moves from running/ to done/ while the
+# agent is still going. A task dispatched before the status line existed has a
+# hooks.json instead, and no implementer cost.
+settings_write() {                      # task_dir worktree
+  local d=$1 f c tmp
   f=$(printf '%q' "$(task_home "$d")/agent.json")
-  tmp="$d/hooks.json.$$"
+  c=$(printf '%q' "$(task_home "$d")/cost")
+  mkdir -p "$d/cost" || return 1
+  tmp="$d/settings.json.$$"
   jq -n \
     --arg working "$(hook_command "$f" working)" \
     --arg permission "$(hook_command "$f" permission)" \
     --arg idle "$(hook_command "$f" idle)" \
     --arg error "$(hook_command "$f" error)" \
+    --arg status "$(statusline_command "$c" "$(statusline_inherited "${2:-}")")" \
     'def h($c): [{hooks: [{type: "command", command: $c}]}];
      {hooks: {UserPromptSubmit: h($working), PostToolUse: h($working),
-              PermissionRequest: h($permission), Stop: h($idle), StopFailure: h($error)}}' \
-    >"$tmp" && mv "$tmp" "$d/hooks.json"
+              PermissionRequest: h($permission), Stop: h($idle), StopFailure: h($error)},
+      statusLine: {type: "command", command: $status}}' \
+    >"$tmp" && mv "$tmp" "$d/settings.json"
 }
 
 # The one reader: event<TAB>at<TAB>error<TAB>message, empty when there is no usable
@@ -2593,6 +2749,12 @@ cmd_ls() {
             | sed '/^$/d' | sort -u | awk 'END { print (NR > 1) }')
   multi_effort=$(while IFS= read -r d; do [ -n "$d" ] && hdr "$d/plan.md" effort; done <<<"$tasks" \
             | sed '/^$/d' | sort -u | awk 'END { print (NR > 1) }')
+  # COST the same way: only once some listed task has a ledger, so a list of
+  # tasks from before cost tracking reads as it always has.
+  local any_cost=0
+  while IFS= read -r d; do
+    [ -n "$d" ] && compgen -G "$d/cost/*.json" >/dev/null && { any_cost=1; break; }
+  done <<<"$tasks"
 
   local tbl="$PQ_HOME/.ls.$$.tsv"
   local slug branch model effort intent added pr num prstate draft agent needs=0 blocked
@@ -2606,7 +2768,9 @@ cmd_ls() {
     hdrline="${hdrline}${TAB}STATE"
     [ "$multi_model" = 1 ]  && hdrline="${hdrline}${TAB}MODEL"
     [ "$multi_effort" = 1 ] && hdrline="${hdrline}${TAB}EFFORT"
-    hdrline="${hdrline}${TAB}AGENT${TAB}PR${TAB}AGE"
+    hdrline="${hdrline}${TAB}AGENT${TAB}PR"
+    [ "$any_cost" = 1 ] && hdrline="${hdrline}${TAB}COST"
+    hdrline="${hdrline}${TAB}AGE"
     printf '%s\n' "$hdrline" > "$tbl"
   fi
   while IFS= read -r d; do
@@ -2662,9 +2826,11 @@ cmd_ls() {
         --arg review "$(st "$d" PQ_REVIEW)" --arg review_result "$(st "$d" PQ_REVIEW_RESULT)" \
         --arg security "$(st "$d" PQ_SECURITY)" --arg security_result "$(st "$d" PQ_SECURITY_RESULT)" \
         --arg design "$(hdr "$d/plan.md" design)" \
+        --arg cost "$(cost_sum "$d")" \
         --argjson holding_slot "$holding" \
         --argjson after "$(after_json "$d")" --argjson blocked "$blocked" '
         def str: if . == "" then null else . end;
+        def num: if . == "" or . == null then null else tonumber end;
         { task: $task, stamp: ($stamp|tonumber), state: $state, dir: $dir,
           repo: $repo, branch: $branch, base: ($base|str), model: $model, effort: $effort,
           intent: ($intent|str), added: ($added|str),
@@ -2676,14 +2842,21 @@ cmd_ls() {
           reaped: ($reaped|str), held: ($held|str),
           review: ($review|str), review_result: ($review_result|str),
           security: ($security|str), security_result: ($security_result|str),
-          design: (if $design == "" then [] else ($design | split(", ")) end) }' >> "$tbl"
+          design: (if $design == "" then [] else ($design | split(", ")) end) }
+        + ($cost | split("\t") as $c
+           | { cost_usd: ($c[0] // "" | num), cost_partial: ($c[1] == "true"),
+               cost: (if $c[0] == null then null else
+                        { name: ($c[2] | num), implementer: ($c[3] | num),
+                          review: ($c[4] | num), security: ($c[5] | num) } end) })' >> "$tbl"
     else
       local row="$slug"
       [ "$multi" = 1 ] && row="${row}${TAB}$(cell "$(basename "${repo:--}")" 20)"
       row="${row}${TAB}${st}"
       [ "$multi_model" = 1 ]  && row="${row}${TAB}${model:--}"
       [ "$multi_effort" = 1 ] && row="${row}${TAB}${effort:--}"
-      row="${row}${TAB}${agent}${TAB}${pr}${TAB}$(age_of "$added")"
+      row="${row}${TAB}${agent}${TAB}${pr}"
+      if [ "$any_cost" = 1 ]; then local spent; spent=$(cost_total "$d"); row="${row}${TAB}${spent:--}"; fi
+      row="${row}${TAB}$(age_of "$added")"
       printf '%s\n' "$row" >> "$tbl"
     fi
   done <<<"$tasks"
@@ -3147,7 +3320,7 @@ agent_start() {                         # task_dir pane model effort -> 0 an age
     # Shielded like `wt new`: a Ctrl-C mid-start would otherwise leave a Claude
     # half-launched with nobody to record it.
     shielded herdr agent start "$name" --kind claude --pane "$pane" --timeout "$PQ_AGENT_START_MS" \
-      -- --model "$model" --effort "$effort" --settings "$(task_home "$d")/hooks.json"
+      -- --model "$model" --effort "$effort" --settings "$(task_home "$d")/settings.json"
     rc=$?
     code=$(herdr_err "$SHIELDED_OUT")
     if [ -z "$code" ] && { [ "$rc" != 0 ] || [ -z "$SHIELDED_OUT" ]; }; then code="herdr exited $rc with no answer"; fi
@@ -3283,10 +3456,12 @@ dispatch_task() {                       # task_dir  -> 0 launched, 1 failed, 2 w
     contract_write "$d" || { warn "$(slug_of "$d"): could not write contract.md"; return 1; }
   fi
 
-  # The agent's hooks, once, for the same reason: `agent_start` passes the file, and
-  # pq reads what they write (see "reading the agent's hooks").
-  if [ ! -f "$d/hooks.json" ]; then
-    hooks_write "$d" || { warn "$(slug_of "$d"): could not write hooks.json"; return 1; }
+  # The agent's hooks and status line, once, for the same reason: `agent_start`
+  # passes the file, and pq reads what they write (see "reading the agent's hooks"
+  # and the `cost` section). After `wt new`, since the status line it chains to is
+  # resolved from the worktree's own settings.
+  if [ ! -f "$d/settings.json" ]; then
+    settings_write "$d" "$(st "$d" PQ_WORKTREE)" || { warn "$(slug_of "$d"): could not write settings.json"; return 1; }
   fi
 
   # Start the agent, unless one is already there. `PQ_STARTED` is the record;
@@ -3704,8 +3879,12 @@ reviewer_launch() {                     # task_dir stem cwd cmd...
   st_set "$d" "$key" running
 }
 
+# Every kill books the try first - a timeout, a pull request that settled under
+# it, `pq rm` - since a reviewer stopped part way spent money all the same: its
+# real cost if it had in fact finished, unknown otherwise (see cost_book).
 reviewer_kill() {                       # task_dir stem
   local d=$1 stem=$2 pid; pid=$(st "$d" "$(reviewer_key "$stem")_PID")
+  cost_book "$d" "$stem"
   if [ -n "$pid" ] && review_alive "$pid"; then
     kill -TERM -- "-$pid" 2>/dev/null || pkill -TERM -g "$pid" 2>/dev/null || true
   fi
@@ -4125,6 +4304,9 @@ review_step() {                         # task_dir dry pr pstate
     running)
       local pid; pid=$(st "$d" PQ_REVIEW_PID)
       if [ -f "$d/review.rc" ]; then
+        # Booked first, whatever the try amounts to: the next launch deletes
+        # review.json, and a try that posted nothing cost just as much.
+        [ "$dry" = 1 ] || cost_book "$d" review
         local limit
         if limit=$(reviewer_limit_text "$d" review); then
           [ "$dry" = 1 ] && { msg "would count $slug's review as a failed try - it hit the usage limit"; return 0; }
@@ -4159,6 +4341,7 @@ review_step() {                         # task_dir dry pr pstate
       fi
       if ! review_alive "$pid"; then
         [ "$dry" = 1 ] && { msg "would count $slug's vanished reviewer as a failed try"; return 0; }
+        cost_book "$d" review
         reviewer_try_failed "$d" review failed "the reviewer process is gone without leaving an exit code"
         return 0
       fi
@@ -4211,6 +4394,7 @@ security_step() {                       # task_dir dry pr pstate
       ;;
     running)
       if [ -f "$d/security.rc" ]; then
+        [ "$dry" = 1 ] || cost_book "$d" security
         local limit
         if limit=$(reviewer_limit_text "$d" security); then
           [ "$dry" = 1 ] && { msg "would count $slug's security review as a failed try - it hit the usage limit"; return 0; }
@@ -4243,6 +4427,7 @@ security_step() {                       # task_dir dry pr pstate
       local pid; pid=$(st "$d" PQ_SECURITY_PID)
       if ! review_alive "$pid"; then
         [ "$dry" = 1 ] && { msg "would count $slug's vanished security reviewer as a failed try"; return 0; }
+        cost_book "$d" security
         reviewer_try_failed "$d" security failed "the security reviewer process is gone without leaving an exit code"
         return 0
       fi
@@ -4753,7 +4938,8 @@ reap_task() {                           # task_dir dry -> 0 torn down, 2 would (
   if [ "$rc" = 0 ]; then
     [ "$was" != dirty ] || st_set "$d" PQ_REAP_HELD ""
     st_set "$d" PQ_REAPED "$(now)"
-    msg "$slug: ${why:-settled} - tore down $branch"
+    local spent; spent=$(cost_total "$d")
+    msg "$slug: ${why:-settled} - tore down $branch${spent:+ ($spent in all)}"
     return 0
   fi
   warn "$slug: wt rm failed - run by hand: wt rm -y $branch"
@@ -4839,7 +5025,8 @@ archive_pass() {                        # dry -> count, via stdout; msg/warn as 
     else
       moved=$(retitle "$d" archive)
       st_set "$moved" PQ_ARCHIVED "$(now)"
-      msg "archived $slug - $why"
+      local spent; spent=$(cost_total "$moved")
+      msg "archived $slug - $why${spent:+ ($spent)}"
     fi
     n_arch=$((n_arch + 1))
   done <<<"$(head -n "$to_archive" <<<"$cands")"
@@ -5002,8 +5189,9 @@ tick_body() {                           # cap dry
           # So does the security reviewer's ladder, for a plan that asked.
           st_set "$d" PQ_REVIEW pending
           [ "$(hdr "$d/plan.md" security)" = yes ] && st_set "$d" PQ_SECURITY pending
+          local spent; spent=$(cost_total "$d")
           retitle "$d" "done" >/dev/null
-          msg "finished $slug - #$num $what"
+          msg "finished $slug - #$num $what${spent:+ ($spent so far)}"
         fi
         continue
       fi

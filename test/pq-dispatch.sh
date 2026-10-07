@@ -148,11 +148,14 @@ echo "== the agent is started and prompted through herdr's agent API ==" >&2
 eq "$(herdr_calls)" "agent start;agent prompt;" "exactly one start, then one prompt, and nothing typed into the pane"
 grep -q "^pane	send-text" "$HERDR_LOG" && bad "nothing may be typed into the pane any more" || ok
 H="$PQ_HOME/tasks/$(basename "$D")"
-eq "$(start_line)" "agent start first --kind claude --pane w1:p1 --timeout 60000 -- --model sonnet --effort xhigh --settings $H/hooks.json" \
-  "the start names the agent after the slug and passes model, effort and the hooks, through the stable path, after --"
-[ -f "$D/hooks.json" ] && ok || bad "hooks.json should be written at dispatch"
-eq "$(jq -r '.hooks | keys | join(",")' "$D/hooks.json")" "PermissionRequest,PostToolUse,Stop,StopFailure,UserPromptSubmit" "with a hook for each lifecycle event"
-has "$(cat "$D/hooks.json")" "$H/agent.json" "each writing the agent's record through the stable path"
+eq "$(start_line)" "agent start first --kind claude --pane w1:p1 --timeout 60000 -- --model sonnet --effort xhigh --settings $H/settings.json" \
+  "the start names the agent after the slug and passes model, effort and the settings, through the stable path, after --"
+[ -f "$D/settings.json" ] && ok || bad "settings.json should be written at dispatch"
+eq "$(jq -r '.hooks | keys | join(",")' "$D/settings.json")" "PermissionRequest,PostToolUse,Stop,StopFailure,UserPromptSubmit" "with a hook for each lifecycle event"
+has "$(cat "$D/settings.json")" "$H/agent.json" "each writing the agent's record through the stable path"
+eq "$(jq -r '.statusLine.type' "$D/settings.json")" command "and a status line"
+has "$(jq -r '.statusLine.command' "$D/settings.json")" "$H/cost" "recording the implementer's cost through the stable path too"
+[ -d "$D/cost" ] && ok || bad "the ledger exists from dispatch"
 eq "$(readlink "$H")" "$D" "the stable tasks/ link points at the task"
 P=$(prompt_text)
 has "$P" "Read $H/plan.md and carry it out." "the prompt points at the plan through the STABLE path - the real one moves"
@@ -164,12 +167,12 @@ hasnt "$P" "--base" "no base clause for a task on the default branch"
 eq "$(grep -c "^agent	prompt	" "$HERDR_LOG")" "1" "one prompt"
 eq "$(awk -F'\t' '$1 == "agent" && $2 == "prompt" { print $3 }' "$HERDR_LOG")" "w1:p1" "aimed at the task's pane"
 
-echo "== hooks.json is written once ==" >&2
-echo sentinel > "$D/hooks.json"
+echo "== settings.json is written once ==" >&2
+echo sentinel > "$D/settings.json"
 reset_logs; st_set "$D" PQ_STARTED ""; st_set "$D" PQ_LAUNCHED ""
 set_panes "$(printf 'w1:p1\t\t')"
 dispatch_task "$D" >/dev/null 2>&1
-eq "$(cat "$D/hooks.json")" "sentinel" "a re-entered dispatch never rewrites a running agent's hooks"
+eq "$(cat "$D/settings.json")" "sentinel" "a re-entered dispatch never rewrites a running agent's settings"
 
 echo "== the contract, written once, with what the header says ==" >&2
 C="$D/contract.md"
