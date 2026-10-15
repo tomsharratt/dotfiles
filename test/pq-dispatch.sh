@@ -193,6 +193,13 @@ hasnt "$(cat "$C")" "$D/" "the contract never names the state directory either"
 [ -d "$H/" ] && ok || bad "the stable path resolves to a real directory"
 has "$(cat "$C")" "Make the thing better." "the intent line is carried in"
 hasnt "$(cat "$C")" "## Design fidelity" "no design section without a design"
+# The evidence goes side by side: stacked, a before and its after are a scroll
+# apart, and most drafts stacked them until the contract said otherwise.
+has "$(cat "$C")" "never stacked one under another" "the screenshots go in tables"
+has "$(cat "$C")" "| Before | After |" "a before beside its after"
+has "$(cat "$C")" "| 1440 | 390 |" "and a new screen's widths beside each other"
+has "$(cat "$C")" "blank line before and after every table" "so a caption is never read as a row"
+hasnt "$(cat "$C")" "| Design | Implemented |" "no design/impl table without a design"
 hasnt "$(cat "$C")" "forked from" "no base clause without a base"
 grep -q -- '—' "$C" && bad "no em dashes" || ok
 # The width is set with emulate: resize quietly clamps it to what the window
@@ -224,6 +231,7 @@ has "$(cat "$C")" "Onboarding Refresh.dc.html, shot.png" "naming its files"
 has "$(cat "$C")" "$PQ_HOME/tasks/$(basename "$DB")/design/" "and where they are, through the stable path"
 has "$(cat "$C")" "NN-<screen>-design.png" "and how to name the comparison pairs"
 has "$(cat "$C")" "## Design fidelity\` table" "the PR section asks for the fidelity table"
+has "$(cat "$C")" "| Design | Implemented |" "and lays the design/impl pairs side by side"
 has "$(cat "$C")" "forked from \`live-events\`" "a based task gets the base clause"
 has "$(cat "$C")" "gh pr create --base live-events" "with the flag to pass"
 P=$(prompt_text)

@@ -244,6 +244,7 @@ History may be rewritten only while the pull request is a draft.
 The width is set with `emulate --viewport "390x844x1"` (or `1440x900x1`), never `resize`, which quietly clamps the width to the window's and so produced "390px" screenshots that were not.
 **Design fidelity**, when the task carries design files: open each in the browser, screenshot the target artboard at its native width, build to it, then screenshot the implementation at the same width and state and compare side by side - layout, spacing, sizes, colour, type, radius, icons, copy, and every state the artboard shows - until nothing differs or a difference is deliberate and recorded.
 **A draft pull request with a guide**: `pq evidence` publishes the screenshots, the pull request opens as a draft with the intent line first, a `## Review guide` (the commits in reading order, where the risk is, what is mechanical) and a `## Visual evidence` section - plus, for a design task, a `## Design fidelity` table and the deliberate deviations.
+The screenshots go side by side in two-column tables, never stacked in one long column: `| Before | After |` with a row per width, `| 1440 | 390 |` for a new screen, and `| Design | Implemented |` for a design task's pairs.
 Exactly one pull request, from the task's own branch, since that is the only one `pq` reviews and watches; and no `/code-review` of the implementer's own, since `pq`'s independent one stands in for whatever the repository's conventions ask for.
 
 Anything about `pq` itself that got in the implementer's way goes in the pull request, under a `## pq` heading, and never in its memory - a note saved there outlives the fix, and one telling agents to `rm -rf` a stray task directory outlived the fix that made it unnecessary by a week.
@@ -405,6 +406,10 @@ The order of that prompt is load-bearing, and was wrong for the gate's first few
 The skill reads the first non-flag token as the level and everything after it as the target, so sending the pull request first (`/code-review N <level> --comment`) meant the level was ignored - silently falling back to `codeReviewLastEffort` in `~/.claude.json`, the level last typed at an interactive prompt, which is what "Reusing xhigh effort (the level you typed last)" at the top of those transcripts was reporting - and the target became the string `N <level>` rather than the pull request number.
 It read as harmless only because the level last typed on this machine happened to be `xhigh` as well, the level the gate ran at then.
 Then `pq` prompts the implementer, through herdr's agent API, to read every comment and resolve each - fix it and push, or reply on the thread with the reasoning for leaving it - and to mark the draft ready with `gh pr ready`.
+Before it does, the implementer puts a `## Executive summary` at the very top of the description, above the intent, for whoever reviews it next.
+It has four parts: a confidence pulse (high, medium or low, and why), the few changes to focus the review on, what to settle before merging (declined findings, decisions not yet agreed, anything unverified), and anything else worth knowing, such as a migration or a flag.
+The draft never has one, because what it says only exists once the reviews are answered.
+The body is edited through a file rather than retyped, so every section and image the draft opened with stays, and screenshots it left stacked are moved into tables.
 Nobody reviews the review.
 The point is that a second pair of eyes has been over the diff, and the first pair has had to answer them, before you read either.
 

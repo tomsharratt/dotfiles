@@ -380,6 +380,17 @@ has "$P" "pull request #42" "the prompt names the PR"
 has "$P" "posted its findings as 2 inline review comments" "and says how many inline comments landed"
 has "$P" "gh api repos/{owner}/{repo}/pulls/42/comments" "and how to read them"
 has "$P" "gh pr ready 42" "and how to mark it ready"
+has "$P" "put an executive summary at the very top of the pull request description, above the intent paragraph" \
+  "a summary goes on top before it is marked ready"
+has "$P" "Head it ## Executive summary" "under its own heading"
+for part in "Confidence: high, medium or low" "Focus your review on:" "Before merging:" "Also consider:"; do
+  has "$P" "$part" "the summary has its part: $part"
+done
+has "$P" "gh pr edit 42 --body-file" "the body goes through a file rather than being retyped"
+has "$P" "Keep every section and image the description has" "and nothing the draft carried is dropped"
+has "$P" "still stacked rather than side by side in tables" "but stacked screenshots go into tables"
+[[ $P == *"## Executive summary"*"gh pr ready 42"* ]] && ok || bad "the summary is asked for before the pull request is marked ready"
+has "$P" "do neither - no summary, and do not mark it ready" "and a stuck pull request gets neither"
 has "$P" "Never wait for input" "and that nobody is watching"
 hasnt "$P" "'" "quote-free"
 hasnt "$P" "single commit" "no restructure clause for a three-commit PR"
@@ -528,6 +539,8 @@ has "$P" "could not get an independent review of pull request #42" "it says the 
 has "$P" "the reviewer exited with an error" "and why"
 has "$P" "git diff origin/master...HEAD" "and asks for a self-review against the base"
 has "$P" "gh pr ready 42" "and still asks for the PR to be marked ready"
+has "$P" "## Executive summary" "with the executive summary on top first"
+has "$P" "saying plainly if a review pq tried to run did not happen" "whose confidence says the review did not happen"
 hasnt "$P" "inline review comments" "without pretending there are comments to read"
 
 echo "== a malformed reply is a failed try too ==" >&2

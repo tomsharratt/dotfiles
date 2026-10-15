@@ -3372,7 +3372,8 @@ Never wait for input - there is nobody watching."
 # rather than guides - and visual work drifts from the design it was planned
 # against, because the implementer never saw the design. The contract answers
 # both: small logical commits in reading order with a review guide, screenshots
-# of every screen touched, and a side-by-side comparison against the design files
+# of every screen touched, each beside its before in a table rather than stacked
+# in one long column, and a side-by-side comparison against the design files
 # the task carries. Then a DRAFT pull request, held for the review gate.
 #
 # Parameterised by the task, so the paths in it are absolute and the dev url is
@@ -3465,7 +3466,32 @@ Open the pull request as a draft (\`gh pr create --draft\`), following the repos
 Add two sections to it:
 
 - \`## Review guide\`: the commits in reading order, one line each on what to look at; where the risk is; what is purely mechanical.
-- \`## Visual evidence\`: the before/after pairs${design:+ and the design/impl pairs} with a one-line caption each${design:+, then a \`## Design fidelity\` table - element, design, implemented, note - followed by the deliberate deviations}.
+- \`## Visual evidence\`: every screenshot, in tables laid out as below${design:+, then a \`## Design fidelity\` table - element, design, implemented, note - followed by the deliberate deviations}.
+
+The screenshots go side by side in two-column tables, never stacked one under another: stacked, a reviewer has to scroll between a before and its after.
+Give each screen or state a one-line caption in bold, then its table, with the image lines \`pq evidence\` printed in its cells.
+Leave a blank line before and after every table: a line written straight under one is read as another of its rows.
+A screen with a before gets \`| Before | After |\`, one row per width, 1440 first.
+A new screen, with no before, gets \`| 1440 | 390 |\` instead, and a lone shot - one width, no before - shares a row with the next lone one, each header naming its screen.
+EOF
+    [ -n "$design" ] && cat <<EOF
+The design/impl pairs get \`| Design | Implemented |\`, one row per width.
+EOF
+    cat <<EOF
+For example:
+
+    **Subscriber list: a held subscription now reads Disputed**
+
+    | Before | After |
+    |---|---|
+    | ![01-subscribers-before.png](...) | ![01-subscribers-after.png](...) |
+    | ![02-subscribers-390-before.png](...) | ![02-subscribers-390-after.png](...) |
+
+    **Dispute panel: new, shown to a disputed subscriber**
+
+    | 1440 | 390 |
+    |---|---|
+    | ![03-dispute-panel-after.png](...) | ![04-dispute-panel-390-after.png](...) |
 
 Leave it a draft.
 pq runs an independent \`/code-review\` of every pull request and will tell you when to resolve its findings and mark the pull request ready.
@@ -3743,8 +3769,9 @@ dispatch_gaveup() { [ "$(st "$1" PQ_DISPATCH_GAVEUP)" = 1 ]; }
 # request as a DRAFT and wait. This section is what happens next: once the agent has gone quiet,
 # pq runs `claude -p "/code-review N --comment"` in the background, in the
 # worktree, which posts inline review comments on the pull request; when that
-# finishes, pq prompts the implementer to resolve every comment and mark the
-# draft ready. Nobody reviews the review. The point is that a second pair of
+# finishes, pq prompts the implementer to resolve every comment, put an executive
+# summary for the human reviewer on top of the description, and mark the draft
+# ready. Nobody reviews the review. The point is that a second pair of
 # eyes has been over the diff, and that the first pair had to answer them,
 # before Tom reads either.
 #
@@ -4270,6 +4297,17 @@ security_skip() {                       # task_dir why
 # The code review's count is said when it is known, so the implementer knows how
 # many threads to answer; the reviewer's own reply is pointed at from the
 # fallback when it posted nothing, since it may list findings it could only print.
+#
+# Both openings end by asking for an executive summary at the very top of the
+# description, for the human about to review it: a confidence pulse, the few
+# changes to focus on, what to settle before merging, anything else worth knowing.
+# It is asked for here, at ready time, and not by the contract at the draft,
+# because what it says - which findings were declined, how sure the change is -
+# only exists once the reviews are answered. Above the intent the contract put
+# first, so the decisions and concerns are the first thing read. The body goes
+# through a file, because `gh pr edit` replaces all of it, and a description
+# retyped from memory drops the evidence images the draft carried. It is also the
+# last chance to put screenshots a draft stacked into the contract's tables.
 review_prompt() {                       # pr result split lines base [security_result security_posted report] [landed reply]
   local pr=$1 result=$2 split=${3:-} lines=${4:-} base=${5:-} splitc="" why text
   local sec=${6:-} sposted=${7:-} report=${8:-} secc="" swhy
@@ -4296,8 +4334,24 @@ the pull request what you checked. " ;;
   [ "$split" = 1 ] && splitc="The pull request is a single commit of $lines changed lines. \
 Before marking it ready, restructure the branch into small logical commits, each coherent \
 on its own with a message saying why, and push with --force-with-lease. "
-  local tail="Then, if the pull request is still a draft, mark it ready with gh pr ready $pr. \
-If you opened it because you were stuck, do not mark it ready; answer what you can and stop. \
+  local tail="Then, before marking it ready, put an executive summary at the very top of the pull request description, \
+above the intent paragraph, for the person who reviews it next: in under a minute it should tell them where to look \
+and what is worth worrying about. Save the description as it stands (gh pr view $pr --json body -q .body) to a file \
+in a directory made with mktemp -d, never inside the worktree, add the summary on top, and apply it with \
+gh pr edit $pr --body-file <file>. Keep every section and image the description has, changing one only where the \
+review fixes made it wrong, such as the commits the review guide lists, or the visual evidence, if its screenshots \
+are still stacked rather than side by side in tables. Head it ## Executive summary and keep it \
+to a handful of bullets under four bold labels. \
+Confidence: high, medium or low, with one line on why - how many review findings you fixed and how many you declined, \
+and saying plainly if a review pq tried to run did not happen. \
+Focus your review on: the few changes that carry the risk or a key decision, every deviation from the plan among them, \
+each pinned to its file or commit with what to check there. \
+Before merging: every review finding you declined with a link to its thread, decisions a human has not yet agreed to, \
+anything you could not verify end to end, and any other concern - or None. \
+Also consider: anything else worth knowing before it ships, such as a migration, a flag to turn on or a follow-up - or None. \
+Be candid: it is read first, and it is only worth reading if it names the weak spots. \
+Then, if the pull request is still a draft, mark it ready with gh pr ready $pr. \
+If you opened it because you were stuck, do neither - no summary, and do not mark it ready; answer what you can and stop. \
 Never wait for input - there is nobody watching."
   case "$result" in
     ok)
