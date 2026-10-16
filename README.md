@@ -304,6 +304,7 @@ A task has at most one dependency, picked at the wizard or set later with `pq af
 A task B builds on is dispatched from A's branch: fill records the branch at the claim (`PQ_STACK_PARENT`), so a dispatch resumed on a later tick keeps it, and dispatch forks the worktree from `origin/<A's branch>` and records the exact commit it forked from (`PQ_STACK_FORK`).
 B's own commits are the ones after that commit.
 An A that merged between the claim and the fork is not built on: B forks from the default branch, which already holds it.
+An A whose pull request was closed meanwhile is not built on either: the dispatch is refused, saying why, since forking from abandoned work helps nobody.
 B's prompt and its contract tell it to open its pull request against A's branch (`gh pr create --draft --base <A's branch>`), what to do if A merged or was rebased before it got that far, and that GitHub may rewrite its branch on origin from then on.
 Once B's pull request exists, the tick adds it to A's stack with the official extension, `gh stack link`, by pull request number only - a branch name would make it push the agent's unpushed work.
 The first link of a series makes a stack of the pair (`gh stack link <A> <B>`); a later link goes through the stack's own number (`gh stack link <stack> <C>`), because the pair form refuses once the stack is longer than the pair.
@@ -511,7 +512,7 @@ The review gate ends when the implementer marks its pull request ready, and for 
 What happens to a pull request after that - CI failing, the base moving until it conflicts, a person leaving review comments - was left for whoever looked next, which was you typing into the pane: "The CI is failing, maybe just flakey", "can you resolve the merge conflicts on the PR".
 So a task whose gate reached `ready` is still watched while its pull request is open and not a draft, and its agent is prompted about the one thing most in the way of a merge:
 
-- **conflict** - the pull request no longer merges into its base; the agent is told to rebase onto it and push with `--force-with-lease --force-if-includes`, never to merge it in, since any ready pull request can become the bottom of a stack and a merge commit would stop the stack merging - and, for an agent dispatched before its contract said so, that this replaces the old rule against rewriting a ready pull request
+- **conflict** - the pull request no longer merges into its base; the agent is told to rebase onto it and push with `--force-with-lease --force-if-includes`, never to merge it in, since any ready pull request can become the bottom of a stack and a merge commit would stop the stack merging - and, for an agent dispatched before its contract said so, that this replaces the old rule against rewriting a ready pull request; a stacked task is told to move only its own layer, `git rebase --onto <base head> <fork>`, since the layer below may have been rebased itself, and pq records that head as its new fork point
 - **ci** - every check has finished and at least one failed; the prompt names each failed check and its run, and says how to rerun a job that is flaky rather than broken
 - **review** - a person has left feedback since the pull request was marked ready: a new inline thread, a reply from someone other than the author, a review with a verdict or a body, or a comment on the conversation
 
