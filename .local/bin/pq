@@ -111,6 +111,7 @@
 #
 #   <task>/plan.md     the settings header + Claude's plan, immutable once queued
 #                     (`design:` is optional, a comma-separated list of the files in design/;
+#                      `artifact:` likewise, the claude.ai links that design was reviewed at, only beside `design:`;
 #                      `security: yes` likewise, when the plan asks for a security review - see name_plan;
 #                      `branch:`, `intent:` and `security:` are absent until it is named)
 #          after       its dependency, one line, TSV  label <TAB> repo <TAB> branch
@@ -1403,16 +1404,23 @@ pick_after() {
 }
 
 # ── design files ─────────────────────────────────────────────────────────────
-# A plan written from a Claude Design file describes the design in prose, and an
+# A plan written from a design describes the design in prose, and an
 # implementer that only ever sees the prose builds to its memory of a picture it
 # never saw - PR #6706 said as much in its own description. So the file travels
 # with the task: the wizard asks for one, and every absolute or ~-prefixed
 # path to a .dc.html/.html/.png/.jpg/.jpeg/.pdf that the plan's text mentions is
-# picked up on its own (AGENTS.md asks the planning session to save the file and
-# cite that path). The files are copied into <task>/design/ inside the staging
-# dance and named in the `design:` header, so a task lands with its design or not
-# at all, and the contract (see contract_write) tells the implementer what to do
-# with them.
+# picked up on its own. The files are copied into <task>/design/ inside the
+# staging dance and named in the `design:` header, so a task lands with its
+# design or not at all, and the contract (see contract_write) tells the
+# implementer what to do with them.
+#
+# The planning session draws the design itself, as an Artifact (AGENTS.md):
+# it writes the page to ~/.claude/plans/designs/<Name>.dc.html, publishes it
+# privately from that path, and cites both the path and the claude.ai link. The
+# path is what the implementer builds to; the link is where Tom reviewed it, so
+# it rides along in the `artifact:` header for the people reading the pull
+# request. Only for them: the page is private, and the implementer's browser is
+# a fresh, logged-out Chrome that would meet a login wall.
 
 # The page claude.ai serves for an artifact is not the file it was published
 # from. The host wraps that file in a document of its own - a doctype, a
@@ -1439,16 +1447,17 @@ design_expand() {                       # path as written -> trimmed, ~ expanded
 # Every design-looking path the plan's text mentions and that exists on disk, one
 # per line; a mention that does not exist is warned about by name.
 #
-# Two shapes are tried per line, because Claude Design names its files with
-# spaces ("Onboarding Refresh.dc.html"): first each whitespace-free token that
-# ends in a design extension, and only if none of those exists on disk, the span
-# from the line's last path start to its last design extension - which is exactly
-# the `Design file: /Users/.../Onboarding Refresh.dc.html` line the AGENTS.md
-# rule asks for. Both shapes want the character before the leading `/` to be one
-# that cannot continue a path and not a ':', so `https://claude.ai/design/...` is
-# never read as a path. A `.html.erb` never matches either: the token has to END
-# in the extension, and the span wants the extension followed by something that
-# cannot continue a filename.
+# Two shapes are tried per line, because a design file is named for what it
+# shows, spaces and all ("Product Checkout.dc.html"): first each
+# whitespace-free token that ends in a design extension, and only if none of
+# those exists on disk, the span from the line's last path start to its last
+# design extension - which is exactly the `Design file: /Users/.../Product
+# Checkout.dc.html` line the AGENTS.md rule asks for. Both shapes want the
+# character before the leading `/` to be one that cannot continue a path and
+# not a ':', so a `https://claude.ai/...` url is never read as a path. A
+# `.html.erb` never matches either: the token has to END in the extension, and
+# the span wants the extension followed by something that cannot continue a
+# filename.
 design_mentions() {                     # plan_file -> existing paths, one per line
   local plan=$1 lines line tok cand found span found_all=""
   lines=$(grep -E '\.(dc\.html|html|png|jpe?g|pdf)' "$plan" 2>/dev/null)
@@ -1491,8 +1500,19 @@ design_mentions() {                     # plan_file -> existing paths, one per l
 
 # Does the plan read as built from a design at all? This is what decides whether
 # an EMPTY design set is worth a question (add_wizard) or a warning (cmd_add).
-design_hinted() {                       # plan_file -> 0 when it cites Claude Design
-  grep -qE 'claude\.ai/design|\.dc\.html' "$1" 2>/dev/null
+# A design board (.dc.html) or the claude.ai link of one says so.
+design_hinted() {                       # plan_file -> 0 when it cites a design
+  grep -qE 'claude\.ai/(code/)?artifact/|\.dc\.html' "$1" 2>/dev/null
+}
+
+# Every claude.ai artifact link the plan's text mentions, in order of first
+# mention: the published design Tom reviewed. Any link, not one behind a label -
+# the Step 4 plans of one-time purchases, the first built this way, cite theirs
+# as "Published (private) for review:". The id ends at the first character a
+# link id cannot hold, so trailing punctuation is never part of it.
+design_links() {                        # plan_file -> urls, one per line
+  grep -oE 'https://claude\.ai/(code/)?artifact/[A-Za-z0-9_-]+' "$1" 2>/dev/null | awk '!seen[$0]++'
+  return 0
 }
 
 # One design file into a task's design/: an artifact's source, which has neither
@@ -1596,6 +1616,11 @@ cmd_add() {
   design_hinted "$plan" && design_hinted=1
   local detected; detected=$(design_mentions "$plan")
   [ -n "$detected" ] && design_vals="${design_vals}${detected}"$'\n'
+  # The claude.ai links of that design, joined like the `design:` header - a
+  # link holds no comma. Written only beside a design set: a link is where the
+  # design in design/ was reviewed, and with no design/ there is nothing for it
+  # to stand beside.
+  local artifact_hdr; artifact_hdr=$(design_links "$plan" | paste -sd, - | sed 's/,/, /g')
 
   add_wizard
 
@@ -1675,6 +1700,7 @@ cmd_add() {
     # there is a design set, so every task without one keeps the header it
     # always had.
     [ -n "$design_hdr" ] && printf 'design:   %s\n' "$design_hdr"
+    [ -n "$design_hdr" ] && [ -n "$artifact_hdr" ] && printf 'artifact: %s\n' "$artifact_hdr"
     printf 'model:    %s\n'   "$model"
     printf 'effort:   %s\n'   "$effort"
     printf 'source:   %s\n'   "$plan"
@@ -1701,7 +1727,7 @@ cmd_add() {
   trap - EXIT
 
   msg "plan:   $plan"
-  [ -n "$design_hdr" ] && msg "design: $design_hdr"
+  [ -n "$design_hdr" ] && msg "design: $design_hdr${artifact_hdr:+ - reviewed at $artifact_hdr}"
   [ -n "$dep_say" ] && msg "$dep_say"
   msg "added:  new/$(basename "$dir")  ($model, effort $effort) - the next tick names it and queues it"
   repo_base_reset
@@ -3062,7 +3088,7 @@ cmd_ls() {
         --arg reaped "$reaped" --arg held "$held" \
         --arg review "$(st "$d" PQ_REVIEW)" --arg review_result "$(st "$d" PQ_REVIEW_RESULT)" \
         --arg security "$(st "$d" PQ_SECURITY)" --arg security_result "$(st "$d" PQ_SECURITY_RESULT)" \
-        --arg design "$(hdr "$d/plan.md" design)" \
+        --arg design "$(hdr "$d/plan.md" design)" --arg artifact "$(hdr "$d/plan.md" artifact)" \
         --arg stack_parent "$(st "$d" PQ_STACK_PARENT)" --arg stack "$(st "$d" PQ_STACK)" \
         --arg restack "$(stack_json "$d")" \
         --arg cost "$(cost_sum "$d")" \
@@ -3082,7 +3108,8 @@ cmd_ls() {
           reaped: ($reaped|str), held: ($held|str),
           review: ($review|str), review_result: ($review_result|str),
           security: ($security|str), security_result: ($security_result|str),
-          design: (if $design == "" then [] else ($design | split(", ")) end) }
+          design: (if $design == "" then [] else ($design | split(", ")) end),
+          artifact: (if $artifact == "" then [] else ($artifact | split(", ")) end) }
         + ($cost | split("\t") as $c
            | { cost_usd: ($c[0] // "" | num), cost_partial: ($c[1] == "true"),
                cost: (if $c[0] == null then null else
@@ -3478,10 +3505,11 @@ ${stackc}Never wait for input - there is nobody watching."
 # once, so agents already running keep their old one; the prompts that matter
 # say outright where they replace it (see review_prompt and watch_prompt).
 contract_write() {                      # task_dir
-  local d=$1 repo branch intent design security url wt slug tmp home parent fork pnum defb
+  local d=$1 repo branch intent design artifact security url wt slug tmp home parent fork pnum defb
   repo=$(hdr "$d/plan.md" repo);   branch=$(hdr "$d/plan.md" branch)
   intent=$(hdr "$d/plan.md" intent)
-  design=$(hdr "$d/plan.md" design); security=$(hdr "$d/plan.md" security)
+  design=$(hdr "$d/plan.md" design); artifact=$(hdr "$d/plan.md" artifact)
+  security=$(hdr "$d/plan.md" security)
   url=$(st "$d" PQ_URL); wt=$(st "$d" PQ_WORKTREE); slug=$(slug_of "$d")
   parent=$(st "$d" PQ_STACK_PARENT); fork=$(st "$d" PQ_STACK_FORK)
   if [ -n "$parent" ]; then
@@ -3574,6 +3602,15 @@ EOF
 ## Design fidelity
 
 The plan was built from these design files, which are in \`$home/design/\`: $design.
+EOF
+    # The link is the reviewers', and the implementer is told so in as many
+    # words: the page is private, and an agent told where the design lives
+    # would open it in a browser that is not signed in to claude.ai.
+    [ -n "$design" ] && [ -n "$artifact" ] && cat <<EOF
+They are copies, taken when this task was added, of the design as it was reviewed on claude.ai: $artifact.
+That link is for the people who review your pull request: the page is private and your browser is not signed in to claude.ai, so never open it, and build only from the copies in \`$home/design/\`.
+EOF
+    [ -n "$design" ] && cat <<EOF
 The plan names the artboards that matter.
 Open each file with \`chrome-devtools-axi open file://$home/design/<file>\`, set the artboard's native width with \`emulate --viewport\`, screenshot it, and build to it.
 Then screenshot your implementation at the same width and in the same state, and compare the two side by side: layout, spacing, sizes, colour, type, radius, icons, copy, and every state the artboard shows (hover, empty, error, blocked).
@@ -3603,6 +3640,9 @@ A new screen, with no before, gets \`| 1440 | 390 |\` instead, and a lone shot -
 EOF
     [ -n "$design" ] && cat <<EOF
 The design/impl pairs get \`| Design | Implemented |\`, one row per width.
+EOF
+    [ -n "$design" ] && [ -n "$artifact" ] && cat <<EOF
+Open \`## Design fidelity\` with a link to the design as it was reviewed, $artifact, so whoever reads the pull request can hold it up against the result.
 EOF
     cat <<EOF
 For example:

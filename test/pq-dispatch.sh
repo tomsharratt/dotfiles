@@ -101,8 +101,8 @@ reset_tasks() {
 reset_tasks
 reset_logs() { : > "$HERDR_LOG"; : > "$WT_LOG"; rm -f "$STUBBIN/.start-fail" "$STUBBIN/.start-fail-once" "$STUBBIN/.prompt-fail"; }
 
-mk_task() {                             # state prio slug branch [design] -> task_dir
-  local state=$1 prio=$2 slug=$3 branch=$4 design=${5:-}
+mk_task() {                             # state prio slug branch [design [artifact]] -> task_dir
+  local state=$1 prio=$2 slug=$3 branch=$4 design=${5:-} artifact=${6:-}
   local dir
   dir="$PQ_HOME/$state/$(printf '%014d' $(( 20260101000000 + 10#$prio )))-$slug"
   mkdir -p "$dir"
@@ -111,6 +111,7 @@ mk_task() {                             # state prio slug branch [design] -> tas
     printf 'repo:     %s\n' "$REPO"
     printf 'branch:   %s\n' "$branch"
     [ -n "$design" ] && printf 'design:   %s\n' "$design"
+    [ -n "$artifact" ] && printf 'artifact: %s\n' "$artifact"
     printf 'model:    sonnet\n'
     printf 'effort:   xhigh\n'
     printf 'intent:   Make the thing better.\n'
@@ -246,6 +247,20 @@ has "$(cat "$C")" "$PQ_HOME/tasks/$(basename "$DB")/design/" "and where they are
 has "$(cat "$C")" "NN-<screen>-design.png" "and how to name the comparison pairs"
 has "$(cat "$C")" "## Design fidelity\` table" "the PR section asks for the fidelity table"
 has "$(cat "$C")" "| Design | Implemented |" "and lays the design/impl pairs side by side"
+hasnt "$(cat "$C")" "claude.ai" "a design with no link names no link"
+
+echo "== a design reviewed on claude.ai: the link is the reviewers', and the pull request carries it ==" >&2
+reset_logs; set_panes ""
+DA=$(mk_task running 003 drawn tom/drawn "Product Checkout.dc.html" "https://claude.ai/artifact/7Ex85ip9EC3gFbGbPgux8q")
+dispatch_task "$DA" >/dev/null 2>&1
+C="$DA/contract.md"
+has "$(cat "$C")" "of the design as it was reviewed on claude.ai: https://claude.ai/artifact/7Ex85ip9EC3gFbGbPgux8q." "the copies are said to be of the reviewed design"
+# The page is private and the implementer's browser is a fresh, logged-out
+# Chrome: told only where the design lives, it would go and open it.
+has "$(cat "$C")" "your browser is not signed in to claude.ai, so never open it" "the implementer is told the link is not for it"
+has "$(cat "$C")" "build only from the copies in \`$PQ_HOME/tasks/$(basename "$DA")/design/\`" "and to build from the copies"
+has "$(cat "$C")" "Open \`## Design fidelity\` with a link to the design as it was reviewed, https://claude.ai/artifact/7Ex85ip9EC3gFbGbPgux8q," "the pull request links it"
+grep -q -- '—' "$C" && bad "no em dashes" || ok
 
 echo "== a repo with no dev server is told so, not handed a url nothing serves ==" >&2
 reset_logs; set_panes ""

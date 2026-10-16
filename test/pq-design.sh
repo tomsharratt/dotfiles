@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # test/pq-design.sh - designs travel with the task: `--design`, auto-detection
 # from the plan's text, the `design:` header and design/ directory, the
-# wrapper an artifact's source is copied in, the wizard's design question - and
-# name_plan's reading of Haiku's reply.
+# claude.ai link the design was reviewed at and the wrapper an artifact's
+# source is copied in, the wizard's design question - and name_plan's reading
+# of Haiku's reply.
 #
 # Same conventions as test/pq-add-pick.sh: plain bash, no framework, PQ_HOME and
 # PQ_PLANS_DIR exported before sourcing pq, a PATH-stubbed `claude` that
@@ -116,6 +117,7 @@ printf '<%%= yield %%>\n' > "$DES/app/views/show.html.erb"
 # host wraps it in a document of its own when it serves it.
 ART="$DES/Product Checkout.dc.html"
 printf '<title>Product Checkout</title>\n<div class="board">artboard</div>\n' > "$ART"
+ART_URL=https://claude.ai/artifact/7Ex85ip9EC3gFbGbPgux8q
 
 reset_tasks() {
   rm -rf "$PQ_HOME/new" "$PQ_HOME/queue" "$PQ_HOME/running" "$PQ_HOME/done"
@@ -191,12 +193,18 @@ has "$(cat "$PQ_HOME/.err")" "not on disk: /nonexistent/Missing Board.dc.html" "
 t=$(find_task d5)
 eq "$(hdr "$t/plan.md" design)" "" "and nothing is attached"
 
-echo "== an artifact's source is copied in wrapped as claude.ai serves it ==" >&2
-add_as "$PLAN" tom/d6 --repo "$REPO" --design "$ART" 2>"$PQ_HOME/.err"
+echo "== an artifact: the link rides in the header, the source is copied in wrapped ==" >&2
+# Cited as the Step 4 plans of one-time purchases cite theirs: a path on one
+# line, and the link on the next behind a label pq does not know.
+PLAN5="$PQ_HOME/.p5.md"
+mkplan "$PLAN5" plain "Design file: $ART" "Published (private) for review: $ART_URL." "Again: $ART_URL"
+add_as "$PLAN5" tom/d6 --repo "$REPO" 2>"$PQ_HOME/.err"
 rc=$?
-[ "$rc" -eq 0 ] && ok || bad "an add with an artifact's source should succeed: $(cat "$PQ_HOME/.err")"
+[ "$rc" -eq 0 ] && ok || bad "an add citing an artifact should succeed: $(cat "$PQ_HOME/.err")"
 t=$(find_task d6)
-eq "$(hdr "$t/plan.md" design)" "Product Checkout.dc.html" "the design file is attached"
+eq "$(hdr "$t/plan.md" design)" "Product Checkout.dc.html" "the design file is detected"
+eq "$(hdr "$t/plan.md" artifact)" "$ART_URL" "the link is the artifact: header, once, without the full stop after it"
+has "$(cat "$PQ_HOME/.err")" "design: Product Checkout.dc.html - reviewed at $ART_URL" "and the add says where it was reviewed"
 copy="$t/design/Product Checkout.dc.html"
 eq "$(head -1 "$copy")" "$ARTIFACT_HEAD" "the copy opens with the host's own wrapper"
 eq "$(tail -c ${#ARTIFACT_TAIL} "$copy")" "$ARTIFACT_TAIL" "and closes it"
@@ -214,6 +222,17 @@ t=$(find_task d7)
 cmp -s "$DOC" "$t/design/Full Board.dc.html" && ok || bad "a design with its own doctype is copied as it is"
 cmp -s "$MENTION" "$t/design/Mention.dc.html" && ok || bad "a design with an <html> tag anywhere is copied as it is"
 
+echo "== an artifact link with no design file writes no artifact: header ==" >&2
+PLAN6="$PQ_HOME/.p6.md"
+mkplan "$PLAN6" plain "Design artifact: $ART_URL"
+add_as "$PLAN6" tom/d8 --repo "$REPO" 2>/dev/null
+t=$(find_task d8)
+grep -q '^artifact:' "$t/plan.md" && bad "a link with nothing in design/ to stand beside must not be written" || ok
+design_hinted "$PLAN6" && ok || bad "but the link alone marks the plan as design-built, so the wizard asks for the file"
+printf 'Design artifact: https://claude.ai/code/artifact/3289789e-6224-48cd-a336-f0a7d33559d2\n' > "$PQ_HOME/.m6.md"
+eq "$(design_links "$PQ_HOME/.m6.md")" "https://claude.ai/code/artifact/3289789e-6224-48cd-a336-f0a7d33559d2" \
+  "a Claude Code artifact link, uuid and all, is read too"
+
 echo "== design_mentions, directly: the shapes it reads ==" >&2
 M="$PQ_HOME/.m.md"
 # shellcheck disable=SC2016  # the backticks are markdown, not a substitution
@@ -227,7 +246,9 @@ printf 'Design file: %s\n' "$DC" > "$M"
 eq "$(design_mentions "$M")" "$DC" "the own-line citation with a space in the name is read whole"
 printf 'nothing here\n' > "$M"
 eq "$(design_mentions "$M")" "" "a plan with no design extension yields nothing"
-design_hinted "$PLAN3" && ok || bad "a claude.ai/design url marks the plan as design-built"
+design_hinted "$PLAN3" && ok || bad "a .dc.html named in a url marks the plan as design-built"
+printf 'Built in https://claude.ai/design/p/1de6ab63 long ago.\n' > "$M"
+design_hinted "$M" && bad "a retired Claude Design url alone no longer marks the plan" || ok
 design_hinted "$PLAN4" && ok || bad "a .dc.html mention marks the plan as design-built"
 design_hinted "$PLAN" && bad "a plain plan is not design-built" || ok
 
@@ -303,9 +324,14 @@ echo "== pq ls --json carries the design set ==" >&2
 reset_tasks
 add_as "$PLAN" tom/dj --repo "$REPO" --design "$DES/shot.png" --design "$DC" >/dev/null 2>&1
 add_as "$PLAN" tom/dj0 --repo "$REPO" >/dev/null 2>&1
+PLAN7="$PQ_HOME/.p7.md"
+mkplan "$PLAN7" plain "Design file: $ART" "Design artifact: $ART_URL" "Older: https://claude.ai/artifact/AbC123"
+add_as "$PLAN7" tom/dja --repo "$REPO" >/dev/null 2>&1
 out=$(main ls --json 2>/dev/null)
 eq "$(jq -c '.[] | select(.task == "dj") | .design' <<<"$out")" '["shot.png","Onboarding Refresh.dc.html"]' "the design basenames, in order"
 eq "$(jq -c '.[] | select(.task == "dj0") | .design' <<<"$out")" '[]' "and an empty array when there is none"
+eq "$(jq -c '.[] | select(.task == "dja") | .artifact' <<<"$out")" "[\"$ART_URL\",\"https://claude.ai/artifact/AbC123\"]" "the links, in order"
+eq "$(jq -c '.[] | select(.task == "dj") | .artifact' <<<"$out")" '[]' "and an empty array when there is none"
 
 printf '\n%d passed, %d failed\n' "$pass" "$fail" >&2
 [ "$fail" -eq 0 ]
