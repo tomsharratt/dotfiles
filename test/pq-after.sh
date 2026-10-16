@@ -354,7 +354,9 @@ after_add "$W" fill-parent "$REPO" tom/fill-parent
 mk_task running 30 fill-ready "$REPO" tom/fill-ready >/dev/null
 S=$(mk_task queue 40 fill-stack "$REPO" tom/fill-stack)
 after_add "$S" fill-ready "$REPO" tom/fill-ready
-# The tick loads its own cache; this stands in for the forge's answer.
+# The tick loads its own cache; this stands in for the forge's answer. The real
+# one is kept and put back afterwards: the tests below use it.
+real_pr_load_all=$(declare -f pr_load_all)
 # shellcheck disable=SC2329  # called by tick_body
 pr_load_all() {
   PR_CACHE="$PQ_HOME/.test.pr"; PR_ANS="$PQ_HOME/.test.ans"
@@ -371,7 +373,7 @@ S=$(first_dir "$PQ_HOME/running"/*-fill-stack)
 [ -n "$S" ] && ok || bad "the stack task is claimed"
 [ -n "$S" ] && eq "$(st "$S" PQ_STACK_PARENT)" "tom/fill-ready" "and records the branch it builds on at the claim"
 [ -d "$W" ] && ok || bad "the on task stays queued"
-unset -f pr_load_all
+eval "$real_pr_load_all"
 
 echo "== pr_targets brings a stacked task's parent along, while it can still change ==" >&2
 reset_tasks
