@@ -4087,7 +4087,7 @@ stack_contains() {                      # repo ancestor descendant -> 0 | 1 | 2
 }
 
 # Which of the cases above a stacked task is in, as verdict<TAB>arg: `linear P`,
-# `gained`, `rebased FP`, `landed`, `stale FP` (merged, still carrying the old
+# `gained`, `rebased FP P`, `landed`, `stale FP` (merged, still carrying the old
 # commits), `closed` - or nothing at all when it cannot say this tick (a ref or
 # an object that is not there, gh not answering), which every caller reads as
 # "no change". Its refs are refreshed with base_fetch, so a tick reads origin
@@ -4126,7 +4126,7 @@ stack_verdict() {                       # task_dir
   stack_contains "$repo" "$F" "$P"; rc=$?
   case "$rc" in
     0) printf 'gained\t' ;;
-    1) printf 'rebased\t%s' "$(fingerprint "$P" "$F")" ;;
+    1) printf 'rebased\t%s\t%s' "$(fingerprint "$P" "$F")" "$P" ;;
   esac
 }
 
@@ -4139,13 +4139,13 @@ st_clear() {                            # task_dir key...
 # Everything a need leaves behind. The tries and the last fingerprint asked
 # about stay, as the watch's do: they bound the task, not the one need.
 stack_clear() {                         # task_dir
-  st_clear "$1" PQ_STACK_DUE PQ_STACK_NEEDS PQ_STACK_SEEN_FP PQ_STACK_SEEN_AT PQ_STACK_WAIT
+  st_clear "$1" PQ_STACK_DUE PQ_STACK_NEEDS PQ_STACK_SEEN_FP PQ_STACK_SEEN_AT PQ_STACK_WAIT PQ_STACK_TARGET
 }
 
 # A need, seen this tick: wait out the debounce, then ask the agent or hand it
 # over - see the section's head.
-stack_restack() {                       # task_dir dry onto fp own pnum
-  local d=$1 dry=$2 onto=$3 fp=$4 own=$5 pnum=$6 slug repo branch parent defb pstate nowsec seen at
+stack_restack() {                       # task_dir dry onto fp own pnum [onto_sha]
+  local d=$1 dry=$2 onto=$3 fp=$4 own=$5 pnum=$6 target=${7:-} slug repo branch parent defb pstate nowsec seen at
   slug=$(slug_of "$d"); repo=$(hdr "$d/plan.md" repo); branch=$(hdr "$d/plan.md" branch)
   parent=$(st "$d" PQ_STACK_PARENT); defb=$(repo_base "$repo")
   local word="#$pnum was rebased, so #$own no longer sits on it"
@@ -4195,6 +4195,7 @@ stack_restack() {                       # task_dir dry onto fp own pnum
     0)
       st_set "$d" PQ_STACK_ASKED "$nowsec"; st_set "$d" PQ_STACK_FP "$fp"; st_set "$d" PQ_STACK_FIXES "$(( tries + 1 ))"
       st_clear "$d" PQ_STACK_NEEDS PQ_STACK_WAIT PQ_WRAPUP_SINCE
+      if [ -n "$target" ]; then st_set "$d" PQ_STACK_TARGET "$target"; else st_clear "$d" PQ_STACK_TARGET; fi
       if [ "$onto" = default ]; then msg "$slug: #$pnum merged but #$own still carries its old commits - $done_word"
       else msg "$slug: #$pnum was rebased - $done_word"; fi ;;
     2)
@@ -4255,7 +4256,20 @@ stack_task() {                          # task_dir dry
       esac
     fi
   fi
-  IFS=$'\t' read -r verdict arg <<<"$(stack_verdict "$d")"
+  # The head the agent was asked to move onto becomes the fork point once the
+  # layer sits on it, whatever the parent has done since. Read from the next
+  # verdict instead, a parent that gained a review fix in between reads as
+  # rebased again, from the old fork point - and an --onto from there replays
+  # the parent's own commits onto a head that already has them.
+  local target; target=$(st "$d" PQ_STACK_TARGET)
+  if [ -n "$target" ] && [ "$dry" != 1 ]; then
+    base_fetch "$repo" "$branch"
+    if stack_contains "$repo" "$target" "refs/remotes/origin/$branch"; then
+      st_set "$d" PQ_STACK_FORK "$target"; st_set "$d" PQ_STACK_TARGET ""
+    fi
+  fi
+  local extra
+  IFS=$'\t' read -r verdict arg extra <<<"$(stack_verdict "$d")"
   [ -n "$verdict" ] || return 0
   pnum=$(pr_get "$repo" "$parent" | cut -f1)
   case "$verdict" in
@@ -4278,7 +4292,7 @@ stack_task() {                          # task_dir dry
       st_clear "$d" PQ_STACK_DUE
       st_set "$d" PQ_STACK_NEEDS closed
       warn "$slug: #$pnum, which #$own is stacked on, was closed without merging - decide what becomes of #$own" ;;
-    rebased) stack_restack "$d" "$dry" parent "$arg" "$own" "$pnum" ;;
+    rebased) stack_restack "$d" "$dry" parent "$arg" "$own" "$pnum" "$extra" ;;
     stale)   stack_restack "$d" "$dry" default "$arg" "$own" "$pnum" ;;
   esac
   return 0

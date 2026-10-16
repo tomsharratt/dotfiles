@@ -557,6 +557,18 @@ idle; g rebase -q --onto "$PA" "$F" "$CH"; gpush "$CH"
 restack "$S" >/dev/null 2>&1
 eq "$(need "$S")" "" "the agent's restack clears the need, and the handover with it"
 
+echo "== the head it was asked onto is the fork point, though the parent gained a commit since ==" >&2
+due 28; age_seen "$S"
+restack "$S" >/dev/null 2>&1
+eq "$(prompts)" "1" "asked onto the rebased head"
+g rebase -q --onto "$PA" "$F" "$CH"; gpush "$CH"
+g checkout -q "$PA"; gcommit "pa-28" "review fix"; gpush "$PA"
+age_asked "$S"; idle
+restack "$S" >/dev/null 2>&1
+eq "$(st "$S" PQ_STACK_FORK)" "$P" "the fork point is the head it was moved onto"
+eq "$(need "$S")" "" "and the parent's review fix since is only a gained commit"
+eq "$(st "$S" PQ_STACK_TARGET)" "" "the ask's target is spent"
+
 echo "== gating: no prompt to a working agent, a dialog, the watch's turn or the reviewer's ==" >&2
 due 21; age_seen "$S"
 working; restack "$S" >/dev/null 2>&1; eq "$(prompts)" "0" "working"
