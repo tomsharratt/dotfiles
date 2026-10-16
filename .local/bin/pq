@@ -3399,12 +3399,27 @@ ${stackc}Never wait for input - there is nobody watching."
 # commands) still apply on top - it says so. One sentence per line, as Tom's
 # markdown rule asks, and written once: dispatch_task only calls this when no
 # contract.md exists, so a re-entered dispatch never rewrites a running agent's.
+#
+# The git rules in `## Working` are for every task, stacked or not: any ready
+# pull request can become the bottom of a stack the moment a task building on it
+# opens its own, and from then on GitHub rewrites branches on origin by itself -
+# after a pull request below merges, and on Rebase stack. So an agent syncs
+# before it acts, rebases rather than merges, and never forces over a rewrite it
+# has not integrated (`--force-if-includes`: after a `git fetch`, a plain
+# `--force-with-lease` overwrites one without a word). A contract is written
+# once, so agents already running keep their old one; the prompts that matter
+# say outright where they replace it (see review_prompt and watch_prompt).
 contract_write() {                      # task_dir
-  local d=$1 repo branch intent design security url wt slug tmp home
+  local d=$1 repo branch intent design security url wt slug tmp home parent fork pnum defb
   repo=$(hdr "$d/plan.md" repo);   branch=$(hdr "$d/plan.md" branch)
   intent=$(hdr "$d/plan.md" intent)
   design=$(hdr "$d/plan.md" design); security=$(hdr "$d/plan.md" security)
   url=$(st "$d" PQ_URL); wt=$(st "$d" PQ_WORKTREE); slug=$(slug_of "$d")
+  parent=$(st "$d" PQ_STACK_PARENT); fork=$(st "$d" PQ_STACK_FORK)
+  if [ -n "$parent" ]; then
+    pnum=$(pr_get "$repo" "$parent" | cut -f1)
+    defb=$(repo_base "$repo"); defb=${defb:-the default branch}
+  fi
   # Every path the agent is given is the STABLE one (task_home): the real
   # directory moves to done/ the moment the pull request is reconciled, while
   # the agent is still saving screenshots into it.
@@ -3429,7 +3444,31 @@ One coherent, self-contained step per commit, in the order a reader should meet 
 A mechanical change (a rename, a move, generated output) is its own commit, and its message says so.
 A non-mechanical commit over about 300 changed lines gets split into smaller ones.
 Never one squashed commit at the end: the commits are how the pull request will be read.
-History may be rewritten (\`git push --force-with-lease\`) only while the pull request is still a draft.
+While the pull request is a draft, rewrite its history as you need to.
+Once it is ready, rewrite it only to rebase onto its base, when pq asks you to or when it conflicts - never to restructure it.
+Push a rewritten branch with \`git push --force-with-lease --force-if-includes\`, never \`--force\`.
+GitHub rebases branches itself when a pull request below this one in a stack merges, or when someone presses Rebase stack, and after a \`git fetch\` a plain lease overwrites that without a word.
+If a push is rejected, origin has moved: run \`git pull --rebase --autostash origin $branch\`, then push again.
+Never merge another branch into this one: a stacked pull request needs a linear history to merge, so bring in a moved base by rebasing.
+EOF
+    if [ -n "$parent" ]; then
+      local title="#$pnum" below="#$pnum" head="the head of #$pnum"
+      [ -n "$pnum" ] || { title="\`$parent\`"; below="the pull request on \`$parent\`"; head="the head of that pull request"; }
+      cat <<EOF
+
+## Building on $title
+
+This branch was forked from \`$parent\` at \`${fork:-its head at dispatch}\`, $head, which is ready for review but not merged.
+Your own commits are the ones after that commit.
+Open your pull request against \`$parent\`: \`gh pr create --draft --base $parent\`.
+pq adds it to $below's stack on GitHub.
+Before you open it, run \`git fetch origin\`.
+If \`origin/$parent\` is gone, $below has merged: run \`git rebase --onto origin/$defb ${fork:-<fork>}\` and open the pull request against \`$defb\` instead.
+If \`git merge-base --is-ancestor ${fork:-<fork>} origin/$parent\` fails, $below was rebased: run \`git rebase --onto origin/$parent ${fork:-<fork>}\` first.
+Once the pull request is open, GitHub may rewrite this branch on origin, so run \`git pull --rebase --autostash origin $branch\` before you change anything.
+EOF
+    fi
+    cat <<EOF
 
 ## Verifying, before the pull request
 
@@ -3474,7 +3513,7 @@ If the plan seems to need two, do it all in this one and say so in the descripti
 
 Run \`pq evidence $slug\`.
 It publishes everything in \`$home/evidence/\` and prints one markdown image line per file, to paste into the description.
-Open the pull request as a draft (\`gh pr create --draft\`), following the repository's pull request conventions, with the intent line above as the first paragraph of the description.
+Open the pull request as a draft (\`gh pr create --draft${parent:+ --base $parent}\`), following the repository's pull request conventions, with the intent line above as the first paragraph of the description.
 Add two sections to it:
 
 - \`## Review guide\`: the commits in reading order, one line each on what to look at; where the risk is; what is purely mechanical.

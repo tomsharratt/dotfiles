@@ -203,6 +203,17 @@ has "$(cat "$C")" "| 1440 | 390 |" "and a new screen's widths beside each other"
 has "$(cat "$C")" "blank line before and after every table" "so a caption is never read as a row"
 hasnt "$(cat "$C")" "| Design | Implemented |" "no design/impl table without a design"
 hasnt "$(cat "$C")" "forked from" "no base clause"
+hasnt "$(cat "$C")" "## Building on" "and no stack section for a task that builds on nothing"
+# The git rules every task gets, since any ready pull request can become the
+# bottom of a stack, and GitHub then rewrites branches on origin by itself.
+has "$(cat "$C")" "While the pull request is a draft, rewrite its history as you need to." "a draft's history is the agent's"
+has "$(cat "$C")" "rewrite it only to rebase onto its base, when pq asks you to or when it conflicts - never to restructure it" "a ready one is only rebased"
+has "$(cat "$C")" "\`git push --force-with-lease --force-if-includes\`, never \`--force\`" "pushed so a rewrite it never saw is refused"
+has "$(cat "$C")" "after a \`git fetch\` a plain lease overwrites that without a word" "and why"
+has "$(cat "$C")" "run \`git pull --rebase --autostash origin tom/first\`, then push again" "a rejected push is synced, naming the branch"
+has "$(cat "$C")" "Never merge another branch into this one" "a moved base is rebased, never merged in"
+hasnt "$(cat "$C")" "only while the pull request is still a draft" "the old draft-only rule is gone"
+has "$(cat "$C")" "(\`gh pr create --draft\`)" "the pull request is aimed at the default branch"
 grep -q -- '—' "$C" && bad "no em dashes" || ok
 # The width is set with emulate: resize quietly clamps it to what the window
 # allows, and two sessions lost time to a 390px screenshot that was not.
@@ -373,6 +384,18 @@ P=$(prompt_text)
 has "$P" "This task builds on pull request #77 (tom/parent), which is ready for review but not merged" "the prompt names the pull request it builds on"
 has "$P" "pass --base tom/parent to gh pr create" "and where to aim its own"
 hasnt "$P" "'" "still quote-free"
+C=$(cat "$DS/contract.md")
+F=$(st "$DS" PQ_STACK_FORK)
+has "$C" "## Building on #77" "a stacked task's contract has the stack section"
+has "$C" "This branch was forked from \`tom/parent\` at \`$F\`, the head of #77, which is ready for review but not merged." "naming the parent and the fork point"
+has "$C" "\`gh pr create --draft --base tom/parent\`" "and where its pull request goes"
+has "$C" "pq adds it to #77's stack on GitHub." "and that pq links it"
+has "$C" "run \`git rebase --onto origin/master $F\` and open the pull request against \`master\` instead" "what to do when the parent merged first"
+has "$C" "If \`git merge-base --is-ancestor $F origin/tom/parent\` fails, #77 was rebased: run \`git rebase --onto origin/tom/parent $F\` first." "and when it was rebased"
+has "$C" "run \`git pull --rebase --autostash origin tom/stacked\` before you change anything" "and to sync once GitHub can rewrite it"
+has "$C" "(\`gh pr create --draft --base tom/parent\`)" "the pull request section aims it at the parent too"
+grep -q -- '—' "$DS/contract.md" && bad "no em dashes in the stack section" || ok
+[ "$(grep -n '^## ' "$DS/contract.md" | sed -n 2p | cut -d: -f2-)" = "## Building on #77" ] && ok || bad "right after ## Working"
 
 echo "== a resumed stacked dispatch neither forks again nor re-records the fork ==" >&2
 fork=$(st "$DS" PQ_STACK_FORK)
