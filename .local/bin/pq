@@ -840,6 +840,20 @@ built_on() {                            # [except_task_dir]
   done <<<"$(all_tasks)"
   return 0
 }
+# The default branch as this checkout already knows it - origin/HEAD, else a
+# main or master on origin - with no forge round trip, for the wizard, which
+# must stay fast; repo_base's `gh` fallback is for the tick.
+local_base() {                          # repo -> name, or "the default branch"
+  local b
+  b=$(git -C "$1" symbolic-ref --quiet --short refs/remotes/origin/HEAD 2>/dev/null); b=${b#origin/}
+  if [ -z "$b" ]; then
+    for b in main master ""; do
+      [ -n "$b" ] && git -C "$1" show-ref --verify --quiet "refs/remotes/origin/$b" 2>/dev/null && break
+    done
+  fi
+  printf '%s' "${b:-the default branch}"
+}
+
 # `#N`, or "its pull request" while there is none to number.
 pr_word() { if [ -n "${1:-}" ]; then printf '#%s' "$1"; else printf 'its pull request'; fi; }
 
@@ -1371,9 +1385,7 @@ pick_after() {
   # One line per row, in the same order, so a chosen line's number is its
   # row's; no trailing padding to tell a chosen line apart by.
   lines=$(awk -F'\t' '{ printf "%-40s  %-8s  %s\n", $2, $3, $4 }' <<<"$rows")
-  none="nothing - start from $(repo_base "$own" || printf 'the default branch')"
-  # Its memo goes now: an Esc below dies before cmd_add's own reset is reached.
-  repo_base_reset
+  none="nothing - start from $(local_base "$own")"
   # No --selected: gum's cursor starts on the first row, which is "nothing".
   picked=$(printf '%s\n%s\n' "$none" "$lines" \
     | ui_choose --height 12 --header "build on which? Enter picks") || die "cancelled"

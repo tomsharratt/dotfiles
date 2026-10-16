@@ -224,6 +224,23 @@ case "$(gum_calls)" in *"--no-limit"*) bad "one pick, not a checklist (got: $(gu
 case "$(gum_calls)" in *"--selected"*) bad "no --selected: the cursor starts on nothing (got: $(gum_calls))" ;; *) ok ;; esac
 case "$(gum_calls)" in *"--header build on which? Enter picks"*) ok ;; *) bad "the question is build on which (got: $(gum_calls))" ;; esac
 
+echo "== pick_after: the nothing row never asks the forge ==" >&2
+# No origin/HEAD: the row names the default branch from origin's refs, or not at
+# all - never through repo_base's gh fallback, which would stall pq add.
+git -C "$REPO" symbolic-ref --delete refs/remotes/origin/HEAD
+printf '#!/bin/sh\necho "$*" >> "%s"\nexit 1\n' "$PQ_HOME/.gh-asked" > "$STUBBIN/gh"
+gum_reset; gum_answer "@1"
+run_pick_after >/dev/null 2>&1
+eq "$(gum_stdin 1 | sed -n 1p)" "nothing - start from master" "origin's master names it"
+[ -e "$PQ_HOME/.gh-asked" ] && bad "gh was asked: $(cat "$PQ_HOME/.gh-asked")" || ok
+git -C "$REPO" update-ref -d refs/remotes/origin/master
+gum_reset; gum_answer "@1"
+run_pick_after >/dev/null 2>&1
+eq "$(gum_stdin 1 | sed -n 1p)" "nothing - start from the default branch" "and with nothing known, it says so"
+git -C "$REPO" update-ref refs/remotes/origin/master refs/heads/master
+git -C "$REPO" symbolic-ref refs/remotes/origin/HEAD refs/remotes/origin/master
+printf '#!/bin/sh\nexit 1\n' > "$STUBBIN/gh"
+
 echo "== pick_after: one pick comes back as its stamp; Enter on nothing, or Esc ==" >&2
 gum_reset; gum_answer "@4"
 eq "$(run_pick_after 2>/dev/null)" "$(stamp_of "$A")" "picking task-a selects its stamp"
