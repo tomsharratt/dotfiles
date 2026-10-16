@@ -2555,44 +2555,6 @@ after_check() {                         # task_dir
   printf '%s' "$verdict"
 }
 
-# The base half of the same gate, and the reason it exists at all: fill CLAIMS a
-# task into `running/` before dispatch is attempted, so a dispatch that refuses
-# leaves it there with no PR and no PQ_LAUNCHED. `active_slots` counts `running/`
-# unconditionally, and the next reconcile reads it as an interrupted dispatch and
-# retries - forever, holding one of three slots all night for a task that cannot
-# start. Refusing from `queue/` instead costs nothing and reports itself.
-#
-# This is not a rare case. It is the NORMAL end of the workflow `base:` exists
-# for: you merge the integration branch into the trunk and delete it, and every
-# task still queued behind it now names a branch that is gone.
-#
-# Only a DECLARED base is checked. A task without one forks wherever `wt` would
-# have sent it anyway, and there is nothing here that could be missing.
-#
-# The local remote-tracking ref is the whole test, deliberately: it is exactly
-# what `dispatch_task` will fork from, so agreeing with it is the point. A
-# deleted remote branch whose stale ref nobody pruned therefore still reads as
-# present - and that case does NOT burn a slot (the fork succeeds), it surfaces
-# as the agent's own `gh pr create --base` failing into a draft PR, which is a
-# visible `done/` row rather than a silent stall.
-#
-# Warns once on the transition and clears on recovery, the same once-only flag
-# after_check uses, so a base that comes back re-arms the warning.
-base_check() {                          # task_dir -> "basegone <branch>" | ""
-  local d=$1 b repo was
-  b=$(hdr "$d/plan.md" base)
-  [ -n "$b" ] || return 0
-  repo=$(hdr "$d/plan.md" repo)
-  was=$(st "$d" PQ_BASE_GONE)
-  if git -C "$repo" rev-parse --verify --quiet "refs/remotes/origin/$b^{commit}" >/dev/null 2>&1; then
-    [ -z "$was" ] || st_set "$d" PQ_BASE_GONE ""
-    return 0
-  fi
-  [ "$was" = 1 ] || { st_set "$d" PQ_BASE_GONE 1
-    warn "$(slug_of "$d"): base origin/$b is gone - merged and deleted? pq rm $(slug_of "$d"), then add it again from the branch it should fork from"; }
-  printf 'basegone %s' "$b"
-}
-
 # {label, repo, branch, state} for every blocker, for cmd_ls --json - assumes
 # PR_CACHE/PR_ANS already cover every blocker's (repo, branch), same as
 # after_state assumes.
@@ -2729,9 +2691,9 @@ agent_cell() {                          # task_dir state
   local d=$1 st=$2 pane status blocked
   case "$st" in
     new)
-      # What naming last recorded, never asked again here - the same rule as a
-      # queued task's base below. `naming failed` and `blocker gone` want you;
-      # anything else is a tick away, or waits on the blocker it names.
+      # What naming last recorded, never asked again here - a listing must not
+      # touch git or write to state.env. `naming failed` and `blocker gone` want
+      # you; anything else is a tick away, or waits on the blocker it names.
       case "$(st "$d" PQ_NAME_WHY)" in
         gaveup) printf 'naming failed'; return ;;
         gone)   printf 'blocker gone'; return ;;
@@ -2746,16 +2708,6 @@ agent_cell() {                          # task_dir state
       return
       ;;
     queue)
-      # A base that has gone missing outranks any blocker verdict: the task cannot
-      # start either way, and this is the one that needs YOU rather than time.
-      # Read from the stamp, never probed here - `base_check` in the tick is the
-      # writer, exactly as `block_cell` reads the agent's record rather than inspecting a
-      # pane. A listing must not touch git or write to state.env.
-      #
-      # Without this a task whose base was merged and deleted would show `-` and
-      # count as healthy, which is precisely the silent stall the rest of this
-      # column exists to prevent.
-      [ "$(st "$d" PQ_BASE_GONE)" = 1 ] && { printf 'base gone'; return; }
       [ -f "$d/after" ] || { printf -- '-'; return; }
       local verdict lbl cnt
       IFS=$'\t' read -r verdict _ <<<"$(after_state "$d")"
@@ -2929,7 +2881,7 @@ cmd_ls() {
     agent=$(agent_cell "$d" "$st")
     case "$agent" in
       permission|gone|exited|blocked|unknown|quiet|error|failed) needs=$((needs + 1)) ;;
-      dead\ *|stalled\ *|held\ *|base\ *)             needs=$((needs + 1)) ;;
+      dead\ *|stalled\ *|held\ *)                     needs=$((needs + 1)) ;;
       naming\ failed|blocker\ gone)                   needs=$((needs + 1)) ;;
       review\ lapsed|ci\ failed|conflict|new\ review)  needs=$((needs + 1)) ;;
     esac
@@ -5486,18 +5438,12 @@ tick_body() {                           # cap dry
   # tick that noticed, and it warms the per-task verdict fill reuses below
   # rather than recomputing it.
   local afterpass="$PQ_HOME/.after.$$"; : > "$afterpass"
-  local v bgone
+  local v
   for d in "$PQ_HOME/queue"/*/; do
     [ -d "$d" ] || continue
     d=${d%/}
     v=""
     [ -f "$d/after" ] && v=$(after_check "$d")
-    # A base that no longer resolves OUTRANKS any blocker verdict: the task
-    # cannot start either way, and this is the one of the two that needs you
-    # rather than time. Run after after_check, never instead of it, so the
-    # blocker bookkeeping (PQ_AFTER_DEAD and its clearing) stays consistent.
-    bgone=$(base_check "$d")
-    [ -n "$bgone" ] && v=$bgone
     [ -n "$v" ] && printf '%s\t%s\n' "$d" "$v" >> "$afterpass"
   done
   local waiting; waiting=$(awk -F'\t' '$2 !~ /^met/ { n++ } END { print n + 0 }' "$afterpass")
@@ -5541,9 +5487,6 @@ tick_body() {                           # cap dry
           continue ;;
         dead\ *)
           [ "$dry" = 1 ] && msg "would skip $slug - blocker ${verdict#dead } is dead"
-          continue ;;
-        basegone\ *)
-          [ "$dry" = 1 ] && msg "would skip $slug - base origin/${verdict#basegone } is gone"
           continue ;;
       esac
       if [ "$dry" = 1 ]; then

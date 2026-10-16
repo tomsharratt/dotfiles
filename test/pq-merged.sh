@@ -55,8 +55,6 @@ pass=0 fail=0
 ok()  { pass=$((pass + 1)); }
 bad() { fail=$((fail + 1)); printf 'FAIL: %s\n' "$1" >&2; }
 eq() { [ "$1" = "$2" ] && ok || bad "$3 (got '$1', want '$2')"; }
-# The first path a glob matched, or nothing: `ls -d glob | head -1` without parsing ls.
-first_of() { [ ! -e "${1:-}" ] || printf '%s' "$1"; }
 
 cleanup() { rm -rf "$PQ_HOME" "$STUBBIN" "${REPO:-}" "${REPO2:-}"; }
 trap cleanup EXIT
@@ -277,80 +275,6 @@ eq "$([ -n "$(st "$r2" PQ_MERGED)" ] && printf yes || printf no)" "no" \
 eq "$([ -s "$WT_LOG" ] && printf called || printf quiet)" "quiet" \
   "reap: must not touch a worktree whose work is not in its base"
 repo_base_reset
-
-echo "== a base that no longer resolves must not burn a slot ==" >&2
-# The failure this guards against is the one pq exists to prevent: fill claims a
-# task into running/ BEFORE dispatch is attempted, so a dispatch that refuses
-# leaves it there with no PR and no PQ_LAUNCHED. active_slots counts running/
-# unconditionally, and the next tick sees an "interrupted dispatch" and retries -
-# forever, holding one of three slots all night for a task that can never start.
-#
-# And this is the NORMAL end of the workflow the header exists for: you merge the
-# integration branch into the trunk and delete it. Every task still queued behind
-# it has a base that is gone.
-reset_tasks; reset_caches; : > "$WT_LOG"
-mk_task queue 60 base-is-gone "$REPO" tom/gone no-such-integration-branch >/dev/null
-# Filesystem, never state_of: that reads the path STRING it is handed, so it would
-# happily report "queue" for a directory fill had already moved to running/.
-where() { first_of "$PQ_HOME"/*/*-"$1"; }
-PQ_SUMMARY="" tick_body 3 0 >/dev/null 2>&1
-eq "$(basename "$(dirname "$(where base-is-gone)")")" "queue" \
-  "a task whose base is gone stays in queue/, unclaimed"
-eq "$([ -s "$WT_LOG" ] && printf called || printf quiet)" "quiet" \
-  "wt must never be reached for a task that cannot be forked"
-eq "$(dir_count "$PQ_HOME/running")" "0" \
-  "it must not be holding a slot"
-# Once-only: the warning fires on the transition, not on every tick all night.
-second=$(PQ_SUMMARY="" tick_body 3 0 2>&1 >/dev/null | grep -c "no-such-integration-branch")
-eq "$second" "0" "the base warning is once-only, like every other block pq stamps"
-
-echo "== ...and it recovers the moment the base comes back ==" >&2
-eq "$(st "$(where base-is-gone)" PQ_BASE_GONE)" "1" "the block is stamped while the base is missing"
-git -C "$REPO" update-ref refs/remotes/origin/no-such-integration-branch "$OID_C"
-PQ_SUMMARY="" tick_body 3 0 >/dev/null 2>&1
-eq "$(basename "$(dirname "$(where base-is-gone)")")" "running" "a recovered base lets the task dispatch"
-eq "$(st "$(where base-is-gone)" PQ_BASE_GONE)" "" "and the block is cleared, so it can warn again later"
-git -C "$REPO" update-ref -d refs/remotes/origin/no-such-integration-branch
-
-echo "== pq ls surfaces a gone base, and counts it as needing you ==" >&2
-# The stall this prevents: a task with no blockers and a deleted base showed `-`
-# in the AGENT column and counted as healthy, so the queue sat still with nothing
-# on screen accounting for it.
-reset_tasks; reset_caches
-nb=$(mk_task queue 65 ls-base-gone "$REPO" tom/lsgone no-such-integration-branch)
-eq "$(agent_cell "$nb" queue)" "-" "before any tick has looked, there is nothing to report"
-st_set "$nb" PQ_BASE_GONE 1
-eq "$(agent_cell "$nb" queue)" "base gone" "once stamped, the listing says so"
-case "$(agent_cell "$nb" queue)" in
-  base\ *) ok ;;                        # the shape cmd_ls counts into "needs you"
-  *) bad "the cell must match the base\ * pattern cmd_ls counts" ;;
-esac
-# It outranks a blocker verdict: both are true, but only one needs you.
-printf 'someone\t%s\ttom/nope\n' "$REPO" > "$nb/after"
-eq "$(agent_cell "$nb" queue)" "base gone" "a gone base outranks a blocker in the cell too"
-st_set "$nb" PQ_BASE_GONE ""
-case "$(agent_cell "$nb" queue)" in
-  base\ *) bad "clearing the stamp must restore the blocker report" ;;
-  *) ok ;;
-esac
-
-echo "== a queued task whose base has gone is gated, and warned about once ==" >&2
-reset_tasks; reset_caches
-# A long-queued task is where a stale base accumulates - the branch it names can
-# be merged and deleted while it waits - so it must be gated, and warned about
-# only once however many ticks it then sits through.
-stale=$(mk_task queue 73 queued-base-gone "$REPO" tom/qbg no-such-integration-branch)
-first_warn=$(base_check "$stale" 2>&1 >/dev/null)
-case "$first_warn" in
-  *"pq rm queued-base-gone, then add it again"*) ok ;;
-  *) bad "the warning should say how to recover (got: $first_warn)" ;;
-esac
-st_set "$stale" PQ_BASE_GONE ""
-eq "$(base_check "$stale")" "basegone no-such-integration-branch" "a task whose base is gone is gated"
-eq "$(st "$stale" PQ_BASE_GONE)" "1" "...and stamped on the transition"
-eq "$(base_check "$stale")" "basegone no-such-integration-branch" "still gated on the next pass"
-second_warn=$(base_check "$stale" 2>&1 >/dev/null)
-eq "$second_warn" "" "it must not re-warn every tick while it sits there"
 
 printf '\n%d passed, %d failed\n' "$pass" "$fail" >&2
 [ "$fail" -eq 0 ]
