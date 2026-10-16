@@ -3479,7 +3479,10 @@ EOF
 
 Run the repository's tests and lint, per its conventions.
 EOF
-    if [ -n "$url" ]; then
+    # The url alone says nothing: wt hands one back for every worktree, and only a
+    # profile with a dev server (wt_dev) gives it a `dev` tab to be served from -
+    # a repo with none was told an app was being served that never would be.
+    if [ -n "$url" ] && [ -n "$(st "$d" PQ_DEV_PANE)" ]; then
       cat <<EOF
 The app is served at $url from the \`dev\` tab in this workspace.
 If nothing answers there, or once you have added a gem, changed an initializer or anything else a running server will not pick up, run \`wt restart\` to restart it in that tab - never \`wt dev\`, which would run the whole stack in your own shell.

@@ -55,7 +55,8 @@ EOF
 cat > "$STUBBIN/wt-stub" <<EOF
 #!/bin/sh
 { printf '%s\t' "\$PWD"; for a in "\$@"; do printf '%s\t' "\$a"; done; printf '\n'; } >> "$WT_LOG"
-printf '{"root_pane_id":"w1:p1","dev_pane_id":"w1:p2","path":"%s","workspace_id":"w1","url":"https://task.test","port":3101}\n' "$WT_PATH_DIR"
+dev=w1:p2; [ -f "$STUBBIN/.nodev" ] && dev=""
+printf '{"root_pane_id":"w1:p1","dev_pane_id":"%s","path":"%s","workspace_id":"w1","url":"https://task.test","port":3101}\n' "\$dev" "$WT_PATH_DIR"
 exit 0
 EOF
 chmod +x "$STUBBIN/claude" "$STUBBIN/gh" "$STUBBIN/herdr" "$STUBBIN/wt-stub"
@@ -245,6 +246,18 @@ has "$(cat "$C")" "$PQ_HOME/tasks/$(basename "$DB")/design/" "and where they are
 has "$(cat "$C")" "NN-<screen>-design.png" "and how to name the comparison pairs"
 has "$(cat "$C")" "## Design fidelity\` table" "the PR section asks for the fidelity table"
 has "$(cat "$C")" "| Design | Implemented |" "and lays the design/impl pairs side by side"
+
+echo "== a repo with no dev server is told so, not handed a url nothing serves ==" >&2
+reset_logs; set_panes ""
+touch "$STUBBIN/.nodev"
+DV=$(mk_task running 008 nodev tom/nodev)
+dispatch_task "$DV" >/dev/null 2>&1
+rm -f "$STUBBIN/.nodev"
+C="$DV/contract.md"
+has "$(cat "$C")" "This repository has no dev server profile, so there is no url to open" "no dev tab, no app"
+hasnt "$(cat "$C")" "https://task.test" "and no url, though wt returned one"
+hasnt "$(cat "$C")" "wt restart" "nor a server to restart"
+reset_logs
 
 echo "== re-entry with PQ_STARTED set logs no second start ==" >&2
 reset_logs
