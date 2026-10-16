@@ -4022,12 +4022,12 @@ stack_link() {                          # task_dir dry
 #   parent closed    every row CLOSED            -> handed to you
 #
 # A child whose parent has merged and which has landed is the bottom of its
-# stack: PQ_STACK_PARENT is cleared, PQ_STACK_LANDED records which pull request
-# it was on, and from here on it is an ordinary pull request.
+# stack: PQ_STACK_PARENT is cleared, and from here on it is an ordinary pull
+# request.
 #
-# Every value written is a single word, as st_set needs: the need is two keys,
-# PQ_STACK_ONTO (`parent` or `default`) and PQ_STACK_DUE (its fingerprint, a
-# cksum), both empty when there is none. A rebase cascades on its own: a child
+# Every value written is a single word, as st_set needs: the need is
+# PQ_STACK_DUE, its fingerprint, empty when there is none - which way the layer
+# moves is the verdict's to say again each tick, so it is not stored. A rebase cascades on its own: a child
 # that moved is a rewritten parent for the layer above it, which a later tick
 # sees from that layer's heads.
 #
@@ -4139,7 +4139,7 @@ st_clear() {                            # task_dir key...
 # Everything a need leaves behind. The tries and the last fingerprint asked
 # about stay, as the watch's do: they bound the task, not the one need.
 stack_clear() {                         # task_dir
-  st_clear "$1" PQ_STACK_ONTO PQ_STACK_DUE PQ_STACK_NEEDS PQ_STACK_SEEN_FP PQ_STACK_SEEN_AT PQ_STACK_WAIT
+  st_clear "$1" PQ_STACK_DUE PQ_STACK_NEEDS PQ_STACK_SEEN_FP PQ_STACK_SEEN_AT PQ_STACK_WAIT
 }
 
 # A need, seen this tick: wait out the debounce, then ask the agent or hand it
@@ -4152,7 +4152,6 @@ stack_restack() {                       # task_dir dry onto fp own pnum
   [ "$onto" = default ] && word="#$pnum merged, but #$own still carries its old commits"
   if [ "$dry" != 1 ]; then
     [ "$(st "$d" PQ_STACK_NEEDS)" = closed ] && st_set "$d" PQ_STACK_NEEDS ""
-    [ "$(st "$d" PQ_STACK_ONTO)" = "$onto" ] || st_set "$d" PQ_STACK_ONTO "$onto"
     [ "$(st "$d" PQ_STACK_DUE)" = "$fp" ] || st_set "$d" PQ_STACK_DUE "$fp"
   fi
   nowsec=$(epoch)
@@ -4262,12 +4261,12 @@ stack_task() {                          # task_dir dry
     landed)
       [ "$dry" = 1 ] && { msg "would record that #$own is the bottom of its stack now - #$pnum merged"; return 0; }
       stack_clear "$d"; st_clear "$d" PQ_STACK_ASKED
-      st_set "$d" PQ_STACK_PARENT ""; st_set "$d" PQ_STACK_LANDED "$pnum"
+      st_set "$d" PQ_STACK_PARENT ""
       msg "$slug: #$pnum merged - #$own is the bottom of its stack now" ;;
     closed)
       [ "$(st "$d" PQ_STACK_NEEDS)" = closed ] && return 0
       [ "$dry" = 1 ] && { msg "would leave $slug to you - #$pnum, which #$own is stacked on, was closed without merging"; return 0; }
-      st_clear "$d" PQ_STACK_ONTO PQ_STACK_DUE
+      st_clear "$d" PQ_STACK_DUE
       st_set "$d" PQ_STACK_NEEDS closed
       warn "$slug: #$pnum, which #$own is stacked on, was closed without merging - decide what becomes of #$own" ;;
     rebased) stack_restack "$d" "$dry" parent "$arg" "$own" "$pnum" ;;

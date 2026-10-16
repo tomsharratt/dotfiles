@@ -326,7 +326,9 @@ rows_merged() {                         # merge_oid: the parent merged into main
 }
 # One tick's worth: the fetch memo goes, as it does between ticks.
 restack() { repo_base_reset; stack_task "$1" "${2:-0}"; }
-need() { printf '%s %s %s' "$(st "$1" PQ_STACK_ONTO)" "$(st "$1" PQ_STACK_DUE)" "$(st "$1" PQ_STACK_NEEDS)" | sed 's/ *$//'; }
+need() { printf '%s %s' "$(st "$1" PQ_STACK_DUE)" "$(st "$1" PQ_STACK_NEEDS)" | sed 's/ *$//'; }
+# Which way the verdict moves the layer, as stack_task reads it.
+verdict() { repo_base_reset; stack_verdict "$1" | cut -f1; }
 fp() { printf '%s %s' "$1" "$2" | cksum | awk '{ print $1 }'; }
 
 echo "== restack: a child on its parent's head needs nothing ==" >&2
@@ -356,7 +358,8 @@ S=$(mk_stacked 2)
 g checkout -q "$PA"; g commit -q --amend -m "pa-2: a, resolved"; gpush "$PA"
 P=$(g rev-parse "$PA")
 restack "$S" >/dev/null 2>&1
-eq "$(need "$S")" "parent $(fp "$P" "$F")" "onto parent, fingerprinted by the parent's head and the fork point"
+eq "$(need "$S")" "$(fp "$P" "$F")" "due, fingerprinted by the parent's head and the fork point"
+eq "$(verdict "$S")" "rebased" "onto the parent"
 eq "$(st "$S" PQ_STACK_FORK)" "$F" "the fork point is where the child's own commits start, until it moves"
 echo "== restack: the child moved onto it clears the need ==" >&2
 g rebase -q --onto "$PA" "$F" "$CH"; gpush "$CH"
@@ -382,7 +385,6 @@ g rebase -q --onto main "$F" "$CH"; gpush main "$CH"
 rows_merged "$SQ"
 out=$(restack "$S" 2>&1)
 eq "$(st "$S" PQ_STACK_PARENT)" "" "the parent is cleared"
-eq "$(st "$S" PQ_STACK_LANDED)" "10" "and what it was stacked on is recorded"
 eq "$(need "$S")" "" "with no need"
 has "$out" "ch-4: #10 merged - #11 is the bottom of its stack now" "and said"
 eq "$(restack "$S" 2>&1)" "" "and from then on it is not looked at"
@@ -393,11 +395,12 @@ S=$(mk_stacked 5)
 g checkout -q main; g merge -q --squash "$PA" >/dev/null; g commit -q -m "squash pa-5"; SQ=$(g rev-parse HEAD); gpush main
 rows_merged "$SQ"
 restack "$S" >/dev/null 2>&1
-eq "$(need "$S")" "default $(fp main "$F")" "onto default, fingerprinted by its name and the fork point"
+eq "$(need "$S")" "$(fp main "$F")" "due, fingerprinted by the default branch's name and the fork point"
+eq "$(verdict "$S")" "stale" "onto the default branch"
 eq "$(st "$S" PQ_STACK_PARENT)" "$PA" "the parent is kept until it lands"
 g rebase -q --onto main "$F" "$CH"; gpush "$CH"
 restack "$S" >/dev/null 2>&1
-eq "$(st "$S" PQ_STACK_LANDED)" "10" "the child's own restack lands it"
+eq "$(st "$S" PQ_STACK_PARENT)" "" "the child's own restack lands it"
 eq "$(need "$S")" "" "and clears the need"
 
 echo "== restack: a merge-commit merge puts the fork point on main: landed ==" >&2
@@ -407,7 +410,6 @@ g checkout -q main; g merge -q --no-ff -m "merge pa-6" "$PA"; MC=$(g rev-parse H
 rows_merged "$MC"
 restack "$S" >/dev/null 2>&1
 eq "$(st "$S" PQ_STACK_PARENT)$(need "$S")" "" "landed, with no need"
-eq "$(st "$S" PQ_STACK_LANDED)" "10" "recorded"
 
 echo "== restack: a closed parent is handed over once, and recovers if it reopens ==" >&2
 reset_tasks; stack_pair 7
@@ -446,7 +448,7 @@ eq "$(cat "$S/state.env")" "$before" "no row for the parent this tick: nothing w
 echo "== restack: its own pull request settled takes the need with it ==" >&2
 reset_tasks; stack_pair 9; rows_open
 S=$(mk_stacked 9)
-st_set "$S" PQ_STACK_ONTO parent; st_set "$S" PQ_STACK_DUE 123; st_set "$S" PQ_STACK_NEEDS restack
+st_set "$S" PQ_STACK_DUE 123; st_set "$S" PQ_STACK_NEEDS restack
 reset_caches; cache_row "$RREPO" "$CH" 11 MERGED "" main
 restack "$S" >/dev/null 2>&1
 eq "$(need "$S")" "" "nothing left to hold the gate or read in pq ls"
