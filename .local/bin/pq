@@ -4263,6 +4263,46 @@ stack_cell() {                          # task_dir
   esac
 }
 
+# Every ref the tick's stack_task calls will read - each open layer's own
+# branch, its parent while that is open, and its repo's default branch - in ONE
+# fetch per repo, recorded in base_fetch's memo so none is fetched again this
+# tick. Done one ref at a time instead, each its own ssh handshake, an open
+# stack of N layers cost up to 3N fetches a tick. A batch fails whole when any
+# one ref is gone from origin, and then nothing is recorded: base_fetch fetches
+# each ref on its own, as before.
+stack_prefetch() {
+  [ "${PQ_FETCH_BASES:-0}" = 1 ] || return 0
+  local d repo branch parent ownstate pairs="" r refs b specs memo="$PQ_HOME/.basefetch.$$"
+  for d in "$PQ_HOME/done"/*/; do
+    [ -d "$d" ] || continue
+    d=${d%/}
+    [ -z "$(st "$d" PQ_REAPED)" ] || continue
+    parent=$(st "$d" PQ_STACK_PARENT)
+    [ -n "$parent" ] && [ -n "$(st "$d" PQ_PR)" ] || continue
+    repo=$(hdr "$d/plan.md" repo); branch=$(hdr "$d/plan.md" branch)
+    ownstate=""; IFS=$'\t' read -r _ ownstate _ <<<"$(pr_get "$repo" "$branch")"
+    [ "$ownstate" = OPEN ] || continue
+    pairs="$pairs$repo"$'\t'"$branch"$'\n'"$repo"$'\t'"$(repo_base "$repo")"$'\n'
+    { pr_has_ready "$repo" "$parent" || pr_has_draft "$repo" "$parent"; } && pairs="$pairs$repo"$'\t'"$parent"$'\n'
+  done
+  [ -n "$pairs" ] || return 0
+  while IFS= read -r r; do
+    [ -n "$r" ] || continue
+    refs=$(awk -F'\t' -v r="$r" '$1 == r && $2 != "" { print $2 }' <<<"$pairs" | sort -u)
+    specs=()
+    while IFS= read -r b; do
+      [ -n "$b" ] || continue
+      grep -qxF "$r"$'\t'"$b" "$memo" 2>/dev/null && continue
+      specs+=("+refs/heads/$b:refs/remotes/origin/$b")
+    done <<<"$refs"
+    [ "${#specs[@]}" -gt 0 ] || continue
+    GIT_SSH_COMMAND="${GIT_SSH_COMMAND:-ssh -o ConnectTimeout=5 -o BatchMode=yes}" \
+      git -C "$r" fetch --quiet origin "${specs[@]}" >/dev/null 2>&1 || continue
+    while IFS= read -r b; do [ -n "$b" ] && printf '%s\t%s\n' "$r" "$b" >> "$memo"; done <<<"$refs"
+  done <<<"$(awk -F'\t' '{ print $1 }' <<<"$pairs" | sort -u)"
+  return 0
+}
+
 # One stacked task, one tick: every done task that is not reaped, has a parent
 # and a pull request, and whose pull request is open. Every write is gated on
 # `dry` at its own site.
@@ -6176,6 +6216,7 @@ tick_body() {                           # cap dry
   # before the gate and the watch, so both read this tick's verdict: the
   # reviewers only ever see a layer on its real base, and a conflict the
   # restack is about to fix is not prompted about twice.
+  stack_prefetch
   for d in "$PQ_HOME/done"/*/; do
     [ -d "$d" ] || continue
     stack_link "${d%/}" "$dry"

@@ -517,6 +517,26 @@ out=$(restack "$S" 1 2>&1)
 has "$out" "would record that #11 is the bottom of its stack now - #10 merged" "landed: says so"
 eq "$(cat "$S/state.env")" "$before" "and writes nothing"
 
+echo "== one fetch per repo for every open layer, and a fallback when a ref is gone ==" >&2
+reset_tasks; reset_caches
+stack_pair 18; S1=$(mk_stacked 18); cache_row "$RREPO" "$PA" 10 OPEN "" main; cache_row "$RREPO" "$CH" 11 OPEN "" "$PA"
+stack_pair 19; S2=$(mk_stacked 19); cache_row "$RREPO" "$PA" 12 OPEN "" main; cache_row "$RREPO" "$CH" 13 OPEN "" "$PA"
+FETCHES="$GITS/.fetches"; : > "$FETCHES"
+# shellcheck disable=SC2329  # called by pq
+git() { [ "${3:-}" = fetch ] && printf '%s\n' "$*" >> "$FETCHES"; command git "$@"; }
+repo_base_reset; stack_prefetch
+eq "$(wc -l < "$FETCHES" | tr -d ' ')" "1" "one fetch for two layers, their parents and main"
+has "$(cat "$FETCHES")" "+refs/heads/tom/ch-19:refs/remotes/origin/tom/ch-19" "naming every ref"
+: > "$FETCHES"
+stack_task "$S1" 0 >/dev/null 2>&1; stack_task "$S2" 0 >/dev/null 2>&1
+eq "$(wc -l < "$FETCHES" | tr -d ' ')" "0" "and stack_task fetches nothing more this tick"
+cache_row "$RREPO" tom/gone-20 14 OPEN "" main
+CH=tom/gone-20; PA=tom/pa-18; S3=$(mk_stacked 20)
+: > "$FETCHES"; repo_base_reset; stack_prefetch
+stack_task "$S1" 0 >/dev/null 2>&1
+[ "$(wc -l < "$FETCHES" | tr -d ' ')" -gt 1 ] && ok || bad "a ref gone from origin fails the batch, and each ref is fetched on its own (got $(cat "$FETCHES"))"
+unset -f git
+
 # ── asking the agent ────────────────────────────────────────────────────────
 set_panes() {                           # "pane<TAB>agent<TAB>status" lines
   PIDX=$1; PIDX_OK=1
