@@ -5048,13 +5048,22 @@ watch_feedback() {                      # repo pr since author -> count<TAB>logi
 # a merge commit in it would stop the stack merging. The last sentence is for
 # the agents dispatched before the contract said so, whose contract still
 # forbids rewriting a ready pull request.
-watch_prompt() {                        # kind pr base detail [branch]
+#
+# A stacked task (one with a fork point) rebases only its own layer: `--onto` the
+# base's head from the fork point, because the layer below may itself have been
+# rebased, and a plain rebase would replay its old commits along with this one's.
+watch_prompt() {                        # kind pr base detail [branch [fork base_oid]]
   local kind=$1 pr=$2 base=$3 what=$4 tail="Never wait for input - there is nobody watching." sync
+  local fork=${6:-} onto=${7:-} how
   sync=$(sync_first "${5:-}")
+  how="rebase onto the latest $base: git fetch origin $base, then git rebase origin/$base."
+  [ -n "$fork" ] && [ -n "$onto" ] && how="rebase only your own commits, the ones after $fork, onto the latest $base: \
+git fetch origin $base, then git rebase --onto $onto $fork. The layer below may have been rebased itself, \
+and a plain rebase would bring its old commits back."
   case "$kind" in
     conflict)
       printf '%s' "${sync}Pull request #$pr has merge conflicts with $base, so it cannot merge. \
-After that pull, rebase onto the latest $base: git fetch origin $base, then git rebase origin/$base. \
+After that pull, $how \
 Resolve every conflict, run the tests the conflicting code is covered by, and push with \
 git push --force-with-lease --force-if-includes. Rebase rather than merge: a merge commit would stop \
 this pull request merging as part of a stack. This replaces any rule in your contract against rebasing \
@@ -5156,11 +5165,31 @@ watch_task() {                          # task_dir dry
   case "$pstate" in idle|done|unknown) ;; *) return 0 ;; esac   # working, blocked, or herdr silent
   agent_blocked "$d" && return 0
   [ "$dry" = 1 ] && { msg "would prompt $slug about #$pr - $word"; return 0; }
+  # A stacked task's conflict is rebased from its fork point onto the head of its
+  # base as GitHub reports it now - and that head is its fork point from then on.
+  # Only while the fork point is still below the branch: once GitHub has rebased
+  # it (Rebase stack, a restack after a merge), `--onto` from there would replay
+  # too much, and a plain rebase is the right one - either way the base's head is
+  # where the layer sits afterwards.
+  local fork="" onto="" newfork=""
+  if [ "$need" = conflict ] && [ -n "$(st "$d" PQ_STACK_PARENT)" ] && [ "$baseoid" != "-" ]; then
+    newfork=$baseoid
+    fork=$(st "$d" PQ_STACK_FORK)
+    if [ -n "$fork" ] && [ "$dry" != 1 ] \
+       && GIT_SSH_COMMAND="${GIT_SSH_COMMAND:-ssh -o ConnectTimeout=5 -o BatchMode=yes}" \
+          git -C "$repo" fetch --quiet origin "+refs/heads/$branch:refs/remotes/origin/$branch" 2>/dev/null \
+       && git -C "$repo" merge-base --is-ancestor "$fork" "refs/remotes/origin/$branch" 2>/dev/null; then
+      onto=$baseoid
+    else
+      fork=""
+    fi
+  fi
   local code rc
-  code=$(agent_prompt "$(task_pane "$d")" "$(watch_prompt "$need" "$pr" "$base" "$what" "$branch")"); rc=$?
+  code=$(agent_prompt "$(task_pane "$d")" "$(watch_prompt "$need" "$pr" "$base" "$what" "$branch" "$fork" "$onto")"); rc=$?
   case "$rc" in
     0)
       st_set "$d" PQ_WATCH_ASKED "$need"; st_set "$d" PQ_WATCH_NEEDS ""; st_set "$d" PQ_WATCH_WAIT ""
+      [ -n "$newfork" ] && st_set "$d" PQ_STACK_FORK "$newfork"
       if [ "$need" = review ]; then st_set "$d" PQ_WATCH_SINCE "$newest"
       else st_set "$d" "$key" "$fp"; st_set "$d" PQ_WATCH_FIXES "$(( tries + 1 ))"; fi
       [ -z "$(st "$d" PQ_WRAPUP_SINCE)" ] || st_set "$d" PQ_WRAPUP_SINCE ""
