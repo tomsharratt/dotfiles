@@ -1324,21 +1324,32 @@ pick_plan() {
 # `local`. A stray `local` here would shadow the caller's variable: every
 # answer would appear to work and be silently discarded. Called as a bare
 # statement for the same reason - `x=$(pick_after)` forks a subshell and
-# throws the mutation away. Writes nothing to stdout. Esc stops the add, like
-# every other question; Enter with nothing ticked is how to say none.
+# throws the mutation away. `repo` is read the same way: the repo the task is
+# being added to. Writes nothing to stdout. Esc stops the add, like every other
+# question.
 #
-# Anything whose work has not landed can be waited on: a task in new/, queue/ or
+# One pick, because a task has one dependency and plans come as a series in a
+# single line (see AGENTS.md). The first row is "nothing", and the cursor starts
+# there, so Enter never stacks a task by accident; the candidates follow newest
+# first, so a chain's previous link is one row down. A candidate in the task's
+# own repo is built on - "stack on it" - and one in another repo is waited for -
+# "<repo>: wait for its merge" (see after_state). A same-repo candidate that
+# another live task already builds on is not offered at all: a stack is a single
+# line (see built_on).
+#
+# Anything whose work has not landed can be picked: a task in new/, queue/ or
 # running/, and one in done/ whose pull request has neither merged nor closed -
 # it can sit there for hours, in review or answering it. Only the verdict pq has
 # already recorded is read (reap_watching), never the forge, so the list costs
 # no round trip; a pull request that merged since the last tick is just a
-# blocker met the moment the task is queued.
+# dependency met the moment the task is queued.
 #
-# What it hands back is each pick's STAMP, not its slug: a task in new/ is renamed
+# What it hands back is the pick's STAMP, not its slug: a task in new/ is renamed
 # when it is named, which a tick can do while this list is on screen, and only
 # the stamp survives that (see "naming").
 pick_after() {
-  local d st rows="" lines picked s i
+  local d st drepo rows="" lines picked i none taken own=${repo:-}
+  taken=$(built_on)
   while IFS= read -r d; do
     [ -n "$d" ] || continue
     st=$(state_of "$d")
@@ -1347,27 +1358,29 @@ pick_after() {
       done) reap_watching "$d" || continue ;;
       *) continue ;;
     esac
-    rows="${rows}$(stamp_of "$d")"$'\t'"$(slug_of "$d")"$'\t'"$st"$'\t'"$(basename "$(hdr "$d/plan.md" repo)")"$'\n'
+    drepo=$(hdr "$d/plan.md" repo)
+    if [ "$drepo" = "$own" ]; then
+      built_on_by "$taken" "$drepo" "$(hdr "$d/plan.md" branch)" "$(stamp_of "$d")" >/dev/null && continue
+      rows="${rows}$(stamp_of "$d")"$'\t'"$(slug_of "$d")"$'\t'"$st"$'\t'"stack on it"$'\n'
+    else
+      rows="${rows}$(stamp_of "$d")"$'\t'"$(slug_of "$d")"$'\t'"$st"$'\t'"$(basename "$drepo"): wait for its merge"$'\n'
+    fi
   done <<<"$(all_tasks)"
   [ -n "$rows" ] || return 0
-  # One line per row, in the same order, so a chosen line's number is its row's.
-  # A project column only once the candidates span more than one repo - the same
-  # rule cmd_ls uses - and no trailing padding to tell a chosen line apart by.
-  lines=$(awk -F'\t' '
-    $1 == "" { next }
-    { n++; slug[n] = $2; st[n] = $3; repo[n] = $4; if (!($4 in seen)) { seen[$4] = 1; nrepo++ } }
-    END { for (i = 1; i <= n; i++) {
-            if (nrepo > 1) printf "%-40s  %-8s  %s\n", slug[i], st[i], repo[i]
-            else           printf "%-40s  %s\n", slug[i], st[i] } }
-  ' <<<"$rows")
-  picked=$(ui_choose --no-limit --height 12 \
-    --header "wait on which? x ticks, Enter confirms, none is fine" <<<"$lines") || die "cancelled"
-  while IFS= read -r s; do
-    s=${s%"${s##*[![:space:]]}"}
-    [ -n "$s" ] || continue
-    i=$(grep -nFx -- "$s" <<<"$lines" | head -1 | cut -d: -f1)
-    [ -n "$i" ] && after_vals="${after_vals}$(sed -n "${i}p" <<<"$rows" | cut -f1)"$'\n'
-  done <<<"$picked"
+  rows=$(sed '/^$/d' <<<"$rows" | sort -t$'\t' -k1,1nr)
+  # One line per row, in the same order, so a chosen line's number is its
+  # row's; no trailing padding to tell a chosen line apart by.
+  lines=$(awk -F'\t' '{ printf "%-40s  %-8s  %s\n", $2, $3, $4 }' <<<"$rows")
+  none="nothing - start from $(repo_base "$own" || printf 'the default branch')"
+  # Its memo goes now: an Esc below dies before cmd_add's own reset is reached.
+  repo_base_reset
+  # No --selected: gum's cursor starts on the first row, which is "nothing".
+  picked=$(printf '%s\n%s\n' "$none" "$lines" \
+    | ui_choose --height 12 --header "build on which? Enter picks") || die "cancelled"
+  picked=${picked%"${picked##*[![:space:]]}"}
+  [ -n "$picked" ] && [ "$picked" != "$none" ] || return 0
+  i=$(grep -nFx -- "$picked" <<<"$lines" | head -1 | cut -d: -f1)
+  [ -n "$i" ] && after_vals="$(sed -n "${i}p" <<<"$rows" | cut -f1)"$'\n'
   return 0
 }
 
@@ -1485,7 +1498,7 @@ add_wizard() {
 }
 
 # `pq add` takes no arguments at all: the plan is picked, and the model, effort,
-# blockers and design are questions. The wizard is the way in, and once its last
+# what it builds on and design are questions. The wizard is the way in, and once its last
 # question is answered the task is in new/ and `pq add` is done - the tick names
 # it (see "naming").
 cmd_add() {
@@ -1557,17 +1570,22 @@ cmd_add() {
     design_hdr="${design_hdr:+$design_hdr, }$dbase"
   done <<<"$design_vals"
 
-  # Every chosen blocker, as it is NOW, found by its stamp - a tick may have
+  # The dependency picked, as it is NOW, found by its stamp - a tick may have
   # named it while the list was on screen. One with a branch resolves to its
   # (label, repo, branch) here, before anything is written, so the dependency
   # survives `pq rm` of it, its ageing out of done/, and its slug being reused
   # (see "after: blockers"). One still in new/ has no branch to resolve to yet,
   # and is held by its stamp in after.new until this task is named; so is the
   # check for a cycle, which only the name can close (see "naming").
-  local after_lines="" after_new="" av b
+  local after_lines="" after_new="" av b dep_say=""
   while IFS= read -r av; do
     [ -n "$av" ] || continue
-    b=$(task_by_stamp "$av") || die "a task you picked to wait on has been removed since - nothing was added"
+    b=$(task_by_stamp "$av") || die "the task you picked to build on has been removed since - nothing was added"
+    if [ "$(hdr "$b/plan.md" repo)" = "$repo" ]; then
+      dep_say="on:     $(slug_of "$b") - starts when its pull request is ready for review"
+    else
+      dep_say="after:  $(slug_of "$b") ($(basename "$(hdr "$b/plan.md" repo)")) - starts once it merges"
+    fi
     if [ "$(state_of "$b")" = new ]; then
       after_new="$after_new$av"$'\n'
     else
@@ -1637,6 +1655,7 @@ cmd_add() {
 
   msg "plan:   $plan"
   [ -n "$design_hdr" ] && msg "design: $design_hdr"
+  [ -n "$dep_say" ] && msg "$dep_say"
   msg "added:  new/$(basename "$dir")  ($model, effort $effort) - the next tick names it and queues it"
   repo_base_reset
 }
