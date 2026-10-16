@@ -440,6 +440,26 @@ eq "$(st "$DM" PQ_STACK_FORK)" "" "so it has no fork point either"
 has "$(cat "$PQ_HOME/.err")" "latecomer: tom/parent merged meanwhile - forking from master" "said once, as it happens"
 hasnt "$(prompt_text)" "builds on" "and its prompt says nothing about a stack"
 
+echo "== a parent whose pull request was closed since the claim is not built on ==" >&2
+reset_tasks; reset_logs; set_panes ""
+printf '%s\ttom/parent\t77\tCLOSED\t\tmaster\t\n' "$REPO" > "$PR_CACHE"
+DC=$(mk_task running 023 abandoned tom/abandoned)
+st_set "$DC" PQ_STACK_PARENT tom/parent
+dispatch_task "$DC" >/dev/null 2>"$PQ_HOME/.err"; rc=$?
+eq "$rc" "1" "the dispatch fails"
+grep -q "	new	" "$WT_LOG" && bad "with no worktree forked from abandoned work" || ok
+has "$(cat "$PQ_HOME/.err")" "the pull request for tom/parent was closed since it was claimed" "saying why"
+
+echo "== a contract with no default branch to name leaves the merged-first line out ==" >&2
+# shellcheck disable=SC2329  # called by contract_write
+C=$( repo_base() { return 1; }; reset_tasks >/dev/null; printf '%s\ttom/parent\t77\tOPEN\t\tmaster\t\n' "$REPO" > "$PR_CACHE"
+     X=$(mk_task running 024 nobase tom/nobase); st_set "$X" PQ_STACK_PARENT tom/parent; st_set "$X" PQ_STACK_FORK abc123
+     contract_write "$X"; cat "$X/contract.md" )
+has "$C" "## Building on #77" "the stack section is there"
+hasnt "$C" "the default branch" "with no prose where a branch name goes"
+hasnt "$C" "origin/ " "and no half-written command"
+has "$C" "If \`git merge-base --is-ancestor abc123 origin/tom/parent\` fails" "the rest of it intact"
+
 echo "== a parent branch missing from origin fails the try ==" >&2
 reset_tasks; reset_logs; set_panes ""
 : > "$PR_CACHE"

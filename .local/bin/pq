@@ -3430,7 +3430,7 @@ contract_write() {                      # task_dir
   parent=$(st "$d" PQ_STACK_PARENT); fork=$(st "$d" PQ_STACK_FORK)
   if [ -n "$parent" ]; then
     pnum=$(pr_get "$repo" "$parent" | cut -f1)
-    defb=$(repo_base "$repo"); defb=${defb:-the default branch}
+    defb=$(repo_base "$repo")
   fi
   # Every path the agent is given is the STABLE one (task_home): the real
   # directory moves to done/ the moment the pull request is reconciled, while
@@ -3475,7 +3475,12 @@ Your own commits are the ones after that commit.
 Open your pull request against \`$parent\`: \`gh pr create --draft --base $parent\`.
 pq adds it to $below's stack on GitHub.
 Before you open it, run \`git fetch origin\`.
+EOF
+      # Only with a default branch to name: a command with prose in it cannot run.
+      [ -n "$defb" ] && cat <<EOF
 If \`origin/$parent\` is gone, $below has merged: run \`git rebase --onto origin/$defb ${fork:-<fork>}\` and open the pull request against \`$defb\` instead.
+EOF
+      cat <<EOF
 If \`git merge-base --is-ancestor ${fork:-<fork>} origin/$parent\` fails, $below was rebased: run \`git rebase --onto origin/$parent ${fork:-<fork>}\` first.
 Once the pull request is open, GitHub may rewrite this branch on origin, so run \`git pull --rebase --autostash origin $branch\` before you change anything.
 EOF
@@ -3726,7 +3731,13 @@ dispatch_task() {                       # task_dir  -> 0 launched, 1 failed, 2 w
         st_set "$d" PQ_STACK_PARENT ""
         msg "$(slug_of "$d"): $parent merged meanwhile - forking from $defb"
         parent=""
-      elif ! git -C "$repo" show-ref --verify --quiet "refs/remotes/origin/$parent"; then
+      elif [ "$(pr_get "$repo" "$parent" | cut -f2)" = CLOSED ] && pr_all_closed "$repo" "$parent"; then
+        warn "$(slug_of "$d"): the pull request for $parent was closed since it was claimed - not building on abandoned work; pq rm $(slug_of "$d"), or pq after it again once you know what it should build on"
+        return 1
+      elif ! { git -C "$repo" show-ref --verify --quiet "refs/remotes/origin/$parent" \
+               || { GIT_SSH_COMMAND="${GIT_SSH_COMMAND:-ssh -o ConnectTimeout=5 -o BatchMode=yes}" \
+                      git -C "$repo" fetch --quiet origin "+refs/heads/$parent:refs/remotes/origin/$parent" 2>/dev/null \
+                    && git -C "$repo" show-ref --verify --quiet "refs/remotes/origin/$parent"; }; }; then
         warn "$(slug_of "$d"): origin/$parent is not there to fork from - the next tick tries again"
         return 1
       else
