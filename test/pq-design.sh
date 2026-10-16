@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # test/pq-design.sh - designs travel with the task: `--design`, auto-detection
 # from the plan's text, the `design:` header and design/ directory, the
-# wizard's design question - and name_plan's reading of Haiku's reply.
+# wrapper an artifact's source is copied in, the wizard's design question - and
+# name_plan's reading of Haiku's reply.
 #
 # Same conventions as test/pq-add-pick.sh: plain bash, no framework, PQ_HOME and
 # PQ_PLANS_DIR exported before sourcing pq, a PATH-stubbed `claude` that
@@ -110,6 +111,11 @@ printf 'PNG\n' > "$DES/shot.png"
 # A view template that exists on disk and ends in .html.erb - must never match.
 mkdir -p "$DES/app/views"
 printf '<%%= yield %%>\n' > "$DES/app/views/show.html.erb"
+# A design the planning session drew as an Artifact: page content only, with no
+# doctype, <html>, <head> or <body>, as the Artifact tool has it written - the
+# host wraps it in a document of its own when it serves it.
+ART="$DES/Product Checkout.dc.html"
+printf '<title>Product Checkout</title>\n<div class="board">artboard</div>\n' > "$ART"
 
 reset_tasks() {
   rm -rf "$PQ_HOME/new" "$PQ_HOME/queue" "$PQ_HOME/running" "$PQ_HOME/done"
@@ -184,6 +190,29 @@ rc=$?
 has "$(cat "$PQ_HOME/.err")" "not on disk: /nonexistent/Missing Board.dc.html" "the dangling path is named"
 t=$(find_task d5)
 eq "$(hdr "$t/plan.md" design)" "" "and nothing is attached"
+
+echo "== an artifact's source is copied in wrapped as claude.ai serves it ==" >&2
+add_as "$PLAN" tom/d6 --repo "$REPO" --design "$ART" 2>"$PQ_HOME/.err"
+rc=$?
+[ "$rc" -eq 0 ] && ok || bad "an add with an artifact's source should succeed: $(cat "$PQ_HOME/.err")"
+t=$(find_task d6)
+eq "$(hdr "$t/plan.md" design)" "Product Checkout.dc.html" "the design file is attached"
+copy="$t/design/Product Checkout.dc.html"
+eq "$(head -1 "$copy")" "$ARTIFACT_HEAD" "the copy opens with the host's own wrapper"
+eq "$(tail -c ${#ARTIFACT_TAIL} "$copy")" "$ARTIFACT_TAIL" "and closes it"
+eq "$(sed '1d;$d' "$copy")" "$(cat "$ART")" "with the source between them, untouched"
+case "$ARTIFACT_HEAD" in '<!doctype html>'*) ok ;; *) bad "the wrapper must open with a doctype, or the copy renders in quirks mode" ;; esac
+has "$ARTIFACT_HEAD" "font:14px -apple-system" "and set the 14px system font claude.ai shows the page in"
+
+echo "== a full document is copied byte for byte, and so is one that only names a tag ==" >&2
+DOC="$DES/Full Board.dc.html"
+printf '<!DOCTYPE html>\n<html lang="en"><body>board</body></html>\n' > "$DOC"
+MENTION="$DES/Mention.dc.html"
+printf '<title>M</title>\n<pre>&lt;html&gt; is not here, but <html lang="x"> is</pre>\n' > "$MENTION"
+add_as "$PLAN" tom/d7 --repo "$REPO" --design "$DOC" --design "$MENTION" 2>/dev/null
+t=$(find_task d7)
+cmp -s "$DOC" "$t/design/Full Board.dc.html" && ok || bad "a design with its own doctype is copied as it is"
+cmp -s "$MENTION" "$t/design/Mention.dc.html" && ok || bad "a design with an <html> tag anywhere is copied as it is"
 
 echo "== design_mentions, directly: the shapes it reads ==" >&2
 M="$PQ_HOME/.m.md"

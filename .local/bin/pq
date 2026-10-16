@@ -125,7 +125,8 @@
 #                      agent's hooks"); hooks.json on a task dispatched before the status line
 #          agent.json  the agent's latest lifecycle event, overwritten by those hooks and
 #                      read by pq instead of the pane
-#          design/     the design files the plan was built from, copied in at add time
+#          design/     the design files the plan was built from, copied in at add time - an
+#                      artifact's source wrapped as claude.ai serves it (see design_copy)
 #          evidence/   the implementer's screenshots, published by `pq evidence`
 #          review.json the review gate's own `claude -p` output, plus review.err and
 #          review.rc   its stderr and exit code - see the `review gate` section
@@ -1413,6 +1414,18 @@ pick_after() {
 # at all, and the contract (see contract_write) tells the implementer what to do
 # with them.
 
+# The page claude.ai serves for an artifact is not the file it was published
+# from. The host wraps that file in a document of its own - a doctype, a
+# viewport meta and a small reset that sets a 14px system font - and the file
+# itself carries none of that, since the Artifact tool's contract forbids a
+# doctype, <html>, <head> or <body> in it. Opened raw from file://, it renders
+# in quirks mode at the browser's 16px default: an implementer comparing against
+# it would build to a page Tom never saw. So design_copy wraps such a file in
+# this, the host's own wrapper, verbatim as `Artifact read` with `page: true`
+# returned it on 2026-10-16.
+ARTIFACT_HEAD='<!doctype html><html><head><meta charset=utf8><meta name=viewport content="width=device-width,initial-scale=1,viewport-fit=cover"><style>:root{color-scheme:light;box-sizing:border-box;padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px)}html{scroll-padding-top:env(safe-area-inset-top,0px)}body{margin:0;padding:0;font:14px -apple-system,BlinkMacSystemFont,sans-serif;background:#fff;color:#000}img{max-width:100%}[hidden]:not([hidden=until-found i]){display:none!important}</style></head><body>'
+ARTIFACT_TAIL='</body></html>'
+
 design_expand() {                       # path as written -> trimmed, ~ expanded
   local p=$1
   p=$(sed 's/^[[:space:]]*//; s/[[:space:]]*$//' <<<"$p")
@@ -1480,6 +1493,23 @@ design_mentions() {                     # plan_file -> existing paths, one per l
 # an EMPTY design set is worth a question (add_wizard) or a warning (cmd_add).
 design_hinted() {                       # plan_file -> 0 when it cites Claude Design
   grep -qE 'claude\.ai/design|\.dc\.html' "$1" 2>/dev/null
+}
+
+# One design file into a task's design/: an artifact's source, which has neither
+# a doctype nor an <html> tag, inside the host's wrapper (see ARTIFACT_HEAD), and
+# anything else byte for byte. A file that only mentions such a tag somewhere is
+# copied as it is - the way every design was copied before.
+design_copy() {                         # src dest_dir
+  local dest; dest="$2/$(basename "$1")"
+  case "$1" in
+    *.html)
+      if ! grep -qiE '<!doctype[[:space:]]|<html[[:space:]>]' "$1"; then
+        { printf '%s\n' "$ARTIFACT_HEAD"; cat "$1"; printf '\n%s' "$ARTIFACT_TAIL"; } > "$dest"
+        return
+      fi
+      ;;
+  esac
+  cp "$1" "$dest"
 }
 
 # The questions that shape how a task runs, asked once pick_plan has chosen a
@@ -1664,7 +1694,7 @@ cmd_add() {
     mkdir -p "$PQ_STAGING/design" || die "could not create the task's design/"
     while IFS= read -r dfile; do
       [ -n "$dfile" ] || continue
-      cp "$dfile" "$PQ_STAGING/design/" || die "could not copy the design file $dfile"
+      design_copy "$dfile" "$PQ_STAGING/design" || die "could not copy the design file $dfile"
     done <<<"$design_files"
   fi
   mv "$PQ_STAGING" "$dir" || die "could not move the new task into new/"
