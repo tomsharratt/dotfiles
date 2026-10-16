@@ -3903,15 +3903,22 @@ stack_link() {                          # task_dir dry
     warn "$slug: gh stack is not installed (gh extension install github/gh-stack) - #$child stays a plain chained pull request on #$pnum"
     return 0
   fi
-  if stack=$(stack_of "$repo" "$child") && [ -n "$stack" ]; then
+  # A stacks API that cannot answer is asked again next tick, never read as
+  # "in no stack": that reading picks the pair form, which a longer stack
+  # refuses, and three of those would give the link up for good.
+  stack=$(stack_of "$repo" "$child") || return 0
+  if [ -n "$stack" ]; then
     st_set "$d" PQ_STACK "$stack"
     msg "$slug: #$child joined #$pnum's stack (stack $stack)"
     return 0
   fi
-  pstack=$(stack_of "$repo" "$pnum") || pstack=""
+  pstack=$(stack_of "$repo" "$pnum") || return 0
   if [ -z "$pstack" ] && [ "$(pr_base "$repo" "$parent")" != "$(repo_base "$repo")" ]; then
+    # Waited for only while a pq task owns the parent and has not given its own
+    # link up: nothing else will ever put a parent that pq does not run into a
+    # stack, so waiting on one would be forever, and silent.
     owner=$(task_by_branch "$repo" "$parent") || owner=""
-    if [ -n "$owner" ] && [ -n "$(st "$owner" PQ_STACK_LINK)" ]; then
+    if [ -z "$owner" ] || [ -n "$(st "$owner" PQ_STACK_LINK)" ]; then
       st_set "$d" PQ_STACK_LINK below
       warn "$slug: #$pnum never joined a stack of its own, so #$child stays a plain chained pull request on it"
     fi

@@ -39,6 +39,7 @@ case "\$1 \$2" in
     for pr in "\$@"; do printf '%s\t%s\n' "\$pr" "\$stack" >> "$STACKS"; done
     exit 0 ;;
   "api -H")
+    [ -f "$STUBBIN/.api-down" ] && exit 1
     pr=\$(printf '%s' "\$4" | sed -n 's/.*pull_request=//p')
     awk -F'\t' -v p="\$pr" '\$1 == p { print \$2; exit }' "$STACKS"
     exit 0 ;;
@@ -72,7 +73,7 @@ reset_tasks() {
   rm -rf "$PQ_HOME/new" "$PQ_HOME/queue" "$PQ_HOME/running" "$PQ_HOME/done"
   mkdir -p "$PQ_HOME/new" "$PQ_HOME/queue" "$PQ_HOME/running" "$PQ_HOME/done"
 }
-reset_gh() { : > "$GH_LOG"; : > "$STACKS"; rm -f "$STUBBIN/.link-rc" "$STUBBIN/.link-out" "$STUBBIN/.nocli"; }
+reset_gh() { : > "$GH_LOG"; : > "$STACKS"; rm -f "$STUBBIN/.link-rc" "$STUBBIN/.link-out" "$STUBBIN/.nocli" "$STUBBIN/.api-down"; }
 reset_caches() {
   PR_CACHE="$PQ_HOME/.test.pr"; PR_ANS="$PQ_HOME/.test.ans"
   : > "$PR_CACHE"; : > "$PR_ANS"
@@ -163,6 +164,31 @@ eq "$(st "$T" PQ_STACK_LINK)" "below" "once the parent's own link has given up, 
 has "$out" "#11 never joined a stack of its own, so #12 stays a plain chained pull request on it" "said once"
 eq "$(stack_link "$T" 0 2>&1)" "" "and not again"
 
+echo "== a parent pq does not run, off the trunk and in no stack, is not waited for ==" >&2
+reset_tasks; reset_gh; reset_caches
+cache_row "$REPO" tom/foreign 11 OPEN "" tom/elsewhere
+O=$(mk_child 55 on-foreign foreign 12)
+out=$(stack_link "$O" 0 2>&1)
+eq "$(links)" "0" "no stack is started on a feature branch"
+eq "$(st "$O" PQ_STACK_LINK)" "below" "and nothing else will ever link that parent, so it stops here"
+has "$out" "#11 never joined a stack of its own, so #12 stays a plain chained pull request on it" "said once"
+: > "$GH_LOG"
+stack_link "$O" 0 >/dev/null 2>&1
+eq "$(gh_calls)" "0" "and costs nothing on every tick after"
+
+echo "== a stacks API that cannot answer is asked again, never read as no stack ==" >&2
+reset_tasks; reset_gh; reset_caches
+printf '10\t100\n11\t100\n' > "$STACKS"
+cache_row "$REPO" tom/second 11 OPEN "" tom/bottom
+A=$(mk_child 56 api-down second 12)
+touch "$STUBBIN/.api-down"
+stack_link "$A" 0 >/dev/null 2>&1
+eq "$(links)" "0" "no pair-form link that a longer stack would refuse"
+eq "$(st "$A" PQ_STACK)$(st "$A" PQ_STACK_LINK)$(st "$A" PQ_STACK_LINK_FAILS)" "" "and no try counted"
+rm -f "$STUBBIN/.api-down"
+stack_link "$A" 0 >/dev/null 2>&1
+eq "$(link_args)" "100 12" "the next tick links through the stack"
+
 echo "== no gh stack: said once, and the pull request stays chained ==" >&2
 reset_tasks; reset_gh; reset_caches; touch "$STUBBIN/.nocli"
 cache_row "$REPO" tom/bottom 10 OPEN "" master
@@ -225,6 +251,7 @@ eq "$(gh_calls)" "0" "without asking gh anything"
 echo "== through the tick: a done task is linked on the pass that sees its pull request ==" >&2
 reset_tasks; reset_gh
 D=$(mk_child 95 ticked bottom 11)
+real_pr_load_all=$(declare -f pr_load_all)
 # shellcheck disable=SC2329  # called by tick_body
 pr_load_all() {
   PR_CACHE="$PQ_HOME/.test.pr"; PR_ANS="$PQ_HOME/.test.ans"; : > "$PR_ANS"
@@ -234,7 +261,7 @@ out=$(tick_body 0 1 2>&1)
 has "$out" "would add #11 to #10's stack" "a dry tick says it would"
 tick_body 0 0 >/dev/null 2>&1
 eq "$(st "$D" PQ_STACK)" "100" "and a real one links it"
-unset -f pr_load_all
+eval "$real_pr_load_all"
 
 printf '\n%d passed, %d failed\n' "$pass" "$fail" >&2
 [ "$fail" -eq 0 ]
