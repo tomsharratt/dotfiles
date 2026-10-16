@@ -344,15 +344,19 @@ So `pq` asks the child's agent to move its own commits onto the default branch a
 
 Which case it is comes from the heads as they are now - the child's, the parent's, the default branch's and the commit the child forked from - never from the parent's commit merely changing, since a Rebase stack press moves parent and child together and must not send a prompt up the stack.
 A child that sits on its parent's head takes that head as its fork point from then on, which is what follows a Rebase stack press or a restack of its own.
-A child whose parent has merged and whose own commits now sit on the default branch is the bottom of its stack, and from then on an ordinary pull request.
-A parent closed without merging is handed to you at once - `parent closed` in `pq ls`, counted into "needs you", warned once - because whether the child still makes sense is a decision, not a rebase; it clears if the parent reopens.
+A child whose parent has merged and whose own commits now sit on the default branch is the bottom of its stack, and from then on an ordinary pull request - once its pull request is aimed at the default branch.
+GitHub retargets a child it linked within seconds; one it never linked, in a repo that keeps merged branches, would stay aimed at the merged parent's branch, where merging it lands nowhere, so after the same minute's wait `pq` aims it at the default branch itself (`gh pr edit --base`), and says so.
+A parent closed without merging is handed to you at once - `parent closed` in `pq ls`, counted into "needs you", warned once - because whether the child still makes sense is a decision, not a rebase.
+It clears if the parent reopens, or once you aim the child at the default branch yourself, which unstacks it.
 
 The agent rebases its own layer with plain git, never `gh stack rebase` or `gh stack sync`, which rewrite every layer's branch, including the ones other agents are working in.
 It is asked only once the same need has been seen on two ticks at least 60 seconds apart, because GitHub's own restack after a merge lands within seconds and `pq` must not race it.
 It is asked the way the watch asks: only while idle, never on a dialog, and never while the watch or a reviewer has its turn.
-An agent that is gone, one that comes back with the same need still there, or one that has had three tries hands the restack to you instead: `pq ls` reads `restack`, counted into "needs you", and the tick warns once.
+An agent that is gone, one that comes back with the same need still there, or one that has had three tries at a need it has not resolved in between hands the restack to you instead: `pq ls` reads `restack`, counted into "needs you", and the tick warns once.
 While the agent is on it, the row reads `restacking`.
-Until the layer is back on its real base, the review gate does not launch, so a reviewer only ever sees the layer's own commits, and the watch raises no conflict, since the restack is the fix.
+Until the layer is back on its real base, or while its parent is closed and you have not decided, the review gate does not launch, so a reviewer only ever sees the layer's own commits, and the watch raises no conflict, since the restack is the fix - or, for a closed parent, a rebase onto abandoned work.
+The head the agent was asked to move onto becomes the layer's fork point as soon as the layer sits on it, so a review fix the parent gains in the meantime reads as gained commits, not as another rebase.
+Every open layer's branch, parent and default branch are fetched in one `git fetch` per repo each tick.
 A restack cascades on its own: a child that moved is a rewritten parent for the layer above it, which a later tick sees and restacks in turn.
 
 `pq tick` is one idempotent pass: reconcile, then fill.
