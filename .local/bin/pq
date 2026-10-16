@@ -4221,6 +4221,35 @@ stack_holds() {                         # task_dir
   [ -n "$(st "$1" PQ_STACK_DUE)" ] || [ "$(st "$1" PQ_STACK_NEEDS)" = closed ]
 }
 
+# A layer whose commits have landed, but whose pull request is still aimed at
+# its merged parent's branch: merging it would land its work on a dead branch.
+# GitHub retargets a child it has linked within seconds of the merge, so this
+# waits out the same debounce first; a child it never linked (stacks off, no
+# gh stack, a link given up) in a repo that keeps merged branches is never
+# retargeted, and pq aims it at the default branch itself - the same correction
+# `gh stack link` makes to a base.
+stack_retarget() {                      # task_dir dry own pnum
+  local d=$1 dry=$2 own=$3 pnum=$4 slug repo defb fp nowsec seen at out
+  slug=$(slug_of "$d"); repo=$(hdr "$d/plan.md" repo); defb=$(repo_base "$repo")
+  fp=$(fingerprint retarget "$defb"); nowsec=$(epoch)
+  seen=$(st "$d" PQ_STACK_SEEN_FP); at=$(st "$d" PQ_STACK_SEEN_AT)
+  if [ "$seen" != "$fp" ] || ! [[ "$at" =~ ^[0-9]+$ ]]; then
+    [ "$dry" = 1 ] && { msg "would wait ${STACK_DEBOUNCE}s to see whether GitHub aims #$own at $defb - #$pnum merged"; return 0; }
+    st_set "$d" PQ_STACK_SEEN_FP "$fp"; st_set "$d" PQ_STACK_SEEN_AT "$nowsec"
+    return 0
+  fi
+  [ $(( nowsec - at )) -ge "$STACK_DEBOUNCE" ] || return 0
+  [ "$dry" = 1 ] && { msg "would aim #$own at $defb - #$pnum merged, and GitHub has not retargeted it"; return 0; }
+  if out=$(cd "$repo" 2>/dev/null && gh pr edit "$own" --base "$defb" 2>&1); then
+    st_clear "$d" PQ_STACK_WAIT
+    msg "$slug: #$pnum merged, and GitHub had not retargeted #$own - aimed it at $defb"
+  else
+    [ "$(st "$d" PQ_STACK_WAIT)" = retarget ] || { st_set "$d" PQ_STACK_WAIT retarget
+      warn "$slug: #$pnum merged, but #$own is still aimed at its branch and could not be aimed at $defb ($(tail -1 <<<"$out" | tr -d '\r')) - retrying each tick"; }
+  fi
+  return 0
+}
+
 # What `pq ls` says about it, and its --json word: asked, restack or closed.
 stack_json() {                          # task_dir
   if [ -n "$(st "$1" PQ_STACK_ASKED)" ]; then printf 'asked'; return; fi
@@ -4295,6 +4324,9 @@ stack_task() {                          # task_dir dry
     gained)
       [ "$dry" = 1 ] || { stack_clear "$d"; stack_resolved "$d"; } ;;
     landed)
+      if [ "$(pr_base "$repo" "$branch")" != "$(repo_base "$repo")" ]; then
+        stack_retarget "$d" "$dry" "$own" "$pnum"; return 0
+      fi
       [ "$dry" = 1 ] && { msg "would record that #$own is the bottom of its stack now - #$pnum merged"; return 0; }
       stack_clear "$d"; st_clear "$d" PQ_STACK_ASKED
       st_set "$d" PQ_STACK_PARENT ""

@@ -56,6 +56,9 @@ case "\$1 \$2" in
     else stack=100; shift 2; fi
     for pr in "\$@"; do printf '%s\t%s\n' "\$pr" "\$stack" >> "$STACKS"; done
     exit 0 ;;
+  "pr edit")
+    [ -f "$STUBBIN/.edit-fail" ] && { echo "GraphQL: could not edit"; exit 1; }
+    exit 0 ;;
   "api -H")
     [ -f "$STUBBIN/.api-down" ] && exit 1
     pr=\$(printf '%s' "\$4" | sed -n 's/.*pull_request=//p')
@@ -330,6 +333,8 @@ need() { printf '%s %s' "$(st "$1" PQ_STACK_DUE)" "$(st "$1" PQ_STACK_NEEDS)" | 
 # Which way the verdict moves the layer, as stack_task reads it.
 verdict() { repo_base_reset; stack_verdict "$1" | cut -f1; }
 fp() { printf '%s %s' "$1" "$2" | cksum | awk '{ print $1 }'; }
+# The debounce, run out: the need was first seen over a minute ago.
+age_seen() { st_set "$1" PQ_STACK_SEEN_AT "$(( $(st "$1" PQ_STACK_SEEN_AT) - STACK_DEBOUNCE - 1 ))"; }
 
 echo "== restack: a child on its parent's head needs nothing ==" >&2
 reset_tasks; stack_pair 1; rows_open
@@ -410,6 +415,39 @@ g checkout -q main; g merge -q --no-ff -m "merge pa-6" "$PA"; MC=$(g rev-parse H
 rows_merged "$MC"
 restack "$S" >/dev/null 2>&1
 eq "$(st "$S" PQ_STACK_PARENT)$(need "$S")" "" "landed, with no need"
+
+echo "== restack: landed, but still aimed at the merged parent's branch: aimed at main ==" >&2
+reset_tasks; stack_pair 16
+S=$(mk_stacked 16)
+g checkout -q main; g merge -q --no-ff -m "merge pa-16" "$PA"; MC=$(g rev-parse HEAD); gpush main
+reset_caches
+printf '%s\t%s\t10\tMERGED\t\tmain\t%s\n' "$RREPO" "$PA" "$MC" >> "$PR_CACHE"
+cache_row "$RREPO" "$CH" 11 OPEN "" "$PA"
+: > "$GH_LOG"
+restack "$S" >/dev/null 2>&1
+eq "$(st "$S" PQ_STACK_PARENT)" "$PA" "not landed while it would merge into a dead branch"
+eq "$(grep -c '^pr	edit' "$GH_LOG")" "0" "first sight: GitHub may be retargeting it now"
+age_seen "$S"
+out=$(restack "$S" 2>&1)
+eq "$(grep '^pr	edit' "$GH_LOG" | tr '\t' ' ' | sed 's/ *$//')" "pr edit 11 --base main" "a minute on, pq aims it at main"
+has "$out" "ch-16: #10 merged, and GitHub had not retargeted #11 - aimed it at main" "and says so"
+reset_caches
+printf '%s\t%s\t10\tMERGED\t\tmain\t%s\n' "$RREPO" "$PA" "$MC" >> "$PR_CACHE"
+cache_row "$RREPO" "$CH" 11 OPEN "" main
+restack "$S" >/dev/null 2>&1
+eq "$(st "$S" PQ_STACK_PARENT)" "" "aimed at main on the next tick: landed"
+reset_tasks; stack_pair 17
+S=$(mk_stacked 17)
+g checkout -q main; g merge -q --no-ff -m "merge pa-17" "$PA"; MC=$(g rev-parse HEAD); gpush main
+reset_caches
+printf '%s\t%s\t10\tMERGED\t\tmain\t%s\n' "$RREPO" "$PA" "$MC" >> "$PR_CACHE"
+cache_row "$RREPO" "$CH" 11 OPEN "" "$PA"
+touch "$STUBBIN/.edit-fail"
+restack "$S" >/dev/null 2>&1; age_seen "$S"
+out=$(restack "$S" 2>&1)
+has "$out" "could not be aimed at main (GraphQL: could not edit) - retrying each tick" "a failed edit is said"
+eq "$(restack "$S" 2>&1)" "" "once"
+rm -f "$STUBBIN/.edit-fail"
 
 echo "== restack: a closed parent is handed over once, and recovers if it reopens ==" >&2
 reset_tasks; stack_pair 7
@@ -496,8 +534,6 @@ perm_on()  { mkdir -p "$PQ_HOME/tasks"; task_link "$1"; printf '{"event":"permis
 perm_off() { rm -f "$(task_home "$1")/agent.json"; }
 # The ask, a minute old.
 age_asked() { st_set "$1" PQ_STACK_ASKED "$(( $(epoch) - STACK_DEBOUNCE - 1 ))"; }
-# The debounce, run out: the need was first seen over a minute ago.
-age_seen() { st_set "$1" PQ_STACK_SEEN_AT "$(( $(st "$1" PQ_STACK_SEEN_AT) - STACK_DEBOUNCE - 1 ))"; }
 # A stacked task whose parent was rebased, seen once, with an idle agent in w1:p1.
 due() {                                 # n -> S PA CH F P
   reset_tasks; stack_pair "$1"; rows_open
