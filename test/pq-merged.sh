@@ -388,53 +388,5 @@ eq "$(base_check "$stale")" "basegone no-such-integration-branch" "still gated o
 second_warn=$(base_check "$stale" 2>&1 >/dev/null)
 eq "$second_warn" "" "it must not re-warn every tick while it sits there"
 
-echo "== pq add infers the base from the branch the repo is on ==" >&2
-# The workflow this serves: you plan the work while standing on the branch it
-# belongs to, so the checkout already knows the answer and nobody has to name it.
-# The failure it replaces was silent - a forgotten base queues against the trunk
-# and only shows up at dispatch.
-reset_tasks
-PLAN=$(mktemp -d); printf '# probe\n\nbody\n' > "$PLAN/plan.md"
-addq() {                                # branch-to-stand-on [extra args...] -> the task dir
-  local stand=$1; shift
-  git -C "$REPO" checkout -q "$stand"
-  add_as "$PLAN/plan.md" "tom/$1" --repo "$REPO" "${@:2}" >/dev/null 2>&1
-  first_of "$PQ_HOME"/queue/*-"$(branch_to_slug "tom/$1")"
-}
-
-# Standing on the integration branch: inherited, and recorded in the header.
-d=$(addq live-events inherit-1)
-eq "$(hdr "$d/plan.md" base)" "live-events" "standing on live-events queues against live-events"
-# And says how to get the default instead, now that the checkout is the only way.
-git -C "$REPO" checkout -q live-events
-note=$(add_as "$PLAN/plan.md" tom/inherit-1b --repo "$REPO" 2>&1 >/dev/null)
-case "$note" in
-  *"base:   live-events (the branch "*" is on - check out master first to queue against it)"*) ok ;;
-  *) bad "the base note should say how to queue against the default (got: $note)" ;;
-esac
-
-# Standing on the default: nothing recorded, because task_base already answers
-# master - every task queued before this feature keeps its exact plan.md.
-d=$(addq master inherit-2)
-eq "$(hdr "$d/plan.md" base)" "" "standing on the default writes no base: header at all"
-eq "$(task_base "$d")" "master" "...and still resolves to master"
-repo_base_reset
-
-# A branch that exists only locally cannot be forked from by wt, and no pull
-# request can target it - so it must NOT be inherited.
-git -C "$REPO" branch -q local-only master 2>/dev/null
-d=$(addq local-only inherit-5)
-eq "$(hdr "$d/plan.md" base)" "" "a branch that is not on origin is not inherited"
-eq "$(task_base "$d")" "master" "...it falls back to the default"
-repo_base_reset
-
-# Detached HEAD has no branch to inherit.
-git -C "$REPO" checkout -q --detach master
-add_as "$PLAN/plan.md" tom/inherit-6 --repo "$REPO" >/dev/null 2>&1
-d=$(first_of "$PQ_HOME"/queue/*-inherit-6)
-eq "$(hdr "$d/plan.md" base)" "" "a detached HEAD inherits nothing"
-git -C "$REPO" checkout -q master
-rm -rf "$PLAN"
-
 printf '\n%d passed, %d failed\n' "$pass" "$fail" >&2
 [ "$fail" -eq 0 ]

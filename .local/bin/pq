@@ -13,9 +13,8 @@
 # `pq`, and `pq` reaches it through one narrow seam (`wt new --no-agent --no-focus
 # --json`).
 #
-#   pq add               pick a plan and add it; it forks from the branch the repo is
-#                        on, when that is not the default; it asks the model, the
-#                        effort, what it should wait on (its PR must merge first) and,
+#   pq add               pick a plan and add it; it asks the model, the effort, what
+#                        it should wait on (its PR must merge first) and,
 #                        for a plan built from a design that names no file on disk,
 #                        the design file the implementer builds to - and then it is
 #                        done. The next tick names it and queues it (see "naming")
@@ -1462,7 +1461,7 @@ cmd_add() {
   [ $# -eq 0 ] || die "pq add takes no arguments - it asks: '$1'"
   need_gum add
   local plan="" model=$PQ_DEFAULT_MODEL effort=$PQ_DEFAULT_EFFORT
-  local repo="" basebr=""
+  local repo=""
   # A string, not an array: an empty bash array expanded under `set -u` is a
   # portability trap (fixed only in bash 4.4+), so every repeatable option in
   # this script accumulates into a newline-joined string instead. See `repos`
@@ -1499,39 +1498,6 @@ cmd_add() {
     *) die "no plans in $PLANS_DIR to add" ;;
   esac
   [ -f "$plan" ] || die "no such plan: $plan"
-
-  # The base is the branch the repo is STANDING ON, when that is something other
-  # than its default. You plan the work in the branch it belongs to, so the
-  # checkout already knows the answer, and asking you to repeat it every time is a
-  # step that will be forgotten - silently, because a forgotten base queues
-  # against the trunk and only shows up at dispatch. To queue against the default
-  # from a feature branch, check the default out first.
-  #
-  # Read from $repo, NOT from $PWD, deliberately. $repo is already resolved to the
-  # MAIN checkout above so that adding from inside a worktree still queues against
-  # the parent - and taking the branch from $PWD would undo that in the worst
-  # possible way: planning from inside a task's worktree would silently base the
-  # new task on THAT task's in-flight branch, which is stacked pull requests, a
-  # much bigger decision than an inferred default should ever make on its own.
-  #
-  # Three things stop this firing when it should not:
-  #   detached HEAD      rev-parse prints "HEAD"; there is no branch to inherit
-  #   already the default  nothing to record - absent means the default
-  #   not on origin      `wt new --base origin/X` cannot fork it and no pull
-  #                      request can target it, so it is not a usable base yet
-  #
-  # Held, not printed here: it is said beside the rest of what was added.
-  local base_note="" cur def
-  cur=$(git -C "$repo" rev-parse --abbrev-ref HEAD 2>/dev/null)
-  def=$(repo_base "$repo")
-  if [ -n "$cur" ] && [ "$cur" != HEAD ] && [ -n "$def" ] && [ "$cur" != "$def" ]; then
-    if git -C "$repo" rev-parse --verify --quiet "refs/remotes/origin/$cur^{commit}" >/dev/null 2>&1; then
-      basebr=$cur
-      base_note="base:   $cur (the branch $(basename "$repo") is on - check out $def first to queue against it)"
-    else
-      warn "$(basename "$repo") is on $cur, which is not on origin - queuing against $def instead; push it first to queue against it"
-    fi
-  fi
 
   # The design set, before the wizard: what the plan's text names and exists on
   # disk. Whether the plan reads as built from a design at all is what the
@@ -1609,12 +1575,9 @@ cmd_add() {
   {
     printf -- '---\n'
     printf 'repo:     %s\n'   "$repo"
-    # Omitted entirely when unset rather than written empty: `task_base` reads
-    # this key, and an absent one is what makes it fall through to the repo
-    # default.
-    [ -n "$basebr" ] && printf 'base:     %s\n' "$basebr"
-    # Same absent-means-none pattern as `base:` - written only when there is
-    # a design set, so every task without one keeps the header it always had.
+    # Omitted entirely when unset rather than written empty - written only when
+    # there is a design set, so every task without one keeps the header it
+    # always had.
     [ -n "$design_hdr" ] && printf 'design:   %s\n' "$design_hdr"
     printf 'model:    %s\n'   "$model"
     printf 'effort:   %s\n'   "$effort"
@@ -1642,7 +1605,6 @@ cmd_add() {
   trap - EXIT
 
   msg "plan:   $plan"
-  [ -n "$base_note" ] && msg "$base_note"
   [ -n "$design_hdr" ] && msg "design: $design_hdr"
   msg "added:  new/$(basename "$dir")  ($model, effort $effort) - the next tick names it and queues it"
   repo_base_reset
