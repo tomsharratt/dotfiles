@@ -271,7 +271,10 @@ review_task "$G" 0
 eq "$(st "$G" PQ_REVIEW)" "pending" "with no reviewer to launch too: the self-review reads the same diff"
 PQ_REVIEW_MAX_TRIES=$saved_tries
 eq "$(claude_calls)" "0" "nothing launched"
-st_set "$G" PQ_STACK_DUE ""
+st_set "$G" PQ_STACK_DUE ""; st_set "$G" PQ_STACK_NEEDS closed
+review_task "$G" 0
+eq "$(st "$G" PQ_REVIEW)" "pending" "a parent closed and not decided about holds it too"
+st_set "$G" PQ_STACK_NEEDS ""
 
 echo "== --dry-run says what it would do and changes nothing ==" >&2
 set_panes "$(printf 'w1:p1\tclaude\tidle')"

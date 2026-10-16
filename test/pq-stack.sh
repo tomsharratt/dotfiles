@@ -424,6 +424,18 @@ eq "$(restack "$S" 2>&1)" "" "once"
 rows_open
 restack "$S" >/dev/null 2>&1
 eq "$(need "$S")" "" "reopened: cleared"
+echo "== restack: a child aimed at main after its parent closed is no longer stacked ==" >&2
+reset_caches
+cache_row "$RREPO" "$PA" 10 CLOSED "" main
+cache_row "$RREPO" "$CH" 11 OPEN "" "$PA"
+restack "$S" >/dev/null 2>&1
+eq "$(st "$S" PQ_STACK_NEEDS)" "closed" "aimed at the closed parent: yours"
+reset_caches
+cache_row "$RREPO" "$PA" 10 CLOSED "" main
+cache_row "$RREPO" "$CH" 11 OPEN "" main
+out=$(restack "$S" 2>&1)
+eq "$(st "$S" PQ_STACK_PARENT)$(need "$S")" "" "aimed at main: unstacked, and nothing wants you"
+has "$out" "ch-7: #11 is aimed at main now - no longer stacked on #10, which was closed" "said"
 
 echo "== restack: a missing ref or object gives no verdict and writes nothing ==" >&2
 reset_tasks; stack_pair 8; rows_open

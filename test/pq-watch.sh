@@ -242,6 +242,12 @@ P=$(prompt_text)
 hasnt "$P" "merge conflicts" "not about the conflict"
 has "$P" "CI failed on pull request #42: build (run 901)" "about CI"
 reset_caches; reset_logs
+Q=$(mk_ready 15 parentclosed w3:p2)
+st_set "$Q" PQ_STACK_PARENT tom/below; st_set "$Q" PQ_STACK_NEEDS closed
+view sha1 base1 CONFLICTING DIRTY "build:SUCCESS"
+watch_task "$Q" 0 >/dev/null 2>&1
+eq "$(prompts)" "0" "a parent closed: no rebase onto abandoned work before you decide"
+reset_caches; reset_logs
 Q=$(mk_ready 14 restackasked w3:p2)
 st_set "$Q" PQ_STACK_PARENT tom/below; st_set "$Q" PQ_STACK_ASKED 1
 view sha1 base1 MERGEABLE UNSTABLE "build:FAILURE"
