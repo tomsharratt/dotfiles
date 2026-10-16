@@ -2296,7 +2296,9 @@ pr_load_all() {                         # pairs: "repo\tbranch" lines, e.g. $(pr
     local repos; repos=$(awk -F'\t' '{ print $1 }' <<<"$pairs" | sed '/^$/d' | sort -u)
     while IFS= read -r r; do
       [ -n "$r" ] || continue
-      branches=$(awk -F'\t' -v r="$r" '$1 == r { print $2 }' <<<"$pairs")
+      # Deduplicated: a stacked task's parent is usually a pq task too, listed
+      # once as its own branch and once as the parent - one `gh` call, not two.
+      branches=$(awk -F'\t' -v r="$r" '$1 == r { print $2 }' <<<"$pairs" | sort -u)
       # shellcheck disable=SC2086
       pr_load "$r" $branches
       cat "$PR_CACHE" >> "$cache" 2>/dev/null

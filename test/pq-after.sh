@@ -534,6 +534,12 @@ eq "$(jqt json-parent '.stack')" "7" "and stack is GitHub's stack number, as a n
 eq "$(jqt json-child '.stack_parent')" "null" "both null for a task that is not stacked"
 eq "$(jqt json-child '.stack')" "null" "the stack too"
 
+echo "== pr_load_all asks once per branch, however many tasks name it ==" >&2
+# shellcheck disable=SC2329  # called by pr_load_all
+( pr_load() { shift; printf '%s\n' "$@" > "$PQ_HOME/.loaded"; PR_CACHE="$PQ_HOME/.l.pr"; PR_ANS="$PQ_HOME/.l.ans"; : > "$PR_CACHE"; : > "$PR_ANS"; }
+  pr_load_all "$(printf '%s\ttom/p\n%s\ttom/q\n%s\ttom/p\n' "$REPO" "$REPO" "$REPO")" )
+eq "$(tr '\n' ' ' < "$PQ_HOME/.loaded")" "tom/p tom/q " "a parent that is also a task's own branch is looked up once"
+
 echo "== regression: repo_base_reset actually removes its cache file ==" >&2
 # Through command substitution, like every real caller (base=$(repo_base ...))
 # - calling it as a bare statement would run in the CURRENT shell rather than
