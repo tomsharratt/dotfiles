@@ -24,11 +24,12 @@ printf '#!/bin/sh\ncase "$*" in "api snapshot") echo %s; exit 0 ;; esac\nexit 1\
 # `stack link` exits with .link-rc (default 0) and prints .link-out; on success it
 # puts every number it was given into one stack - the first argument's stack when
 # that is a stack number already listed, a new one (100) otherwise - as GitHub
-# does.
+# does. `.nocli` makes `gh stack` unknown, as a gh without the extension is.
 cat > "$STUBBIN/gh" <<EOF
 #!/bin/sh
 { for a in "\$@"; do printf '%s\t' "\$a"; done; printf '\n'; } >> "$GH_LOG"
 case "\$1 \$2" in
+  "stack --help") [ -f "$STUBBIN/.nocli" ] && exit 1; exit 0 ;;
   "stack link")
     rc=\$(cat "$STUBBIN/.link-rc" 2>/dev/null || echo 0)
     cat "$STUBBIN/.link-out" 2>/dev/null
@@ -71,7 +72,7 @@ reset_tasks() {
   rm -rf "$PQ_HOME/new" "$PQ_HOME/queue" "$PQ_HOME/running" "$PQ_HOME/done"
   mkdir -p "$PQ_HOME/new" "$PQ_HOME/queue" "$PQ_HOME/running" "$PQ_HOME/done"
 }
-reset_gh() { : > "$GH_LOG"; : > "$STACKS"; rm -f "$STUBBIN/.link-rc" "$STUBBIN/.link-out"; }
+reset_gh() { : > "$GH_LOG"; : > "$STACKS"; rm -f "$STUBBIN/.link-rc" "$STUBBIN/.link-out" "$STUBBIN/.nocli"; }
 reset_caches() {
   PR_CACHE="$PQ_HOME/.test.pr"; PR_ANS="$PQ_HOME/.test.ans"
   : > "$PR_CACHE"; : > "$PR_ANS"
@@ -139,7 +140,7 @@ for state in MERGED CLOSED; do
   G=$(mk_child 40 orphan gone 11)
   out=$(stack_link "$G" 0 2>&1)
   eq "$(gh_calls)" "0" "$state parent: no gh call"
-  eq "$(st "$G" PQ_STACK)" "" "$state parent: nothing recorded, for the restack to deal with"
+  eq "$(st "$G" PQ_STACK)$(st "$G" PQ_STACK_LINK)" "" "$state parent: nothing recorded, for the restack to deal with"
 done
 reset_tasks; reset_gh; reset_caches
 G=$(mk_child 41 no-row nowhere 11)
@@ -155,7 +156,62 @@ printf -- '---\nrepo:     %s\nbranch:   tom/middle\n---\n' "$REPO" > "$M/plan.md
 T=$(mk_child 51 top middle 12)
 stack_link "$T" 0 >/dev/null 2>&1
 eq "$(links)" "0" "no stack is started with a feature branch for its trunk"
-eq "$(st "$T" PQ_STACK)" "" "and nothing is recorded: the next tick looks again"
+eq "$(st "$T" PQ_STACK)$(st "$T" PQ_STACK_LINK)" "" "and nothing is recorded: the next tick looks again"
+st_set "$M" PQ_STACK_LINK failed
+out=$(stack_link "$T" 0 2>&1)
+eq "$(st "$T" PQ_STACK_LINK)" "below" "once the parent's own link has given up, so does the child's"
+has "$out" "#11 never joined a stack of its own, so #12 stays a plain chained pull request on it" "said once"
+eq "$(stack_link "$T" 0 2>&1)" "" "and not again"
+
+echo "== no gh stack: said once, and the pull request stays chained ==" >&2
+reset_tasks; reset_gh; reset_caches; touch "$STUBBIN/.nocli"
+cache_row "$REPO" tom/bottom 10 OPEN "" master
+N=$(mk_child 60 no-cli bottom 11)
+out=$(stack_link "$N" 0 2>&1)
+eq "$(st "$N" PQ_STACK_LINK)" "nocli" "recorded"
+has "$out" "no-cli: gh stack is not installed (gh extension install github/gh-stack) - #11 stays a plain chained pull request on #10" "with how to get it"
+eq "$(links)" "0" "and no link is tried"
+: > "$GH_LOG"
+eq "$(stack_link "$N" 0 2>&1)" "" "said once"
+eq "$(gh_calls)" "0" "and never asked again"
+
+echo "== stacks off for the repo (exit 9): said once ==" >&2
+reset_tasks; reset_gh; reset_caches; printf 9 > "$STUBBIN/.link-rc"
+cache_row "$REPO" tom/bottom 10 OPEN "" master
+X=$(mk_child 70 disabled bottom 11)
+out=$(stack_link "$X" 0 2>&1)
+eq "$(st "$X" PQ_STACK_LINK)" "disabled" "recorded"
+has "$out" "stacked pull requests are not enabled for $(basename "$REPO") - #11 stays a plain chained pull request on #10" "and said"
+: > "$GH_LOG"
+eq "$(stack_link "$X" 0 2>&1)" "" "once"
+eq "$(gh_calls)" "0" "and never tried again"
+
+echo "== any other failure is tried three times, then said once ==" >&2
+reset_tasks; reset_gh; reset_caches; printf 5 > "$STUBBIN/.link-rc"
+printf 'Checking existing stacks...\nCannot update stack: this would remove #10 from the stack\n' > "$STUBBIN/.link-out"
+cache_row "$REPO" tom/bottom 10 OPEN "" master
+F=$(mk_child 80 flaky bottom 11)
+out=$(stack_link "$F" 0 2>&1)
+eq "$(st "$F" PQ_STACK_LINK_FAILS)" "1" "the first failure is counted"
+eq "$out" "" "and kept quiet"
+stack_link "$F" 0 >/dev/null 2>&1
+eq "$(st "$F" PQ_STACK_LINK)" "" "the second is still a retry"
+out=$(stack_link "$F" 0 2>&1)
+eq "$(st "$F" PQ_STACK_LINK)" "failed" "the third gives up"
+has "$out" "could not add #11 to #10's stack after 3 tries (Cannot update stack: this would remove #10 from the stack) - it stays a plain chained pull request" "with the last error"
+eq "$(links)" "3" "three tries"
+eq "$(stack_link "$F" 0 2>&1)" "" "and said once"
+eq "$(links)" "3" "with no fourth"
+# A link gh says worked but the API does not list is a failure too.
+reset_tasks; reset_gh; reset_caches
+cache_row "$REPO" tom/bottom 10 OPEN "" master
+U=$(mk_child 81 unlisted bottom 11)
+# shellcheck disable=SC2329  # called by stack_link_run
+gh() { if [ "$1 $2" = "stack link" ]; then printf 'stack\tlink\t%s\t%s\t\n' "$3" "$4" >> "$GH_LOG"; return 0; fi; command gh "$@"; }
+stack_link "$U" 0 >/dev/null 2>&1
+unset -f gh
+eq "$(st "$U" PQ_STACK)" "" "nothing is recorded as linked"
+eq "$(st "$U" PQ_STACK_LINK_FAILS)" "1" "and it counts as a try"
 
 echo "== --dry-run says what it would do and writes nothing ==" >&2
 reset_tasks; reset_gh; reset_caches
@@ -164,7 +220,7 @@ D=$(mk_child 90 dry bottom 11)
 out=$(stack_link "$D" 1 2>&1)
 has "$out" "would add #11 to #10's stack" "it says so"
 eq "$(gh_calls)" "0" "without asking gh anything"
-[ -f "$D/state.env" ] && eq "$(grep -c 'PQ_STACK=' "$D/state.env")" "0" "and records nothing" || ok
+[ -f "$D/state.env" ] && eq "$(grep -c 'PQ_STACK=\|PQ_STACK_LINK' "$D/state.env")" "0" "and records nothing" || ok
 
 echo "== through the tick: a done task is linked on the pass that sees its pull request ==" >&2
 reset_tasks; reset_gh

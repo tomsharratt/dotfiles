@@ -3841,14 +3841,19 @@ dispatch_gaveup() { [ "$(st "$1" PQ_DISPATCH_GAVEUP)" = 1 ]; }
 #
 # A parent that is in no stack and is not aimed at the trunk is itself a layer
 # whose link has not happened yet, and is waited for: linking to it would start
-# a stack whose trunk is a feature branch.
+# a stack whose trunk is a feature branch. If its link has given up, so does the
+# child's - it stays a plain chained pull request.
 #
-# It is idempotent by construction - pq stops once PQ_STACK is set, and asks the
-# stacks API first, so a pull request linked by hand, or by a tick that stopped
-# before it could record it, is just recorded. A link that does not go through
-# is tried again on the next tick.
+# Missing extension (`nocli`), stacks off for the repo (`disabled`, gh-stack's
+# exit 9) and three failures in a row (`failed`) are each said once and stop
+# there, recorded as PQ_STACK_LINK. None of them counts into "needs you": the
+# chained pull request still works, and only the stack map and GitHub's
+# automatic restack are lost. It is idempotent by construction - pq stops once
+# PQ_STACK is set, and asks the stacks API first, so a pull request linked by
+# hand, or by a tick that stopped before it could record it, is just recorded.
 #
 # A parent that merged or closed is PR 3's (restack); this does nothing about it.
+STACK_LINK_TRIES=3
 STACK_API_VERSION=2026-03-10
 
 # GitHub's number for the stack holding pull request N, or nothing when it is in
@@ -3865,27 +3870,53 @@ stack_link_run() {                      # repo bottom-or-stack child
 }
 
 stack_link() {                          # task_dir dry
-  local d=$1 dry=$2 slug repo parent child pnum pstate pstack stack
+  local d=$1 dry=$2 slug repo parent child pnum pstate pstack stack rc out n owner
   [ -z "$(st "$d" PQ_REAPED)" ] || return 0
   parent=$(st "$d" PQ_STACK_PARENT); child=$(st "$d" PQ_PR)
   [ -n "$parent" ] && [ -n "$child" ] || return 0
-  [ -z "$(st "$d" PQ_STACK)" ] || return 0
+  [ -z "$(st "$d" PQ_STACK)" ] && [ -z "$(st "$d" PQ_STACK_LINK)" ] || return 0
   slug=$(slug_of "$d"); repo=$(hdr "$d/plan.md" repo)
   pnum=""; pstate=""
   IFS=$'\t' read -r pnum pstate _ <<<"$(pr_get "$repo" "$parent")"
   [ "${pstate:-}" = OPEN ] && [ -n "$pnum" ] || return 0
   [ "$dry" = 1 ] && { msg "would add #$child to #$pnum's stack"; return 0; }
+  if ! gh stack --help >/dev/null 2>&1; then
+    st_set "$d" PQ_STACK_LINK nocli
+    warn "$slug: gh stack is not installed (gh extension install github/gh-stack) - #$child stays a plain chained pull request on #$pnum"
+    return 0
+  fi
   if stack=$(stack_of "$repo" "$child") && [ -n "$stack" ]; then
     st_set "$d" PQ_STACK "$stack"
     msg "$slug: #$child joined #$pnum's stack (stack $stack)"
     return 0
   fi
   pstack=$(stack_of "$repo" "$pnum") || pstack=""
-  [ -z "$pstack" ] && [ "$(pr_base "$repo" "$parent")" != "$(repo_base "$repo")" ] && return 0
-  shielded stack_link_run "$repo" "${pstack:-$pnum}" "$child"
-  if stack=$(stack_of "$repo" "$child") && [ -n "$stack" ]; then
+  if [ -z "$pstack" ] && [ "$(pr_base "$repo" "$parent")" != "$(repo_base "$repo")" ]; then
+    owner=$(task_by_branch "$repo" "$parent") || owner=""
+    if [ -n "$owner" ] && [ -n "$(st "$owner" PQ_STACK_LINK)" ]; then
+      st_set "$d" PQ_STACK_LINK below
+      warn "$slug: #$pnum never joined a stack of its own, so #$child stays a plain chained pull request on it"
+    fi
+    return 0
+  fi
+  shielded stack_link_run "$repo" "${pstack:-$pnum}" "$child"; rc=$?; out=$SHIELDED_OUT
+  if [ "$rc" = 0 ] && stack=$(stack_of "$repo" "$child") && [ -n "$stack" ]; then
     st_set "$d" PQ_STACK "$stack"
+    [ -z "$(st "$d" PQ_STACK_LINK_FAILS)" ] || st_set "$d" PQ_STACK_LINK_FAILS ""
     msg "$slug: #$child joined #$pnum's stack (stack $stack)"
+    return 0
+  fi
+  if [ "$rc" = 9 ]; then
+    st_set "$d" PQ_STACK_LINK disabled
+    warn "$slug: stacked pull requests are not enabled for $(basename "$repo") - #$child stays a plain chained pull request on #$pnum"
+    return 0
+  fi
+  [ "$rc" = 0 ] && out="gh stack link said it worked, but the stacks API does not list #$child"
+  n=$(st "$d" PQ_STACK_LINK_FAILS); n=$(( ${n:-0} + 1 ))
+  st_set "$d" PQ_STACK_LINK_FAILS "$n"
+  if [ "$n" -ge "$STACK_LINK_TRIES" ]; then
+    st_set "$d" PQ_STACK_LINK failed
+    warn "$slug: could not add #$child to #$pnum's stack after $n tries ($(tail -1 <<<"$out" | tr -d '\r')) - it stays a plain chained pull request"
   fi
   return 0
 }
