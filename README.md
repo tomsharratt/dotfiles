@@ -264,14 +264,26 @@ An agent that gets stuck, or finds the plan does not fit, commits what it has an
 
 #### Designs travel with the task
 
-A plan written from a Claude Design file describes the design in prose, and an implementer that only ever sees the prose builds to its memory of a picture it never saw - one pull request's own description admitted as much.
+A plan written from a design describes the design in prose, and an implementer that only ever sees the prose builds to its memory of a picture it never saw - one pull request's own description admitted as much.
 So the file travels with the task.
-The wizard asks for one when a plan built from a design names none, and every absolute or `~`-prefixed path to a `.dc.html`, `.html`, `.png`, `.jpg`, `.jpeg` or `.pdf` that the plan's text mentions is picked up on its own; a mention that does not exist on disk is warned about by name, and a `.html.erb` or a `claude.ai` url is never mistaken for one.
-The rule in `AGENTS.md` closes the loop from the planning side: a plan built from a Claude Design file saves that file to `~/.claude/plans/designs/` and cites the absolute path on its own line, so `pq add` finds it.
 
+The design is drawn in the planning session itself, as an Artifact - Claude Design is part of Claude Code now, so there is no design file to go and fetch.
+The rule in `AGENTS.md` has the session ask the questions that shape the screens first, then draw the design in a background fork while the rest of the interview goes on.
+The fork writes the page to `~/.claude/plans/designs/<Name>.dc.html` and publishes it privately from that path, so the file stays the artifact's source and every republish keeps the link.
+The plan cites both on their own lines - `Design file: /Users/...` and `Design artifact: https://claude.ai/artifact/...` - so `pq add` finds them.
+Step 4 of one-time purchases was the first series whose design was drawn in planning, though after the interview rather than during it.
+
+Every absolute or `~`-prefixed path to a `.dc.html`, `.html`, `.png`, `.jpg`, `.jpeg` or `.pdf` that the plan's text mentions is picked up on its own; a mention that does not exist on disk is warned about by name, and a `.html.erb` or a `claude.ai` url is never mistaken for one.
 The files are copied into `<task>/design/` inside the same staging step that writes `plan.md`, so a task lands with its design or not at all, and the `design:` header lists them - absent when there are none.
-A plan that reads as built from a design (it cites `claude.ai/design` or a `.dc.html`) with no file found gets one question at the wizard - the file, or Esc to go without, loudly.
-The contract then tells the implementer exactly what to do with them.
+A plan that reads as built from a design (it cites a `.dc.html` or a `claude.ai` artifact link) with no file found gets one question at the wizard - the file, or Esc to go without, loudly.
+
+The page claude.ai serves is not quite the file it was published from: the host wraps it in a document of its own, a doctype and a small reset with a 14px system font, and the file carries none of that.
+Opened raw from disk it renders in quirks mode at the browser's 16px default, so every line of text without a size of its own comes out bigger, and the whole board sits lower, than the page Tom reviewed.
+So a design file with neither a doctype nor an `<html>` tag - exactly an artifact's source - is copied in wrapped in the host's own wrapper, and comes out byte for byte the page claude.ai serves; anything else is copied as it is.
+
+Every `claude.ai` artifact link the plan mentions rides along in the `artifact:` header, written only beside `design:`, since a link with nothing in `design/` has nothing to stand beside.
+The contract tells the implementer the link is not for it - the page is private, and its browser is a fresh Chrome that is not signed in to claude.ai - and to build only from the copies in `design/`, which it opens and compares against as below.
+The link is for whoever reads the pull request: its `## Design fidelity` section opens with it, so the result can be held up against the design as it was reviewed.
 
 #### Evidence
 
