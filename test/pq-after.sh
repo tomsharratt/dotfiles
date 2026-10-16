@@ -73,7 +73,8 @@ eq() {                                   # got want msg
   [ "$1" = "$2" ] && ok || bad "$3 (got '$1', want '$2')"
 }
 
-cleanup() { rm -rf "$PQ_HOME" "$STUBBIN" "${REPO:-}"; }
+cleanup() { rm -rf "$PQ_HOME" "$STUBBIN" "${REPO:-}" "${REPO2:-}"; }
+first_dir() { [ -d "${1:-}" ] && printf '%s' "$1"; }
 trap cleanup EXIT
 
 # ── a real, throwaway git repo ──────────────────────────────────────────────
@@ -216,7 +217,7 @@ reset_tasks; reset_caches
 t=$(mk_task queue 20 unknown-owner "$REPO" tom/unknown-owner)
 after_add "$t" ghost "$REPO" tom/never-answered
 verdict=$(after_state "$t"); verdict=${verdict%%$'\t'*}
-case "$verdict" in waiting\ *) ok ;; *) bad "gh-down should read as waiting (got '$verdict')" ;; esac
+eq "$verdict" "on ghost" "gh-down reads as an ordinary wait - for a same-repo parent, on it"
 after_check "$t" >/dev/null
 [ "$(st "$t" PQ_AFTER_DEAD)" != 1 ] && ok || bad "gh-down must not set PQ_AFTER_DEAD"
 
@@ -269,7 +270,7 @@ after_check "$dep" >/dev/null
 
 echo "== an after file with no trailing newline still gates (regression) ==" >&2
 reset_tasks; reset_caches
-cache_row "$REPO" tom/no-newline-blocker 15 OPEN "" master
+cache_row "$REPO" tom/no-newline-blocker 15 OPEN draft master
 owner=$(mk_task queue 10 no-newline-owner "$REPO" tom/no-newline-blocker)
 dep=$(mk_task queue 20 no-newline-dependent "$REPO" tom/no-newline-dependent)
 # Written directly, WITHOUT a trailing newline - `after` is documented as
@@ -277,7 +278,7 @@ dep=$(mk_task queue 20 no-newline-dependent "$REPO" tom/no-newline-dependent)
 # writer) looks like on disk.
 printf '%s\t%s\t%s' "$(slug_of "$owner")" "$REPO" tom/no-newline-blocker > "$dep/after"
 verdict=$(after_state "$dep"); verdict=${verdict%%$'\t'*}
-case "$verdict" in waiting\ *) ok ;; *) bad "a trailing-newline-less after file must still gate (got '$verdict')" ;; esac
+case "$verdict" in on\ *) ok ;; *) bad "a trailing-newline-less after file must still gate (got '$verdict')" ;; esac
 deps=$(dependents_of "$REPO" tom/no-newline-blocker)
 eq "$deps" "no-newline-dependent" "dependents_of must not drop the last line either"
 
@@ -302,6 +303,75 @@ out=$(tick_body 3 1 2>&1 1>/dev/null)
 case "$out" in *"would dispatch $(slug_of "$A")"*) ok ;; *) bad "chain: A should be eligible ($out)" ;; esac
 case "$out" in *"would skip $(slug_of "$B")"*)     ok ;; *) bad "chain: B should be skipped ($out)" ;; esac
 case "$out" in *"would skip $(slug_of "$C")"*)     ok ;; *) bad "chain: C should be skipped ($out)" ;; esac
+
+echo "== a same-repo dependency builds on its parent: on, stack, met ==" >&2
+# A second repo, for a dependency that crosses repos and so waits for a merge.
+REPO2=$(mktemp -d)
+git init -q -b main "$REPO2"
+git -C "$REPO2" -c user.email=test@test -c user.name=test commit -q --allow-empty -m init
+mkdir -p "$REPO2/.git/refs/remotes/origin"
+git -C "$REPO2" update-ref refs/remotes/origin/main refs/heads/main
+git -C "$REPO2" symbolic-ref refs/remotes/origin/HEAD refs/remotes/origin/main
+verdict_of() { local v; v=$(after_state "$1"); printf '%s' "${v%%$'\t'*}"; }
+
+reset_tasks; reset_caches
+mk_task running 10 stack-parent "$REPO" tom/stack-parent >/dev/null
+K=$(mk_task queue 20 stack-child "$REPO" tom/stack-child)
+after_add "$K" stack-parent "$REPO" tom/stack-parent
+ans_row "$REPO" tom/stack-parent
+eq "$(verdict_of "$K")" "on stack-parent" "no pull request yet: on its parent"
+cache_row "$REPO" tom/stack-parent 30 OPEN draft master
+eq "$(verdict_of "$K")" "on stack-parent" "a draft in review: still on its parent"
+reset_caches
+cache_row "$REPO" tom/stack-parent 30 OPEN "" master
+eq "$(verdict_of "$K")" "stack stack-parent" "marked ready: it builds on it"
+eq "$(agent_cell "$K" queue)" "-" "eligible, so pq ls has nothing to say about it"
+reset_caches
+cache_row "$REPO" tom/stack-parent 30 MERGED "" master
+eq "$(verdict_of "$K")" "met" "merged: met, and it starts from the default branch"
+reset_caches
+ans_row "$REPO" tom/stack-parent
+eq "$(agent_cell "$K" queue)" "on stack-parent" "pq ls reads on <label> while it waits"
+eq "$(stack_branch "$K" stack-parent)" "tom/stack-parent" "stack_branch reads the branch off its after line"
+
+echo "== a dependency in another repo waits for its merge, ready or not ==" >&2
+reset_tasks; reset_caches
+mk_task running 10 web-parent "$REPO2" tom/web-parent >/dev/null
+M=$(mk_task queue 20 app-child "$REPO" tom/app-child)
+after_add "$M" web-parent "$REPO2" tom/web-parent
+cache_row "$REPO2" tom/web-parent 31 OPEN "" main
+eq "$(verdict_of "$M")" "waiting web-parent 1" "marked ready is still waiting across repos"
+eq "$(agent_cell "$M" queue)" "after web-parent" "and reads after <label>, as before"
+reset_caches
+cache_row "$REPO2" tom/web-parent 31 MERGED "" main
+eq "$(verdict_of "$M")" "met" "merged into its own repo's default branch: met"
+
+echo "== fill claims a stack task and records its parent, and skips one still on it ==" >&2
+reset_tasks; reset_caches
+mk_task running 10 fill-parent "$REPO" tom/fill-parent >/dev/null
+W=$(mk_task queue 20 fill-waiting "$REPO" tom/fill-waiting)
+after_add "$W" fill-parent "$REPO" tom/fill-parent
+mk_task running 30 fill-ready "$REPO" tom/fill-ready >/dev/null
+S=$(mk_task queue 40 fill-stack "$REPO" tom/fill-stack)
+after_add "$S" fill-ready "$REPO" tom/fill-ready
+# The tick loads its own cache; this stands in for the forge's answer.
+# shellcheck disable=SC2329  # called by tick_body
+pr_load_all() {
+  PR_CACHE="$PQ_HOME/.test.pr"; PR_ANS="$PQ_HOME/.test.ans"
+  printf '%s\t%s\n' "$REPO" tom/fill-parent "$REPO" tom/fill-ready > "$PR_ANS"
+  printf '%s\ttom/fill-ready\t41\tOPEN\t\tmaster\t\n' "$REPO" > "$PR_CACHE"
+}
+out=$(tick_body 5 1 2>&1 1>/dev/null)
+case "$out" in *"would skip fill-waiting - waiting for fill-parent to be marked ready"*) ok ;; *) bad "an on task is skipped, saying why ($out)" ;; esac
+case "$out" in *"would dispatch fill-stack (tom/fill-stack), building on fill-ready"*) ok ;; *) bad "a stack task is eligible ($out)" ;; esac
+case "$out" in *"1 waiting"*) ok ;; *) bad "the summary counts the on task as waiting, and not the stack one ($out)" ;; esac
+# shellcheck disable=SC2329  # called by tick_body
+( dispatch_try() { return 0; }; tick_body 5 0 ) >/dev/null 2>&1
+S=$(first_dir "$PQ_HOME/running"/*-fill-stack)
+[ -n "$S" ] && ok || bad "the stack task is claimed"
+[ -n "$S" ] && eq "$(st "$S" PQ_STACK_PARENT)" "tom/fill-ready" "and records the branch it builds on at the claim"
+[ -d "$W" ] && ok || bad "the on task stays queued"
+unset -f pr_load_all
 
 echo "== cycle and self-reference rejected by pq after ==" >&2
 reset_tasks
@@ -342,7 +412,7 @@ b_rc=$?
 b_dir=$(find_task add-chain-b 2>/dev/null)
 if [ -n "$b_dir" ] && [ -f "$b_dir/after" ]; then ok; else bad "chained add should have written an after file"; fi
 verdict=$(after_state "$b_dir" 2>/dev/null); verdict=${verdict%%$'\t'*}
-case "$verdict" in waiting\ *) ok ;; *) bad "B should be waiting on A right after being chained (got '$verdict')" ;; esac
+eq "$verdict" "on add-chain-a" "B should be on A right after being chained"
 
 echo "== an --after blocker is recorded, and pq ls --json sees the task blocked ==" >&2
 add_as "$PLAN_FILE" tom/add-json-test --repo "$REPO" --after add-chain-a 2>"$PQ_HOME/.add.stderr"

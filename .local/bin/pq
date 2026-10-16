@@ -2445,7 +2445,8 @@ blocker_state() {                       # repo branch base
 }
 
 # after_state <task_dir> -> "verdict\tdetail" where verdict is
-# met | waiting <label> <n_unmet> | stalled <label> | dead <label>, and detail
+# met | stack <label> | on <label> | waiting <label> <n_unmet> | stalled <label>
+# | dead <label>, and detail
 # is one of dead|orphan|stalled|nobase:<repo>|"" - the finer-grained reason a
 # caller needs for a warning message but that would overload the verdict text
 # itself. Both are printed on the SAME line, tab-separated, rather than through
@@ -2454,14 +2455,25 @@ blocker_state() {                       # repo branch base
 # vanish the moment it returned - the same trap repo_base's cache sidesteps by
 # being a file instead of a variable.
 #
-# Aggregates every blocker: dead/orphan outranks stalled outranks plain
-# waiting, because the fix differs and the worse case is the one worth
-# surfacing first - a task can be both "waiting on two" and "one of them is
-# dead", and dead is the one that will never resolve on its own.
+# A dependency's kind is derived from where it lives, never stored. One in the
+# task's own repo is a STACK dependency - the task builds on it: it is eligible
+# once that pull request is marked ready (`stack <label>`), forked from its
+# branch, and until then it is `on <label>`; once it has merged the task is
+# simply `met` and starts from the default branch. One in another repo is a
+# MERGE dependency, since a stack cannot cross repos: it waits for the merge,
+# and `ready` is still `waiting` there.
+#
+# Nothing new writes more than one line, but an old task may carry two, so
+# this still aggregates: dead/orphan outranks stalled outranks a merge still to
+# come outranks a pull request still to be marked ready, because the fix
+# differs and the worse case is the one worth surfacing first - dead is the
+# one that will never resolve on its own.
 after_state() {                         # task_dir
-  local d=$1 label repo branch base bst
+  local d=$1 own label repo branch base bst
   local first_dead="" first_dead_detail="" first_stalled="" first_wait="" n_unmet=0 nobase=""
+  local first_on="" first_stack=""
   if [ ! -f "$d/after" ]; then printf 'met\t'; return; fi
+  own=$(hdr "$d/plan.md" repo)
   while IFS=$'\t' read -r label repo branch; do
     [ -n "$label" ] || continue
     base=$(repo_base "$repo")
@@ -2478,7 +2490,13 @@ after_state() {                         # task_dir
         if [ -z "$first_dead" ]; then first_dead=$label; first_dead_detail=$bst; fi
         ;;
       stalled) n_unmet=$((n_unmet + 1)); [ -n "$first_stalled" ] || first_stalled=$label ;;
-      *)       n_unmet=$((n_unmet + 1)); [ -n "$first_wait" ] || first_wait=$label ;;
+      ready|waiting|unknown)
+        if [ "$repo" = "$own" ]; then
+          if [ "$bst" = ready ]; then [ -n "$first_stack" ] || first_stack=$label
+          else [ -n "$first_on" ] || first_on=$label; fi
+        else
+          n_unmet=$((n_unmet + 1)); [ -n "$first_wait" ] || first_wait=$label
+        fi ;;
     esac
   done <<<"$(after_list "$d")"
   if [ -n "$first_dead" ]; then
@@ -2487,9 +2505,20 @@ after_state() {                         # task_dir
     printf 'stalled %s\tstalled' "$first_stalled"
   elif [ "$n_unmet" -gt 0 ]; then
     printf 'waiting %s %d\t%s' "$first_wait" "$n_unmet" "${nobase:+nobase:$nobase}"
+  elif [ -n "$first_on" ]; then
+    printf 'on %s\t' "$first_on"
+  elif [ -n "$first_stack" ]; then
+    printf 'stack %s\t' "$first_stack"
   else
     printf 'met\t'
   fi
+}
+
+# The branch a task builds on, from its `after` line in its own repo under this
+# label - what fill records when after_state says `stack <label>`.
+stack_branch() {                        # task_dir label -> branch, or nothing
+  awk -F'\t' -v r="$(hdr "$1/plan.md" repo)" -v l="$2" \
+    '$1 == l && $2 == r { print $3; exit }' "$1/after" 2>/dev/null
 }
 
 # The tick-time wrapper: after_state plus the once-only warning. dead, orphan
@@ -2691,7 +2720,9 @@ agent_cell() {                          # task_dir state
       local verdict lbl cnt
       IFS=$'\t' read -r verdict _ <<<"$(after_state "$d")"
       case "$verdict" in
-        met)  printf -- '-' ;;
+        # Eligible, and building on it once a slot frees: nothing to wait on.
+        met|stack\ *) printf -- '-' ;;
+        on\ *) printf 'on %s' "$(cell "${verdict#on }" "$PQ_LABEL_MAX")" ;;
         waiting\ *)
           lbl=${verdict#waiting }; cnt=${lbl##* }; lbl=${lbl% *}
           lbl=$(cell "$lbl" "$PQ_LABEL_MAX")
@@ -2889,7 +2920,7 @@ cmd_ls() {
       *)      pr="-" ;;
     esac
     if [ "$as_json" = 1 ]; then
-      case "$(after_state "$d")" in met$'\t'*) blocked=false ;; *) blocked=true ;; esac
+      case "$(after_state "$d")" in met$'\t'*|stack\ *) blocked=false ;; *) blocked=true ;; esac
       local merged closed reaped held
       merged=$(st "$d" PQ_MERGED); closed=$(st "$d" PQ_CLOSED)
       reaped=$(st "$d" PQ_REAPED); held=$(st "$d" PQ_REAP_HELD)
@@ -5425,7 +5456,9 @@ tick_body() {                           # cap dry
     [ -f "$d/after" ] && v=$(after_check "$d")
     [ -n "$v" ] && printf '%s\t%s\n' "$d" "$v" >> "$afterpass"
   done
-  local waiting; waiting=$(awk -F'\t' '$2 !~ /^met/ { n++ } END { print n + 0 }' "$afterpass")
+  # Eligible is not waiting: `stack` is a task that builds on a pull request
+  # already marked ready.
+  local waiting; waiting=$(awk -F'\t' '$2 !~ /^(met|stack )/ { n++ } END { print n + 0 }' "$afterpass")
 
   # 2. Fill. A live agent is a slot, wherever its task now sits - every running/
   #    task (a task blocked on a permission prompt still holds one, the
@@ -5454,7 +5487,10 @@ tick_body() {                           # cap dry
       fi
       verdict=$(awk -F'\t' -v d="$d" '$1 == d { print $2; exit }' "$afterpass")
       case "${verdict:-met}" in
-        met) ;;
+        met|stack\ *) ;;
+        on\ *)
+          [ "$dry" = 1 ] && msg "would skip $slug - waiting for ${verdict#on } to be marked ready"
+          continue ;;
         waiting\ *)
           if [ "$dry" = 1 ]; then
             lbl=${verdict#waiting }; n=${lbl##* }; lbl=${lbl% *}
@@ -5469,7 +5505,8 @@ tick_body() {                           # cap dry
           continue ;;
       esac
       if [ "$dry" = 1 ]; then
-        msg "would dispatch $slug ($(hdr "$d/plan.md" branch))"
+        local on=""; case "$verdict" in stack\ *) on=", building on ${verdict#stack }" ;; esac
+        msg "would dispatch $slug ($(hdr "$d/plan.md" branch))$on"
         # A separate counter from $started: --dry-run changes nothing, and a
         # summary that says "N started" when nothing moved is the one line a
         # human actually reads before trusting the rest of it.
@@ -5480,6 +5517,11 @@ tick_body() {                           # cap dry
       # left queue/ a second tick would happily pick up the very same plan.
       claimed=$(retitle "$d" running) || continue
       st_set "$claimed" PQ_CLAIMED "$(now)"
+      # What it builds on is decided here, at the claim, so a dispatch resumed on
+      # a later tick keeps it - see dispatch_task for what it does with it.
+      case "$verdict" in
+        stack\ *) st_set "$claimed" PQ_STACK_PARENT "$(stack_branch "$claimed" "${verdict#stack }")" ;;
+      esac
       dispatch_try "$claimed"
       [ $? = 1 ] && ! dispatch_gaveup "$claimed" && warn "$slug: left in running/ half-dispatched - the next tick will retry it"
       started=$((started + 1)); free=$((free - 1))
@@ -5504,7 +5546,7 @@ $([ "$unnamed" -gt 0 ] && printf ', %s new' "$unnamed")\
 $([ "$n_named" -gt 0 ] && printf ', %s named' "$n_named")\
 $([ "$started" -gt 0 ] && printf ', %s started' "$started")\
 $([ "$would" -gt 0 ] && printf ', %s would start' "$would")\
-$([ "$waiting" -gt 0 ] && printf ', %s waiting on a merge' "$waiting")\
+$([ "$waiting" -gt 0 ] && printf ', %s waiting' "$waiting")\
 $([ "$n_reviewing" -gt 0 ] && printf ', %s reviewing' "$n_reviewing")\
 $([ "$n_torn" -gt 0 ] && printf ', %s torn down' "$n_torn")\
 $([ "$would_torn" -gt 0 ] && printf ', %s would tear down' "$would_torn")$reap_note\

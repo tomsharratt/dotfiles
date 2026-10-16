@@ -127,7 +127,7 @@ eq "$(state_of "$qb")/$(slug_of "$qb")" "queue/chain-b" "and so is what waits on
 eq "$(stamp_of "$qa") $(stamp_of "$qb")" "$sa $sb" "each keeping its stamp, so the queue is still add-order"
 eq "$(cat "$qb/after")" "chain-a"$'\t'"$(hdr "$qa/plan.md" repo)"$'\t'"tom/chain-a" "the stamp became the blocker's (label, repo, branch)"
 [ -e "$qb/after.new" ] || [ -e "$qb/state.env" ] && bad "a queued task keeps nothing of its naming" || ok
-eq "$(after_state "$qb" | cut -f1)" "waiting chain-a 1" "and it gates the dependent"
+eq "$(after_state "$qb" | cut -f1)" "on chain-a" "and it gates the dependent, which builds on it"
 [ -L "$PQ_HOME/tasks/$(basename "$qa")" ] && ok || bad "the named task gets its stable link"
 [ -e "$PQ_HOME/tasks/$(basename "$a")" ] && bad "and none is left under its old name" || ok
 has "$(said)" "queued chain-a - tom/chain-a" "the run log says what each was named"
