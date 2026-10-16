@@ -3900,7 +3900,7 @@ dispatch_gaveup() { [ "$(st "$1" PQ_DISPATCH_GAVEUP)" = 1 ]; }
 # PQ_STACK is set, and asks the stacks API first, so a pull request linked by
 # hand, or by a tick that stopped before it could record it, is just recorded.
 #
-# A parent that merged or closed is PR 3's (restack); this does nothing about it.
+# A parent that merged or closed is the restack's (below); this does nothing about it.
 STACK_LINK_TRIES=3
 STACK_API_VERSION=2026-03-10
 
@@ -3973,6 +3973,171 @@ stack_link() {                          # task_dir dry
     st_set "$d" PQ_STACK_LINK failed
     warn "$slug: could not add #$child to #$pnum's stack after $n tries ($(tail -1 <<<"$out" | tr -d '\r')) - it stays a plain chained pull request"
   fi
+  return 0
+}
+
+# ── restacking a layer ──────────────────────────────────────────────────────
+# A stacked task forks from its parent's head (PQ_STACK_FORK), and the parent
+# can then change in four ways. Two of them need nothing from pq:
+#
+#   gained commits      review or CI fixes on the parent. The child's diff still
+#                       shows only its own layer, and Rebase stack at merge time
+#                       makes the stack linear again
+#   squash-merged, and  GitHub retargets the child to the default branch and
+#   GitHub restacked    force-pushes a rebased copy of it, server-side
+#
+# and two of them do, because the child's diff then shows the parent's OLD
+# commits beside its own:
+#
+#   rebased             a conflict fix on the parent, now that conflicts are
+#                       rebased (6 of 32 ready pull requests needed one) - the
+#                       need is `onto parent`
+#   merged, and the     GitHub's restack failed, or never ran because the child
+#   child still carries was never linked: it does not restack a child that is
+#   the old commits     no longer linear on its parent - the need is `onto default`
+#
+# Which one it is comes from the heads as they are NOW - never from "the
+# parent's sha changed", since Rebase stack moves parent and child together and
+# must not send a prompt up the stack. P is the parent's head on origin, C the
+# task's own, F its fork point, and "contains" is git ancestry:
+#
+#   parent open      C contains P                -> linear; F becomes P
+#                    P contains F                -> gained commits
+#                    neither                     -> rebased: onto parent
+#   parent merged    F is on the default branch,
+#                    or C no longer contains F   -> landed
+#                    C still contains F          -> onto default
+#   parent closed    every row CLOSED            -> handed to you
+#
+# A child whose parent has merged and which has landed is the bottom of its
+# stack: PQ_STACK_PARENT is cleared, PQ_STACK_LANDED records which pull request
+# it was on, and from here on it is an ordinary pull request.
+#
+# Every value written is a single word, as st_set needs: the need is two keys,
+# PQ_STACK_ONTO (`parent` or `default`) and PQ_STACK_DUE (its fingerprint, a
+# cksum), both empty when there is none. A rebase cascades on its own: a child
+# that moved is a rewritten parent for the layer above it, which a later tick
+# sees from that layer's heads.
+
+# The commit a remote-tracking ref names, or nothing (and 1) when there is none.
+stack_head() {                          # repo branch -> sha
+  git -C "$1" rev-parse --verify --quiet "refs/remotes/origin/$2^{commit}" 2>/dev/null
+}
+# git ancestry with its three answers kept apart: 0 contains, 1 does not, 2 git
+# could not say - an object it does not have, say. `merged_into` may read
+# failure as "not yet"; here a missing F would read as "landed" and clear the
+# parent for good, so only a real 1 counts as no.
+stack_contains() {                      # repo ancestor descendant -> 0 | 1 | 2
+  git -C "$1" merge-base --is-ancestor "$2" "$3" 2>/dev/null
+  case $? in 0) return 0 ;; 1) return 1 ;; *) return 2 ;; esac
+}
+stack_fp() { printf '%s %s' "$1" "$2" | cksum | awk '{ print $1 }'; }
+
+# Which of the cases above a stacked task is in, as verdict<TAB>arg: `linear P`,
+# `gained`, `rebased FP`, `landed`, `stale FP` (merged, still carrying the old
+# commits), `closed` - or nothing at all when it cannot say this tick (a ref or
+# an object that is not there, gh not answering), which every caller reads as
+# "no change". Its refs are refreshed with base_fetch, so a tick reads origin
+# as it is and a listing reads what is on disk.
+stack_verdict() {                       # task_dir
+  local d=$1 repo branch parent defb F P C rc
+  repo=$(hdr "$d/plan.md" repo); branch=$(hdr "$d/plan.md" branch)
+  parent=$(st "$d" PQ_STACK_PARENT); F=$(st "$d" PQ_STACK_FORK)
+  [ -n "$repo" ] && [ -n "$branch" ] && [ -n "$parent" ] && [ -n "$F" ] || return 0
+  defb=$(repo_base "$repo") || return 0
+  pr_has_row "$repo" "$parent" || return 0
+  base_fetch "$repo" "$branch"
+  git -C "$repo" cat-file -e "$F^{commit}" 2>/dev/null || return 0
+  C=$(stack_head "$repo" "$branch") || return 0
+  if merged_into "$repo" "$parent" "$defb"; then
+    # merged_into answers most merges from the cache alone, without the fetch.
+    base_fetch "$repo" "$defb"
+    stack_contains "$repo" "$F" "refs/remotes/origin/$defb"; rc=$?
+    [ "$rc" = 2 ] && return 0
+    [ "$rc" = 0 ] && { printf 'landed\t'; return 0; }
+    stack_contains "$repo" "$F" "$C"; rc=$?
+    case "$rc" in
+      0) printf 'stale\t%s' "$(stack_fp "$defb" "$F")" ;;
+      1) printf 'landed\t' ;;
+    esac
+    return 0
+  fi
+  pr_all_closed "$repo" "$parent" && { printf 'closed\t'; return 0; }
+  # Merged somewhere that is not the default branch, and nowhere near it: not a
+  # case a stack produces, and nothing to judge.
+  pr_has_ready "$repo" "$parent" || pr_has_draft "$repo" "$parent" || return 0
+  base_fetch "$repo" "$parent"
+  P=$(stack_head "$repo" "$parent") || return 0
+  stack_contains "$repo" "$P" "$C"; rc=$?
+  case "$rc" in 0) printf 'linear\t%s' "$P"; return 0 ;; 2) return 0 ;; esac
+  stack_contains "$repo" "$F" "$P"; rc=$?
+  case "$rc" in
+    0) printf 'gained\t' ;;
+    1) printf 'rebased\t%s' "$(stack_fp "$P" "$F")" ;;
+  esac
+}
+
+# Clear each key that is set, and write nothing for one that is not - this runs
+# for every stacked task on every tick.
+st_clear() {                            # task_dir key...
+  local d=$1 k; shift
+  for k in "$@"; do [ -z "$(st "$d" "$k")" ] || st_set "$d" "$k" ""; done
+}
+# Everything a need leaves behind. The tries and the last fingerprint asked
+# about stay, as the watch's do: they bound the task, not the one need.
+stack_clear() {                         # task_dir
+  st_clear "$1" PQ_STACK_ONTO PQ_STACK_DUE PQ_STACK_NEEDS
+}
+
+# One stacked task, one tick: every done task that is not reaped, has a parent
+# and a pull request, and whose pull request is open. Every write is gated on
+# `dry` at its own site.
+stack_task() {                          # task_dir dry
+  local d=$1 dry=$2 slug repo branch parent own ownstate pnum verdict arg
+  [ -z "$(st "$d" PQ_REAPED)" ] || return 0
+  parent=$(st "$d" PQ_STACK_PARENT); own=$(st "$d" PQ_PR)
+  [ -n "$parent" ] && [ -n "$own" ] || return 0
+  slug=$(slug_of "$d"); repo=$(hdr "$d/plan.md" repo); branch=$(hdr "$d/plan.md" branch)
+  ownstate=""
+  IFS=$'\t' read -r _ ownstate _ <<<"$(pr_get "$repo" "$branch")"
+  # Its own pull request settled: whatever was asked or handed over goes with
+  # it, or a merged task would read `restack` in `pq ls` for good - and a
+  # PQ_STACK_DUE left behind holds the review gate.
+  case "${ownstate:-}" in
+    MERGED|CLOSED) [ "$dry" = 1 ] || stack_clear "$d"; return 0 ;;
+    OPEN) ;;
+    *) return 0 ;;
+  esac
+  IFS=$'\t' read -r verdict arg <<<"$(stack_verdict "$d")"
+  [ -n "$verdict" ] || return 0
+  pnum=$(pr_get "$repo" "$parent" | cut -f1)
+  case "$verdict" in
+    linear)
+      # What follows a Rebase stack press, or the agent's own restack: the layer
+      # sits on the parent's head, which is its fork point from here on.
+      [ "$dry" = 1 ] && return 0
+      [ "$arg" = "$(st "$d" PQ_STACK_FORK)" ] || st_set "$d" PQ_STACK_FORK "$arg"
+      stack_clear "$d" ;;
+    gained)
+      [ "$dry" = 1 ] || stack_clear "$d" ;;
+    landed)
+      [ "$dry" = 1 ] && { msg "would record that #$own is the bottom of its stack now - #$pnum merged"; return 0; }
+      stack_clear "$d"
+      st_set "$d" PQ_STACK_PARENT ""; st_set "$d" PQ_STACK_LANDED "$pnum"
+      msg "$slug: #$pnum merged - #$own is the bottom of its stack now" ;;
+    closed)
+      [ "$(st "$d" PQ_STACK_NEEDS)" = closed ] && return 0
+      [ "$dry" = 1 ] && { msg "would leave $slug to you - #$pnum, which #$own is stacked on, was closed without merging"; return 0; }
+      st_clear "$d" PQ_STACK_ONTO PQ_STACK_DUE
+      st_set "$d" PQ_STACK_NEEDS closed
+      warn "$slug: #$pnum, which #$own is stacked on, was closed without merging - decide what becomes of #$own" ;;
+    rebased|stale)
+      [ "$dry" = 1 ] && return 0
+      local onto=parent; [ "$verdict" = stale ] && onto=default
+      [ "$(st "$d" PQ_STACK_NEEDS)" = closed ] && st_set "$d" PQ_STACK_NEEDS ""
+      [ "$(st "$d" PQ_STACK_ONTO)" = "$onto" ] || st_set "$d" PQ_STACK_ONTO "$onto"
+      [ "$(st "$d" PQ_STACK_DUE)" = "$arg" ] || st_set "$d" PQ_STACK_DUE "$arg" ;;
+  esac
   return 0
 }
 
@@ -5783,12 +5948,16 @@ tick_body() {                           # cap dry
   fi
 
   # 1.21 Stacks - add each stacked task's pull request to its parent's stack on
-  # GitHub, once it exists - see the `stacks` section. After reconcile, so a
-  # pull request opened this tick is linked this tick; before the gate, so the
-  # reviewers see it in the stack.
+  # GitHub, once it exists - see the `stacks` section - and then see whether the
+  # layer below moved in a way it has to follow (see "restacking a layer").
+  # After reconcile, so a pull request opened this tick is linked this tick;
+  # before the gate and the watch, so both read this tick's verdict: the
+  # reviewers only ever see a layer on its real base, and a conflict the
+  # restack is about to fix is not prompted about twice.
   for d in "$PQ_HOME/done"/*/; do
     [ -d "$d" ] || continue
     stack_link "${d%/}" "$dry"
+    stack_task "${d%/}" "$dry"
   done
 
   # 1.22 The review gate, one step per task - see the `review gate` section.
