@@ -2316,6 +2316,13 @@ pr_has_draft() {                        # repo branch
     $1 == r && $2 == b && $5 == "draft" { ok = 1; exit }
     END { exit !ok }' "${PR_CACHE:-/dev/null}"
 }
+# Pure: reads only PR_CACHE. 0 when at least one row is OPEN and not a draft -
+# marked ready for review.
+pr_has_ready() {                        # repo branch
+  awk -F'\t' -v r="$1" -v b="$2" '
+    $1 == r && $2 == b && $4 == "OPEN" && $5 == "" { ok = 1; exit }
+    END { exit !ok }' "${PR_CACHE:-/dev/null}"
+}
 # Pure: reads only PR_CACHE. The merge commit of the first MERGED row, or empty.
 pr_merge_oid() {                        # repo branch
   awk -F'\t' -v r="$1" -v b="$2" \
@@ -2389,23 +2396,27 @@ merged_into() {                         # repo branch base
   git -C "$repo" merge-base --is-ancestor "$oid" "refs/remotes/origin/$base" 2>/dev/null
 }
 
-# blocker_state <repo> <branch> <base> -> met | waiting | stalled | dead | orphan | unknown
+# blocker_state <repo> <branch> <base> -> met | dead | stalled | ready | waiting | orphan | unknown
 #
 # Not pure past this line: task_by_branch walks all_tasks() and touches disk,
-# which is why the five pr_* predicates above are split out on their own - they
-# are the seam a test can exercise without a single real task directory.
+# which is why the pr_* predicates above are split out on their own - they are
+# the seam a test can exercise without a single real task directory.
 #
 # One row per outcome in the table this mirrors, in the same order, because
 # that is the only way to keep the two in sync by inspection rather than by
 # memory:
 #   MERGED, and that work is present in $base              -> met
-#   no PR yet, a live task owns the branch                -> waiting (normal)
-#   an OPEN row, a live task owns the branch               -> waiting (in review)
+#   every row is CLOSED                                    -> dead
 #   a DRAFT row whose owning task has reached done AND
 #     whose review gate is over (or never applied)         -> stalled
-#   every row is CLOSED                                    -> dead
+#   an OPEN row that is not a draft                        -> ready
+#   any other row - a draft in review, a merge elsewhere   -> waiting (in review)
+#   no PR yet, a live task owns the branch                 -> waiting (normal)
 #   no PR, and no task in any state owns the branch        -> orphan
 #   no row and gh never answered                           -> unknown
+#
+# `ready` is what a task that builds on this one waits for (see after_state); one
+# that waits for a merge reads it as `waiting`, since ready is not merged.
 #
 # A draft during the review gate is the gate WORKING - every pull request now
 # opens as one and stays one until the implementer has answered the review - so
@@ -2422,6 +2433,7 @@ blocker_state() {                       # repo branch base
        && review_settled "$owner"; then
       printf 'stalled'; return
     fi
+    pr_has_ready "$repo" "$branch" && { printf 'ready'; return; }
     printf 'waiting'; return
   fi
   if pr_answered "$repo" "$branch"; then
@@ -2988,7 +3000,7 @@ cmd_after() {
       esac
       case "$bst" in
         met)     desc="present in ${base:-its default branch} - satisfied" ;;
-        waiting)
+        waiting|ready)
           case "$ownerst" in
             done|-) desc="waiting on your merge" ;;
             *)

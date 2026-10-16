@@ -174,17 +174,24 @@ reset_caches
 ans_row "$REPO" tom/nobody-owns-this
 eq "$(blocker_state "$REPO" tom/nobody-owns-this master)" "orphan" "no PR, no owner"
 
-# OPEN, owner running -> waiting
+# OPEN and marked ready, owner running -> ready
 reset_caches
 cache_row "$REPO" tom/open-running 8 OPEN "" master
 mk_task running 10 owner-running "$REPO" tom/open-running >/dev/null
-eq "$(blocker_state "$REPO" tom/open-running master)" "waiting" "OPEN, owner running"
+eq "$(blocker_state "$REPO" tom/open-running master)" "ready" "OPEN and not a draft, owner running"
 
-# OPEN, owner in done -> waiting (this is the chain WORKING, not stalled)
+# OPEN and marked ready, owner in done -> ready (the chain WORKING, not stalled)
 reset_caches
 cache_row "$REPO" tom/open-done 9 OPEN "" master
 mk_task "done" 10 owner-open-done "$REPO" tom/open-done >/dev/null
-eq "$(blocker_state "$REPO" tom/open-done master)" "waiting" "OPEN, owner done"
+eq "$(blocker_state "$REPO" tom/open-done master)" "ready" "OPEN and not a draft, owner done"
+
+# A DRAFT whose owner is still running is in review, not ready
+reset_caches
+cache_row "$REPO" tom/draft-running 9 OPEN draft master
+mk_task running 10 owner-draft-running "$REPO" tom/draft-running >/dev/null
+eq "$(blocker_state "$REPO" tom/draft-running master)" "waiting" "a draft, owner running"
+pr_has_ready "$REPO" tom/draft-running && bad "pr_has_ready: a draft is not ready" || ok
 
 # DRAFT, owner in done -> stalled (a stuck agent, not a healthy wait)
 reset_caches
