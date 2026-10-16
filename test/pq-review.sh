@@ -379,6 +379,7 @@ review_task "$G" 0 >"$PQ_HOME/.out" 2>&1
 eq "$(st "$G" PQ_REVIEW)" "posted" "collected as posted"
 eq "$(st "$G" PQ_REVIEW_RESULT)" "ok" "with an ok result"
 has "$(cat "$PQ_HOME/.out")" "review of #42 posted - 2 inline comments (\$1.20, 0m5s)" "what landed, cost and duration are reported"
+hasnt "$(cat "$PQ_HOME/.out")" "the follow-up waits" "with no security review asked for, nothing holds the follow-up"
 eq "$(cut -f1,2,5 <<<"$(cost_sum "$G")")" $'1.2\ttrue\t1.2' "the try is booked beside the unknown one, so the total is a lower bound"
 eq "$(cost_total "$G")" "\$1.20+" "and reads as one"
 eq "$(st "$G" PQ_REVIEW_POSTED)" "2" "the two comments that landed are recorded"

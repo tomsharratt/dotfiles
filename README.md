@@ -529,6 +529,7 @@ Then `pq` delivers the report itself: it is saved as `<task>/security.md` and po
 
 The two reviews meet at one point: the follow-up waits until both have finished, so the implementer is told once, about both - answer every inline comment and every finding in the security report, by fixing it or saying why it stands - and the slot stays held until then.
 `pq ls` reads `security review 4m` while the gate waits on it, and `security review failed` if it did not happen.
+The tick says so as well when the code review lands first - `review of #7116 posted - 9 inline comments ($0.99, 3m38s) - the follow-up waits for the security review, running 4m` - since `posted` alone read as the implementer being told next, while the agent sat idle for eight more minutes behind a security review nothing mentioned.
 A security review that fails is retried and then given up on exactly like the code review, and the follow-up then asks the implementer to check its own diff for the risks the plan names.
 A report that could not be posted is not a failed review: the follow-up asks the implementer to post it from `security.md`.
 The security reviewer never probes the pull request itself - it launches only once the code reviewer's probe has passed - so a `STUCK:` title or a settled pull request stops both, and one that settles mid-review has both killed.

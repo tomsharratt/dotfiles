@@ -381,9 +381,12 @@ home="$PQ_HOME/tasks/$(basename "$G")"
 set_panes "$(printf 'w1:p1\tclaude\tidle')"
 review_task "$G" 0 >/dev/null 2>&1
 wait_for test -f "$G/review.rc" && ok || bad "the code stub should have finished"
-review_task "$G" 0 >/dev/null 2>&1
+review_task "$G" 0 >"$PQ_HOME/.out" 2>&1
 eq "$(st "$G" PQ_REVIEW)" "posted" "the code review is collected"
 eq "$(st "$G" PQ_SECURITY)" "running" "the security review is still going"
+has "$(cat "$PQ_HOME/.out")" "review of #42 posted - 2 inline comments" "the code review is reported"
+has "$(cat "$PQ_HOME/.out")" "- the follow-up waits for the security review, running $(age_since "$(st "$G" PQ_SECURITY_AT)")" \
+  "with what the implementer is still waiting on, so posted does not read as told"
 eq "$(review_cell "$G")" "security review $(age_since "$(st "$G" PQ_SECURITY_AT)")" "and the cell says what the gate is waiting on"
 review_inflight "$G" && ok || bad "the slot stays held"
 review_task "$G" 0 >/dev/null 2>&1
@@ -424,8 +427,9 @@ eq "$(st "$G" PQ_REVIEW)" "running" "the gate is still running"
 eq "$(review_cell "$G")" "reviewing $(age_since "$(st "$G" PQ_REVIEW_AT)")" "and says so"
 release code
 wait_for test -f "$G/review.rc" && ok || bad "the held code stub should have finished"
-review_task "$G" 0 >/dev/null 2>&1
+review_task "$G" 0 >"$PQ_HOME/.out" 2>&1
 eq "$(st "$G" PQ_REVIEW)" "posted" "one step: collected"
+hasnt "$(cat "$PQ_HOME/.out")" "the follow-up waits" "with the security review already in, nothing is said to hold the follow-up"
 eq "$(review_cell "$G")" "reviewed" "reviewed, with both done"
 review_task "$G" 0 >/dev/null 2>&1
 eq "$(st "$G" PQ_REVIEW)" "prompted" "the next: delivered"

@@ -4577,6 +4577,17 @@ review_settled() {                      # task_dir -> 0 when the gate is over, o
   case "$(st "$1" PQ_REVIEW)" in ""|ready|lapsed|skipped) return 0 ;; esac
   return 1
 }
+# What a line about the code review reaching `posted` adds while the follow-up
+# is held for the security reviewer. "review of #7116 posted - 9 inline
+# comments" alone reads as the implementer being told next, and the security
+# reviewer on that one ran eight more minutes, with nothing saying why the agent
+# sat idle - the same misreading review_cell already avoids for `pq ls`.
+security_hold() {                       # task_dir -> " - ..." or nothing
+  case "$(st "$1" PQ_SECURITY)" in
+    pending) printf ' - the follow-up waits for the security review' ;;
+    running) printf ' - the follow-up waits for the security review, running %s' "$(age_since "$(st "$1" PQ_SECURITY_AT)")" ;;
+  esac
+}
 review_alive() {                        # pid (a process group id)
   [ -n "${1:-}" ] || return 1
   pgrep -g "$1" >/dev/null 2>&1
@@ -4930,7 +4941,7 @@ reviewer_try_failed() {                 # task_dir stem result why
     warn "$slug: $noun attempt $tries failed - $why; retrying in $(( PQ_REVIEW_RETRY / 60 ))m"
   else
     st_set "$d" "$key" "$final"
-    warn "$slug: $noun failed after $tries attempt(s) - $why; the implementer will be asked to self-review instead"
+    warn "$slug: $noun failed after $tries attempt(s) - $why; the implementer will be asked to self-review instead$([ "$stem" = review ] && security_hold "$d")"
   fi
 }
 
@@ -5309,7 +5320,7 @@ review_step() {                         # task_dir dry pr pstate
             [ "$dry" = 1 ] && { msg "would record $slug's review as posted"; return 0; }
             st_set "$d" PQ_REVIEW posted; st_set "$d" PQ_REVIEW_RESULT ok; st_set "$d" PQ_REVIEW_POSTED "$landed"
             msg "$slug: review of #$pr posted${landed:+ - $landed inline comment$([ "$landed" = 1 ] || printf s)}$(fmt_cost "$(jq -r '.total_cost_usd // empty' "$d/review.json" 2>/dev/null)" \
-                                                        "$(jq -r '.duration_ms // empty' "$d/review.json" 2>/dev/null)")" ;;
+                                                        "$(jq -r '.duration_ms // empty' "$d/review.json" 2>/dev/null)")$(security_hold "$d")" ;;
           empty)
             [ "$dry" = 1 ] && { msg "would count $slug's review as a failed try - it posted nothing"; return 0; }
             # Its reply may still carry findings GitHub refused inline; the
@@ -5320,7 +5331,7 @@ review_step() {                         # task_dir dry pr pstate
           denied)
             [ "$dry" = 1 ] && { msg "would record $slug's review as denied"; return 0; }
             st_set "$d" PQ_REVIEW posted; st_set "$d" PQ_REVIEW_RESULT denied
-            warn "$slug: the reviewer was denied permission to post through gh - check PQ_REVIEW_TOOLS; falling back to self-review" ;;
+            warn "$slug: the reviewer was denied permission to post through gh - check PQ_REVIEW_TOOLS; falling back to self-review$(security_hold "$d")" ;;
           *)
             [ "$dry" = 1 ] && { msg "would count $slug's failed review as a try"; return 0; }
             reviewer_try_failed "$d" review failed "the reviewer exited $(cat "$d/review.rc" 2>/dev/null) - see $d/review.err" ;;
