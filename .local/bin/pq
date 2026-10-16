@@ -14,14 +14,15 @@
 # --json`).
 #
 #   pq add               pick a plan and add it; it asks the model, the effort, what
-#                        it should wait on (its PR must merge first) and,
-#                        for a plan built from a design that names no file on disk,
+#                        it builds on (a task in its own repo, once that pull request
+#                        is ready) or waits for (one in another repo, once it merges)
+#                        and, for a plan built from a design that names no file on disk,
 #                        the design file the implementer builds to - and then it is
 #                        done. The next tick names it and queues it (see "naming")
 #   pq evidence [task]   publish a task's screenshots to the pq-evidence branch; prints the markdown to paste
-#   pq after <task>      list a task's blockers and what each is waiting on
-#   pq after <task> T... add blockers to a task already in the queue
-#   pq after <task> --clear   drop them all
+#   pq after <task>      what a task builds on or waits for, and where that stands
+#   pq after <task> T    set it, for a task already in the queue - replacing any
+#   pq after <task> --clear   drop it
 #   pq ls                every task, its state, what it is waiting on, and what it has cost
 #   pq ls --all           also show archive/ - settled history pq no longer walks
 #   pq rm <task>         drop a task (never touches a worktree or a branch)
@@ -37,10 +38,13 @@
 # keeps spending its slot until that agent has actually stopped - see the
 # `slots` section below for why the release is a timer rather than an exit.
 #
-# A task may name blockers: other work that must have merged before it is
-# eligible for dispatch. Blocked is derived, not stored - a blocked task sits in
-# `queue/` like any other, and fill just skips it, the same way the cap is soft
-# arithmetic rather than a drain state. Merge state comes from the forge (`gh`),
+# A task may name one dependency: another task it BUILDS ON, in its own repo -
+# eligible once that pull request is marked ready, forked from its branch, and
+# joined to its stack on GitHub (see "linking into GitHub's stack") - or, in
+# another repo, one it WAITS FOR, eligible once that has merged. Blocked is
+# derived, not stored - a blocked task sits in `queue/` like any other, and fill
+# just skips it, the same way the cap is soft arithmetic rather than a drain
+# state. Merge state comes from the forge (`gh`),
 # never from a BRANCH TIP's git ancestry - a squash-merged branch's tip is not an
 # ancestor of anything, so `git branch --merged` misses every real merge. See
 # `after_state` below for the full predicate.
@@ -107,9 +111,9 @@
 #                     (`design:` is optional, a comma-separated list of the files in design/;
 #                      `security: yes` likewise, when the plan asks for a security review - see name_plan;
 #                      `branch:`, `intent:` and `security:` are absent until it is named)
-#          after       blockers: one per line, TSV  label <TAB> repo <TAB> branch
-#          after.new   only in new/: blockers that had no name yet when it was added,
-#                      one task stamp per line - see "naming"
+#          after       its dependency, one line, TSV  label <TAB> repo <TAB> branch
+#          after.new   only in new/: a dependency that had no name yet when it was added,
+#                      by its task stamp - see "naming"
 #          state.env   KEY=VALUE runtime facts, written as dispatch progresses
 #          contract.md how the plan is to be delivered - written once, at dispatch, from
 #                      pq's own template (see `contract_write`); the plan carries the work,
@@ -130,9 +134,9 @@
 #
 # `after` is neither of the other two: `plan.md` is immutable by contract so an
 # agent re-reading its own plan never sees it change, and `state.env` is runtime
-# facts written as dispatch progresses. Blockers are your intent, edited before
-# dispatch, so they get their own file - named for the verb that writes it. An
-# absent file means no blockers.
+# facts written as dispatch progresses. A dependency is your intent, edited before
+# dispatch, so it gets its own file - named for the verb that writes it. An
+# absent file means none.
 #
 # Every transition is a `mv`, which is atomic within one filesystem - so two
 # dispatchers racing cannot both claim the same task, and a `mv` that fails means
@@ -809,6 +813,41 @@ dependents_of() {                       # repo branch
       [ "$r" = "$1" ] && [ "$b" = "$2" ] && printf '%s\n' "$(slug_of "$d")"
     done <<<"$(after_list "$d")"
   done <<<"$(all_tasks)"
+}
+
+# What live tasks already build on - one line per same-repo dependency, as
+# `slug<TAB>repo<TAB>branch`, or `slug<TAB>repo<TAB>#stamp` for one a task in
+# new/ still holds by stamp - leaving out the task given, which is the one about
+# to be given a dependency of its own. A stack is a single line, and GitHub only
+# ever adds a pull request to its top, so a task something already builds on
+# cannot be built on twice: the wizard does not offer it and `pq after` refuses
+# it. Built once and searched with built_on_by, so the wizard's list costs one
+# walk rather than one per candidate. Live is what the wizard offers: new,
+# queue, running, and done while its pull request is yet to settle.
+built_on() {                            # [except_task_dir]
+  local except=${1:-} d repo slug
+  while IFS= read -r d; do
+    [ -n "$d" ] && [ "$d" != "$except" ] || continue
+    case "$(state_of "$d")" in
+      new|queue|running) ;;
+      done) reap_watching "$d" || continue ;;
+      *) continue ;;
+    esac
+    [ -f "$d/after" ] || [ -f "$d/after.new" ] || continue
+    repo=$(hdr "$d/plan.md" repo); slug=$(slug_of "$d")
+    awk -F'\t' -v r="$repo" -v s="$slug" '$2 == r && $3 != "" { print s "\t" $2 "\t" $3 }' "$d/after" 2>/dev/null
+    awk -v r="$repo" -v s="$slug" '/^[0-9]+$/ { print s "\t" r "\t#" $0 }' "$d/after.new" 2>/dev/null
+  done <<<"$(all_tasks)"
+  return 0
+}
+# `#N`, or "its pull request" while there is none to number.
+pr_word() { if [ -n "${1:-}" ]; then printf '#%s' "$1"; else printf 'its pull request'; fi; }
+
+# The slug of the first task in a built_on list that builds on this (repo,
+# branch), or on the task by this stamp; 1 when none does.
+built_on_by() {                         # built_on_list repo branch [stamp]
+  awk -F'\t' -v r="$2" -v b="$3" -v s="${4:+#$4}" \
+    '$2 == r && (($3 == b && b != "") || ($3 == s && s != "")) { print $1; f = 1; exit } END { exit !f }' <<<"$1"
 }
 
 # ── add ─────────────────────────────────────────────────────────────────────
@@ -3004,35 +3043,40 @@ $([ "$narch" -gt 0 ] && printf ', %s archived%s' "$narch" "$([ "$all" = 1 ] || p
 }
 
 # ── the small commands ──────────────────────────────────────────────────────
-# `pq after <task>` alone answers "why has this not started": per blocker, both
-# the state of the TASK that owns the branch and the state of its PR, since
-# either one can be the reason and the fix differs.
+# `pq after <task>` alone answers "why has this not started": its one
+# dependency, with both the state of the TASK that owns the branch and the state
+# of its PR, since either one can be the reason and the fix differs.
 #
-# `pq after <task> <task|branch>...` adds blockers; `--clear` drops them all.
-# Restricted to what has not been dispatched - blockers only gate what has not
-# started.
+# `pq after <task> <task|branch>` sets it, replacing any it had; `--clear` drops
+# it. Restricted to what has not been dispatched - a dependency only gates what
+# has not started.
 #
 # And to what has a name, on both sides. A task in new/ may already wait on
-# something by stamp alone, where `after_cycle` cannot follow it, so adding to
-# one could close a cycle nothing would see - and one given AS a blocker has no
+# something by stamp alone, where `after_cycle` cannot follow it, so setting one
+# could close a cycle nothing would see - and one given AS a dependency has no
 # branch to wait on yet. Either is a tick away from having one.
+#
+# A same-repo dependency something else already builds on is refused: a stack
+# is a single line, and GitHub only ever adds a pull request to its top.
 cmd_after() {
   local d; d=$(find_task "${1:-}") || exit 1; shift
   [ "$(state_of "$d")" = new ] && die "$(slug_of "$d") has no name yet - the next tick names it and queues it; pq after it then"
 
   if [ $# -eq 0 ]; then
     if [ ! -f "$d/after" ]; then
-      msg "$(slug_of "$d") has no blockers"
+      msg "$(slug_of "$d") builds on nothing and waits for nothing"
       return 0
     fi
     pr_load_all "$(after_list "$d" | awk -F'\t' '{ print $2 "\t" $3 }')"
-    local label repo branch base bst owner ownerst num prstate draft prtxt desc overdict
+    local own label repo branch base bst owner ownerst num prstate draft prtxt desc overdict slug
+    own=$(hdr "$d/plan.md" repo); slug=$(slug_of "$d")
     while IFS=$'\t' read -r label repo branch; do
       [ -n "$label" ] || continue
       base=$(repo_base "$repo")
       bst=$(blocker_state "$repo" "$branch" "${base:-}")
       owner=$(task_by_branch "$repo" "$branch") || owner=""
       ownerst=${owner:+$(state_of "$owner")}; ownerst=${ownerst:--}
+      num=""; prstate=""; draft=""
       IFS=$'\t' read -r num prstate draft <<<"$(pr_get "$repo" "$branch")"
       case "${prstate:-}" in
         MERGED) prtxt="#$num merged" ;;
@@ -3041,23 +3085,35 @@ cmd_after() {
         *)      prtxt="no PR yet" ;;
       esac
       case "$bst" in
-        met)     desc="present in ${base:-its default branch} - satisfied" ;;
-        waiting|ready)
-          case "$ownerst" in
-            done|-) desc="waiting on your merge" ;;
-            *)
-              IFS=$'\t' read -r overdict _ <<<"$(after_state "$owner")"
-              case "$overdict" in
-                waiting\ *) desc="waiting on ${overdict##* } of its own" ;;
-                *)          desc="in progress" ;;
-              esac
-              ;;
-          esac
-          ;;
         stalled) desc="stalled - a draft PR, but its task already reached done" ;;
         dead)    desc="dead - every PR for it is closed" ;;
         orphan)  desc="orphan - nothing will ever open a PR for this branch" ;;
-        *)       desc="gh has not answered yet" ;;
+        unknown) desc="gh has not answered yet" ;;
+        *)
+          if [ "$repo" = "$own" ]; then
+            case "$bst" in
+              met)   desc="merged - $slug starts from ${base:-its default branch}" ;;
+              ready) desc="ready - $slug builds on it" ;;
+              *)     desc="waiting for $(pr_word "$num") to be marked ready" ;;
+            esac
+          else
+            case "$bst" in
+              met) desc="present in ${base:-its default branch} - satisfied" ;;
+              *)
+                case "$ownerst" in
+                  done|-) desc="waiting on your merge" ;;
+                  *)
+                    IFS=$'\t' read -r overdict _ <<<"$(after_state "$owner")"
+                    case "$overdict" in
+                      waiting\ *|on\ *) desc="waiting on ${overdict##* } of its own" ;;
+                      *)                 desc="in progress" ;;
+                    esac
+                    ;;
+                esac
+                ;;
+            esac
+          fi
+          ;;
       esac
       printf '  %-20s %-8s %-12s %s\n' "$label" "$ownerst" "$prtxt" "$desc"
     done <<<"$(after_list "$d")"
@@ -3066,47 +3122,57 @@ cmd_after() {
     return 0
   fi
 
-  # Both mutating forms - clearing and adding - are restricted to what has not
-  # started: blockers only gate a task that has not been dispatched yet.
+  # Both mutating forms - clearing and setting - are restricted to what has not
+  # started: a dependency only gates a task that has not been dispatched yet.
   # Checked under the lock, which is held to the end, so a tick cannot claim
-  # the task between the check and the write - and write the blockers into a
+  # the task between the check and the write - and write the dependency into a
   # directory that has moved on.
   case "$(state_of "$d")" in
     queue) ;;
-    *) die "$(slug_of "$d") is $(state_of "$d") - blockers only gate what has not started" ;;
+    *) die "$(slug_of "$d") is $(state_of "$d") - a dependency only gates what has not started" ;;
   esac
+  [ $# -eq 1 ] || die "pq after takes one task or branch - a task builds on, or waits for, exactly one (usage: pq after <task> [<task|branch> | --clear])"
   task_locked "$d" >/dev/null || exit 1
 
   if [ "$1" = --clear ]; then
     rm -f "$d/after"
     release_lock
-    msg "cleared blockers on $(slug_of "$d")"
+    msg "cleared $(slug_of "$d")'s dependency"
     return 0
   fi
 
-  local owner_repo owner_branch value resolved label repo branch base b
-  owner_repo=$(hdr "$d/plan.md" repo); owner_branch=$(hdr "$d/plan.md" branch)
-  for value in "$@"; do
-    case "$value" in
-      */*) ;;
-      *) b=$(find_task "$value" 2>/dev/null) && [ "$(state_of "$b")" = new ] \
-           && { release_lock; die "$(slug_of "$b") has no name yet, so there is no branch to wait on - the next tick names it; pq after again then"; } ;;
-    esac
-    resolved=$(resolve_after "$owner_repo" "$value") || { release_lock; die "could not resolve '$value' to a task or branch"; }
-    IFS=$'\t' read -r label repo branch <<<"$resolved"
-    [ -n "$repo" ] && [ -n "$branch" ] || { release_lock; die "could not resolve '$value' to a repo and branch"; }
-    [ "$repo" = "$owner_repo" ] && [ "$branch" = "$owner_branch" ] && { release_lock; die "a task cannot block on itself"; }
-    after_cycle "$owner_repo" "$owner_branch" "$repo" "$branch" \
-      && { release_lock; die "'$value' would create a cycle - $(slug_of "$d") already leads back to it"; }
-    after_add "$d" "$label" "$repo" "$branch"
-    pr_load_all "$(printf '%s\t%s\n' "$repo" "$branch")"
-    base=$(repo_base "$repo")
-    if [ -n "$base" ] && merged_into "$repo" "$branch" "$base"; then
-      msg "$(slug_of "$d") after $label: already in $base - nothing to wait for"
-    else
-      msg "$(slug_of "$d") after $label ($branch)"
-    fi
-  done
+  local owner_repo owner_branch value=$1 resolved label repo branch base b="" other num prstate draft slug
+  owner_repo=$(hdr "$d/plan.md" repo); owner_branch=$(hdr "$d/plan.md" branch); slug=$(slug_of "$d")
+  case "$value" in
+    */*) ;;
+    *) b=$(find_task "$value" 2>/dev/null) && [ "$(state_of "$b")" = new ] \
+         && { release_lock; die "$(slug_of "$b") has no name yet, so there is no branch to wait on - the next tick names it; pq after again then"; } ;;
+  esac
+  resolved=$(resolve_after "$owner_repo" "$value") || { release_lock; die "could not resolve '$value' to a task or branch"; }
+  IFS=$'\t' read -r label repo branch <<<"$resolved"
+  [ -n "$repo" ] && [ -n "$branch" ] || { release_lock; die "could not resolve '$value' to a repo and branch"; }
+  [ "$repo" = "$owner_repo" ] && [ "$branch" = "$owner_branch" ] && { release_lock; die "a task cannot build on itself"; }
+  after_cycle "$owner_repo" "$owner_branch" "$repo" "$branch" \
+    && { release_lock; die "'$value' would create a cycle - $slug already leads back to it"; }
+  if [ "$repo" = "$owner_repo" ] \
+     && other=$(built_on_by "$(built_on "$d")" "$repo" "$branch" "${b:+$(stamp_of "$b")}"); then
+    release_lock
+    die "$other already builds on $label - a stack is a single line, so build on $other instead"
+  fi
+  printf '%s\t%s\t%s\n' "$label" "$repo" "$branch" > "$d/after"
+  pr_load_all "$(printf '%s\t%s\n' "$repo" "$branch")"
+  base=$(repo_base "$repo")
+  num=""; prstate=""; draft=""
+  IFS=$'\t' read -r num prstate draft <<<"$(pr_get "$repo" "$branch")"
+  if [ -n "$base" ] && merged_into "$repo" "$branch" "$base"; then
+    msg "$slug after $label: already in $base - nothing to wait for"
+  elif [ "$repo" != "$owner_repo" ]; then
+    msg "$slug waits for $label ($(basename "$repo")) to merge"
+  elif [ "${prstate:-}" = OPEN ] && [ -z "${draft:-}" ]; then
+    msg "$slug builds on $label - #$num is ready for review, so it starts once a slot is free"
+  else
+    msg "$slug builds on $label - it starts once $(pr_word "$num") is marked ready"
+  fi
   release_lock
   rm -f "$PR_CACHE" "$PR_ANS"
   repo_base_reset
@@ -5702,7 +5768,7 @@ main() {
     ls)         shift; cmd_ls "$@" ;;
     rm)         shift; cmd_rm "$@" ;;
     evidence)   shift; cmd_evidence "$@" ;;
-    *) die "usage: pq {add | after <task> [<task|branch>... | --clear] | ls [--all] [--json] | tick [--dry-run] | run | cap [N] | rm <task> | evidence [task]}" ;;
+    *) die "usage: pq {add | after <task> [<task|branch> | --clear] | ls [--all] [--json] | tick [--dry-run] | run | cap [N] | rm <task> | evidence [task]}" ;;
   esac
 }
 if [ "${BASH_SOURCE[0]}" = "$0" ]; then main "$@"; fi

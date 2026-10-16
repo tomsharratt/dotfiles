@@ -409,6 +409,70 @@ else
   bad "a genuine, non-cyclic blocker should have been accepted"
 fi
 
+echo "== pq after sets one dependency, replacing any ==" >&2
+reset_tasks
+A=$(mk_task queue 10 one-a "$REPO" tom/one-a)
+B=$(mk_task queue 20 one-b "$REPO" tom/one-b)
+C=$(mk_task queue 30 one-c "$REPO" tom/one-c)
+out=$( ( main after one-c one-a ) 2>&1 ); rc=$?
+eq "$rc" "0" "setting a dependency succeeds"
+case "$out" in *"one-c builds on one-a - it starts once its pull request is marked ready"*) ok ;; *) bad "and says what it set ($out)" ;; esac
+( main after one-c one-b ) >/dev/null 2>&1
+eq "$(cut -f1 "$C/after")" "one-b" "a second pq after replaces the first rather than adding to it"
+eq "$(wc -l < "$C/after" | tr -d ' ')" "1" "one line, always"
+( main after one-c one-b ) >/dev/null 2>&1 && ok || bad "setting the same one again is not a fan-out of itself"
+( main after one-c one-a one-b ) >/dev/null 2>"$PQ_HOME/.err" && bad "two at once is refused" || ok
+case "$(cat "$PQ_HOME/.err")" in *"takes one task or branch"*) ok ;; *) bad "saying why ($(cat "$PQ_HOME/.err"))" ;; esac
+eq "$(cut -f1 "$C/after")" "one-b" "and changes nothing"
+
+echo "== pq after refuses to build on what something else already builds on ==" >&2
+out=$( ( main after one-a one-b ) 2>&1 ); rc=$?
+[ "$rc" != 0 ] && ok || bad "one-b is already built on by one-c, so one-a cannot build on it"
+case "$out" in *"one-c already builds on one-b - a stack is a single line, so build on one-c instead"*) ok ;; *) bad "saying so ($out)" ;; esac
+[ -f "$A/after" ] && bad "and nothing is written" || ok
+# Through a task in new/ that still holds its dependency by stamp.
+N=$(mk_task new 40 unnamed-child "$REPO" "")
+printf '%s\n' "$(stamp_of "$A")" > "$N/after.new"
+out=$( ( main after one-b one-a ) 2>&1 ) && bad "a stamp held in new/ counts as building on it" || ok
+case "$out" in *"unnamed-child already builds on one-a"*) ok ;; *) bad "naming the task in new/ ($out)" ;; esac
+rm -rf "$N"
+# Across repos it is a wait, not a stack, and many can wait on one merge.
+REPO3=$(mktemp -d); git init -q -b master "$REPO3"
+O=$(mk_task queue 50 other-repo "$REPO3" tom/other-repo)
+after_add "$O" one-a "$REPO" tom/one-a
+( main after one-b one-a ) >/dev/null 2>&1 && ok || bad "a task in another repo waiting on one-a does not stop one-b building on it"
+out=$( ( main after other-repo one-c ) 2>&1 ); rc=$?
+eq "$rc" "0" "a cross-repo wait is set"
+case "$out" in *"other-repo waits for one-c ($(basename "$REPO")) to merge"*) ok ;; *) bad "and reads as one ($out)" ;; esac
+rm -rf "$REPO3"
+
+echo "== pq after <task> describes both kinds ==" >&2
+reset_tasks
+A=$(mk_task running 10 desc-a "$REPO" tom/desc-a)
+B=$(mk_task queue 20 desc-b "$REPO" tom/desc-b)
+after_add "$B" desc-a "$REPO" tom/desc-a
+X=$(mk_task running 30 desc-x "$REPO2" tom/desc-x)
+Y=$(mk_task queue 40 desc-y "$REPO" tom/desc-y)
+after_add "$Y" desc-x "$REPO2" tom/desc-x
+describe() {                            # task cache_rows -> pq after's line
+  local rows=$2
+  # shellcheck disable=SC2329  # called by cmd_after
+  ( pr_load_all() {
+      PR_CACHE="$PQ_HOME/.test.pr"; PR_ANS="$PQ_HOME/.test.ans"
+      printf '%s' "$rows" > "$PR_CACHE"; : > "$PR_ANS"
+    }
+    main after "$1" ) 2>&1
+}
+case "$(describe desc-b "$REPO"$'\t'tom/desc-a$'\t'7$'\t'OPEN$'\t'draft$'\t'master$'\t'$'\n')" in
+  *"#7 draft"*"waiting for #7 to be marked ready"*) ok ;; *) bad "a stack dependency in review waits to be marked ready" ;; esac
+case "$(describe desc-b "$REPO"$'\t'tom/desc-a$'\t'7$'\t'OPEN$'\t'$'\t'master$'\t'$'\n')" in
+  *"ready - desc-b builds on it"*) ok ;; *) bad "a ready one is built on" ;; esac
+case "$(describe desc-b "$REPO"$'\t'tom/desc-a$'\t'7$'\t'MERGED$'\t'$'\t'master$'\t'$'\n')" in
+  *"merged - desc-b starts from master"*) ok ;; *) bad "a merged one is where it starts from" ;; esac
+case "$(describe desc-y "$REPO2"$'\t'tom/desc-x$'\t'8$'\t'OPEN$'\t'$'\t'main$'\t'$'\n')" in
+  *"#8 open"*"in progress"*) ok ;; *) bad "a merge dependency reads as it always did, ready or not" ;; esac
+case "$(main after desc-x 2>&1)" in *"builds on nothing and waits for nothing"*) ok ;; *) bad "a task with none says so" ;; esac
+
 echo "== pq add --after: a blocker named by slug gates the new task ==" >&2
 reset_tasks
 PLAN_FILE="$PQ_HOME/.test-plan.md"
