@@ -482,6 +482,8 @@ prompts() { grep -c "^agent	prompt	" "$HERDR_LOG" 2>/dev/null || true; }
 prompt_text() { grep "^agent	prompt	" "$HERDR_LOG" | tail -1 | cut -f4; }
 perm_on()  { mkdir -p "$PQ_HOME/tasks"; task_link "$1"; printf '{"event":"permission","at":1}' > "$(task_home "$1")/agent.json"; }
 perm_off() { rm -f "$(task_home "$1")/agent.json"; }
+# The ask, a minute old.
+age_asked() { st_set "$1" PQ_STACK_ASKED "$(( $(epoch) - STACK_DEBOUNCE - 1 ))"; }
 # The debounce, run out: the need was first seen over a minute ago.
 age_seen() { st_set "$1" PQ_STACK_SEEN_AT "$(( $(st "$1" PQ_STACK_SEEN_AT) - STACK_DEBOUNCE - 1 ))"; }
 # A stacked task whose parent was rebased, seen once, with an idle agent in w1:p1.
@@ -504,7 +506,7 @@ age_seen "$S"; st_set "$S" PQ_WRAPUP_SINCE 2026-01-01T00:00:00Z
 out=$(restack "$S" 2>&1)
 eq "$(prompts)" "1" "a minute on: the agent is asked"
 has "$out" "ch-20: #10 was rebased - asked its agent to move #11 onto it" "and said"
-eq "$(st "$S" PQ_STACK_ASKED)" "1" "asked"
+[[ "$(st "$S" PQ_STACK_ASKED)" =~ ^[0-9]+$ ]] && ok || bad "asked, when (got '$(st "$S" PQ_STACK_ASKED)')"
 eq "$(st "$S" PQ_STACK_FIXES)" "1" "one try"
 eq "$(st "$S" PQ_STACK_FP)" "$(fp "$P" "$F")" "for this need"
 eq "$(st "$S" PQ_WRAPUP_SINCE)" "" "and its slot is held while it works"
@@ -519,9 +521,14 @@ hasnt "$T" "gh pr edit" "no retarget while the parent is open"
 hasnt "$T" "'" "quote-free"
 
 echo "== while asked: no second prompt; once idle, the same need left is handed over ==" >&2
+idle
+restack "$S" >/dev/null 2>&1
+[ -n "$(st "$S" PQ_STACK_ASKED)" ] && ok || bad "idle on the next tick, a moment after the ask: not answered yet - the agent may not have started"
+eq "$(st "$S" PQ_STACK_NEEDS)" "" "and not handed over mid-rebase"
+age_asked "$S"
 working
 restack "$S" >/dev/null 2>&1
-eq "$(st "$S" PQ_STACK_ASKED)" "1" "working: still asked"
+[ -n "$(st "$S" PQ_STACK_ASKED)" ] && ok || bad "working: still asked"
 eq "$(prompts)" "1" "and no second prompt"
 idle
 out=$(restack "$S" 2>&1)
@@ -530,6 +537,13 @@ eq "$(st "$S" PQ_STACK_NEEDS)" "restack" "the same need left: handed over"
 has "$out" "ch-20: #10 was rebased, so #11 no longer sits on it, and its agent looked and left it as it was - look at it" "warned"
 eq "$(prompts)" "1" "not asked again"
 eq "$(restack "$S" 2>&1)" "" "warned once"
+
+echo "== an ask is answered even on a tick that cannot judge the layer ==" >&2
+saved_fork=$(st "$S" PQ_STACK_FORK); st_set "$S" PQ_STACK_ASKED 1
+st_set "$S" PQ_STACK_FORK 0123456789abcdef0123456789abcdef01234567
+restack "$S" >/dev/null 2>&1
+eq "$(st "$S" PQ_STACK_ASKED)" "" "idle, with no verdict: the ask is still answered, so the watch is not held off"
+st_set "$S" PQ_STACK_FORK "$saved_fork"
 
 echo "== a new fingerprint restarts the clock ==" >&2
 g checkout -q "$PA"; g commit -q --amend -m "$PA: again"; gpush "$PA"; P2=$(g rev-parse "$PA")
@@ -568,7 +582,7 @@ out=$(restack "$S" 2>&1)
 has "$out" "could not tell its agent that #10 was rebased, so #11 no longer sits on it (boom) - retrying each tick" "an error"
 rm -f "$STUBBIN/.prompt-fail"
 restack "$S" >/dev/null 2>&1
-eq "$(st "$S" PQ_STACK_ASKED)$(st "$S" PQ_STACK_WAIT)" "1" "the next tick gets through, and the wait clears"
+[ -n "$(st "$S" PQ_STACK_ASKED)" ] && [ -z "$(st "$S" PQ_STACK_WAIT)" ] && ok || bad "the next tick gets through, and the wait clears"
 
 echo "== handover: the agent gone, or three tries ==" >&2
 n=23

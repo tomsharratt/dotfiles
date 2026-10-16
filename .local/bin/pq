@@ -4193,7 +4193,7 @@ stack_restack() {                       # task_dir dry onto fp own pnum
            "$(restack_prompt "$onto" "$own" "$pnum" "$parent" "$defb" "$branch" "$(st "$d" PQ_STACK_FORK)")"); rc=$?
   case "$rc" in
     0)
-      st_set "$d" PQ_STACK_ASKED 1; st_set "$d" PQ_STACK_FP "$fp"; st_set "$d" PQ_STACK_FIXES "$(( tries + 1 ))"
+      st_set "$d" PQ_STACK_ASKED "$nowsec"; st_set "$d" PQ_STACK_FP "$fp"; st_set "$d" PQ_STACK_FIXES "$(( tries + 1 ))"
       st_clear "$d" PQ_STACK_NEEDS PQ_STACK_WAIT PQ_WRAPUP_SINCE
       if [ "$onto" = default ]; then msg "$slug: #$pnum merged but #$own still carries its old commits - $done_word"
       else msg "$slug: #$pnum was rebased - $done_word"; fi ;;
@@ -4239,16 +4239,25 @@ stack_task() {                          # task_dir dry
     OPEN) ;;
     *) return 0 ;;
   esac
+  # An ask is answered once its agent is idle again: it has had its turn, and
+  # whether it moved the layer is the next verdict's to say. Before the verdict,
+  # so a tick that cannot say does not leave the ask - and the watch's silence
+  # behind it - standing. And not before STACK_DEBOUNCE has passed since the ask
+  # (PQ_STACK_ASKED is its epoch): a tick right after it can read the pane as
+  # idle before the agent has started, and hand over a layer mid-rebase as left
+  # as it was.
+  local asked; asked=$(st "$d" PQ_STACK_ASKED)
+  if [ -n "$asked" ] && [ "$dry" != 1 ]; then
+    [[ "$asked" =~ ^[0-9]+$ ]] || asked=0
+    if [ $(( $(epoch) - asked )) -ge "$STACK_DEBOUNCE" ]; then
+      case "$(pane_state "$(task_pane "$d")")" in
+        idle|done|unknown|noagent|missing) st_set "$d" PQ_STACK_ASKED "" ;;
+      esac
+    fi
+  fi
   IFS=$'\t' read -r verdict arg <<<"$(stack_verdict "$d")"
   [ -n "$verdict" ] || return 0
   pnum=$(pr_get "$repo" "$parent" | cut -f1)
-  # An ask is answered once its agent is idle again: it has had its turn, and
-  # whether it moved the layer is the next verdict's to say.
-  if [ -n "$(st "$d" PQ_STACK_ASKED)" ] && [ "$dry" != 1 ]; then
-    case "$(pane_state "$(task_pane "$d")")" in
-      idle|done|unknown|noagent|missing) st_set "$d" PQ_STACK_ASKED "" ;;
-    esac
-  fi
   case "$verdict" in
     linear)
       # What follows a Rebase stack press, or the agent's own restack: the layer
