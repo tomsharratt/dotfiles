@@ -4018,6 +4018,48 @@ stack_link() {                          # task_dir dry
 # cksum), both empty when there is none. A rebase cascades on its own: a child
 # that moved is a rewritten parent for the layer above it, which a later tick
 # sees from that layer's heads.
+#
+# A need is acted on by the agent that owns the layer, with plain git, once pq
+# asks it to - never by `gh stack rebase`, which rewrites every layer's branch,
+# including the ones live agents are working in. The ask is gated the way the
+# watch's are: only an idle agent, never one on a dialog, never while the watch
+# or the review gate has the agent's turn. And debounced: a need is acted on
+# only once the same fingerprint has been seen at least STACK_DEBOUNCE seconds
+# before (PQ_STACK_SEEN_FP and PQ_STACK_SEEN_AT), because GitHub's own restack
+# after a merge lands within seconds (#7006: retargeted 12:22:20, pushed
+# 12:22:25) and pq must not race it. The agent gone, an agent that came back
+# with the same need still there, or STACK_FIXES tries, hand it to you instead:
+# `restack` in `pq ls`, counted into "needs you", warned once.
+STACK_DEBOUNCE=60
+STACK_FIXES=3
+
+# What the agent is told, quote-free like every other prompt. `kind` is the
+# need's PQ_STACK_ONTO; `fork` the full fork point, which is where the layer's
+# own commits start. Each opens by syncing, since GitHub may have rebased this
+# branch too, and says outright that it replaces the contract's rule against
+# rewriting a ready pull request - a contract is written once, at dispatch.
+# The parent is fetched before the guard, not after it: a stale origin/<parent>
+# still names the old head the layer forked from, which the guard would pass.
+restack_prompt() {                      # kind pr parent_pr parent default branch fork
+  local kind=$1 pr=$2 ppr=$3 parent=$4 defb=$5 branch=$6 fork=$7
+  local tail="Never wait for input - there is nobody watching."
+  case "$kind" in
+    parent)
+      printf '%s' "Pull request #$ppr ($parent), which this one is stacked on, was rebased, so this branch no longer sits on it. \
+First run git pull --rebase --autostash origin $branch, since GitHub may have rebased this branch too, then git fetch origin $parent. \
+If git merge-base --is-ancestor origin/$parent HEAD now succeeds, it already sits on it: stop there. \
+Otherwise move your own commits onto it: git rebase --onto origin/$parent $fork. \
+Resolve every conflict, run the tests the conflicting code is covered by, and push with git push --force-with-lease --force-if-includes. \
+This pull request is in a stack, so rebasing it is expected even though it is ready - this replaces any rule in your contract against rebasing a ready pull request. $tail" ;;
+    default)
+      printf '%s' "Pull request #$ppr ($parent), which this one was stacked on, has merged into $defb, but this branch still carries its commits as they were before the merge, because GitHub could not restack it. \
+First run git pull --rebase --autostash origin $branch. \
+Then move your own commits onto $defb: git fetch origin $defb, then git rebase --onto origin/$defb $fork. \
+Resolve every conflict, run the tests the conflicting code is covered by, and push with git push --force-with-lease --force-if-includes. \
+If the pull request is not aimed at $defb yet, aim it there: gh pr edit $pr --base $defb. \
+This replaces any rule in your contract against rebasing a ready pull request. $tail" ;;
+  esac
+}
 
 # The commit a remote-tracking ref names, or nothing (and 1) when there is none.
 stack_head() {                          # repo branch -> sha
@@ -4086,7 +4128,73 @@ st_clear() {                            # task_dir key...
 # Everything a need leaves behind. The tries and the last fingerprint asked
 # about stay, as the watch's do: they bound the task, not the one need.
 stack_clear() {                         # task_dir
-  st_clear "$1" PQ_STACK_ONTO PQ_STACK_DUE PQ_STACK_NEEDS
+  st_clear "$1" PQ_STACK_ONTO PQ_STACK_DUE PQ_STACK_NEEDS PQ_STACK_SEEN_FP PQ_STACK_SEEN_AT PQ_STACK_WAIT
+}
+
+# A need, seen this tick: wait out the debounce, then ask the agent or hand it
+# over - see the section's head.
+stack_restack() {                       # task_dir dry onto fp own pnum
+  local d=$1 dry=$2 onto=$3 fp=$4 own=$5 pnum=$6 slug repo branch parent defb pstate nowsec seen at
+  slug=$(slug_of "$d"); repo=$(hdr "$d/plan.md" repo); branch=$(hdr "$d/plan.md" branch)
+  parent=$(st "$d" PQ_STACK_PARENT); defb=$(repo_base "$repo")
+  local word="#$pnum was rebased, so #$own no longer sits on it"
+  [ "$onto" = default ] && word="#$pnum merged, but #$own still carries its old commits"
+  if [ "$dry" != 1 ]; then
+    [ "$(st "$d" PQ_STACK_NEEDS)" = closed ] && st_set "$d" PQ_STACK_NEEDS ""
+    [ "$(st "$d" PQ_STACK_ONTO)" = "$onto" ] || st_set "$d" PQ_STACK_ONTO "$onto"
+    [ "$(st "$d" PQ_STACK_DUE)" = "$fp" ] || st_set "$d" PQ_STACK_DUE "$fp"
+  fi
+  nowsec=$(epoch)
+  seen=$(st "$d" PQ_STACK_SEEN_FP); at=$(st "$d" PQ_STACK_SEEN_AT)
+  if [ "$seen" != "$fp" ] || ! [[ "$at" =~ ^[0-9]+$ ]]; then
+    [ "$dry" = 1 ] && { msg "would wait ${STACK_DEBOUNCE}s to see whether GitHub restacks $slug - $word"; return 0; }
+    st_set "$d" PQ_STACK_SEEN_FP "$fp"; st_set "$d" PQ_STACK_SEEN_AT "$nowsec"
+    return 0
+  fi
+  [ $(( nowsec - at )) -ge "$STACK_DEBOUNCE" ] || return 0
+  [ -z "$(st "$d" PQ_STACK_ASKED)" ] || return 0          # the agent is on it
+
+  pstate=$(pane_state "$(task_pane "$d")")
+  local handover="" tries
+  tries=$(st "$d" PQ_STACK_FIXES); tries=${tries:-0}
+  case "$pstate" in noagent|missing) handover="its agent is gone" ;; esac
+  if [ -z "$handover" ]; then
+    if [ "$(st "$d" PQ_STACK_FP)" = "$fp" ]; then handover="its agent looked and left it as it was"
+    elif [ "$tries" -ge "$STACK_FIXES" ]; then handover="its agent has had $tries goes at restacking it"; fi
+  fi
+  if [ -n "$handover" ]; then
+    [ "$dry" = 1 ] && { msg "would leave $slug's restack to you - $word, and $handover"; return 0; }
+    [ "$(st "$d" PQ_STACK_NEEDS)" = restack ] || { st_set "$d" PQ_STACK_NEEDS restack
+      warn "$slug: $word, and $handover - look at it"; }
+    return 0
+  fi
+
+  # Only an idle agent whose turn nobody else has: not the watch's, not a
+  # reviewer reading the worktree, not the review follow-up about to go.
+  case "$pstate" in idle|done|unknown) ;; *) return 0 ;; esac
+  agent_blocked "$d" && return 0
+  [ -z "$(st "$d" PQ_WATCH_ASKED)" ] || return 0
+  case "$(st "$d" PQ_REVIEW)" in running|posted) return 0 ;; esac
+  local done_word="asked its agent to move #$own onto it"
+  [ "$onto" = default ] && done_word="asked its agent to move it onto $defb"
+  [ "$dry" = 1 ] && { msg "would prompt $slug - $word"; return 0; }
+  local code rc
+  code=$(agent_prompt "$(task_pane "$d")" \
+           "$(restack_prompt "$onto" "$own" "$pnum" "$parent" "$defb" "$branch" "$(st "$d" PQ_STACK_FORK)")"); rc=$?
+  case "$rc" in
+    0)
+      st_set "$d" PQ_STACK_ASKED 1; st_set "$d" PQ_STACK_FP "$fp"; st_set "$d" PQ_STACK_FIXES "$(( tries + 1 ))"
+      st_clear "$d" PQ_STACK_NEEDS PQ_STACK_WAIT PQ_WRAPUP_SINCE
+      if [ "$onto" = default ]; then msg "$slug: #$pnum merged but #$own still carries its old commits - $done_word"
+      else msg "$slug: #$pnum was rebased - $done_word"; fi ;;
+    2)
+      [ "$(st "$d" PQ_STACK_WAIT)" = blocked ] || { st_set "$d" PQ_STACK_WAIT blocked
+        msg "$slug: the agent is on a dialog - telling it that $word waits for you to answer it"; } ;;
+    *)
+      [ "$(st "$d" PQ_STACK_WAIT)" = error ] || { st_set "$d" PQ_STACK_WAIT error
+        warn "$slug: could not tell its agent that $word ($code) - retrying each tick"; } ;;
+  esac
+  return 0
 }
 
 # One stacked task, one tick: every done task that is not reaped, has a parent
@@ -4104,13 +4212,20 @@ stack_task() {                          # task_dir dry
   # it, or a merged task would read `restack` in `pq ls` for good - and a
   # PQ_STACK_DUE left behind holds the review gate.
   case "${ownstate:-}" in
-    MERGED|CLOSED) [ "$dry" = 1 ] || stack_clear "$d"; return 0 ;;
+    MERGED|CLOSED) [ "$dry" = 1 ] || { stack_clear "$d"; st_clear "$d" PQ_STACK_ASKED; }; return 0 ;;
     OPEN) ;;
     *) return 0 ;;
   esac
   IFS=$'\t' read -r verdict arg <<<"$(stack_verdict "$d")"
   [ -n "$verdict" ] || return 0
   pnum=$(pr_get "$repo" "$parent" | cut -f1)
+  # An ask is answered once its agent is idle again: it has had its turn, and
+  # whether it moved the layer is the next verdict's to say.
+  if [ -n "$(st "$d" PQ_STACK_ASKED)" ] && [ "$dry" != 1 ]; then
+    case "$(pane_state "$(task_pane "$d")")" in
+      idle|done|unknown|noagent|missing) st_set "$d" PQ_STACK_ASKED "" ;;
+    esac
+  fi
   case "$verdict" in
     linear)
       # What follows a Rebase stack press, or the agent's own restack: the layer
@@ -4122,7 +4237,7 @@ stack_task() {                          # task_dir dry
       [ "$dry" = 1 ] || stack_clear "$d" ;;
     landed)
       [ "$dry" = 1 ] && { msg "would record that #$own is the bottom of its stack now - #$pnum merged"; return 0; }
-      stack_clear "$d"
+      stack_clear "$d"; st_clear "$d" PQ_STACK_ASKED
       st_set "$d" PQ_STACK_PARENT ""; st_set "$d" PQ_STACK_LANDED "$pnum"
       msg "$slug: #$pnum merged - #$own is the bottom of its stack now" ;;
     closed)
@@ -4131,12 +4246,8 @@ stack_task() {                          # task_dir dry
       st_clear "$d" PQ_STACK_ONTO PQ_STACK_DUE
       st_set "$d" PQ_STACK_NEEDS closed
       warn "$slug: #$pnum, which #$own is stacked on, was closed without merging - decide what becomes of #$own" ;;
-    rebased|stale)
-      [ "$dry" = 1 ] && return 0
-      local onto=parent; [ "$verdict" = stale ] && onto=default
-      [ "$(st "$d" PQ_STACK_NEEDS)" = closed ] && st_set "$d" PQ_STACK_NEEDS ""
-      [ "$(st "$d" PQ_STACK_ONTO)" = "$onto" ] || st_set "$d" PQ_STACK_ONTO "$onto"
-      [ "$(st "$d" PQ_STACK_DUE)" = "$arg" ] || st_set "$d" PQ_STACK_DUE "$arg" ;;
+    rebased) stack_restack "$d" "$dry" parent "$arg" "$own" "$pnum" ;;
+    stale)   stack_restack "$d" "$dry" default "$arg" "$own" "$pnum" ;;
   esac
   return 0
 }
