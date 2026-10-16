@@ -159,10 +159,10 @@ Dispatch runs `wt new` in that repo, which picks up its profile, and everything 
 Branch *lookups* are keyed on the repo as well as the name, but a task's slug is a single global namespace, so two live tasks can never share a branch leaf even across two different projects - `tom/fix-timezone` cannot be queued in both at once.
 
 ```
-pq add                   pick a plan and add it; asks model, effort, what to wait on and, for a design plan, the design file - the next tick names it
-pq after <task>          list a task's blockers and what each is waiting on
-pq after <task> T...     add blockers to a task still in queue/
-pq after <task> --clear  drop them all
+pq add                   pick a plan and add it; asks model, effort, what to build on and, for a design plan, the design file - the next tick names it
+pq after <task>          what a task builds on or waits for, and where that stands
+pq after <task> T        set it, for a task still in queue/ - replacing any it had
+pq after <task> --clear  drop it
 pq ls [--all] [--json]   every task, its state, what it is waiting on, and what it has cost
 pq tick [--dry-run]      free finished slots, then fill them from the queue
 pq run                   tick every two minutes until you stop it
@@ -189,10 +189,18 @@ Once you confirm, it asks the things that actually shape how a task runs:
 - which model should run it - `sonnet`, `opus` or `fable`, starting on `sonnet`;
 - what effort - `low`, `medium`, `high`, `xhigh` or `max`, starting on `medium`;
 - when the plan was built from a design but names no file that exists, the design file, from a file picker that starts in `~/.claude/plans/designs` - Esc goes without it, loudly;
-- which tasks it should wait on - x ticks one, Enter confirms, and Enter with nothing ticked means none.
+- which task it builds on - `build on which? Enter picks`, one pick.
 
-Anything whose work has not landed can be waited on: a task in `new/`, `queue/` or `running/`, and one in `done/` whose pull request has neither merged nor closed, since that is where a task sits while it is reviewed.
+That last question is a single choice, because a task has one dependency and plans come as a series in a single line (see "Building on another task" below).
+Its first row is `nothing - start from <default branch>`, and the cursor starts there, so Enter never stacks a task by accident.
+The candidates follow, newest first, so a chain's previous link is one row down.
+A task in the same repo reads `stack on it`: the new task starts as soon as that pull request is marked ready for review, forked from its branch, and joins its stack.
+A task in another repo reads `<repo>: wait for its merge`, since a stack cannot cross repos.
+A task in the same repo that something else already builds on is not offered at all: a stack is a single line, and GitHub only ever adds a pull request to its top.
+
+Anything whose work has not landed can be picked: a task in `new/`, `queue/` or `running/`, and one in `done/` whose pull request has neither merged nor closed, since that is where a task sits while it is reviewed.
 Only the verdict `pq` has already recorded is read, so the list costs no round trip to the forge.
+The add closes by saying what it set: `on: <task> - starts when its pull request is ready for review`, or `after: <task> (<repo>) - starts once it merges`.
 
 The repo is the one you are standing in.
 Outside any repo it asks which of the repos pq already knows.
@@ -210,8 +218,8 @@ It writes the branch, intent and security verdict into the header and moves the 
 The run log says `queued <slug> - <branch>`.
 
 A plan that lands as a chain of pull requests is added one link at a time, about a minute apart - faster than a tick - so the link before is usually still in `new/` when the next one picks it.
-A blocker with no name yet has no branch to wait on, so it is held by its timestamp until the task waiting on it is named; `new/` is named oldest first, so both land on the same tick.
-A blocker that is still unnamed holds its dependent back with it, which reads `after <blocker>`.
+A task with no name yet has no branch to build on, so it is held by its timestamp until the task building on it is named; `new/` is named oldest first, so both land on the same tick.
+A task still unnamed holds the one building on it back with it, which reads `after <task>`.
 One removed before it was ever named holds its dependent for good, since nothing can now say which branch it meant: `pq rm` warns as it removes it, and `pq ls` reads `blocker gone`.
 `pq after` takes neither side of an unnamed task - it is a tick away from having a name.
 
@@ -237,7 +245,11 @@ The repository's own conventions still apply on top; the contract says so.
 
 It asks for four things.
 **Commits are the unit of review**: one coherent, self-contained step per commit, in the order a reader should meet them, each message saying what and why; a mechanical change is its own commit and says so; a non-mechanical commit over about 300 lines is split; never one squashed commit at the end.
-History may be rewritten only while the pull request is a draft.
+A draft's history is the agent's to rewrite; once the pull request is ready it is only ever rebased onto its base, when `pq` asks or when it conflicts, never restructured.
+A rewritten branch is pushed with `--force-with-lease --force-if-includes`, never `--force`: GitHub rebases branches in a stack on its own - after a pull request below merges, and on Rebase stack - and after a `git fetch` a plain lease overwrites such a rewrite without a word, where `--force-if-includes` refuses it.
+A rejected push is synced with `git pull --rebase --autostash origin <branch>` and pushed again, and a moved base is always rebased in, never merged, because a stacked pull request needs a linear history to merge.
+These hold for every task, stacked or not: any ready pull request can become the bottom of a stack the moment a task building on it opens its own.
+For the same reason every prompt `pq` sends about a pull request - the review follow-up and each watch prompt - opens with that same `git pull --rebase --autostash`, which is a no-op on a branch nobody rewrote.
 **Verification in the browser**: the app is served at the worktree's own url from its `dev` tab, and the implementer walks every path the change touches, captures each screen before and after with `chrome-devtools-axi`, and is told to fix anything that looks off even when the plan did not name it.
 The width is set with `emulate --viewport "390x844x1"` (or `1440x900x1`), never `resize`, which quietly clamps the width to the window's and so produced "390px" screenshots that were not.
 **Design fidelity**, when the task carries design files: open each in the browser, screenshot the target artboard at its native width, build to it, then screenshot the implementation at the same width and state and compare side by side - layout, spacing, sizes, colour, type, radius, icons, copy, and every state the artboard shows - until nothing differs or a difference is deliberate and recorded.
@@ -278,33 +290,58 @@ The queue is add-order, oldest first - a task's position is exactly when it was 
 There is no number to slot between two tasks, and nothing to promote or demote one later, because plans are added in the order they should run - so there was never anything to insert between them, or any position to correct.
 The fourteen-digit prefix is a fixed-width UTC timestamp, which is what makes bash's own glob order agree with numeric order - `pq ls` and the queue's actual dispatch order are the same order.
 
-#### Blockers
+#### Building on another task
 
-Some work is several pull requests where the second cannot start until the first has shipped - a client change waiting on the endpoint it calls, say.
-The wizard's blocker question, or `pq after B A` once both are queued, says exactly that: B is not eligible for dispatch until A's PR has merged into A's repo's default branch.
+Some work is several pull requests where the second needs the first's code - a screen on top of the model it reads, say.
+A dependency used to wait for a merge: the second task was not dispatched until the first's pull request had merged, so every link of a series waited on your review and merge before the next one even started, and you were the bottleneck of every series.
+Now a task builds on another one in the same repo, on top of GitHub's native stacked pull requests: it starts as soon as that pull request is marked ready for review, forked from its branch, and joins its stack.
 
-Blocked is derived, not stored - a blocked task sits in `queue/` like any other and fill just skips it, the same way the cap is soft arithmetic rather than a drain state.
-A task's blockers live in a third file, `after`, alongside `plan.md` and `state.env`: one blocker per line, `label<TAB>repo<TAB>branch`.
-A blocker is a resolved `(label, repo, branch)` triple, not a task reference - it is captured at the moment you type it, so it survives `pq rm A`, survives A ageing out of `done/`, and survives a slug being reused.
-That is also what makes a cross-repo blocker work for free, and lets a blocker name a branch that was never added to `pq` at all.
+A task has at most one dependency, picked at the wizard or set later with `pq after B A` once both are queued, and its kind is derived from where it lives rather than stored:
+
+- **in the same repo, B builds on A** - B reads `on A` until A's pull request is marked ready (open, not a draft), and is then eligible; once A has merged, B is plainly met and starts from the default branch like any other task;
+- **in another repo, B waits for A** - a stack cannot cross repos, so B is eligible once A's pull request has merged into A's repo's default branch, and reads `after A` until then.
+
+A task B builds on is dispatched from A's branch: fill records the branch at the claim (`PQ_STACK_PARENT`), so a dispatch resumed on a later tick keeps it, and dispatch forks the worktree from `origin/<A's branch>` and records the exact commit it forked from (`PQ_STACK_FORK`).
+B's own commits are the ones after that commit.
+An A that merged between the claim and the fork is not built on: B forks from the default branch, which already holds it.
+B's prompt and its contract tell it to open its pull request against A's branch (`gh pr create --draft --base <A's branch>`), what to do if A merged or was rebased before it got that far, and that GitHub may rewrite its branch on origin from then on.
+Once B's pull request exists, the tick adds it to A's stack with the official extension, `gh stack link`, by pull request number only - a branch name would make it push the agent's unpushed work.
+The first link of a series makes a stack of the pair (`gh stack link <A> <B>`); a later link goes through the stack's own number (`gh stack link <stack> <C>`), because the pair form refuses once the stack is longer than the pair.
+Either form corrects a pull request opened against the wrong base.
+Without the extension (`gh extension install github/gh-stack`), with stacks off for the repo, or after three failed tries, `pq` warns once and leaves a plain chained pull request: it still works, and only the stack map and GitHub's automatic restack are lost.
+Both reviewers diff against the pull request's live base, so a stacked task is reviewed for its own layer only.
+
+A stack is a single line - "Stacks can't include forks or branching structures" - so `pq` supports no fan-in and no fan-out: a task in the same repo that something already builds on is not offered at the wizard, and `pq after` refuses it ("<other> already builds on <A> - a stack is a single line, so build on <other> instead").
+The planning rule in `AGENTS.md` keeps a series that way from the start: one plan file per pull request, each building only on the one before it.
+
+A stacked pull request is merged from GitHub's merge box or with `gh stack merge <pr> --yes --squash`; `gh pr merge` refuses one ("must be merged using the asynchronous merge REST API").
+Merging a layer lands every unmerged layer below it in one operation, and after a bottom layer merges GitHub retargets the next one to the trunk and force-pushes a rebased copy of every layer above, server-side.
+
+The dependency lives in a third file, `after`, alongside `plan.md` and `state.env`: one line, `label<TAB>repo<TAB>branch`.
+It is a resolved `(label, repo, branch)` triple, not a task reference - captured at the moment you pick it, so it survives `pq rm A`, survives A ageing out of `done/`, and survives a slug being reused.
+That is also what makes a cross-repo wait work for free, and lets `pq after` name a branch that was never added to `pq` at all.
 
 Merge state comes from the forge, never from git ancestry: a squash-merged branch's tip is not an ancestor of its default branch, so `git branch --merged` misses every real merge.
-`pq` asks `gh` instead, and only trusts a `MERGED` pull request whose work is on its repo's default branch: merged into it, or merged into another branch with a merge commit that is on it - which is how a stack merged from its top lands.
+`pq` asks `gh` instead, and only trusts a `MERGED` pull request whose work is on its repo's default branch: merged into it, or merged into another branch with a merge commit that is on it.
+That second arm is how a stack merged from its top lands: GitHub records each upper pull request as merged into the branch below it, not into the trunk, while its merge commit is plainly on the trunk - so exact matching would read it as unmerged and freeze the queue.
 Merged into some other branch and nowhere near the default does not count.
 
-`pq after <task>` answers "why has this not started": per blocker, both the state of the task that owns the branch and the state of its pull request, since either one can be the reason and the fix differs.
-A blocker that has already merged is fine to add - `pq` says so rather than refusing.
+`pq after <task>` answers "why has this not started": the state of the task that owns the branch and the state of its pull request, since either one can be the reason and the fix differs, and what that means for this kind - "waiting for #N to be marked ready", "ready - <task> builds on it", "merged - <task> starts from <default>", or, for a wait across repos, the merge it is waiting on.
+A dependency that has already merged is fine to set - `pq` says so rather than refusing.
 Self-reference and cycles are rejected at the moment you try to create them.
 
-Three situations short-circuit the ordinary wait and warn once, because they read as healthy waiting until you look closer: a **dead** blocker (every pull request for it is closed), an **orphan** (nothing owns that branch, so nothing will ever open one), and a **stalled** chain (the owning task already reached `done` with only a draft PR open *and* its review gate settled - a stuck agent, not a chain in review).
+Three situations short-circuit the ordinary wait and warn once, for either kind, because they read as healthy waiting until you look closer: a **dead** dependency (every pull request for it is closed), an **orphan** (nothing owns that branch, so nothing will ever open one), and a **stalled** chain (the owning task already reached `done` with only a draft PR open *and* its review gate settled - a stuck agent, not a chain in review; for a task that builds on it, the layer below is stuck in a draft).
 That last qualification matters now that every pull request opens as a draft: a draft during the review gate is the gate working, and only a draft still open once the gate is over is a stalled chain.
 None of the three auto-holds anything; fill already costs no slot on a blocked task, and `pq` does not re-order your work on its own judgement.
 
+One gap remains until the restack lands (the next pull request in this series): `pq` does not yet notice when the layer below is rebased after its child forked - a conflict fix on the parent, which about one ready pull request in five has needed so far.
+Until then the child's diff shows the parent's old commits, and pressing Rebase stack in the child's merge box is the fallback.
+
 `pq tick` is one idempotent pass: reconcile, then fill.
 Reconcile runs first so a task that shipped leaves the queue promptly - any pull request, in any state, means the work is out of `queue`'s hands.
-Any pull request of the task's own, that is: only one opened after the task was claimed counts, for reconcile and for everything else that reads the task's pull request (the review gate, the teardown, the blocker predicate, `pq ls`).
+Any pull request of the task's own, that is: only one opened after the task was claimed counts, for reconcile and for everything else that reads the task's pull request (the review gate, the teardown, the dependency predicate, `pq ls`).
 A name reused from an old task used to read as "finished, #old merged" one tick after dispatch, and the teardown then removed a worktree whose agent was still working in it.
-A blocker on a task still in the queue is judged the same way - nothing on the forge can be the work of a task nobody has claimed yet.
+A dependency on a task still in the queue is judged the same way - nothing on the forge can be the work of a task nobody has claimed yet.
 Leaving the queue and giving up the slot are separate things, though: see the cap below, which keeps counting a task whose agent is still working on its PR.
 Fill claims a task by moving it to `running/` *before* calling `wt new`, because that call takes the better part of a minute and an unclaimed task is one a second tick would happily pick up too.
 Each dispatch step records itself as it succeeds, so an interrupted tick is resumed rather than restarted - and resuming deliberately skips `wt new` when the pane is still there, since re-provisioning would drop the worktree's database.
@@ -318,6 +355,7 @@ It used to be a directory with the pid written into it a moment later, so a tick
 
 `pq run` sits in a Herdr space and ticks on an interval, so it inherits the socket and you can watch it.
 It prints a summary only when one differs from the last, so an idle night leaves a log of what changed rather than a line per interval.
+The summary's `N waiting` counts the queued tasks that are not yet eligible - most of them now waiting for a pull request to be marked ready, not merged - and never one that builds on a pull request already ready.
 
 The cap is **state, not an argument**: it lives in a file that is re-read at the top of every tick, so `pq cap 1` in the morning and `pq cap 4` at bedtime take effect on the next pass with no restart.
 `pq cap 0` is the pause, which is why pausing needs no separate concept.
@@ -452,7 +490,7 @@ The implementer's contract says `pq` runs the review, and not to run one itself.
 Once the draft is open, `pq` runs `claude -p "/security-review"` in the task's worktree beside the code reviewer, launched on the same tick, on the same `PQ_REVIEWER_MODEL`, timeout, `PQ_REVIEW_MAX_TRIES` and retry but at `xhigh` rather than the code review's `high`, and under the same read-only deny rules, with `gh` denied outright.
 The skill takes no target and posts nothing: it reviews `git diff origin/HEAD...` of wherever it runs and replies with a markdown report.
 So its brief names the diff to go by - `git diff origin/<base>...HEAD`, since `origin/HEAD` is the default branch whatever the pull request is aimed at - and points it at the plan, which says why it asked and what to look at.
-For now every task's base is its repo's default branch, so the two agree; the brief names it all the same, for a worktree whose `origin/HEAD` was never set up.
+The base is the pull request's live one: for a stacked task its parent's branch, so only its own layer is reviewed, and otherwise the default branch - named all the same, for a worktree whose `origin/HEAD` was never set up.
 Then `pq` delivers the report itself: it is saved as `<task>/security.md` and posted on the pull request as one comment, next to the code review's inline ones.
 
 The two reviews meet at one point: the follow-up waits until both have finished, so the implementer is told once, about both - answer every inline comment and every finding in the security report, by fixing it or saying why it stands - and the slot stays held until then.
@@ -473,7 +511,7 @@ The review gate ends when the implementer marks its pull request ready, and for 
 What happens to a pull request after that - CI failing, the base moving until it conflicts, a person leaving review comments - was left for whoever looked next, which was you typing into the pane: "The CI is failing, maybe just flakey", "can you resolve the merge conflicts on the PR".
 So a task whose gate reached `ready` is still watched while its pull request is open and not a draft, and its agent is prompted about the one thing most in the way of a merge:
 
-- **conflict** - the pull request no longer merges into its base; the agent is told to merge the base in, since rebasing or force-pushing a ready pull request is not its call
+- **conflict** - the pull request no longer merges into its base; the agent is told to rebase onto it and push with `--force-with-lease --force-if-includes`, never to merge it in, since any ready pull request can become the bottom of a stack and a merge commit would stop the stack merging - and, for an agent dispatched before its contract said so, that this replaces the old rule against rewriting a ready pull request
 - **ci** - every check has finished and at least one failed; the prompt names each failed check and its run, and says how to rerun a job that is flaky rather than broken
 - **review** - a person has left feedback since the pull request was marked ready: a new inline thread, a reply from someone other than the author, a review with a verdict or a body, or a comment on the conversation
 
@@ -493,7 +531,7 @@ That is the same `wt rm` you would have run by hand, driven unattended.
 
 Settled means either of two things:
 
-- **merged** into its repo's default branch - checked against the forge, the same predicate blockers use, not `wt gc --settled`'s looser "state == MERGED"; a merge commit on the default branch counts, which is how a stack merged from its top lands
+- **merged** into its repo's default branch - checked against the forge, the same predicate dependencies use, not `wt gc --settled`'s looser "state == MERGED"; a merge commit on the default branch counts, which is how a stack merged from its top lands
 - **closed** without merging, every pull request for the branch - closing one is a decision that the work is finished, so it settles the task exactly as a merge does
 
 Closing a pull request is how you say you are done with a piece of work, and there is nothing left for its agent to come back to either way.
@@ -544,7 +582,7 @@ Once a done task is **terminal** - its PR settled, merged or closed, *and* its w
 Both halves are required: `archive/` is not walked on the hot path, so filing a task away on the verdict alone would strand its worktree, database and port where nothing would ever reclaim them.
 A task with no verdict yet, one held on `PQ_REAP_HELD`, and one reaped with no verdict at all all stay in `done/` - each of those still wants something.
 
-A blocker survives this by construction: it is a resolved `(label, repo, branch)` triple, not a task reference, so a dependent still resolves it correctly once its blocker has archived - see "Blockers" above.
+A dependency survives this by construction: it is a resolved `(label, repo, branch)` triple, not a task reference, so a dependent still resolves it correctly once the task it named has archived - see "Building on another task" above.
 
 The newest three archivable tasks are kept behind in `done/`, so `pq ls` still answers "did last night's batch ship?" at a glance.
 `pq ls` hides `archive/` by default and reports how many rows it is hiding; `pq ls --all` shows everything, and `--json` composes with either.
