@@ -335,8 +335,25 @@ Three situations short-circuit the ordinary wait and warn once, for either kind,
 That last qualification matters now that every pull request opens as a draft: a draft during the review gate is the gate working, and only a draft still open once the gate is over is a stalled chain.
 None of the three auto-holds anything; fill already costs no slot on a blocked task, and `pq` does not re-order your work on its own judgement.
 
-One gap remains until the restack lands (the next pull request in this series): `pq` does not yet notice when the layer below is rebased after its child forked - a conflict fix on the parent, which about one ready pull request in five has needed so far.
-Until then the child's diff shows the parent's old commits, and pressing Rebase stack in the child's merge box is the fallback.
+A stacked task forks from its parent's head, and the parent can then change in four ways, only two of which need anything from `pq`.
+A parent that only gains commits - review fixes, CI fixes - needs nothing: the child's diff still shows only its own layer, and Rebase stack at merge time makes the stack linear.
+A parent that is squash-merged with GitHub restacking the child needs nothing either: GitHub retargets the child to the default branch and force-pushes a rebased copy of it.
+A parent that is rebased - a conflict fix, which about one ready pull request in five has needed so far - leaves the child's diff showing the parent's old commits, so `pq` asks the child's agent to move its own commits onto the parent's new head.
+And a parent that merged while GitHub's restack failed or never ran leaves the child carrying the parent's old commits on top of the default branch: GitHub does not restack a child that is no longer linear on its parent, and cannot restack one that was never linked.
+So `pq` asks the child's agent to move its own commits onto the default branch and aim its pull request there.
+
+Which case it is comes from the heads as they are now - the child's, the parent's, the default branch's and the commit the child forked from - never from the parent's commit merely changing, since a Rebase stack press moves parent and child together and must not send a prompt up the stack.
+A child that sits on its parent's head takes that head as its fork point from then on, which is what follows a Rebase stack press or a restack of its own.
+A child whose parent has merged and whose own commits now sit on the default branch is the bottom of its stack, and from then on an ordinary pull request.
+A parent closed without merging is handed to you at once - `parent closed` in `pq ls`, counted into "needs you", warned once - because whether the child still makes sense is a decision, not a rebase; it clears if the parent reopens.
+
+The agent rebases its own layer with plain git, never `gh stack rebase` or `gh stack sync`, which rewrite every layer's branch, including the ones other agents are working in.
+It is asked only once the same need has been seen on two ticks at least 60 seconds apart, because GitHub's own restack after a merge lands within seconds and `pq` must not race it.
+It is asked the way the watch asks: only while idle, never on a dialog, and never while the watch or a reviewer has its turn.
+An agent that is gone, one that comes back with the same need still there, or one that has had three tries hands the restack to you instead: `pq ls` reads `restack`, counted into "needs you", and the tick warns once.
+While the agent is on it, the row reads `restacking`.
+Until the layer is back on its real base, the review gate does not launch, so a reviewer only ever sees the layer's own commits, and the watch raises no conflict, since the restack is the fix.
+A restack cascades on its own: a child that moved is a rewritten parent for the layer above it, which a later tick sees and restacks in turn.
 
 `pq tick` is one idempotent pass: reconcile, then fill.
 Reconcile runs first so a task that shipped leaves the queue promptly - any pull request, in any state, means the work is out of `queue`'s hands.
@@ -523,6 +540,7 @@ Each condition is asked about once, and only of an idle agent that is not on a d
 A CI failure's fingerprint is the head commit and the failed jobs, so a push or a rerun that fails again is a new failure and a new prompt, while the same failure sitting there is not.
 An agent that comes back from a failure without a new commit or a rerun, one that has had three goes at a fix, or one that is gone hands the condition to you instead: `pq ls` reads `ci failed`, `conflict` or `new review`, counted into "needs you", and the tick warns once.
 While the agent is on it, the row reads `fixing ci`, `fixing conflict` or `answering review`.
+A stacked task whose layer below has moved is not prompted about a conflict at all while its restack is due, since the restack is the fix (see "Building on another task"); its row reads `restacking`, `restack` or `parent closed` instead.
 An agent whose slot had already been released takes it back while it works, so the cap can be passed by one for as long as a fix takes - the same soft overshoot the review follow-up accepts, since fixing a pull request that is about to merge is worth more than starting the next task a turn sooner.
 
 #### Tearing a task down

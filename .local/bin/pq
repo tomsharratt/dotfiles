@@ -87,7 +87,9 @@
 # and mark the pull request ready - see the `review gate` section. Once it is
 # ready, the pull request is still watched: a conflict, failed CI or a person's
 # review feedback gets the agent prompted again (see "watching a ready pull
-# request").
+# request"). And a stacked task's agent is asked to move its layer when the one
+# below is rebased, or merges without GitHub restacking it (see "restacking a
+# layer").
 #
 # Once a done task has settled AND been torn down - not on the verdict alone,
 # which would strand its worktree - `pq tick` files it away to `archive/`, keeping only the
