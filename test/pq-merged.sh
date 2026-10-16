@@ -1,15 +1,15 @@
 #!/usr/bin/env bash
-# test/pq-base.sh - the per-task `base:` header: what counts as merged when a
-# task is not aimed at its repo's default branch, and where its worktree forks
-# from.
+# test/pq-merged.sh - what counts as merged: a task's work is present in its
+# repo's default branch, and a blocker's in its own repo's default branch.
 #
 # Same shape as test/pq-after.sh and test/pq-reap.sh - sources pq so the
 # predicates are callable directly against a hand-primed PR cache, with no live
 # PR and no `gh` in the loop.
 #
-# The rows that matter here are the ones that used to fail SILENTLY: a task
-# whose PR merged into an integration branch read as "still in review" forever,
-# its worktree was never torn down, and `pq ls` printed "merged" the whole time.
+# The rows that matter here are the ones that would fail SILENTLY: an upper
+# layer of a stack merged from its top is recorded as merged into the branch
+# below it, not into the trunk, so exact matching would read it as "still in
+# review" forever, never tear its worktree down, and freeze its dependents.
 #
 # SC2015: `ok` never fails, so `[ ... ] && ok || bad` is an if/else.
 # shellcheck disable=SC2015
@@ -33,8 +33,8 @@ EOF
 chmod +x "$STUBBIN/claude" "$STUBBIN/gh" "$STUBBIN/herdr"
 export PATH="$STUBBIN:$PATH"
 
-# A `wt` stub, so the fork-point assertions can read back exactly what pq asked
-# `wt new` for without a real worktree, database or Herdr pane in sight.
+# A `wt` stub, so the reap assertions can read back whether pq asked `wt` to
+# remove a worktree, without a real worktree, database or Herdr pane in sight.
 WT_LOG="$STUBBIN/.wt-calls"
 : > "$WT_LOG"
 cat > "$STUBBIN/wt-stub" <<EOF
@@ -59,17 +59,19 @@ eq() { [ "$1" = "$2" ] && ok || bad "$3 (got '$1', want '$2')"; }
 cleanup() { rm -rf "$PQ_HOME" "$STUBBIN" "${REPO:-}" "${REPO2:-}"; }
 trap cleanup EXIT
 
-# ── a real repo with a real integration branch ──────────────────────────────
+# ── a real repo with a real stack ───────────────────────────────────────────
 # The ancestry arm of `merged_into` reads actual git history, so this fixture has
-# to be genuine - a faked ref is not enough. The shape mirrors the case that
-# provoked all of this:
+# to be genuine - a faked ref is not enough. The shape is a stack merged from
+# its top, as GitHub records it:
 #
-#   master        A ── B                 B is part 3's merge commit
-#                       \
-#   live-events          C               cut from B, then part 6 landed as C
+#   master        A ── B                 B is the upper layer's merge commit,
+#                       \                landed on master with the whole stack
+#   tom/lower            C               C is only on the lower layer's branch
 #
-# So B (merged into master) IS present in live-events, while C (merged into
-# live-events) is NOT present in master. Those two facts are the whole test.
+# GitHub reports the upper pull request as MERGED with baseRefName=tom/lower
+# (supercast #6999), yet its merge commit B is on master. A row into tom/lower
+# whose merge commit C is NOT on master has not landed. Those two facts are the
+# whole test.
 REPO=$(mktemp -d)
 git init -q -b master "$REPO"
 git -C "$REPO" -c user.email=test@test -c user.name=test commit -q --allow-empty -m A
@@ -78,12 +80,12 @@ OID_B=$(git -C "$REPO" rev-parse HEAD)
 mkdir -p "$REPO/.git/refs/remotes/origin"
 git -C "$REPO" update-ref refs/remotes/origin/master refs/heads/master
 git -C "$REPO" symbolic-ref refs/remotes/origin/HEAD refs/remotes/origin/master
-git -C "$REPO" branch live-events master
+git -C "$REPO" branch tom/lower master
 git -C "$REPO" -c user.email=test@test -c user.name=test \
   commit-tree -p "$OID_B" -m C "$(git -C "$REPO" rev-parse "HEAD^{tree}")" > "$PQ_HOME/.oidc"
 OID_C=$(cat "$PQ_HOME/.oidc")
-git -C "$REPO" update-ref refs/heads/live-events "$OID_C"
-git -C "$REPO" update-ref refs/remotes/origin/live-events "$OID_C"
+git -C "$REPO" update-ref refs/heads/tom/lower "$OID_C"
+git -C "$REPO" update-ref refs/remotes/origin/tom/lower "$OID_C"
 
 # A second repo, so the cross-repo blocker rule has somewhere to point.
 REPO2=$(mktemp -d)
@@ -107,11 +109,9 @@ reset_tasks() {
 }
 reset_tasks
 
-# A task built by hand. $base is written as a `base:` header only when non-empty,
-# exactly as cmd_add does it - a task with no base must produce a plan.md that is
-# byte-for-byte what it would have been before this header existed.
-mk_task() {                             # state prio slug repo branch base -> task_dir
-  local st=$1 prio=$2 slug=$3 repo=$4 branch=$5 base=${6:-}
+# A task built by hand, with the header cmd_add and naming write.
+mk_task() {                             # state prio slug repo branch -> task_dir
+  local st=$1 prio=$2 slug=$3 repo=$4 branch=$5
   local dir
   dir="$PQ_HOME/$st/$(printf '%014d' $(( 20260101000000 + 10#$prio )))-$slug"
   mkdir -p "$dir"
@@ -119,7 +119,6 @@ mk_task() {                             # state prio slug repo branch base -> ta
     printf -- '---\n'
     printf 'repo:     %s\n' "$repo"
     printf 'branch:   %s\n' "$branch"
-    [ -n "$base" ] && printf 'base:     %s\n' "$base"
     printf 'model:    sonnet\n'
     printf 'effort:   xhigh\n'
     printf 'intent:   test fixture\n'
@@ -130,62 +129,43 @@ mk_task() {                             # state prio slug repo branch base -> ta
 }
 
 
-echo "== task_base ==" >&2
-reset_tasks
-d=$(mk_task queue 10 no-base "$REPO" tom/a)
-eq "$(task_base "$d")" "master" "no base: header falls back to the repo default"
-repo_base_reset
-d=$(mk_task queue 11 with-base "$REPO" tom/b live-events)
-eq "$(task_base "$d")" "live-events" "base: header wins over the repo default"
-repo_base_reset
-d=$(mk_task queue 12 nobase-repo "$REPO2/nope" tom/c)
-eq "$(task_base "$d")" "" "unresolvable repo default reads empty, not a guess"
-repo_base_reset
-
 echo "== merged_into: the cheap arm (exact merge target) ==" >&2
 reset_caches
-cache_row "$REPO" tom/exact 1 MERGED "" live-events "$OID_C"
-merged_into "$REPO" tom/exact live-events && ok \
-  || bad "merged into live-events should be present in live-events"
-
-# The bug, stated as a test: this is what returned false before, froze the
-# queue, and left the worktree standing.
-reset_caches
-cache_row "$REPO" tom/feature 2 MERGED "" live-events "$OID_C"
-{ pr_merged_into "$REPO" tom/feature master \
-    && bad "pr_merged_into should still be exact - that is what makes it pure"; } || ok
-merged_into "$REPO" tom/feature live-events && ok \
-  || bad "a PR merged into the integration branch must count for a task based on it"
+cache_row "$REPO" tom/exact 1 MERGED "" master "$OID_B"
+pr_merged_into "$REPO" tom/exact master && ok \
+  || bad "a MERGED row into master is an exact match"
+merged_into "$REPO" tom/exact master && ok \
+  || bad "merged into master should be present in master"
 
 echo "== merged_into: the ancestry arm ==" >&2
-# Part 3 merged into MASTER; part 4 is based on live-events, which was cut from
-# master AFTER that merge. Exact matching calls this unmet and refreezes the
-# queue inside the workflow the feature exists to support.
+# The upper layer of a stack merged from its top: recorded as merged into the
+# layer below, landed on master all the same. Exact matching calls this unmet
+# and freezes the queue.
 reset_caches
-cache_row "$REPO" tom/part3 3 MERGED "" master "$OID_B"
-{ pr_merged_into "$REPO" tom/part3 live-events \
-    && bad "exact match cannot see this - the arms must be distinct"; } || ok
-merged_into "$REPO" tom/part3 live-events && ok \
-  || bad "a trunk merge contained in the integration branch must count"
+cache_row "$REPO" tom/upper 2 MERGED "" tom/lower "$OID_B"
+{ pr_merged_into "$REPO" tom/upper master \
+    && bad "pr_merged_into should still be exact - that is what makes it pure"; } || ok
+merged_into "$REPO" tom/upper master && ok \
+  || bad "a row into tom/lower whose merge commit is on master must count as merged into master"
 
 # ...and the direction that must NOT be waved through: work that only exists on
-# the integration branch is not in master, and a task based on master must wait.
+# the lower branch is not in master, and must wait.
 reset_caches
-cache_row "$REPO" tom/part6 4 MERGED "" live-events "$OID_C"
-{ merged_into "$REPO" tom/part6 master \
-    && bad "work only on live-events must NOT count as present in master"; } || ok
+cache_row "$REPO" tom/stranded 3 MERGED "" tom/lower "$OID_C"
+{ merged_into "$REPO" tom/stranded master \
+    && bad "work only on tom/lower must NOT count as present in master"; } || ok
 
 echo "== merged_into: fails closed ==" >&2
 reset_caches
-cache_row_v1 "$REPO" tom/legacy 5 MERGED "" live-events
+cache_row_v1 "$REPO" tom/legacy 5 MERGED "" tom/lower
 { merged_into "$REPO" tom/legacy master \
     && bad "a cached row with no merge oid must fail closed, not guess"; } || ok
 reset_caches
-cache_row "$REPO" tom/unknown-oid 6 MERGED "" live-events 0000000000000000000000000000000000000000
+cache_row "$REPO" tom/unknown-oid 6 MERGED "" tom/lower 0000000000000000000000000000000000000000
 { merged_into "$REPO" tom/unknown-oid master \
     && bad "an oid this repo does not have must fail closed"; } || ok
 reset_caches
-cache_row "$REPO" tom/nobase 7 MERGED "" live-events "$OID_C"
+cache_row "$REPO" tom/nobase 7 MERGED "" master "$OID_B"
 { merged_into "$REPO" tom/nobase "" \
     && bad "an empty base must never read as met"; } || ok
 
@@ -193,87 +173,84 @@ echo "== base_fetch stays off unless the tick turns it on ==" >&2
 # Proven by its own memo file: a no-op leaves nothing behind, and nothing here
 # is allowed to reach the network.
 rm -f "$PQ_HOME/.basefetch.$$"
-base_fetch "$REPO" live-events
+base_fetch "$REPO" master
 [ -f "$PQ_HOME/.basefetch.$$" ] && bad "base_fetch must be a no-op with PQ_FETCH_BASES unset" || ok
-PQ_FETCH_BASES=1 base_fetch "$REPO" live-events
+PQ_FETCH_BASES=1 base_fetch "$REPO" master
 [ -f "$PQ_HOME/.basefetch.$$" ] && ok || bad "base_fetch should record its attempt when enabled"
-PQ_FETCH_BASES=1 base_fetch "$REPO" live-events
+PQ_FETCH_BASES=1 base_fetch "$REPO" master
 eq "$(wc -l < "$PQ_HOME/.basefetch.$$" | tr -d ' ')" "1" "base_fetch memoises per (repo, base)"
 rm -f "$PQ_HOME/.basefetch.$$"
 
-echo "== blocker_state / after_state judge against the DEPENDENT's base ==" >&2
-reset_tasks; reset_caches
-# The blocker landed on live-events. Its owning task is done.
-cache_row "$REPO" tom/blocker 8 MERGED "" live-events "$OID_C"
-mk_task "done" 20 blocker-owner "$REPO" tom/blocker live-events >/dev/null
-
-# A dependent based on live-events: met.
-dep=$(mk_task queue 21 dep-on-feature "$REPO" tom/dep1 live-events)
-printf 'blocker-owner\t%s\ttom/blocker\n' "$REPO" > "$dep/after"
-eq "$(blocker_state "$REPO" tom/blocker "$(task_base "$dep")")" "met" \
-  "blocker merged into the base the dependent forks from"
-eq "$(after_state "$dep")" "met$(printf '\t')" "after_state: met via the dependent's base"
+echo "== task_base is the repo's default branch ==" >&2
+reset_tasks
+d=$(mk_task queue 10 plain "$REPO" tom/a)
+eq "$(task_base "$d")" "master" "a task's base is its repo's default branch"
+repo_base_reset
+# An old `base:` header is ignored: nothing reads it any more.
+awk '{ print } /^branch:/ { print "base:     tom/lower" }' "$d/plan.md" > "$d/plan.tmp" && mv "$d/plan.tmp" "$d/plan.md"
+eq "$(hdr "$d/plan.md" base)" "tom/lower" "the fixture does carry an old base: header"
+eq "$(task_base "$d")" "master" "...and task_base ignores it"
+repo_base_reset
+d=$(mk_task queue 12 nobase-repo "$REPO2/nope" tom/c)
+eq "$(task_base "$d")" "" "unresolvable repo default reads empty, not a guess"
 repo_base_reset
 
-# The same blocker, same PR, a dependent based on master: still waiting, and
-# correctly so - the work genuinely is not in master.
-dep2=$(mk_task queue 22 dep-on-master "$REPO" tom/dep2)
-printf 'blocker-owner\t%s\ttom/blocker\n' "$REPO" > "$dep2/after"
-eq "$(blocker_state "$REPO" tom/blocker "$(task_base "$dep2")")" "waiting" \
-  "the same merge does not satisfy a dependent aimed at master"
-case "$(after_state "$dep2")" in
+echo "== a blocker is judged against its repo's default branch ==" >&2
+reset_tasks; reset_caches
+cache_row "$REPO" tom/blocker 8 MERGED "" tom/lower "$OID_B"
+mk_task "done" 20 blocker-owner "$REPO" tom/blocker >/dev/null
+dep=$(mk_task queue 21 dep "$REPO" tom/dep1)
+printf 'blocker-owner\t%s\ttom/blocker\n' "$REPO" > "$dep/after"
+eq "$(after_state "$dep")" "met$(printf '\t')" "a blocker whose merge commit is on master is met"
+repo_base_reset
+
+reset_caches
+cache_row "$REPO" tom/blocker 8 MERGED "" tom/lower "$OID_C"
+case "$(after_state "$dep")" in
   waiting*) ok ;;
-  *) bad "after_state should still be waiting for a master-based dependent (got '$(after_state "$dep2")')" ;;
+  *) bad "a blocker whose work is only on tom/lower is still waiting (got '$(after_state "$dep")')" ;;
 esac
 repo_base_reset
 
 echo "== a cross-repo blocker keeps its OWN repo's default branch ==" >&2
-# "Will my base contain it" is meaningless across two repositories with no
-# shared history, so a blocker in another repo is judged against that repo's
-# trunk - never the dependent's integration branch, which does not exist there.
+# A blocker in another repo is judged against that repo's trunk - the
+# dependent's default branch does not exist there.
 reset_tasks; reset_caches
 cache_row "$REPO2" ios/thing 9 MERGED "" trunk ""
 mk_task "done" 30 ios-owner "$REPO2" ios/thing >/dev/null
-dep3=$(mk_task queue 31 dep-cross-repo "$REPO" tom/dep3 live-events)
+dep3=$(mk_task queue 31 dep-cross-repo "$REPO" tom/dep3)
 printf 'ios-owner\t%s\tios/thing\n' "$REPO2" > "$dep3/after"
-eq "$(blocker_base "$dep3" "$REPO2")" "trunk" "cross-repo blocker judged against its own default"
-eq "$(blocker_base "$dep3" "$REPO")"  "live-events" "same-repo blocker judged against the dependent's base"
-eq "$(after_state "$dep3")" "met$(printf '\t')" "a cross-repo blocker on its own trunk is met"
+eq "$(after_state "$dep3")" "met$(printf '\t')" "a cross-repo blocker merged into its own trunk is met"
 repo_base_reset
 
-echo "== reap_task honours the task's own base ==" >&2
+echo "== reap_task judges against the default branch ==" >&2
 reset_tasks; reset_caches
-SOCK="$PQ_HOME/.sock"; python3 -c "
-import socket,sys
-s=socket.socket(socket.AF_UNIX); s.bind('$SOCK')
-" 2>/dev/null || SOCK=""
-mk_reaped() {                           # prio slug branch base -> dir (with a live worktree)
-  local dir; dir=$(mk_task "done" "$1" "$2" "$REPO" "$3" "${4:-}")
+mk_reaped() {                           # prio slug branch -> dir (with a live worktree)
+  local dir; dir=$(mk_task "done" "$1" "$2" "$REPO" "$3")
   local wt="$PQ_HOME/wt-$2"; mkdir -p "$wt"
   st_set "$dir" PQ_WORKTREE "$wt"
   printf '%s' "$dir"
 }
+# The upper layer of a stack merged from its top -> tear it down.
 : > "$WT_LOG"
-# Aimed at live-events, landed on live-events -> tear it down.
-r1=$(mk_reaped 40 reap-feature tom/reap1 live-events)
-cache_row "$REPO" tom/reap1 11 MERGED "" live-events "$OID_C"
+r1=$(mk_reaped 40 reap-upper tom/reap1)
+cache_row "$REPO" tom/reap1 11 MERGED "" tom/lower "$OID_B"
 PIDX_OK=1 reap_task "$r1" 0 >/dev/null 2>&1
 eq "$([ -n "$(st "$r1" PQ_MERGED)" ] && printf yes || printf no)" "yes" \
-  "reap: a PR merged into the task's own base counts as merged"
+  "reap: a merge whose commit is on master counts as merged"
 grep -q "rm" "$WT_LOG" && ok || bad "reap: should have asked wt to remove the worktree"
 repo_base_reset
 
-# Aimed at master, landed on live-events -> left alone. This is the same PR
-# state as above; only the header differs, which is the point.
+# The same PR state, but its merge commit never reached master -> left alone.
 : > "$WT_LOG"
 reset_caches
-r2=$(mk_reaped 41 reap-master tom/reap2)
-cache_row "$REPO" tom/reap2 12 MERGED "" live-events "$OID_C"
+r2=$(mk_reaped 41 reap-stranded tom/reap2)
+cache_row "$REPO" tom/reap2 12 MERGED "" tom/lower "$OID_C"
 PIDX_OK=1 reap_task "$r2" 0 >/dev/null 2>&1
 eq "$([ -n "$(st "$r2" PQ_MERGED)" ] && printf yes || printf no)" "no" \
-  "reap: a merge outside the task's base must not count"
+  "reap: a merge that is not on the default branch must not count"
 eq "$([ -s "$WT_LOG" ] && printf called || printf quiet)" "quiet" \
-  "reap: must not touch a worktree whose work is not in its base"
+  "reap: must not touch a worktree whose work is not on the default branch"
 repo_base_reset
 
 printf '\n%d passed, %d failed\n' "$pass" "$fail" >&2

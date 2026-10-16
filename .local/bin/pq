@@ -45,13 +45,10 @@
 # ancestor of anything, so `git branch --merged` misses every real merge. See
 # `after_state` below for the full predicate.
 #
-# What "merged" means is per-task, not per-repo. A task's `base:` header names the
-# branch it forks from and opens its pull request against - the branch its repo
-# was standing on at `pq add`, when that was not the default; without one it is
-# the repo's default branch.
-# A blocker is met when its work is present in the DEPENDENT's base - the question
-# a fork point actually asks - so a stack landing on an integration branch is
-# gated correctly instead of waiting forever on a trunk it was never aimed at.
+# What "merged" means is the same for every task: its work is present in its
+# repo's default branch, the branch every task forks from and opens its pull
+# request against. A blocker is met when its work is present in ITS OWN repo's
+# default branch.
 # `merged_into` is that predicate, and the one place git ancestry is consulted:
 # on the forge's own MERGE COMMIT, which unlike a branch tip is by construction on
 # the branch it landed on. The forge still decides whether something merged; git
@@ -61,9 +58,9 @@
 # task earns a teardown once its pull request has SETTLED, which is either of two
 # things:
 #
-#   merged into THE BASE IT WAS AIMED AT - its own `base:` header, or its repo's
-#   default branch when it has none; checked against the forge, never `wt`'s
-#   looser "state == MERGED"
+#   merged into its repo's default branch - checked against the forge, never
+#   `wt`'s looser "state == MERGED"; a merge commit on the default branch counts,
+#   which is how a stack merged from its top lands
 #
 #   closed without merging, every pull request for the branch - closing one is a
 #   decision that the work is finished, so it settles the task exactly as a merge
@@ -74,10 +71,6 @@
 # the decision is always yours, and this only acts on one you already made. The
 # one thing that holds a teardown off is the agent still going, or `pq` itself
 # sitting in the workspace about to be closed - see `reap_task` below.
-#
-# "Merged into its base" is deliberately not the same as "merged": a task aimed
-# at an integration branch that lands there HAS shipped as far as it was ever
-# going to, and one aimed at the trunk that landed somewhere else has not.
 #
 # Between a pull request opening and you reading it, `pq` does two more things.
 # Every implementer is dispatched with a delivery CONTRACT (`contract_write`):
@@ -111,8 +104,7 @@
 #                                                          the implementer is ever told, since the real one moves
 #
 #   <task>/plan.md     the settings header + Claude's plan, immutable once queued
-#                     (`base:` is optional and absent on most tasks - see `task_base`;
-#                      `design:` likewise, a comma-separated list of the files in design/;
+#                     (`design:` is optional, a comma-separated list of the files in design/;
 #                      `security: yes` likewise, when the plan asks for a security review - see name_plan;
 #                      `branch:`, `intent:` and `security:` are absent until it is named)
 #          after       blockers: one per line, TSV  label <TAB> repo <TAB> branch
@@ -2282,34 +2274,13 @@ repo_base() {                           # repo -> default branch name (bare), or
 # base_fetch's own memo goes with it: same lifetime, same reasoning.
 repo_base_reset() { rm -f "$PQ_HOME/.base.$$" "$PQ_HOME/.basefetch.$$" 2>/dev/null; }
 
-# The branch this task forks from and aims its pull request at: its own `base:`
-# header when it has one, otherwise its repo's default branch. Everything pq used
-# to ask `repo_base` directly now asks this instead, and a task with no `base:`
-# gets byte-for-byte the old answer - which is what keeps a single-trunk repo's
-# behaviour completely unchanged.
+# The branch this task forks from and aims its pull request at, and the one its
+# work is judged merged against: its repo's default branch, for every task.
 #
 # Empty means unresolvable, and every caller has to fail closed on that, exactly
 # as they already do for repo_base - see after_state's "nobase" detail.
 task_base() {                           # task_dir -> base branch name, or "" when unresolvable
-  local d=$1 b
-  b=$(hdr "$d/plan.md" base)
-  [ -n "$b" ] && { printf '%s' "$b"; return 0; }
-  repo_base "$(hdr "$d/plan.md" repo)"
-}
-
-# Which base ONE blocker of $d is judged against. The whole point of the change:
-# a blocker is met when its work is in the branch the dependent will fork from,
-# not when it reached some repo-wide trunk the dependent may not even be aiming
-# at.
-#
-# Cross-repo blockers are the exception, and they have to be. A task in
-# supercast can wait on one in supercast-ios, and "will my base contain
-# it" is meaningless across two repositories that share no history - so those
-# keep being judged against their OWN repo's default branch, which is the only
-# trunk they have in common with anything.
-blocker_base() {                        # task_dir blocker_repo -> the base to judge it against
-  local d=$1 brepo=$2
-  if [ "$brepo" = "$(hdr "$d/plan.md" repo)" ]; then task_base "$d"; else repo_base "$brepo"; fi
+  repo_base "$(hdr "$1/plan.md" repo)"
 }
 
 # Pure: reads only PR_CACHE. 0 when a PR for this branch merged into base.
@@ -2389,18 +2360,14 @@ base_fetch() {                          # repo base
 # Two arms, cheapest first:
 #
 #   1. A MERGED row whose baseRefName IS $base. Pure, cache-only, no git at all,
-#      and the only arm a repo with a single integration target ever reaches -
-#      so the common path costs exactly what it did before this existed.
+#      and the arm almost every merge reaches.
 #   2. That row's MERGE COMMIT is an ancestor of $base. This is what carries a
-#      stack whose lower parts landed on the trunk BEFORE the integration branch
-#      was cut: part 3 merged to master, part 4 is based on `live-events`, and
-#      master's own commit is sitting in `live-events` history. Exact matching
-#      calls that unmet and freezes the queue; containment gets it right.
-#
-# Testing whether $base CONTAINS the repo default instead would be cheaper and is
-# wrong: an integration branch is cut once and then diverges, so origin/master
-# stops being an ancestor of it within a day (measured: master 3 ahead,
-# live-events 1 ahead) while the merge commit is still plainly in both.
+#      stack merged from its top: GitHub lands every layer in one operation, but
+#      records each upper pull request as merged into the branch BELOW it, not
+#      into the trunk (supercast #6999 reads MERGED with
+#      baseRefName=multi-newsletters-1-data-model) - while its merge commit is
+#      plainly on master. Exact matching calls that unmet and freezes the queue;
+#      containment gets it right.
 #
 # This does not reopen the "never git ancestry" rule at the top of this file. That
 # rule is about a branch TIP, and it is right - a squash-merged branch's tip is
@@ -2485,7 +2452,7 @@ after_state() {                         # task_dir
   if [ ! -f "$d/after" ]; then printf 'met\t'; return; fi
   while IFS=$'\t' read -r label repo branch; do
     [ -n "$label" ] || continue
-    base=$(blocker_base "$d" "$repo")
+    base=$(repo_base "$repo")
     if [ -z "$base" ]; then
       nobase=$repo
       n_unmet=$((n_unmet + 1)); [ -n "$first_wait" ] || first_wait=$label
@@ -2564,7 +2531,7 @@ after_json() {                          # task_dir
   local tmp="$PQ_HOME/.afterjson.$$"; : > "$tmp"
   while IFS=$'\t' read -r label repo branch; do
     [ -n "$label" ] || continue
-    base=$(blocker_base "$d" "$repo")
+    base=$(repo_base "$repo")
     st=$(blocker_state "$repo" "$branch" "${base:-}")
     jq -nc --arg label "$label" --arg repo "$repo" --arg branch "$branch" --arg state "$st" \
       '{label: $label, repo: $repo, branch: $branch, state: $state}' >> "$tmp"
@@ -2896,14 +2863,14 @@ cmd_ls() {
     esac
     num=""; prstate=""; draft=""
     IFS=$'\t' read -r num prstate draft <<<"$(pr_get "$repo" "$branch")"
-    local tbase; tbase=$(task_base "$d")
     case "${prstate:-}" in
-      # A merged PR that is NOT in this task's base is the one row that used to
-      # read as finished while the queue quietly disagreed with it - `#6460
-      # merged` on screen, `waiting` in the predicate, and nothing anywhere
-      # reconciling the two. Say where it went instead.
+      # A merged PR that is NOT in its repo's default branch is the one row
+      # that used to read as finished while the queue quietly disagreed with it
+      # - `#6460 merged` on screen, `waiting` in the predicate, and nothing
+      # anywhere reconciling the two. Say where it went instead. The base is
+      # looked up here, in this arm only, so no other row pays for it.
       MERGED) pr="#$num merged"
-              merged_into "$repo" "$branch" "$tbase" \
+              merged_into "$repo" "$branch" "$(task_base "$d")" \
                 || pr="#$num merged->$(pr_base "$repo" "$branch")" ;;
       OPEN)   pr="#$num ${draft:-open}" ;;
       CLOSED) pr="#$num closed" ;;
@@ -2917,7 +2884,6 @@ cmd_ls() {
       jq -nc --arg task "$slug" --arg state "$st" --arg branch "$branch" \
         --arg repo "$repo" --arg model "$model" --arg effort "$effort" \
         --arg intent "$intent" --arg added "$added" --arg dir "$d" \
-        --arg base "$tbase" \
         --arg agent "$agent" --arg pr "${num:-}" --arg prstate "${prstate:-}" \
         --arg draft "$draft" --arg stamp "$(stamp_of "$d")" \
         --arg merged "$merged" --arg closed "$closed" \
@@ -2931,7 +2897,7 @@ cmd_ls() {
         def str: if . == "" then null else . end;
         def num: if . == "" or . == null then null else tonumber end;
         { task: $task, stamp: ($stamp|tonumber), state: $state, dir: $dir,
-          repo: $repo, branch: ($branch|str), base: ($base|str), model: $model, effort: $effort,
+          repo: $repo, branch: ($branch|str), model: $model, effort: $effort,
           intent: ($intent|str), added: ($added|str),
           agent: ($agent | if . == "-" then null else . end),
           pr: ($pr|str|if . then tonumber else null end),
@@ -3009,7 +2975,7 @@ cmd_after() {
     local label repo branch base bst owner ownerst num prstate draft prtxt desc overdict
     while IFS=$'\t' read -r label repo branch; do
       [ -n "$label" ] || continue
-      base=$(blocker_base "$d" "$repo")
+      base=$(repo_base "$repo")
       bst=$(blocker_state "$repo" "$branch" "${base:-}")
       owner=$(task_by_branch "$repo" "$branch") || owner=""
       ownerst=${owner:+$(state_of "$owner")}; ownerst=${ownerst:--}
@@ -3080,7 +3046,7 @@ cmd_after() {
       && { release_lock; die "'$value' would create a cycle - $(slug_of "$d") already leads back to it"; }
     after_add "$d" "$label" "$repo" "$branch"
     pr_load_all "$(printf '%s\t%s\n' "$repo" "$branch")"
-    base=$(blocker_base "$d" "$repo")
+    base=$(repo_base "$repo")
     if [ -n "$base" ] && merged_into "$repo" "$branch" "$base"; then
       msg "$(slug_of "$d") after $label: already in $base - nothing to wait for"
     else
@@ -3894,12 +3860,13 @@ security_cmd() {                        # pr task_home base
 
 # What the security reviewer is told beside the skill. The base is named because
 # the skill diffs against origin/HEAD - the repository default, whatever the pull
-# request is aimed at - so a task on an integration branch would otherwise be
-# reviewed as the whole integration branch. It is named for a default-branch
-# task too, so a worktree whose origin/HEAD was never set up still has the right
-# command. The plan is pointed at because it says why it asked and what to look
-# at, and the `wt` clause is review_brief's: the spike's reviewers ran code to
-# check a finding, and in a Rails worktree that means a database. One line, and
+# request is aimed at - so a pull request aimed anywhere else, as a stacked one
+# is, would otherwise be reviewed along with everything below it. For now every
+# task's base is its repo's default branch, and it is named all the same, so a
+# worktree whose origin/HEAD was never set up still has the right command. The
+# plan is pointed at because it says why it asked and what to look at, and the
+# `wt` clause is review_brief's: the spike's reviewers ran code to check a
+# finding, and in a Rails worktree that means a database. One line, and
 # quote-free by the same convention as dispatch_prompt.
 security_brief() {                      # pr task_home base
   local basec=""
@@ -4847,8 +4814,8 @@ watch_cell() {                          # task_dir
 # its port, its redis index, its puma-dev entry, and the Herdr workspace holding
 # the agent's pane. Reclaiming all of that used to be a human errand, `wt rm` by
 # hand or `wt gc --settled` if you remembered it existed. This is the other end of
-# dispatch: once a task's pull request has settled - merged into the base it was
-# aimed at, or closed without merging - `pq` tears down what it built, the same
+# dispatch: once a task's pull request has settled - merged into its repo's
+# default branch, or closed without merging - `pq` tears down what it built, the same
 # `wt rm` you would have run yourself, driven unattended.
 #
 # `pq` still never touches a worktree it did not create, never merges or closes a
