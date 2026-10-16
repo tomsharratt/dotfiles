@@ -230,6 +230,25 @@ out=$(watch_task "$C" 0 2>&1)
 eq "$(prompts)" "0" "idle again with the same conflict: no second prompt"
 eq "$(agent_cell "$C" "done")" "conflict" "it is yours"
 
+echo "== a restack due is the conflict's fix: no conflict prompt, but CI is still raised ==" >&2
+reset_caches; reset_logs
+Q=$(mk_ready 13 restackdue w3:p2)
+st_set "$Q" PQ_STACK_PARENT tom/below; st_set "$Q" PQ_STACK_DUE 123
+set_panes "$(printf 'w3:p2\tclaude\tidle')"
+view sha1 base1 CONFLICTING DIRTY "build:FAILURE"
+watch_task "$Q" 0 >/dev/null 2>&1
+eq "$(prompts)" "1" "one prompt"
+P=$(prompt_text)
+hasnt "$P" "merge conflicts" "not about the conflict"
+has "$P" "CI failed on pull request #42: build (run 901)" "about CI"
+reset_caches; reset_logs
+Q=$(mk_ready 14 restackasked w3:p2)
+st_set "$Q" PQ_STACK_PARENT tom/below; st_set "$Q" PQ_STACK_ASKED 1
+view sha1 base1 MERGEABLE UNSTABLE "build:FAILURE"
+watch_task "$Q" 0 >/dev/null 2>&1
+eq "$(prompts)" "0" "the restack has the agent's turn: nothing on top of it"
+eq "$(grep -c 'pr view' "$GH_LOG")" "0" "and gh is not asked"
+
 echo "== a stacked task's conflict rebases only its own layer, from its fork point ==" >&2
 # A real origin, so the fetch and the ancestry check run for real.
 ORIGIN=$(mktemp -d); git init -q --bare "$ORIGIN"

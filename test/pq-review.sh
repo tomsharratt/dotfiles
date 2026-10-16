@@ -261,6 +261,18 @@ review_task "$G" 0
 eq "$(st "$G" PQ_REVIEW)" "pending" "herdr silent is no verdict"
 eq "$(claude_calls)" "0" "and nothing was launched through any of that"
 
+echo "== pending waits while a restack is due: the reviewer only sees a layer on its real base ==" >&2
+set_panes "$(printf 'w1:p1\tclaude\tidle')"
+st_set "$G" PQ_STACK_DUE 123
+review_task "$G" 0
+eq "$(st "$G" PQ_REVIEW)" "pending" "a restack due holds the gate"
+saved_tries=$PQ_REVIEW_MAX_TRIES; PQ_REVIEW_MAX_TRIES=0
+review_task "$G" 0
+eq "$(st "$G" PQ_REVIEW)" "pending" "with no reviewer to launch too: the self-review reads the same diff"
+PQ_REVIEW_MAX_TRIES=$saved_tries
+eq "$(claude_calls)" "0" "nothing launched"
+st_set "$G" PQ_STACK_DUE ""
+
 echo "== --dry-run says what it would do and changes nothing ==" >&2
 set_panes "$(printf 'w1:p1\tclaude\tidle')"
 OUT=$(review_task "$G" 1 2>&1)

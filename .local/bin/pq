@@ -5030,6 +5030,11 @@ review_step() {                         # task_dir dry pr pstate
   case "$state" in
     pending)
       [ -n "$pr" ] || return 0
+      # Not while the layer is off its real base - a reviewer would read the
+      # parent's old commits as this one's. stack_task ran earlier this tick, so
+      # this is this tick's verdict; above the no-reviewer branch, which reads
+      # the diff just the same.
+      [ -z "$(st "$d" PQ_STACK_DUE)" ] || return 0
       # Not while the agent is still going or blocked - on a prompt pq has
       # recorded, too, whatever herdr makes of the pane; not while herdr is
       # silent; not inside a retry backoff.
@@ -5407,6 +5412,9 @@ watch_task() {                          # task_dir dry
       return 0 ;;
   esac
   [ "${prstate:-}" = OPEN ] && [ -z "${draft:-}" ] || return 0
+  # The restack has the agent's turn - asked this very tick, maybe, on the pane
+  # state this one would read as idle.
+  [ -z "$(st "$d" PQ_STACK_ASKED)" ] || return 0
   pr=$(st "$d" PQ_PR); [ -n "$pr" ] || pr=$num
   since=$(st "$d" PQ_WATCH_SINCE)
   if [ -z "$since" ]; then
@@ -5421,7 +5429,9 @@ watch_task() {                          # task_dir dry
   # What is most in the way, and the fingerprint that says whether it is new - a
   # checksum, since state.env holds words (see st_set).
   local need="" fp="" what="" newest=""
-  if [ "$conflict" = 1 ]; then
+  # A conflict while a restack is due is the restack's to fix - see "restacking
+  # a layer" - so it is not raised here; CI and feedback still are.
+  if [ "$conflict" = 1 ] && [ -z "$(st "$d" PQ_STACK_DUE)" ]; then
     need=conflict; fp=$(printf '%s %s' "$head" "$baseoid" | cksum | awk '{ print $1 }')
   elif [ "$ci" = fail ]; then
     need=ci; fp=$(printf '%s %s' "$head" "$jobs" | cksum | awk '{ print $1 }'); what=$failed
