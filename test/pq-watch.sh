@@ -327,6 +327,18 @@ watch_task "$N" 0 >/dev/null 2>&1
 eq "$(prompts)" "0" "gh silent is nothing to judge"
 rm -f "$STUBBIN/.gh-down"
 
+echo "== a pull request that settles ends the watch, and what it had asked goes with it ==" >&2
+reset_caches; reset_logs
+S=$(mk_ready 19 settles w7:p2)
+st_set "$S" PQ_WATCH_ASKED conflict; st_set "$S" PQ_WATCH_NEEDS ci
+reset_caches; cache_row "$REPO" tom/settles 42 MERGED "" master
+watch_task "$S" 1 >/dev/null 2>&1
+eq "$(st "$S" PQ_WATCH_ASKED)" "conflict" "a dry run clears nothing"
+watch_task "$S" 0 >/dev/null 2>&1
+eq "$(st "$S" PQ_WATCH_ASKED)$(st "$S" PQ_WATCH_NEEDS)" "" "merged: nothing asked or handed over any more"
+st_set "$S" PQ_WATCH_ASKED conflict; st_set "$S" PQ_REAPED 2026-01-02T00:00:00Z
+eq "$(agent_cell "$S" "done")" "-" "and a torn-down task reads - in pq ls, whatever was left behind"
+
 echo "== --dry-run says what it would do and changes nothing ==" >&2
 reset_caches; reset_logs
 Y=$(mk_ready 17 dry w8:p1)

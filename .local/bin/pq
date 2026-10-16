@@ -2814,6 +2814,8 @@ agent_cell() {                          # task_dir state
       # automatically now, so it settles exactly as a merged one does and wants
       # nothing - and the PR column reads `#N closed` either way, which is where
       # that fact belongs.
+      # Torn down: no agent, no pull request left to work on, nothing for you.
+      [ -n "$(st "$d" PQ_REAPED)" ] && { printf -- '-'; return; }
       local reason
       reason=$(st "$d" PQ_REAP_HELD)
       # These three want a decision from you and say nothing about the agent, so
@@ -5072,7 +5074,16 @@ watch_task() {                          # task_dir dry
   num=""; prstate=""; draft=""
   IFS=$'\t' read -r num prstate draft <<<"$(pr_get "$repo" "$branch")"
   # Merged or closed is reap's; a draft is back in its author's hands; no row this
-  # tick is nothing to judge. None of them costs a call.
+  # tick is nothing to judge. None of them costs a call. A settled pull request
+  # ends the watch, and whatever it had asked or handed over goes with it - left
+  # behind, a merged task read `fixing conflict` in `pq ls` for good.
+  case "${prstate:-}" in
+    MERGED|CLOSED)
+      [ "$dry" = 1 ] && return 0
+      [ -z "$(st "$d" PQ_WATCH_ASKED)" ] || st_set "$d" PQ_WATCH_ASKED ""
+      [ -z "$(st "$d" PQ_WATCH_NEEDS)" ] || st_set "$d" PQ_WATCH_NEEDS ""
+      return 0 ;;
+  esac
   [ "${prstate:-}" = OPEN ] && [ -z "${draft:-}" ] || return 0
   pr=$(st "$d" PQ_PR); [ -n "$pr" ] || pr=$num
   since=$(st "$d" PQ_WATCH_SINCE)
