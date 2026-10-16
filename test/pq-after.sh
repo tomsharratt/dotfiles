@@ -73,7 +73,8 @@ eq() {                                   # got want msg
   [ "$1" = "$2" ] && ok || bad "$3 (got '$1', want '$2')"
 }
 
-cleanup() { rm -rf "$PQ_HOME" "$STUBBIN" "${REPO:-}"; }
+cleanup() { rm -rf "$PQ_HOME" "$STUBBIN" "${REPO:-}" "${REPO2:-}"; }
+first_dir() { [ -d "${1:-}" ] && printf '%s' "$1"; }
 trap cleanup EXIT
 
 # ── a real, throwaway git repo ──────────────────────────────────────────────
@@ -174,17 +175,24 @@ reset_caches
 ans_row "$REPO" tom/nobody-owns-this
 eq "$(blocker_state "$REPO" tom/nobody-owns-this master)" "orphan" "no PR, no owner"
 
-# OPEN, owner running -> waiting
+# OPEN and marked ready, owner running -> ready
 reset_caches
 cache_row "$REPO" tom/open-running 8 OPEN "" master
 mk_task running 10 owner-running "$REPO" tom/open-running >/dev/null
-eq "$(blocker_state "$REPO" tom/open-running master)" "waiting" "OPEN, owner running"
+eq "$(blocker_state "$REPO" tom/open-running master)" "ready" "OPEN and not a draft, owner running"
 
-# OPEN, owner in done -> waiting (this is the chain WORKING, not stalled)
+# OPEN and marked ready, owner in done -> ready (the chain WORKING, not stalled)
 reset_caches
 cache_row "$REPO" tom/open-done 9 OPEN "" master
 mk_task "done" 10 owner-open-done "$REPO" tom/open-done >/dev/null
-eq "$(blocker_state "$REPO" tom/open-done master)" "waiting" "OPEN, owner done"
+eq "$(blocker_state "$REPO" tom/open-done master)" "ready" "OPEN and not a draft, owner done"
+
+# A DRAFT whose owner is still running is in review, not ready
+reset_caches
+cache_row "$REPO" tom/draft-running 9 OPEN draft master
+mk_task running 10 owner-draft-running "$REPO" tom/draft-running >/dev/null
+eq "$(blocker_state "$REPO" tom/draft-running master)" "waiting" "a draft, owner running"
+pr_has_ready "$REPO" tom/draft-running && bad "pr_has_ready: a draft is not ready" || ok
 
 # DRAFT, owner in done -> stalled (a stuck agent, not a healthy wait)
 reset_caches
@@ -209,7 +217,7 @@ reset_tasks; reset_caches
 t=$(mk_task queue 20 unknown-owner "$REPO" tom/unknown-owner)
 after_add "$t" ghost "$REPO" tom/never-answered
 verdict=$(after_state "$t"); verdict=${verdict%%$'\t'*}
-case "$verdict" in waiting\ *) ok ;; *) bad "gh-down should read as waiting (got '$verdict')" ;; esac
+eq "$verdict" "on ghost" "gh-down reads as an ordinary wait - for a same-repo parent, on it"
 after_check "$t" >/dev/null
 [ "$(st "$t" PQ_AFTER_DEAD)" != 1 ] && ok || bad "gh-down must not set PQ_AFTER_DEAD"
 
@@ -262,7 +270,7 @@ after_check "$dep" >/dev/null
 
 echo "== an after file with no trailing newline still gates (regression) ==" >&2
 reset_tasks; reset_caches
-cache_row "$REPO" tom/no-newline-blocker 15 OPEN "" master
+cache_row "$REPO" tom/no-newline-blocker 15 OPEN draft master
 owner=$(mk_task queue 10 no-newline-owner "$REPO" tom/no-newline-blocker)
 dep=$(mk_task queue 20 no-newline-dependent "$REPO" tom/no-newline-dependent)
 # Written directly, WITHOUT a trailing newline - `after` is documented as
@@ -270,7 +278,7 @@ dep=$(mk_task queue 20 no-newline-dependent "$REPO" tom/no-newline-dependent)
 # writer) looks like on disk.
 printf '%s\t%s\t%s' "$(slug_of "$owner")" "$REPO" tom/no-newline-blocker > "$dep/after"
 verdict=$(after_state "$dep"); verdict=${verdict%%$'\t'*}
-case "$verdict" in waiting\ *) ok ;; *) bad "a trailing-newline-less after file must still gate (got '$verdict')" ;; esac
+case "$verdict" in on\ *) ok ;; *) bad "a trailing-newline-less after file must still gate (got '$verdict')" ;; esac
 deps=$(dependents_of "$REPO" tom/no-newline-blocker)
 eq "$deps" "no-newline-dependent" "dependents_of must not drop the last line either"
 
@@ -296,6 +304,89 @@ case "$out" in *"would dispatch $(slug_of "$A")"*) ok ;; *) bad "chain: A should
 case "$out" in *"would skip $(slug_of "$B")"*)     ok ;; *) bad "chain: B should be skipped ($out)" ;; esac
 case "$out" in *"would skip $(slug_of "$C")"*)     ok ;; *) bad "chain: C should be skipped ($out)" ;; esac
 
+echo "== a same-repo dependency builds on its parent: on, stack, met ==" >&2
+# A second repo, for a dependency that crosses repos and so waits for a merge.
+REPO2=$(mktemp -d)
+git init -q -b main "$REPO2"
+git -C "$REPO2" -c user.email=test@test -c user.name=test commit -q --allow-empty -m init
+mkdir -p "$REPO2/.git/refs/remotes/origin"
+git -C "$REPO2" update-ref refs/remotes/origin/main refs/heads/main
+git -C "$REPO2" symbolic-ref refs/remotes/origin/HEAD refs/remotes/origin/main
+verdict_of() { local v; v=$(after_state "$1"); printf '%s' "${v%%$'\t'*}"; }
+
+reset_tasks; reset_caches
+mk_task running 10 stack-parent "$REPO" tom/stack-parent >/dev/null
+K=$(mk_task queue 20 stack-child "$REPO" tom/stack-child)
+after_add "$K" stack-parent "$REPO" tom/stack-parent
+ans_row "$REPO" tom/stack-parent
+eq "$(verdict_of "$K")" "on stack-parent" "no pull request yet: on its parent"
+cache_row "$REPO" tom/stack-parent 30 OPEN draft master
+eq "$(verdict_of "$K")" "on stack-parent" "a draft in review: still on its parent"
+reset_caches
+cache_row "$REPO" tom/stack-parent 30 OPEN "" master
+eq "$(verdict_of "$K")" "stack stack-parent" "marked ready: it builds on it"
+eq "$(agent_cell "$K" queue)" "-" "eligible, so pq ls has nothing to say about it"
+reset_caches
+cache_row "$REPO" tom/stack-parent 30 MERGED "" master
+eq "$(verdict_of "$K")" "met" "merged: met, and it starts from the default branch"
+reset_caches
+ans_row "$REPO" tom/stack-parent
+eq "$(agent_cell "$K" queue)" "on stack-parent" "pq ls reads on <label> while it waits"
+eq "$(stack_branch "$K" stack-parent)" "tom/stack-parent" "stack_branch reads the branch off its after line"
+
+echo "== a dependency in another repo waits for its merge, ready or not ==" >&2
+reset_tasks; reset_caches
+mk_task running 10 web-parent "$REPO2" tom/web-parent >/dev/null
+M=$(mk_task queue 20 app-child "$REPO" tom/app-child)
+after_add "$M" web-parent "$REPO2" tom/web-parent
+cache_row "$REPO2" tom/web-parent 31 OPEN "" main
+eq "$(verdict_of "$M")" "waiting web-parent 1" "marked ready is still waiting across repos"
+eq "$(agent_cell "$M" queue)" "after web-parent" "and reads after <label>, as before"
+reset_caches
+cache_row "$REPO2" tom/web-parent 31 MERGED "" main
+eq "$(verdict_of "$M")" "met" "merged into its own repo's default branch: met"
+
+echo "== fill claims a stack task and records its parent, and skips one still on it ==" >&2
+reset_tasks; reset_caches
+mk_task running 10 fill-parent "$REPO" tom/fill-parent >/dev/null
+W=$(mk_task queue 20 fill-waiting "$REPO" tom/fill-waiting)
+after_add "$W" fill-parent "$REPO" tom/fill-parent
+mk_task running 30 fill-ready "$REPO" tom/fill-ready >/dev/null
+S=$(mk_task queue 40 fill-stack "$REPO" tom/fill-stack)
+after_add "$S" fill-ready "$REPO" tom/fill-ready
+# The tick loads its own cache; this stands in for the forge's answer. The real
+# one is kept and put back afterwards: the tests below use it.
+real_pr_load_all=$(declare -f pr_load_all)
+# shellcheck disable=SC2329  # called by tick_body
+pr_load_all() {
+  PR_CACHE="$PQ_HOME/.test.pr"; PR_ANS="$PQ_HOME/.test.ans"
+  printf '%s\t%s\n' "$REPO" tom/fill-parent "$REPO" tom/fill-ready > "$PR_ANS"
+  printf '%s\ttom/fill-ready\t41\tOPEN\t\tmaster\t\n' "$REPO" > "$PR_CACHE"
+}
+out=$(tick_body 5 1 2>&1 1>/dev/null)
+case "$out" in *"would skip fill-waiting - waiting for fill-parent to be marked ready"*) ok ;; *) bad "an on task is skipped, saying why ($out)" ;; esac
+case "$out" in *"would dispatch fill-stack (tom/fill-stack), building on fill-ready"*) ok ;; *) bad "a stack task is eligible ($out)" ;; esac
+case "$out" in *"1 waiting"*) ok ;; *) bad "the summary counts the on task as waiting, and not the stack one ($out)" ;; esac
+# shellcheck disable=SC2329  # called by tick_body
+( dispatch_try() { return 0; }; tick_body 5 0 ) >/dev/null 2>&1
+S=$(first_dir "$PQ_HOME/running"/*-fill-stack)
+[ -n "$S" ] && ok || bad "the stack task is claimed"
+[ -n "$S" ] && eq "$(st "$S" PQ_STACK_PARENT)" "tom/fill-ready" "and records the branch it builds on at the claim"
+[ -d "$W" ] && ok || bad "the on task stays queued"
+eval "$real_pr_load_all"
+
+echo "== pr_targets brings a stacked task's parent along, while it can still change ==" >&2
+reset_tasks
+R=$(mk_task running 10 tgt-run "$REPO" tom/tgt-run); st_set "$R" PQ_STACK_PARENT tom/tgt-parent-a
+D=$(mk_task "done" 20 tgt-done "$REPO" tom/tgt-done); st_set "$D" PQ_STACK_PARENT tom/tgt-parent-b
+E=$(mk_task "done" 30 tgt-merged "$REPO" tom/tgt-merged); st_set "$E" PQ_STACK_PARENT tom/tgt-parent-c
+st_set "$E" PQ_MERGED 2026-01-02T00:00:00Z
+targets=$(pr_targets running)
+case "$targets" in *"$REPO"$'\t'tom/tgt-parent-a*) ok ;; *) bad "a running task's parent is looked up ($targets)" ;; esac
+case "$targets" in *tom/tgt-parent-b*) ok ;; *) bad "so is a done one's, while reap still watches it ($targets)" ;; esac
+case "$targets" in *tom/tgt-parent-c*) bad "but not once its own pull request has merged ($targets)" ;; *) ok ;; esac
+case "$(pr_targets all)" in *tom/tgt-parent-c*) bad "not even for pq ls" ;; *) ok ;; esac
+
 echo "== cycle and self-reference rejected by pq after ==" >&2
 reset_tasks
 X=$(mk_task queue 10 cyc-x "$REPO" tom/cyc-x)
@@ -320,6 +411,80 @@ else
   bad "a genuine, non-cyclic blocker should have been accepted"
 fi
 
+echo "== pq after sets one dependency, replacing any ==" >&2
+reset_tasks
+A=$(mk_task queue 10 one-a "$REPO" tom/one-a)
+B=$(mk_task queue 20 one-b "$REPO" tom/one-b)
+C=$(mk_task queue 30 one-c "$REPO" tom/one-c)
+out=$( ( main after one-c one-a ) 2>&1 ); rc=$?
+eq "$rc" "0" "setting a dependency succeeds"
+case "$out" in *"one-c builds on one-a - it starts once its pull request is marked ready"*) ok ;; *) bad "and says what it set ($out)" ;; esac
+( main after one-c one-b ) >/dev/null 2>&1
+eq "$(cut -f1 "$C/after")" "one-b" "a second pq after replaces the first rather than adding to it"
+eq "$(wc -l < "$C/after" | tr -d ' ')" "1" "one line, always"
+( main after one-c one-b ) >/dev/null 2>&1 && ok || bad "setting the same one again is not a fan-out of itself"
+( main after one-c one-a one-b ) >/dev/null 2>"$PQ_HOME/.err" && bad "two at once is refused" || ok
+case "$(cat "$PQ_HOME/.err")" in *"takes one task or branch"*) ok ;; *) bad "saying why ($(cat "$PQ_HOME/.err"))" ;; esac
+eq "$(cut -f1 "$C/after")" "one-b" "and changes nothing"
+
+echo "== pq after refuses to build on what something else already builds on ==" >&2
+out=$( ( main after one-a one-b ) 2>&1 ); rc=$?
+[ "$rc" != 0 ] && ok || bad "one-b is already built on by one-c, so one-a cannot build on it"
+case "$out" in *"one-c already builds on one-b - a stack is a single line, so build on one-c instead"*) ok ;; *) bad "saying so ($out)" ;; esac
+[ -f "$A/after" ] && bad "and nothing is written" || ok
+# Through a task in new/ that still holds its dependency by stamp.
+N=$(mk_task new 40 unnamed-child "$REPO" "")
+printf '%s\n' "$(stamp_of "$A")" > "$N/after.new"
+out=$( ( main after one-b one-a ) 2>&1 ) && bad "a stamp held in new/ counts as building on it" || ok
+case "$out" in *"unnamed-child already builds on one-a"*) ok ;; *) bad "naming the task in new/ ($out)" ;; esac
+# The same when the parent is given by branch rather than by slug.
+out=$( ( main after one-b tom/one-a ) 2>&1 ) && bad "given by branch, a stamp held in new/ still counts" || ok
+case "$out" in *"unnamed-child already builds on"*) ok ;; *) bad "naming the task in new/ ($out)" ;; esac
+rm -rf "$N"
+# Across repos it is a wait, not a stack, and many can wait on one merge.
+REPO3=$(mktemp -d); git init -q -b master "$REPO3"
+O=$(mk_task queue 50 other-repo "$REPO3" tom/other-repo)
+after_add "$O" one-a "$REPO" tom/one-a
+( main after one-b one-a ) >/dev/null 2>&1 && ok || bad "a task in another repo waiting on one-a does not stop one-b building on it"
+out=$( ( main after other-repo one-c ) 2>&1 ); rc=$?
+eq "$rc" "0" "a cross-repo wait is set"
+case "$out" in *"other-repo waits for one-c ($(basename "$REPO")) to merge"*) ok ;; *) bad "and reads as one ($out)" ;; esac
+rm -rf "$REPO3"
+
+echo "== pq after <task> describes both kinds ==" >&2
+reset_tasks
+A=$(mk_task running 10 desc-a "$REPO" tom/desc-a)
+B=$(mk_task queue 20 desc-b "$REPO" tom/desc-b)
+after_add "$B" desc-a "$REPO" tom/desc-a
+X=$(mk_task running 30 desc-x "$REPO2" tom/desc-x)
+Y=$(mk_task queue 40 desc-y "$REPO" tom/desc-y)
+after_add "$Y" desc-x "$REPO2" tom/desc-x
+describe() {                            # task cache_rows -> pq after's line
+  local rows=$2
+  # shellcheck disable=SC2329  # called by cmd_after
+  ( pr_load_all() {
+      PR_CACHE="$PQ_HOME/.test.pr"; PR_ANS="$PQ_HOME/.test.ans"
+      printf '%s' "$rows" > "$PR_CACHE"; : > "$PR_ANS"
+    }
+    main after "$1" ) 2>&1
+}
+case "$(describe desc-b "$REPO"$'\t'tom/desc-a$'\t'7$'\t'OPEN$'\t'draft$'\t'master$'\t'$'\n')" in
+  *"#7 draft"*"waiting for #7 to be marked ready"*) ok ;; *) bad "a stack dependency in review waits to be marked ready" ;; esac
+case "$(describe desc-b "$REPO"$'\t'tom/desc-a$'\t'7$'\t'OPEN$'\t'$'\t'master$'\t'$'\n')" in
+  *"ready - desc-b builds on it"*) ok ;; *) bad "a ready one is built on" ;; esac
+case "$(describe desc-b "$REPO"$'\t'tom/desc-a$'\t'7$'\t'MERGED$'\t'$'\t'master$'\t'$'\n')" in
+  *"merged - desc-b starts from master"*) ok ;; *) bad "a merged one is where it starts from" ;; esac
+case "$(describe desc-y "$REPO2"$'\t'tom/desc-x$'\t'8$'\t'OPEN$'\t'$'\t'main$'\t'$'\n')" in
+  *"#8 open"*"in progress"*) ok ;; *) bad "a merge dependency reads as it always did, ready or not" ;; esac
+# A merge dependency whose owner is itself on a parent says so, not "waiting on <label> of its own".
+Z=$(mk_task queue 50 desc-z "$REPO2" tom/desc-z)
+after_add "$Z" desc-w "$REPO2" tom/desc-w
+mk_task running 45 desc-w "$REPO2" tom/desc-w >/dev/null
+printf 'desc-z\t%s\ttom/desc-z\n' "$REPO2" > "$Y/after"
+zrow="$REPO2"$'\t'tom/desc-z$'\t'9$'\t'OPEN$'\t'draft$'\t'main$'\t'$'\n'
+case "$(describe desc-y "$zrow")" in *"waiting for desc-w to be marked ready"*) ok ;; *) bad "an owner on a parent reads as waiting to be marked ready ($(describe desc-y "$zrow"))" ;; esac
+case "$(main after desc-x 2>&1)" in *"builds on nothing and waits for nothing"*) ok ;; *) bad "a task with none says so" ;; esac
+
 echo "== pq add --after: a blocker named by slug gates the new task ==" >&2
 reset_tasks
 PLAN_FILE="$PQ_HOME/.test-plan.md"
@@ -335,7 +500,7 @@ b_rc=$?
 b_dir=$(find_task add-chain-b 2>/dev/null)
 if [ -n "$b_dir" ] && [ -f "$b_dir/after" ]; then ok; else bad "chained add should have written an after file"; fi
 verdict=$(after_state "$b_dir" 2>/dev/null); verdict=${verdict%%$'\t'*}
-case "$verdict" in waiting\ *) ok ;; *) bad "B should be waiting on A right after being chained (got '$verdict')" ;; esac
+eq "$verdict" "on add-chain-a" "B should be on A right after being chained"
 
 echo "== an --after blocker is recorded, and pq ls --json sees the task blocked ==" >&2
 add_as "$PLAN_FILE" tom/add-json-test --repo "$REPO" --after add-chain-a 2>"$PQ_HOME/.add.stderr"
@@ -345,6 +510,35 @@ ls_json=$(main ls --json 2>/dev/null)
 if printf '%s' "$ls_json" \
      | jq -e '[.[] | select(.task == "add-json-test")][0] | .blocked == true' >/dev/null 2>&1
 then ok; else bad "pq ls --json should mark the chained task blocked=true"; fi
+
+echo "== pq ls --json: kind, ready, stack_parent and stack ==" >&2
+reset_tasks
+J1=$(mk_task running 10 json-parent "$REPO" tom/json-parent)
+st_set "$J1" PQ_STACK_PARENT tom/json-grand; st_set "$J1" PQ_STACK 7
+J2=$(mk_task queue 20 json-child "$REPO" tom/json-child)
+after_add "$J2" json-parent "$REPO" tom/json-parent
+J3=$(mk_task queue 30 json-app "$REPO2" tom/json-app)
+after_add "$J3" json-parent "$REPO" tom/json-parent
+rows="$REPO"$'\t'tom/json-parent$'\t'5$'\t'OPEN$'\t'$'\t'master$'\t'$'\n'
+# shellcheck disable=SC2329  # called by cmd_ls
+ls_json=$( ( pr_load_all() { PR_CACHE="$PQ_HOME/.test.pr"; PR_ANS="$PQ_HOME/.test.ans"; printf '%s' "$rows" > "$PR_CACHE"; : > "$PR_ANS"; }
+             main ls --json ) 2>/dev/null )
+jqt() { jq -r --arg t "$1" "[.[] | select(.task == \$t)][0] | $2" <<<"$ls_json"; }
+eq "$(jqt json-child '.after[0].kind')" "stack" "a same-repo dependency is a stack"
+eq "$(jqt json-child '.after[0].state')" "ready" "and its state can now be ready"
+eq "$(jqt json-child '.blocked')" "false" "a task that builds on a ready pull request is not blocked"
+eq "$(jqt json-app '.after[0].kind')" "merge" "a dependency in another repo is a merge"
+eq "$(jqt json-app '.blocked')" "true" "and blocked until it merges, ready or not"
+eq "$(jqt json-parent '.stack_parent')" "tom/json-grand" "stack_parent is the branch it builds on"
+eq "$(jqt json-parent '.stack')" "7" "and stack is GitHub's stack number, as a number"
+eq "$(jqt json-child '.stack_parent')" "null" "both null for a task that is not stacked"
+eq "$(jqt json-child '.stack')" "null" "the stack too"
+
+echo "== pr_load_all asks once per branch, however many tasks name it ==" >&2
+# shellcheck disable=SC2329  # called by pr_load_all
+( pr_load() { shift; printf '%s\n' "$@" > "$PQ_HOME/.loaded"; PR_CACHE="$PQ_HOME/.l.pr"; PR_ANS="$PQ_HOME/.l.ans"; : > "$PR_CACHE"; : > "$PR_ANS"; }
+  pr_load_all "$(printf '%s\ttom/p\n%s\ttom/q\n%s\ttom/p\n' "$REPO" "$REPO" "$REPO")" )
+eq "$(tr '\n' ' ' < "$PQ_HOME/.loaded")" "tom/p tom/q " "a parent that is also a task's own branch is looked up once"
 
 echo "== regression: repo_base_reset actually removes its cache file ==" >&2
 # Through command substitution, like every real caller (base=$(repo_base ...))

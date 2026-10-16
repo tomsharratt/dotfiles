@@ -58,8 +58,8 @@ gum_stdin() { cat "$GUM_STATE/stdin.$1"; }     # what call N was handed on stdin
 # subshell, leaving the task in new/ as a real `pq add` does: the plan is $1.
 # What the wizard would have answered comes as options, so one test reads like
 # the add it stands for:
-#   --repo R  --model M  --effort E  --after T (repeatable)  --design P (repeatable)
-# --after takes a task's slug, and hands the wizard its stamp, as pick_after
+#   --repo R  --model M  --effort E  --after T  --design P (repeatable)
+# --after takes the slug of the task it builds on, and hands the wizard its stamp, as pick_after
 # does. The names the stand-ins set are cmd_add's own locals, reached through
 # bash's dynamic scope at call time.
 add_new() {                             # plan [options...]

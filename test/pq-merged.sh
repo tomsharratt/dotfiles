@@ -207,7 +207,7 @@ repo_base_reset
 reset_caches
 cache_row "$REPO" tom/blocker 8 MERGED "" tom/lower "$OID_C"
 case "$(after_state "$dep")" in
-  waiting*) ok ;;
+  on\ *) ok ;;
   *) bad "a blocker whose work is only on tom/lower is still waiting (got '$(after_state "$dep")')" ;;
 esac
 repo_base_reset

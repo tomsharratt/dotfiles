@@ -19,6 +19,9 @@ If something clearly looks off, even if it is not directly related to what you a
 If you see one, even if it is not caused by what you are working on right now, still get it fixed.
 - When a plan is built from a Claude Design file, save that file to disk (`~/.claude/plans/designs/<file>.dc.html`) and cite the absolute path in the plan on its own line (`Design file: /Users/...`).
 A plan that only describes a design in prose leaves the implementer with nothing to compare against.
+- When work needs several pull requests, plan them as a series in a single line: one plan file per pull request, each building only on the one before it.
+Never plan a pull request that builds on two others, or two that build on the same one - GitHub stacked pull requests, which `pq` uses for a series, only form a single line, so independent pieces go one after another.
+Each plan file is all its implementer sees, so repeat the shared context, evidence and decisions in every file of the series.
 
 ## Tom's opinions
 

@@ -140,6 +140,8 @@ has "$P" "gh run view <run> --log-failed" "how to read why"
 has "$P" "gh run rerun <run> --failed" "and how to rerun a flake, rather than fix what is not broken"
 hasnt "$P" "lint" "a passing check is not mentioned"
 hasnt "$P" "'" "quote-free"
+case "$P" in "First run git pull --rebase --autostash origin tom/cifail: GitHub rebases branches in a stack on its own"*) ok ;;
+  *) bad "it opens by syncing the branch GitHub may have rewritten (got '$P')" ;; esac
 eq "$(st "$D" PQ_WATCH_ASKED)" "ci" "the ask is recorded"
 eq "$(st "$D" PQ_WATCH_FIXES)" "1" "and counted"
 eq "$(st "$D" PQ_WRAPUP_SINCE)" "" "the wrap-up clock is cleared, as the review follow-up clears it"
@@ -200,7 +202,7 @@ watch_task "$R" 0 >/dev/null 2>&1
 eq "$(prompts)" "0" "a green pull request wants nothing"
 eq "$(agent_cell "$R" "done")" "wrapping up" "and reads as it always did"
 
-echo "== a conflict outranks CI, and asks for a merge, not a rebase ==" >&2
+echo "== a conflict outranks CI, and asks for a rebase, never a merge ==" >&2
 reset_caches; reset_logs
 C=$(mk_ready 12 conflicted w3:p1)
 set_panes "$(printf 'w3:p1\tclaude\tidle')"
@@ -208,8 +210,13 @@ view sha1 base1 CONFLICTING DIRTY "build:FAILURE"
 watch_task "$C" 0 >/dev/null 2>&1
 P=$(prompt_text)
 has "$P" "Pull request #42 has merge conflicts with master" "the conflict is what it is told about"
-has "$P" "git merge origin/master" "merging the base in"
-has "$P" "do not rebase and do not force-push" "not rewriting a ready pull request"
+case "$P" in "First run git pull --rebase --autostash origin tom/conflicted: "*) ok ;; *) bad "after syncing first (got '$P')" ;; esac
+has "$P" "git fetch origin master, then git rebase origin/master" "rebasing onto the base"
+has "$P" "push with git push --force-with-lease --force-if-includes" "pushed so a rewrite it never saw is refused"
+has "$P" "a merge commit would stop this pull request merging as part of a stack" "saying why not a merge"
+has "$P" "This replaces any rule in your contract against rebasing or force-pushing a ready pull request." "overriding an older contract"
+hasnt "$P" "git merge" "never a merge"
+hasnt "$P" "'" "quote-free"
 hasnt "$P" "CI failed" "one thing at a time"
 eq "$(agent_cell "$C" "done")" "fixing conflict" "pq ls"
 reset_logs
@@ -222,6 +229,38 @@ view sha1 base1 CONFLICTING DIRTY "build:FAILURE"
 out=$(watch_task "$C" 0 2>&1)
 eq "$(prompts)" "0" "idle again with the same conflict: no second prompt"
 eq "$(agent_cell "$C" "done")" "conflict" "it is yours"
+
+echo "== a stacked task's conflict rebases only its own layer, from its fork point ==" >&2
+# A real origin, so the fetch and the ancestry check run for real.
+ORIGIN=$(mktemp -d); git init -q --bare "$ORIGIN"
+git -C "$REPO" remote add origin "$ORIGIN" 2>/dev/null || git -C "$REPO" remote set-url origin "$ORIGIN"
+gc() { git -C "$REPO" -c user.email=t@t -c user.name=t "$@"; }
+gc checkout -q -b tom/below; gc commit -q --allow-empty -m below; FORK=$(gc rev-parse HEAD)
+gc checkout -q -b tom/stackconf; gc commit -q --allow-empty -m "the layer's own"
+gc push -q origin tom/stackconf 2>/dev/null; gc checkout -q master
+reset_caches; reset_logs
+K=$(mk_ready 21 stackconf w3:p3)
+st_set "$K" PQ_STACK_PARENT tom/below; st_set "$K" PQ_STACK_FORK "$FORK"
+set_panes "$(printf 'w3:p3\tclaude\tidle')"
+view sha9 newbelowsha CONFLICTING DIRTY "build:SUCCESS"
+watch_task "$K" 0 >/dev/null 2>&1
+P=$(prompt_text)
+has "$P" "rebase only your own commits, the ones after $FORK, onto the latest master" "it is told to move only its own layer"
+has "$P" "git rebase --onto newbelowsha $FORK" "from its fork point onto the base's head as GitHub reports it"
+hasnt "$P" "git rebase origin/master" "not a plain rebase that would bring the layer below's old commits back"
+eq "$(st "$K" PQ_STACK_FORK)" "newbelowsha" "and that head is its fork point from now on"
+# Once GitHub has rebased the branch itself, the old fork point is no longer below it.
+reset_caches; reset_logs
+K2=$(mk_ready 22 restacked w3:p4)
+st_set "$K2" PQ_STACK_PARENT tom/below; st_set "$K2" PQ_STACK_FORK 0123456789abcdef0123456789abcdef01234567
+gc push -q origin master:tom/restacked 2>/dev/null
+set_panes "$(printf 'w3:p4\tclaude\tidle')"
+view sha8 belowsha2 CONFLICTING DIRTY "build:SUCCESS"
+watch_task "$K2" 0 >/dev/null 2>&1
+P=$(prompt_text)
+has "$P" "git fetch origin master, then git rebase origin/master" "a fork point no longer below the branch: a plain rebase"
+eq "$(st "$K2" PQ_STACK_FORK)" "belowsha2" "and the fork point still moves to where the layer will sit"
+git -C "$REPO" remote remove origin; rm -rf "$ORIGIN"
 
 echo "== a person's review feedback after ready, and only that ==" >&2
 reset_caches; reset_logs
@@ -252,6 +291,7 @@ P=$(prompt_text)
 has "$P" "new review feedback on pull request #42 since it was marked ready, from alice, bob" \
   "named by who left it - not the author's own replies, a bot, or the author's conversation comments"
 has "$P" "Leave none unanswered" "and every point answered"
+case "$P" in "First run git pull --rebase --autostash origin tom/feedback: "*) ok ;; *) bad "after syncing first (got '$P')" ;; esac
 eq "$(st "$F" PQ_WATCH_SINCE)" "$later" "the watermark moves past what was handed over"
 eq "$(agent_cell "$F" "done")" "answering review" "pq ls"
 reset_logs
@@ -318,6 +358,18 @@ touch "$STUBBIN/.gh-down"
 watch_task "$N" 0 >/dev/null 2>&1
 eq "$(prompts)" "0" "gh silent is nothing to judge"
 rm -f "$STUBBIN/.gh-down"
+
+echo "== a pull request that settles ends the watch, and what it had asked goes with it ==" >&2
+reset_caches; reset_logs
+S=$(mk_ready 19 settles w7:p2)
+st_set "$S" PQ_WATCH_ASKED conflict; st_set "$S" PQ_WATCH_NEEDS ci
+reset_caches; cache_row "$REPO" tom/settles 42 MERGED "" master
+watch_task "$S" 1 >/dev/null 2>&1
+eq "$(st "$S" PQ_WATCH_ASKED)" "conflict" "a dry run clears nothing"
+watch_task "$S" 0 >/dev/null 2>&1
+eq "$(st "$S" PQ_WATCH_ASKED)$(st "$S" PQ_WATCH_NEEDS)" "" "merged: nothing asked or handed over any more"
+st_set "$S" PQ_WATCH_ASKED conflict; st_set "$S" PQ_REAPED 2026-01-02T00:00:00Z
+eq "$(agent_cell "$S" "done")" "-" "and a torn-down task reads - in pq ls, whatever was left behind"
 
 echo "== --dry-run says what it would do and changes nothing ==" >&2
 reset_caches; reset_logs

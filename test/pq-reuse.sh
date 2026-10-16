@@ -147,7 +147,7 @@ w=$(mk_task queue 13 waiter tom/waiter)
 printf 'owner\t%s\ttom/owner\n' "$REPO" > "$w/after"
 prs tom/owner "$(pr_json 102 MERGED 2026-08-01T00:00:00Z)"
 pr_load_all "$(pr_targets)"
-eq "$(cut -f1 <<<"$(after_state "$w")")" "waiting owner 1" \
+eq "$(cut -f1 <<<"$(after_state "$w")")" "on owner" \
   "an unclaimed owner's branch has no pull request of its own to have merged"
 repo_base_reset
 

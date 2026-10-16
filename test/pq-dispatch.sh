@@ -5,8 +5,8 @@
 #
 # Merges test/pq-merged.sh's JSON-returning `wt` stub with test/pq-pane.sh's
 # recording `herdr` stub, plus `agent start` / `agent prompt` arms that answer
-# the way herdr really does: JSON on stdout and exit 0 either way, an error
-# being an {"error":{"code":...}} body.
+# the way herdr 0.9.3 really does: JSON on stdout and exit 0 on success, and an
+# {"error":{"code":...}} body on STDERR with exit 1 on failure.
 #
 # SC2034: the knobs and caches set here are read by the pq sourced below.
 # SC2015: `ok` never fails, so `[ ... ] && ok || bad` is an if/else.
@@ -38,15 +38,15 @@ case "\$1 \$2" in
   "agent start")
     if [ -f "$STUBBIN/.start-fail-once" ]; then
       code=\$(cat "$STUBBIN/.start-fail-once"); rm -f "$STUBBIN/.start-fail-once"
-      printf '{"error":{"code":"%s","message":"stub"},"id":"cli:agent:start"}\n' "\$code"; exit 0
+      printf '{"error":{"code":"%s","message":"stub"},"id":"cli:agent:start"}\n' "\$code" >&2; exit 1
     fi
     if [ -f "$STUBBIN/.start-fail" ]; then
-      printf '{"error":{"code":"%s","message":"stub"},"id":"cli:agent:start"}\n' "\$(cat "$STUBBIN/.start-fail")"; exit 0
+      printf '{"error":{"code":"%s","message":"stub"},"id":"cli:agent:start"}\n' "\$(cat "$STUBBIN/.start-fail")" >&2; exit 1
     fi
     printf '{"id":"cli:agent:start","result":{"agent":{"pane_id":"%s","name":"%s"}}}\n' "\$5" "\$3"; exit 0 ;;
   "agent prompt")
     if [ -f "$STUBBIN/.prompt-fail" ]; then
-      printf '{"error":{"code":"%s","message":"stub"},"id":"cli:agent:prompt"}\n' "\$(cat "$STUBBIN/.prompt-fail")"; exit 0
+      printf '{"error":{"code":"%s","message":"stub"},"id":"cli:agent:prompt"}\n' "\$(cat "$STUBBIN/.prompt-fail")" >&2; exit 1
     fi
     printf '{"id":"cli:agent:prompt","result":{"submitted":true}}\n'; exit 0 ;;
 esac
@@ -55,7 +55,8 @@ EOF
 cat > "$STUBBIN/wt-stub" <<EOF
 #!/bin/sh
 { printf '%s\t' "\$PWD"; for a in "\$@"; do printf '%s\t' "\$a"; done; printf '\n'; } >> "$WT_LOG"
-printf '{"root_pane_id":"w1:p1","dev_pane_id":"w1:p2","path":"%s","workspace_id":"w1","url":"https://task.test","port":3101}\n' "$WT_PATH_DIR"
+dev=w1:p2; [ -f "$STUBBIN/.nodev" ] && dev=""
+printf '{"root_pane_id":"w1:p1","dev_pane_id":"%s","path":"%s","workspace_id":"w1","url":"https://task.test","port":3101}\n' "\$dev" "$WT_PATH_DIR"
 exit 0
 EOF
 chmod +x "$STUBBIN/claude" "$STUBBIN/gh" "$STUBBIN/herdr" "$STUBBIN/wt-stub"
@@ -85,6 +86,10 @@ git -C "$REPO" -c user.email=test@test -c user.name=test commit -q --allow-empty
 mkdir -p "$REPO/.git/refs/remotes/origin"
 git -C "$REPO" update-ref refs/remotes/origin/master refs/heads/master
 git -C "$REPO" symbolic-ref refs/remotes/origin/HEAD refs/remotes/origin/master
+# The worktree `wt new` hands back is a real repo, so the commit a stacked task
+# forked from can be read off its HEAD.
+git init -q -b master "$WT_PATH_DIR"
+git -C "$WT_PATH_DIR" -c user.email=test@test -c user.name=test commit -q --allow-empty -m fork-point
 
 unset HERDR_ENV HERDR_SOCKET_PATH HERDR_WORKSPACE_ID
 PQ_DONE_KEEP=99
@@ -199,6 +204,17 @@ has "$(cat "$C")" "| 1440 | 390 |" "and a new screen's widths beside each other"
 has "$(cat "$C")" "blank line before and after every table" "so a caption is never read as a row"
 hasnt "$(cat "$C")" "| Design | Implemented |" "no design/impl table without a design"
 hasnt "$(cat "$C")" "forked from" "no base clause"
+hasnt "$(cat "$C")" "## Building on" "and no stack section for a task that builds on nothing"
+# The git rules every task gets, since any ready pull request can become the
+# bottom of a stack, and GitHub then rewrites branches on origin by itself.
+has "$(cat "$C")" "While the pull request is a draft, rewrite its history as you need to." "a draft's history is the agent's"
+has "$(cat "$C")" "rewrite it only to rebase onto its base, when pq asks you to or when it conflicts - never to restructure it" "a ready one is only rebased"
+has "$(cat "$C")" "\`git push --force-with-lease --force-if-includes\`, never \`--force\`" "pushed so a rewrite it never saw is refused"
+has "$(cat "$C")" "after a \`git fetch\` a plain lease overwrites that without a word" "and why"
+has "$(cat "$C")" "run \`git pull --rebase --autostash origin tom/first\`, then push again" "a rejected push is synced, naming the branch"
+has "$(cat "$C")" "Never merge another branch into this one" "a moved base is rebased, never merged in"
+hasnt "$(cat "$C")" "only while the pull request is still a draft" "the old draft-only rule is gone"
+has "$(cat "$C")" "(\`gh pr create --draft\`)" "the pull request is aimed at the default branch"
 grep -q -- '—' "$C" && bad "no em dashes" || ok
 # The width is set with emulate: resize quietly clamps it to what the window
 # allows, and two sessions lost time to a 390px screenshot that was not.
@@ -230,6 +246,18 @@ has "$(cat "$C")" "$PQ_HOME/tasks/$(basename "$DB")/design/" "and where they are
 has "$(cat "$C")" "NN-<screen>-design.png" "and how to name the comparison pairs"
 has "$(cat "$C")" "## Design fidelity\` table" "the PR section asks for the fidelity table"
 has "$(cat "$C")" "| Design | Implemented |" "and lays the design/impl pairs side by side"
+
+echo "== a repo with no dev server is told so, not handed a url nothing serves ==" >&2
+reset_logs; set_panes ""
+touch "$STUBBIN/.nodev"
+DV=$(mk_task running 008 nodev tom/nodev)
+dispatch_task "$DV" >/dev/null 2>&1
+rm -f "$STUBBIN/.nodev"
+C="$DV/contract.md"
+has "$(cat "$C")" "This repository has no dev server profile, so there is no url to open" "no dev tab, no app"
+hasnt "$(cat "$C")" "https://task.test" "and no url, though wt returned one"
+hasnt "$(cat "$C")" "wt restart" "nor a server to restart"
+reset_logs
 
 echo "== re-entry with PQ_STARTED set logs no second start ==" >&2
 reset_logs
@@ -319,6 +347,13 @@ DQ=$(mk_task running 007 quiet tom/quiet)
 eq "$rc" "1" "a silent herdr fails the dispatch"
 eq "$(st "$DQ" PQ_STARTED)" "" "and records no start"
 
+echo "== an error on stdout with exit 0, as herdr before 0.9.3 answered, still reads ==" >&2
+mkdir -p "$STUBBIN/old"
+printf '#!/bin/sh\nprintf %s\nexit 0\n' "'{\"error\":{\"code\":\"agent_blocked\"}}'" > "$STUBBIN/old/herdr"; chmod +x "$STUBBIN/old/herdr"
+code=$(PATH="$STUBBIN/old:$PATH" agent_prompt w1:p1 hello); rc=$?
+eq "$rc" "2" "agent_blocked on stdout is still a dialog"
+eq "$code" "agent_blocked" "with its code"
+
 echo "== the helpers ==" >&2
 eq "$(herdr_err '{"error":{"code":"agent_blocked"}}')" "agent_blocked" "herdr_err reads the code"
 eq "$(herdr_err '{"result":{}}')" "" "and nothing on success"
@@ -346,6 +381,95 @@ has "$p" "Read /tasks/x/plan.md" "the plan path"
 has "$p" "/tasks/x/contract.md" "the contract path"
 hasnt "$p" "--base" "no base clause"
 hasnt "$p" "'" "quote-free"
+p=$(dispatch_prompt /tasks/x tom/below 12)
+has "$p" "builds on pull request #12 (tom/below)" "a stacked task's prompt names the pull request"
+has "$p" "pass --base tom/below to gh pr create - and pq adds it to that stack." "and where to aim its own"
+p=$(dispatch_prompt /tasks/x tom/below)
+has "$p" "builds on pull request (tom/below)" "with no row on file, the number is left out"
+hasnt "$p" "#" "and nothing stands in for it"
+
+echo "== a stacked task forks from its parent's branch and records the commit ==" >&2
+reset_tasks; reset_logs; set_panes ""
+git -C "$REPO" update-ref refs/remotes/origin/tom/parent refs/heads/master
+PR_CACHE="$PQ_HOME/.test.pr"; PR_ANS="$PQ_HOME/.test.ans"
+printf '%s\ttom/parent\t77\tOPEN\t\tmaster\t\n' "$REPO" > "$PR_CACHE"; : > "$PR_ANS"
+DS=$(mk_task running 020 stacked tom/stacked)
+st_set "$DS" PQ_STACK_PARENT tom/parent
+dispatch_task "$DS" >/dev/null 2>"$PQ_HOME/.err"; rc=$?
+eq "$rc" "0" "the stacked dispatch succeeds"
+has "$(tr '\t' ' ' < "$WT_LOG")" "new --no-agent --no-focus --base origin/tom/parent --json tom/stacked" "wt new forks it from origin/<parent>"
+eq "$(st "$DS" PQ_STACK_FORK)" "$(git -C "$WT_PATH_DIR" rev-parse HEAD)" "and the fork point is the new worktree's HEAD"
+eq "$(st "$DS" PQ_STACK_PARENT)" "tom/parent" "the parent stays recorded"
+P=$(prompt_text)
+has "$P" "This task builds on pull request #77 (tom/parent), which is ready for review but not merged" "the prompt names the pull request it builds on"
+has "$P" "pass --base tom/parent to gh pr create" "and where to aim its own"
+hasnt "$P" "'" "still quote-free"
+C=$(cat "$DS/contract.md")
+F=$(st "$DS" PQ_STACK_FORK)
+has "$C" "## Building on #77" "a stacked task's contract has the stack section"
+has "$C" "This branch was forked from \`tom/parent\` at \`$F\`, the head of #77, which is ready for review but not merged." "naming the parent and the fork point"
+has "$C" "\`gh pr create --draft --base tom/parent\`" "and where its pull request goes"
+has "$C" "pq adds it to #77's stack on GitHub." "and that pq links it"
+has "$C" "run \`git rebase --onto origin/master $F\` and open the pull request against \`master\` instead" "what to do when the parent merged first"
+has "$C" "If \`git merge-base --is-ancestor $F origin/tom/parent\` fails, #77 was rebased: run \`git rebase --onto origin/tom/parent $F\` first." "and when it was rebased"
+has "$C" "run \`git pull --rebase --autostash origin tom/stacked\` before you change anything" "and to sync once GitHub can rewrite it"
+has "$C" "(\`gh pr create --draft --base tom/parent\`)" "the pull request section aims it at the parent too"
+grep -q -- '—' "$DS/contract.md" && bad "no em dashes in the stack section" || ok
+[ "$(grep -n '^## ' "$DS/contract.md" | sed -n 2p | cut -d: -f2-)" = "## Building on #77" ] && ok || bad "right after ## Working"
+
+echo "== a resumed stacked dispatch neither forks again nor re-records the fork ==" >&2
+fork=$(st "$DS" PQ_STACK_FORK)
+git -C "$WT_PATH_DIR" -c user.email=test@test -c user.name=test commit -q --allow-empty -m "the agent's own work"
+reset_logs; st_set "$DS" PQ_LAUNCHED ""
+set_panes "$(printf 'w1:p1\tclaude\tidle')"
+dispatch_task "$DS" >/dev/null 2>&1
+grep -q "	new	" "$WT_LOG" && bad "wt new must not run on a resume" || ok
+eq "$(st "$DS" PQ_STACK_FORK)" "$fork" "the fork point is kept as it was"
+git -C "$WT_PATH_DIR" reset -q --hard HEAD~1
+
+echo "== a parent that merged meanwhile is not built on ==" >&2
+reset_tasks; reset_logs; set_panes ""
+printf '%s\ttom/parent\t77\tMERGED\t\tmaster\t\n' "$REPO" > "$PR_CACHE"
+DM=$(mk_task running 021 latecomer tom/latecomer)
+st_set "$DM" PQ_STACK_PARENT tom/parent
+dispatch_task "$DM" >/dev/null 2>"$PQ_HOME/.err"; rc=$?
+eq "$rc" "0" "it dispatches"
+grep -q -- "--base" "$WT_LOG" && bad "from the default branch, with no --base" || ok
+eq "$(st "$DM" PQ_STACK_PARENT)" "" "and it no longer builds on anything"
+eq "$(st "$DM" PQ_STACK_FORK)" "" "so it has no fork point either"
+has "$(cat "$PQ_HOME/.err")" "latecomer: tom/parent merged meanwhile - forking from master" "said once, as it happens"
+hasnt "$(prompt_text)" "builds on" "and its prompt says nothing about a stack"
+
+echo "== a parent whose pull request was closed since the claim is not built on ==" >&2
+reset_tasks; reset_logs; set_panes ""
+printf '%s\ttom/parent\t77\tCLOSED\t\tmaster\t\n' "$REPO" > "$PR_CACHE"
+DC=$(mk_task running 023 abandoned tom/abandoned)
+st_set "$DC" PQ_STACK_PARENT tom/parent
+dispatch_task "$DC" >/dev/null 2>"$PQ_HOME/.err"; rc=$?
+eq "$rc" "1" "the dispatch fails"
+grep -q "	new	" "$WT_LOG" && bad "with no worktree forked from abandoned work" || ok
+has "$(cat "$PQ_HOME/.err")" "the pull request for tom/parent was closed since it was claimed" "saying why"
+
+echo "== a contract with no default branch to name leaves the merged-first line out ==" >&2
+# shellcheck disable=SC2329  # called by contract_write
+C=$( repo_base() { return 1; }; reset_tasks >/dev/null; printf '%s\ttom/parent\t77\tOPEN\t\tmaster\t\n' "$REPO" > "$PR_CACHE"
+     X=$(mk_task running 024 nobase tom/nobase); st_set "$X" PQ_STACK_PARENT tom/parent; st_set "$X" PQ_STACK_FORK abc123
+     contract_write "$X"; cat "$X/contract.md" )
+has "$C" "## Building on #77" "the stack section is there"
+hasnt "$C" "the default branch" "with no prose where a branch name goes"
+hasnt "$C" "origin/ " "and no half-written command"
+has "$C" "If \`git merge-base --is-ancestor abc123 origin/tom/parent\` fails" "the rest of it intact"
+
+echo "== a parent branch missing from origin fails the try ==" >&2
+reset_tasks; reset_logs; set_panes ""
+: > "$PR_CACHE"
+DG=$(mk_task running 022 orphaned tom/orphaned)
+st_set "$DG" PQ_STACK_PARENT tom/nowhere
+dispatch_task "$DG" >/dev/null 2>"$PQ_HOME/.err"; rc=$?
+eq "$rc" "1" "the dispatch fails, so the next tick retries"
+grep -q "	new	" "$WT_LOG" && bad "and makes no worktree" || ok
+has "$(cat "$PQ_HOME/.err")" "origin/tom/nowhere is not there to fork from" "saying why"
+PR_CACHE=""; PR_ANS=""
 
 echo "== a directory in running/ with no plan.md is a phantom, not a task ==" >&2
 # What a stale path produces: an agent's `mkdir -p` into a task directory that

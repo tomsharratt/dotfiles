@@ -361,6 +361,18 @@ echo "== a pull request aimed elsewhere, as a stacked one is, has its base named
 has "$(security_brief 42 /x tom/lower)" "exactly \`git diff origin/tom/lower...HEAD\`: where the diff shown to you differs from that" \
   "the base the pull request is aimed at, not origin/HEAD"
 hasnt "$(security_brief 42 /x "")" "git diff origin/" "and with no base known, no command is invented"
+# Launched for a stacked task, the base is the one its pull request is aimed at
+# now - the parent's branch - read off the PR cache.
+reset_tasks; reset_caches; reset_logs; mode sleep; smode sleep
+S=$(mk_gated 012 layered w1:p1)
+reset_caches; cache_row "$REPO" tom/layered 42 OPEN draft tom/lower
+st_set "$S" PQ_STACK_PARENT tom/lower
+set_panes "$(printf 'w1:p1\tclaude\tidle')"
+review_task "$S" 0 >/dev/null 2>&1
+wait_for calls_at_least sec_calls 1
+has "$(grep $'\t/security-review\t$' "$CLAUDE_LOG" | head -1)" "\`git diff origin/tom/lower...HEAD\`" \
+  "a stacked task's security review is of its own layer"
+reset_tasks
 
 echo "== code first: posted waits on the security review, then one follow-up about both ==" >&2
 reset_tasks; reset_caches; reset_logs; mode ok; smode hold

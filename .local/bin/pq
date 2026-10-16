@@ -14,14 +14,15 @@
 # --json`).
 #
 #   pq add               pick a plan and add it; it asks the model, the effort, what
-#                        it should wait on (its PR must merge first) and,
-#                        for a plan built from a design that names no file on disk,
+#                        it builds on (a task in its own repo, once that pull request
+#                        is ready) or waits for (one in another repo, once it merges)
+#                        and, for a plan built from a design that names no file on disk,
 #                        the design file the implementer builds to - and then it is
 #                        done. The next tick names it and queues it (see "naming")
 #   pq evidence [task]   publish a task's screenshots to the pq-evidence branch; prints the markdown to paste
-#   pq after <task>      list a task's blockers and what each is waiting on
-#   pq after <task> T... add blockers to a task already in the queue
-#   pq after <task> --clear   drop them all
+#   pq after <task>      what a task builds on or waits for, and where that stands
+#   pq after <task> T    set it, for a task already in the queue - replacing any
+#   pq after <task> --clear   drop it
 #   pq ls                every task, its state, what it is waiting on, and what it has cost
 #   pq ls --all           also show archive/ - settled history pq no longer walks
 #   pq rm <task>         drop a task (never touches a worktree or a branch)
@@ -37,10 +38,13 @@
 # keeps spending its slot until that agent has actually stopped - see the
 # `slots` section below for why the release is a timer rather than an exit.
 #
-# A task may name blockers: other work that must have merged before it is
-# eligible for dispatch. Blocked is derived, not stored - a blocked task sits in
-# `queue/` like any other, and fill just skips it, the same way the cap is soft
-# arithmetic rather than a drain state. Merge state comes from the forge (`gh`),
+# A task may name one dependency: another task it BUILDS ON, in its own repo -
+# eligible once that pull request is marked ready, forked from its branch, and
+# joined to its stack on GitHub (see "linking into GitHub's stack") - or, in
+# another repo, one it WAITS FOR, eligible once that has merged. Blocked is
+# derived, not stored - a blocked task sits in `queue/` like any other, and fill
+# just skips it, the same way the cap is soft arithmetic rather than a drain
+# state. Merge state comes from the forge (`gh`),
 # never from a BRANCH TIP's git ancestry - a squash-merged branch's tip is not an
 # ancestor of anything, so `git branch --merged` misses every real merge. See
 # `after_state` below for the full predicate.
@@ -107,9 +111,9 @@
 #                     (`design:` is optional, a comma-separated list of the files in design/;
 #                      `security: yes` likewise, when the plan asks for a security review - see name_plan;
 #                      `branch:`, `intent:` and `security:` are absent until it is named)
-#          after       blockers: one per line, TSV  label <TAB> repo <TAB> branch
-#          after.new   only in new/: blockers that had no name yet when it was added,
-#                      one task stamp per line - see "naming"
+#          after       its dependency, one line, TSV  label <TAB> repo <TAB> branch
+#          after.new   only in new/: a dependency that had no name yet when it was added,
+#                      by its task stamp - see "naming"
 #          state.env   KEY=VALUE runtime facts, written as dispatch progresses
 #          contract.md how the plan is to be delivered - written once, at dispatch, from
 #                      pq's own template (see `contract_write`); the plan carries the work,
@@ -130,9 +134,9 @@
 #
 # `after` is neither of the other two: `plan.md` is immutable by contract so an
 # agent re-reading its own plan never sees it change, and `state.env` is runtime
-# facts written as dispatch progresses. Blockers are your intent, edited before
-# dispatch, so they get their own file - named for the verb that writes it. An
-# absent file means no blockers.
+# facts written as dispatch progresses. A dependency is your intent, edited before
+# dispatch, so it gets its own file - named for the verb that writes it. An
+# absent file means none.
 #
 # Every transition is a `mv`, which is atomic within one filesystem - so two
 # dispatchers racing cannot both claim the same task, and a `mv` that fails means
@@ -811,6 +815,55 @@ dependents_of() {                       # repo branch
   done <<<"$(all_tasks)"
 }
 
+# What live tasks already build on - one line per same-repo dependency, as
+# `slug<TAB>repo<TAB>branch`, or `slug<TAB>repo<TAB>#stamp` for one a task in
+# new/ still holds by stamp - leaving out the task given, which is the one about
+# to be given a dependency of its own. A stack is a single line, and GitHub only
+# ever adds a pull request to its top, so a task something already builds on
+# cannot be built on twice: the wizard does not offer it and `pq after` refuses
+# it. Built once and searched with built_on_by, so the wizard's list costs one
+# walk rather than one per candidate. Live is what the wizard offers: new,
+# queue, running, and done while its pull request is yet to settle.
+built_on() {                            # [except_task_dir]
+  local except=${1:-} d repo slug
+  while IFS= read -r d; do
+    [ -n "$d" ] && [ "$d" != "$except" ] || continue
+    case "$(state_of "$d")" in
+      new|queue|running) ;;
+      done) reap_watching "$d" || continue ;;
+      *) continue ;;
+    esac
+    [ -f "$d/after" ] || [ -f "$d/after.new" ] || continue
+    repo=$(hdr "$d/plan.md" repo); slug=$(slug_of "$d")
+    awk -F'\t' -v r="$repo" -v s="$slug" '$2 == r && $3 != "" { print s "\t" $2 "\t" $3 }' "$d/after" 2>/dev/null
+    awk -v r="$repo" -v s="$slug" '/^[0-9]+$/ { print s "\t" r "\t#" $0 }' "$d/after.new" 2>/dev/null
+  done <<<"$(all_tasks)"
+  return 0
+}
+# The default branch as this checkout already knows it - origin/HEAD, else a
+# main or master on origin - with no forge round trip, for the wizard, which
+# must stay fast; repo_base's `gh` fallback is for the tick.
+local_base() {                          # repo -> name, or "the default branch"
+  local b
+  b=$(git -C "$1" symbolic-ref --quiet --short refs/remotes/origin/HEAD 2>/dev/null); b=${b#origin/}
+  if [ -z "$b" ]; then
+    for b in main master ""; do
+      [ -n "$b" ] && git -C "$1" show-ref --verify --quiet "refs/remotes/origin/$b" 2>/dev/null && break
+    done
+  fi
+  printf '%s' "${b:-the default branch}"
+}
+
+# `#N`, or "its pull request" while there is none to number.
+pr_word() { if [ -n "${1:-}" ]; then printf '#%s' "$1"; else printf 'its pull request'; fi; }
+
+# The slug of the first task in a built_on list that builds on this (repo,
+# branch), or on the task by this stamp; 1 when none does.
+built_on_by() {                         # built_on_list repo branch [stamp]
+  awk -F'\t' -v r="$2" -v b="$3" -v s="${4:+#$4}" \
+    '$2 == r && (($3 == b && b != "") || ($3 == s && s != "")) { print $1; f = 1; exit } END { exit !f }' <<<"$1"
+}
+
 # ── add ─────────────────────────────────────────────────────────────────────
 # The plans Claude wrote, newest first, for the picker. Claude Code names these
 # itself, from the prompt that started the session, so the filename is never
@@ -1285,21 +1338,32 @@ pick_plan() {
 # `local`. A stray `local` here would shadow the caller's variable: every
 # answer would appear to work and be silently discarded. Called as a bare
 # statement for the same reason - `x=$(pick_after)` forks a subshell and
-# throws the mutation away. Writes nothing to stdout. Esc stops the add, like
-# every other question; Enter with nothing ticked is how to say none.
+# throws the mutation away. `repo` is read the same way: the repo the task is
+# being added to. Writes nothing to stdout. Esc stops the add, like every other
+# question.
 #
-# Anything whose work has not landed can be waited on: a task in new/, queue/ or
+# One pick, because a task has one dependency and plans come as a series in a
+# single line (see AGENTS.md). The first row is "nothing", and the cursor starts
+# there, so Enter never stacks a task by accident; the candidates follow newest
+# first, so a chain's previous link is one row down. A candidate in the task's
+# own repo is built on - "stack on it" - and one in another repo is waited for -
+# "<repo>: wait for its merge" (see after_state). A same-repo candidate that
+# another live task already builds on is not offered at all: a stack is a single
+# line (see built_on).
+#
+# Anything whose work has not landed can be picked: a task in new/, queue/ or
 # running/, and one in done/ whose pull request has neither merged nor closed -
 # it can sit there for hours, in review or answering it. Only the verdict pq has
 # already recorded is read (reap_watching), never the forge, so the list costs
 # no round trip; a pull request that merged since the last tick is just a
-# blocker met the moment the task is queued.
+# dependency met the moment the task is queued.
 #
-# What it hands back is each pick's STAMP, not its slug: a task in new/ is renamed
+# What it hands back is the pick's STAMP, not its slug: a task in new/ is renamed
 # when it is named, which a tick can do while this list is on screen, and only
 # the stamp survives that (see "naming").
 pick_after() {
-  local d st rows="" lines picked s i
+  local d st drepo rows="" lines picked i none taken own=${repo:-}
+  taken=$(built_on)
   while IFS= read -r d; do
     [ -n "$d" ] || continue
     st=$(state_of "$d")
@@ -1308,27 +1372,27 @@ pick_after() {
       done) reap_watching "$d" || continue ;;
       *) continue ;;
     esac
-    rows="${rows}$(stamp_of "$d")"$'\t'"$(slug_of "$d")"$'\t'"$st"$'\t'"$(basename "$(hdr "$d/plan.md" repo)")"$'\n'
+    drepo=$(hdr "$d/plan.md" repo)
+    if [ "$drepo" = "$own" ]; then
+      built_on_by "$taken" "$drepo" "$(hdr "$d/plan.md" branch)" "$(stamp_of "$d")" >/dev/null && continue
+      rows="${rows}$(stamp_of "$d")"$'\t'"$(slug_of "$d")"$'\t'"$st"$'\t'"stack on it"$'\n'
+    else
+      rows="${rows}$(stamp_of "$d")"$'\t'"$(slug_of "$d")"$'\t'"$st"$'\t'"$(basename "$drepo"): wait for its merge"$'\n'
+    fi
   done <<<"$(all_tasks)"
   [ -n "$rows" ] || return 0
-  # One line per row, in the same order, so a chosen line's number is its row's.
-  # A project column only once the candidates span more than one repo - the same
-  # rule cmd_ls uses - and no trailing padding to tell a chosen line apart by.
-  lines=$(awk -F'\t' '
-    $1 == "" { next }
-    { n++; slug[n] = $2; st[n] = $3; repo[n] = $4; if (!($4 in seen)) { seen[$4] = 1; nrepo++ } }
-    END { for (i = 1; i <= n; i++) {
-            if (nrepo > 1) printf "%-40s  %-8s  %s\n", slug[i], st[i], repo[i]
-            else           printf "%-40s  %s\n", slug[i], st[i] } }
-  ' <<<"$rows")
-  picked=$(ui_choose --no-limit --height 12 \
-    --header "wait on which? x ticks, Enter confirms, none is fine" <<<"$lines") || die "cancelled"
-  while IFS= read -r s; do
-    s=${s%"${s##*[![:space:]]}"}
-    [ -n "$s" ] || continue
-    i=$(grep -nFx -- "$s" <<<"$lines" | head -1 | cut -d: -f1)
-    [ -n "$i" ] && after_vals="${after_vals}$(sed -n "${i}p" <<<"$rows" | cut -f1)"$'\n'
-  done <<<"$picked"
+  rows=$(sed '/^$/d' <<<"$rows" | sort -t$'\t' -k1,1nr)
+  # One line per row, in the same order, so a chosen line's number is its
+  # row's; no trailing padding to tell a chosen line apart by.
+  lines=$(awk -F'\t' '{ printf "%-40s  %-8s  %s\n", $2, $3, $4 }' <<<"$rows")
+  none="nothing - start from $(local_base "$own")"
+  # No --selected: gum's cursor starts on the first row, which is "nothing".
+  picked=$(printf '%s\n%s\n' "$none" "$lines" \
+    | ui_choose --height 12 --header "build on which? Enter picks") || die "cancelled"
+  picked=${picked%"${picked##*[![:space:]]}"}
+  [ -n "$picked" ] && [ "$picked" != "$none" ] || return 0
+  i=$(grep -nFx -- "$picked" <<<"$lines" | head -1 | cut -d: -f1)
+  [ -n "$i" ] && after_vals="$(sed -n "${i}p" <<<"$rows" | cut -f1)"$'\n'
   return 0
 }
 
@@ -1446,7 +1510,7 @@ add_wizard() {
 }
 
 # `pq add` takes no arguments at all: the plan is picked, and the model, effort,
-# blockers and design are questions. The wizard is the way in, and once its last
+# what it builds on and design are questions. The wizard is the way in, and once its last
 # question is answered the task is in new/ and `pq add` is done - the tick names
 # it (see "naming").
 cmd_add() {
@@ -1518,17 +1582,22 @@ cmd_add() {
     design_hdr="${design_hdr:+$design_hdr, }$dbase"
   done <<<"$design_vals"
 
-  # Every chosen blocker, as it is NOW, found by its stamp - a tick may have
+  # The dependency picked, as it is NOW, found by its stamp - a tick may have
   # named it while the list was on screen. One with a branch resolves to its
   # (label, repo, branch) here, before anything is written, so the dependency
   # survives `pq rm` of it, its ageing out of done/, and its slug being reused
   # (see "after: blockers"). One still in new/ has no branch to resolve to yet,
   # and is held by its stamp in after.new until this task is named; so is the
   # check for a cycle, which only the name can close (see "naming").
-  local after_lines="" after_new="" av b
+  local after_lines="" after_new="" av b dep_say=""
   while IFS= read -r av; do
     [ -n "$av" ] || continue
-    b=$(task_by_stamp "$av") || die "a task you picked to wait on has been removed since - nothing was added"
+    b=$(task_by_stamp "$av") || die "the task you picked to build on has been removed since - nothing was added"
+    if [ "$(hdr "$b/plan.md" repo)" = "$repo" ]; then
+      dep_say="on:     $(slug_of "$b") - starts when its pull request is ready for review"
+    else
+      dep_say="after:  $(slug_of "$b") ($(basename "$(hdr "$b/plan.md" repo)")) - starts once it merges"
+    fi
     if [ "$(state_of "$b")" = new ]; then
       after_new="$after_new$av"$'\n'
     else
@@ -1598,6 +1667,7 @@ cmd_add() {
 
   msg "plan:   $plan"
   [ -n "$design_hdr" ] && msg "design: $design_hdr"
+  [ -n "$dep_say" ] && msg "$dep_say"
   msg "added:  new/$(basename "$dir")  ($model, effort $effort) - the next tick names it and queues it"
   repo_base_reset
 }
@@ -2178,8 +2248,15 @@ pr_get() {                              # repo branch
 # change. A merged task stamps `PQ_MERGED` and drops out (only local checks
 # remain - no more reason to ask `gh`); a closed one stamps `PQ_CLOSED` and
 # drops out; a worktree already gone stamps `PQ_REAPED` and drops out.
+#
+# A task that builds on another (PQ_STACK_PARENT) brings its parent's branch
+# along, running or done, so dispatch and the stack link can read the parent's
+# row even when the parent is not a pq task. A done one only while
+# reap_watching: once its own pull request has merged, the parent is history
+# that cannot change, and asking about it every tick would be the very call the
+# `running` scope exists to save.
 pr_targets() {                          # [scope: all|running]
-  local scope=${1:-all} d st repo branch
+  local scope=${1:-all} d st repo branch parent
   while IFS= read -r d; do
     [ -n "$d" ] || continue
     st=$(state_of "$d")
@@ -2187,11 +2264,15 @@ pr_targets() {                          # [scope: all|running]
       running)
         repo=$(hdr "$d/plan.md" repo); branch=$(hdr "$d/plan.md" branch)
         [ -n "$repo" ] && [ -n "$branch" ] && printf '%s\t%s\n' "$repo" "$branch"
+        parent=$(st "$d" PQ_STACK_PARENT)
+        [ -n "$repo" ] && [ -n "$parent" ] && printf '%s\t%s\n' "$repo" "$parent"
         ;;
       done)
         [ "$scope" = all ] || reap_watching "$d" || continue
         repo=$(hdr "$d/plan.md" repo); branch=$(hdr "$d/plan.md" branch)
         [ -n "$repo" ] && [ -n "$branch" ] && printf '%s\t%s\n' "$repo" "$branch"
+        parent=$(st "$d" PQ_STACK_PARENT)
+        [ -n "$repo" ] && [ -n "$parent" ] && reap_watching "$d" && printf '%s\t%s\n' "$repo" "$parent"
         ;;
       queue)
         while IFS=$'\t' read -r _ repo branch; do
@@ -2215,7 +2296,9 @@ pr_load_all() {                         # pairs: "repo\tbranch" lines, e.g. $(pr
     local repos; repos=$(awk -F'\t' '{ print $1 }' <<<"$pairs" | sed '/^$/d' | sort -u)
     while IFS= read -r r; do
       [ -n "$r" ] || continue
-      branches=$(awk -F'\t' -v r="$r" '$1 == r { print $2 }' <<<"$pairs")
+      # Deduplicated: a stacked task's parent is usually a pq task too, listed
+      # once as its own branch and once as the parent - one `gh` call, not two.
+      branches=$(awk -F'\t' -v r="$r" '$1 == r { print $2 }' <<<"$pairs" | sort -u)
       # shellcheck disable=SC2086
       pr_load "$r" $branches
       cat "$PR_CACHE" >> "$cache" 2>/dev/null
@@ -2316,6 +2399,13 @@ pr_has_draft() {                        # repo branch
     $1 == r && $2 == b && $5 == "draft" { ok = 1; exit }
     END { exit !ok }' "${PR_CACHE:-/dev/null}"
 }
+# Pure: reads only PR_CACHE. 0 when at least one row is OPEN and not a draft -
+# marked ready for review.
+pr_has_ready() {                        # repo branch
+  awk -F'\t' -v r="$1" -v b="$2" '
+    $1 == r && $2 == b && $4 == "OPEN" && $5 == "" { ok = 1; exit }
+    END { exit !ok }' "${PR_CACHE:-/dev/null}"
+}
 # Pure: reads only PR_CACHE. The merge commit of the first MERGED row, or empty.
 pr_merge_oid() {                        # repo branch
   awk -F'\t' -v r="$1" -v b="$2" \
@@ -2389,23 +2479,27 @@ merged_into() {                         # repo branch base
   git -C "$repo" merge-base --is-ancestor "$oid" "refs/remotes/origin/$base" 2>/dev/null
 }
 
-# blocker_state <repo> <branch> <base> -> met | waiting | stalled | dead | orphan | unknown
+# blocker_state <repo> <branch> <base> -> met | dead | stalled | ready | waiting | orphan | unknown
 #
 # Not pure past this line: task_by_branch walks all_tasks() and touches disk,
-# which is why the five pr_* predicates above are split out on their own - they
-# are the seam a test can exercise without a single real task directory.
+# which is why the pr_* predicates above are split out on their own - they are
+# the seam a test can exercise without a single real task directory.
 #
 # One row per outcome in the table this mirrors, in the same order, because
 # that is the only way to keep the two in sync by inspection rather than by
 # memory:
 #   MERGED, and that work is present in $base              -> met
-#   no PR yet, a live task owns the branch                -> waiting (normal)
-#   an OPEN row, a live task owns the branch               -> waiting (in review)
+#   every row is CLOSED                                    -> dead
 #   a DRAFT row whose owning task has reached done AND
 #     whose review gate is over (or never applied)         -> stalled
-#   every row is CLOSED                                    -> dead
+#   an OPEN row that is not a draft                        -> ready
+#   any other row - a draft in review, a merge elsewhere   -> waiting (in review)
+#   no PR yet, a live task owns the branch                 -> waiting (normal)
 #   no PR, and no task in any state owns the branch        -> orphan
 #   no row and gh never answered                           -> unknown
+#
+# `ready` is what a task that builds on this one waits for (see after_state); one
+# that waits for a merge reads it as `waiting`, since ready is not merged.
 #
 # A draft during the review gate is the gate WORKING - every pull request now
 # opens as one and stays one until the implementer has answered the review - so
@@ -2422,6 +2516,7 @@ blocker_state() {                       # repo branch base
        && review_settled "$owner"; then
       printf 'stalled'; return
     fi
+    pr_has_ready "$repo" "$branch" && { printf 'ready'; return; }
     printf 'waiting'; return
   fi
   if pr_answered "$repo" "$branch"; then
@@ -2433,7 +2528,8 @@ blocker_state() {                       # repo branch base
 }
 
 # after_state <task_dir> -> "verdict\tdetail" where verdict is
-# met | waiting <label> <n_unmet> | stalled <label> | dead <label>, and detail
+# met | stack <label> | on <label> | waiting <label> <n_unmet> | stalled <label>
+# | dead <label>, and detail
 # is one of dead|orphan|stalled|nobase:<repo>|"" - the finer-grained reason a
 # caller needs for a warning message but that would overload the verdict text
 # itself. Both are printed on the SAME line, tab-separated, rather than through
@@ -2442,14 +2538,25 @@ blocker_state() {                       # repo branch base
 # vanish the moment it returned - the same trap repo_base's cache sidesteps by
 # being a file instead of a variable.
 #
-# Aggregates every blocker: dead/orphan outranks stalled outranks plain
-# waiting, because the fix differs and the worse case is the one worth
-# surfacing first - a task can be both "waiting on two" and "one of them is
-# dead", and dead is the one that will never resolve on its own.
+# A dependency's kind is derived from where it lives, never stored. One in the
+# task's own repo is a STACK dependency - the task builds on it: it is eligible
+# once that pull request is marked ready (`stack <label>`), forked from its
+# branch, and until then it is `on <label>`; once it has merged the task is
+# simply `met` and starts from the default branch. One in another repo is a
+# MERGE dependency, since a stack cannot cross repos: it waits for the merge,
+# and `ready` is still `waiting` there.
+#
+# Nothing new writes more than one line, but an old task may carry two, so
+# this still aggregates: dead/orphan outranks stalled outranks a merge still to
+# come outranks a pull request still to be marked ready, because the fix
+# differs and the worse case is the one worth surfacing first - dead is the
+# one that will never resolve on its own.
 after_state() {                         # task_dir
-  local d=$1 label repo branch base bst
+  local d=$1 own label repo branch base bst
   local first_dead="" first_dead_detail="" first_stalled="" first_wait="" n_unmet=0 nobase=""
+  local first_on="" first_stack=""
   if [ ! -f "$d/after" ]; then printf 'met\t'; return; fi
+  own=$(hdr "$d/plan.md" repo)
   while IFS=$'\t' read -r label repo branch; do
     [ -n "$label" ] || continue
     base=$(repo_base "$repo")
@@ -2466,7 +2573,13 @@ after_state() {                         # task_dir
         if [ -z "$first_dead" ]; then first_dead=$label; first_dead_detail=$bst; fi
         ;;
       stalled) n_unmet=$((n_unmet + 1)); [ -n "$first_stalled" ] || first_stalled=$label ;;
-      *)       n_unmet=$((n_unmet + 1)); [ -n "$first_wait" ] || first_wait=$label ;;
+      ready|waiting|unknown)
+        if [ "$repo" = "$own" ]; then
+          if [ "$bst" = ready ]; then [ -n "$first_stack" ] || first_stack=$label
+          else [ -n "$first_on" ] || first_on=$label; fi
+        else
+          n_unmet=$((n_unmet + 1)); [ -n "$first_wait" ] || first_wait=$label
+        fi ;;
     esac
   done <<<"$(after_list "$d")"
   if [ -n "$first_dead" ]; then
@@ -2475,9 +2588,20 @@ after_state() {                         # task_dir
     printf 'stalled %s\tstalled' "$first_stalled"
   elif [ "$n_unmet" -gt 0 ]; then
     printf 'waiting %s %d\t%s' "$first_wait" "$n_unmet" "${nobase:+nobase:$nobase}"
+  elif [ -n "$first_on" ]; then
+    printf 'on %s\t' "$first_on"
+  elif [ -n "$first_stack" ]; then
+    printf 'stack %s\t' "$first_stack"
   else
     printf 'met\t'
   fi
+}
+
+# The branch a task builds on, from its `after` line in its own repo under this
+# label - what fill records when after_state says `stack <label>`.
+stack_branch() {                        # task_dir label -> branch, or nothing
+  awk -F'\t' -v r="$(hdr "$1/plan.md" repo)" -v l="$2" \
+    '$1 == l && $2 == r { print $3; exit }' "$1/after" 2>/dev/null
 }
 
 # The tick-time wrapper: after_state plus the once-only warning. dead, orphan
@@ -2522,19 +2646,22 @@ after_check() {                         # task_dir
   printf '%s' "$verdict"
 }
 
-# {label, repo, branch, state} for every blocker, for cmd_ls --json - assumes
-# PR_CACHE/PR_ANS already cover every blocker's (repo, branch), same as
-# after_state assumes.
+# {label, repo, branch, kind, state} for the dependency, for cmd_ls --json -
+# kind is `stack` in the task's own repo and `merge` in another (see
+# after_state), and state is blocker_state's word, `ready` included. Assumes
+# PR_CACHE/PR_ANS already cover its (repo, branch), same as after_state assumes.
 after_json() {                          # task_dir
-  local d=$1 label repo branch base st
+  local d=$1 own label repo branch base st kind
   [ -f "$d/after" ] || { printf '[]'; return; }
+  own=$(hdr "$d/plan.md" repo)
   local tmp="$PQ_HOME/.afterjson.$$"; : > "$tmp"
   while IFS=$'\t' read -r label repo branch; do
     [ -n "$label" ] || continue
     base=$(repo_base "$repo")
     st=$(blocker_state "$repo" "$branch" "${base:-}")
-    jq -nc --arg label "$label" --arg repo "$repo" --arg branch "$branch" --arg state "$st" \
-      '{label: $label, repo: $repo, branch: $branch, state: $state}' >> "$tmp"
+    kind=merge; [ "$repo" = "$own" ] && kind=stack
+    jq -nc --arg label "$label" --arg repo "$repo" --arg branch "$branch" --arg kind "$kind" --arg state "$st" \
+      '{label: $label, repo: $repo, branch: $branch, kind: $kind, state: $state}' >> "$tmp"
   done <<<"$(after_list "$d")"
   jq -sc '.' "$tmp"
   rm -f "$tmp"
@@ -2679,7 +2806,9 @@ agent_cell() {                          # task_dir state
       local verdict lbl cnt
       IFS=$'\t' read -r verdict _ <<<"$(after_state "$d")"
       case "$verdict" in
-        met)  printf -- '-' ;;
+        # Eligible, and building on it once a slot frees: nothing to wait on.
+        met|stack\ *) printf -- '-' ;;
+        on\ *) printf 'on %s' "$(cell "${verdict#on }" "$PQ_LABEL_MAX")" ;;
         waiting\ *)
           lbl=${verdict#waiting }; cnt=${lbl##* }; lbl=${lbl% *}
           lbl=$(cell "$lbl" "$PQ_LABEL_MAX")
@@ -2699,6 +2828,8 @@ agent_cell() {                          # task_dir state
       # automatically now, so it settles exactly as a merged one does and wants
       # nothing - and the PR column reads `#N closed` either way, which is where
       # that fact belongs.
+      # Torn down: no agent, no pull request left to work on, nothing for you.
+      [ -n "$(st "$d" PQ_REAPED)" ] && { printf -- '-'; return; }
       local reason
       reason=$(st "$d" PQ_REAP_HELD)
       # These three want a decision from you and say nothing about the agent, so
@@ -2877,7 +3008,7 @@ cmd_ls() {
       *)      pr="-" ;;
     esac
     if [ "$as_json" = 1 ]; then
-      case "$(after_state "$d")" in met$'\t'*) blocked=false ;; *) blocked=true ;; esac
+      case "$(after_state "$d")" in met$'\t'*|stack\ *) blocked=false ;; *) blocked=true ;; esac
       local merged closed reaped held
       merged=$(st "$d" PQ_MERGED); closed=$(st "$d" PQ_CLOSED)
       reaped=$(st "$d" PQ_REAPED); held=$(st "$d" PQ_REAP_HELD)
@@ -2891,6 +3022,7 @@ cmd_ls() {
         --arg review "$(st "$d" PQ_REVIEW)" --arg review_result "$(st "$d" PQ_REVIEW_RESULT)" \
         --arg security "$(st "$d" PQ_SECURITY)" --arg security_result "$(st "$d" PQ_SECURITY_RESULT)" \
         --arg design "$(hdr "$d/plan.md" design)" \
+        --arg stack_parent "$(st "$d" PQ_STACK_PARENT)" --arg stack "$(st "$d" PQ_STACK)" \
         --arg cost "$(cost_sum "$d")" \
         --argjson holding_slot "$holding" \
         --argjson after "$(after_json "$d")" --argjson blocked "$blocked" '
@@ -2903,6 +3035,7 @@ cmd_ls() {
           pr: ($pr|str|if . then tonumber else null end),
           pr_state: ($prstate|str), pr_draft: ($draft == "draft"),
           after: $after, blocked: $blocked, holding_slot: $holding_slot,
+          stack_parent: ($stack_parent|str), stack: ($stack|num),
           merged: ($merged|str), closed: ($closed|str),
           reaped: ($reaped|str), held: ($held|str),
           review: ($review|str), review_result: ($review_result|str),
@@ -2950,35 +3083,40 @@ $([ "$narch" -gt 0 ] && printf ', %s archived%s' "$narch" "$([ "$all" = 1 ] || p
 }
 
 # ── the small commands ──────────────────────────────────────────────────────
-# `pq after <task>` alone answers "why has this not started": per blocker, both
-# the state of the TASK that owns the branch and the state of its PR, since
-# either one can be the reason and the fix differs.
+# `pq after <task>` alone answers "why has this not started": its one
+# dependency, with both the state of the TASK that owns the branch and the state
+# of its PR, since either one can be the reason and the fix differs.
 #
-# `pq after <task> <task|branch>...` adds blockers; `--clear` drops them all.
-# Restricted to what has not been dispatched - blockers only gate what has not
-# started.
+# `pq after <task> <task|branch>` sets it, replacing any it had; `--clear` drops
+# it. Restricted to what has not been dispatched - a dependency only gates what
+# has not started.
 #
 # And to what has a name, on both sides. A task in new/ may already wait on
-# something by stamp alone, where `after_cycle` cannot follow it, so adding to
-# one could close a cycle nothing would see - and one given AS a blocker has no
+# something by stamp alone, where `after_cycle` cannot follow it, so setting one
+# could close a cycle nothing would see - and one given AS a dependency has no
 # branch to wait on yet. Either is a tick away from having one.
+#
+# A same-repo dependency something else already builds on is refused: a stack
+# is a single line, and GitHub only ever adds a pull request to its top.
 cmd_after() {
   local d; d=$(find_task "${1:-}") || exit 1; shift
   [ "$(state_of "$d")" = new ] && die "$(slug_of "$d") has no name yet - the next tick names it and queues it; pq after it then"
 
   if [ $# -eq 0 ]; then
     if [ ! -f "$d/after" ]; then
-      msg "$(slug_of "$d") has no blockers"
+      msg "$(slug_of "$d") builds on nothing and waits for nothing"
       return 0
     fi
     pr_load_all "$(after_list "$d" | awk -F'\t' '{ print $2 "\t" $3 }')"
-    local label repo branch base bst owner ownerst num prstate draft prtxt desc overdict
+    local own label repo branch base bst owner ownerst num prstate draft prtxt desc overdict slug
+    own=$(hdr "$d/plan.md" repo); slug=$(slug_of "$d")
     while IFS=$'\t' read -r label repo branch; do
       [ -n "$label" ] || continue
       base=$(repo_base "$repo")
       bst=$(blocker_state "$repo" "$branch" "${base:-}")
       owner=$(task_by_branch "$repo" "$branch") || owner=""
       ownerst=${owner:+$(state_of "$owner")}; ownerst=${ownerst:--}
+      num=""; prstate=""; draft=""
       IFS=$'\t' read -r num prstate draft <<<"$(pr_get "$repo" "$branch")"
       case "${prstate:-}" in
         MERGED) prtxt="#$num merged" ;;
@@ -2987,23 +3125,36 @@ cmd_after() {
         *)      prtxt="no PR yet" ;;
       esac
       case "$bst" in
-        met)     desc="present in ${base:-its default branch} - satisfied" ;;
-        waiting)
-          case "$ownerst" in
-            done|-) desc="waiting on your merge" ;;
-            *)
-              IFS=$'\t' read -r overdict _ <<<"$(after_state "$owner")"
-              case "$overdict" in
-                waiting\ *) desc="waiting on ${overdict##* } of its own" ;;
-                *)          desc="in progress" ;;
-              esac
-              ;;
-          esac
-          ;;
         stalled) desc="stalled - a draft PR, but its task already reached done" ;;
         dead)    desc="dead - every PR for it is closed" ;;
         orphan)  desc="orphan - nothing will ever open a PR for this branch" ;;
-        *)       desc="gh has not answered yet" ;;
+        unknown) desc="gh has not answered yet" ;;
+        *)
+          if [ "$repo" = "$own" ]; then
+            case "$bst" in
+              met)   desc="merged - $slug starts from ${base:-its default branch}" ;;
+              ready) desc="ready - $slug builds on it" ;;
+              *)     desc="waiting for $(pr_word "$num") to be marked ready" ;;
+            esac
+          else
+            case "$bst" in
+              met) desc="present in ${base:-its default branch} - satisfied" ;;
+              *)
+                case "$ownerst" in
+                  done|-) desc="waiting on your merge" ;;
+                  *)
+                    IFS=$'\t' read -r overdict _ <<<"$(after_state "$owner")"
+                    case "$overdict" in
+                      waiting\ *) desc="waiting on ${overdict##* } of its own" ;;
+                      on\ *)      desc="waiting for ${overdict#on } to be marked ready" ;;
+                      *)                 desc="in progress" ;;
+                    esac
+                    ;;
+                esac
+                ;;
+            esac
+          fi
+          ;;
       esac
       printf '  %-20s %-8s %-12s %s\n' "$label" "$ownerst" "$prtxt" "$desc"
     done <<<"$(after_list "$d")"
@@ -3012,47 +3163,61 @@ cmd_after() {
     return 0
   fi
 
-  # Both mutating forms - clearing and adding - are restricted to what has not
-  # started: blockers only gate a task that has not been dispatched yet.
+  # Both mutating forms - clearing and setting - are restricted to what has not
+  # started: a dependency only gates a task that has not been dispatched yet.
   # Checked under the lock, which is held to the end, so a tick cannot claim
-  # the task between the check and the write - and write the blockers into a
+  # the task between the check and the write - and write the dependency into a
   # directory that has moved on.
   case "$(state_of "$d")" in
     queue) ;;
-    *) die "$(slug_of "$d") is $(state_of "$d") - blockers only gate what has not started" ;;
+    *) die "$(slug_of "$d") is $(state_of "$d") - a dependency only gates what has not started" ;;
   esac
+  [ $# -eq 1 ] || die "pq after takes one task or branch - a task builds on, or waits for, exactly one (usage: pq after <task> [<task|branch> | --clear])"
   task_locked "$d" >/dev/null || exit 1
 
   if [ "$1" = --clear ]; then
     rm -f "$d/after"
     release_lock
-    msg "cleared blockers on $(slug_of "$d")"
+    msg "cleared $(slug_of "$d")'s dependency"
     return 0
   fi
 
-  local owner_repo owner_branch value resolved label repo branch base b
-  owner_repo=$(hdr "$d/plan.md" repo); owner_branch=$(hdr "$d/plan.md" branch)
-  for value in "$@"; do
-    case "$value" in
-      */*) ;;
-      *) b=$(find_task "$value" 2>/dev/null) && [ "$(state_of "$b")" = new ] \
-           && { release_lock; die "$(slug_of "$b") has no name yet, so there is no branch to wait on - the next tick names it; pq after again then"; } ;;
-    esac
-    resolved=$(resolve_after "$owner_repo" "$value") || { release_lock; die "could not resolve '$value' to a task or branch"; }
-    IFS=$'\t' read -r label repo branch <<<"$resolved"
-    [ -n "$repo" ] && [ -n "$branch" ] || { release_lock; die "could not resolve '$value' to a repo and branch"; }
-    [ "$repo" = "$owner_repo" ] && [ "$branch" = "$owner_branch" ] && { release_lock; die "a task cannot block on itself"; }
-    after_cycle "$owner_repo" "$owner_branch" "$repo" "$branch" \
-      && { release_lock; die "'$value' would create a cycle - $(slug_of "$d") already leads back to it"; }
-    after_add "$d" "$label" "$repo" "$branch"
-    pr_load_all "$(printf '%s\t%s\n' "$repo" "$branch")"
-    base=$(repo_base "$repo")
-    if [ -n "$base" ] && merged_into "$repo" "$branch" "$base"; then
-      msg "$(slug_of "$d") after $label: already in $base - nothing to wait for"
-    else
-      msg "$(slug_of "$d") after $label ($branch)"
-    fi
-  done
+  local owner_repo owner_branch value=$1 resolved label repo branch base b="" other num slug
+  owner_repo=$(hdr "$d/plan.md" repo); owner_branch=$(hdr "$d/plan.md" branch); slug=$(slug_of "$d")
+  case "$value" in
+    */*) ;;
+    *) b=$(find_task "$value" 2>/dev/null) && [ "$(state_of "$b")" = new ] \
+         && { release_lock; die "$(slug_of "$b") has no name yet, so there is no branch to wait on - the next tick names it; pq after again then"; } ;;
+  esac
+  resolved=$(resolve_after "$owner_repo" "$value") || { release_lock; die "could not resolve '$value' to a task or branch"; }
+  IFS=$'\t' read -r label repo branch <<<"$resolved"
+  [ -n "$repo" ] && [ -n "$branch" ] || { release_lock; die "could not resolve '$value' to a repo and branch"; }
+  [ "$repo" = "$owner_repo" ] && [ "$branch" = "$owner_branch" ] && { release_lock; die "a task cannot build on itself"; }
+  after_cycle "$owner_repo" "$owner_branch" "$repo" "$branch" \
+    && { release_lock; die "'$value' would create a cycle - $slug already leads back to it"; }
+  # The stamp too, whichever way it was named: a task in new/ holds what it
+  # builds on by stamp alone, so a branch given here is matched by its owner's.
+  [ -n "$b" ] || b=$(task_by_branch "$repo" "$branch") || b=""
+  if [ "$repo" = "$owner_repo" ] \
+     && other=$(built_on_by "$(built_on "$d")" "$repo" "$branch" "${b:+$(stamp_of "$b")}"); then
+    release_lock
+    die "$other already builds on $label - a stack is a single line, so build on $other instead"
+  fi
+  printf '%s\t%s\t%s\n' "$label" "$repo" "$branch" > "$d/after"
+  pr_load_all "$(printf '%s\t%s\n' "$repo" "$branch")"
+  base=$(repo_base "$repo")
+  num=$(pr_get "$repo" "$branch" | cut -f1)
+  # The predicate fill itself uses, so what is said is what will happen.
+  local bst; bst=$(blocker_state "$repo" "$branch" "${base:-}")
+  if [ "$bst" = met ]; then
+    msg "$slug after $label: already in $base - nothing to wait for"
+  elif [ "$repo" != "$owner_repo" ]; then
+    msg "$slug waits for $label ($(basename "$repo")) to merge"
+  elif [ "$bst" = ready ]; then
+    msg "$slug builds on $label - #$num is ready for review, so it starts once a slot is free"
+  else
+    msg "$slug builds on $label - it starts once $(pr_word "$num") is marked ready"
+  fi
   release_lock
   rm -f "$PR_CACHE" "$PR_ANS"
   repo_base_reset
@@ -3228,10 +3393,20 @@ cmd_evidence() {
 # refused; it goes to `herdr agent prompt` as one argv element that no shell ever
 # re-parses, so nothing would break. The convention stays because the review
 # follow-up (review_prompt) shares it, and one rule is easier to keep than two.
-dispatch_prompt() {                     # task_dir
+#
+# A task that builds on another is told so here as well as in its contract,
+# since where its pull request is aimed is the one thing it must not get wrong:
+# aimed at the default branch, its diff would carry the whole layer below.
+dispatch_prompt() {                     # task_home [parent_branch [parent_pr]]
+  local parent=${2:-} num=${3:-} stackc=""
+  if [ -n "$parent" ]; then
+    stackc="This task builds on pull request ${num:+#$num }($parent), which is ready for review but not merged, \
+and this branch was forked from it: open your pull request against it - pass --base $parent to gh pr create - \
+and pq adds it to that stack. "
+  fi
   printf '%s' "Read $1/plan.md and carry it out. \
 $1/contract.md is how to deliver it: read it before you start and follow it to the letter. \
-Never wait for input - there is nobody watching."
+${stackc}Never wait for input - there is nobody watching."
 }
 
 # ── the delivery contract ────────────────────────────────────────────────────
@@ -3250,12 +3425,27 @@ Never wait for input - there is nobody watching."
 # commands) still apply on top - it says so. One sentence per line, as Tom's
 # markdown rule asks, and written once: dispatch_task only calls this when no
 # contract.md exists, so a re-entered dispatch never rewrites a running agent's.
+#
+# The git rules in `## Working` are for every task, stacked or not: any ready
+# pull request can become the bottom of a stack the moment a task building on it
+# opens its own, and from then on GitHub rewrites branches on origin by itself -
+# after a pull request below merges, and on Rebase stack. So an agent syncs
+# before it acts, rebases rather than merges, and never forces over a rewrite it
+# has not integrated (`--force-if-includes`: after a `git fetch`, a plain
+# `--force-with-lease` overwrites one without a word). A contract is written
+# once, so agents already running keep their old one; the prompts that matter
+# say outright where they replace it (see review_prompt and watch_prompt).
 contract_write() {                      # task_dir
-  local d=$1 repo branch intent design security url wt slug tmp home
+  local d=$1 repo branch intent design security url wt slug tmp home parent fork pnum defb
   repo=$(hdr "$d/plan.md" repo);   branch=$(hdr "$d/plan.md" branch)
   intent=$(hdr "$d/plan.md" intent)
   design=$(hdr "$d/plan.md" design); security=$(hdr "$d/plan.md" security)
   url=$(st "$d" PQ_URL); wt=$(st "$d" PQ_WORKTREE); slug=$(slug_of "$d")
+  parent=$(st "$d" PQ_STACK_PARENT); fork=$(st "$d" PQ_STACK_FORK)
+  if [ -n "$parent" ]; then
+    pnum=$(pr_get "$repo" "$parent" | cut -f1)
+    defb=$(repo_base "$repo")
+  fi
   # Every path the agent is given is the STABLE one (task_home): the real
   # directory moves to done/ the moment the pull request is reconciled, while
   # the agent is still saving screenshots into it.
@@ -3280,13 +3470,45 @@ One coherent, self-contained step per commit, in the order a reader should meet 
 A mechanical change (a rename, a move, generated output) is its own commit, and its message says so.
 A non-mechanical commit over about 300 changed lines gets split into smaller ones.
 Never one squashed commit at the end: the commits are how the pull request will be read.
-History may be rewritten (\`git push --force-with-lease\`) only while the pull request is still a draft.
+While the pull request is a draft, rewrite its history as you need to.
+Once it is ready, rewrite it only to rebase onto its base, when pq asks you to or when it conflicts - never to restructure it.
+Push a rewritten branch with \`git push --force-with-lease --force-if-includes\`, never \`--force\`.
+GitHub rebases branches itself when a pull request below this one in a stack merges, or when someone presses Rebase stack, and after a \`git fetch\` a plain lease overwrites that without a word.
+If a push is rejected, origin has moved: run \`git pull --rebase --autostash origin $branch\`, then push again.
+Never merge another branch into this one: a stacked pull request needs a linear history to merge, so bring in a moved base by rebasing.
+EOF
+    if [ -n "$parent" ]; then
+      local title="#$pnum" below="#$pnum" head="the head of #$pnum"
+      [ -n "$pnum" ] || { title="\`$parent\`"; below="the pull request on \`$parent\`"; head="the head of that pull request"; }
+      cat <<EOF
+
+## Building on $title
+
+This branch was forked from \`$parent\` at \`${fork:-its head at dispatch}\`, $head, which is ready for review but not merged.
+Your own commits are the ones after that commit.
+Open your pull request against \`$parent\`: \`gh pr create --draft --base $parent\`.
+pq adds it to $below's stack on GitHub.
+Before you open it, run \`git fetch origin\`.
+EOF
+      # Only with a default branch to name: a command with prose in it cannot run.
+      [ -n "$defb" ] && cat <<EOF
+If \`origin/$parent\` is gone, $below has merged: run \`git rebase --onto origin/$defb ${fork:-<fork>}\` and open the pull request against \`$defb\` instead.
+EOF
+      cat <<EOF
+If \`git merge-base --is-ancestor ${fork:-<fork>} origin/$parent\` fails, $below was rebased: run \`git rebase --onto origin/$parent ${fork:-<fork>}\` first.
+Once the pull request is open, GitHub may rewrite this branch on origin, so run \`git pull --rebase --autostash origin $branch\` before you change anything.
+EOF
+    fi
+    cat <<EOF
 
 ## Verifying, before the pull request
 
 Run the repository's tests and lint, per its conventions.
 EOF
-    if [ -n "$url" ]; then
+    # The url alone says nothing: wt hands one back for every worktree, and only a
+    # profile with a dev server (wt_dev) gives it a `dev` tab to be served from -
+    # a repo with none was told an app was being served that never would be.
+    if [ -n "$url" ] && [ -n "$(st "$d" PQ_DEV_PANE)" ]; then
       cat <<EOF
 The app is served at $url from the \`dev\` tab in this workspace.
 If nothing answers there, or once you have added a gem, changed an initializer or anything else a running server will not pick up, run \`wt restart\` to restart it in that tab - never \`wt dev\`, which would run the whole stack in your own shell.
@@ -3325,7 +3547,7 @@ If the plan seems to need two, do it all in this one and say so in the descripti
 
 Run \`pq evidence $slug\`.
 It publishes everything in \`$home/evidence/\` and prints one markdown image line per file, to paste into the description.
-Open the pull request as a draft (\`gh pr create --draft\`), following the repository's pull request conventions, with the intent line above as the first paragraph of the description.
+Open the pull request as a draft (\`gh pr create --draft${parent:+ --base $parent}\`), following the repository's pull request conventions, with the intent line above as the first paragraph of the description.
 Add two sections to it:
 
 - \`## Review guide\`: the commits in reading order, one line each on what to look at; where the risk is; what is purely mechanical.
@@ -3385,11 +3607,19 @@ EOF
 # `prompt` refuses a target sitting on a dialog (`agent_blocked`) before sending
 # anything - and a prompt passed as argv is never re-parsed by a shell.
 #
-# herdr answers on stdout with JSON and exits 0 EITHER WAY: an error is an
-# `{"error":{"code":...}}` body, not a non-zero status. So every call here reads
-# the body, and treats no body at all as a failure too.
+# herdr answers with JSON, and an error is an `{"error":{"code":...}}` body. Where
+# that body goes has changed under pq: herdr used to print it on stdout and exit
+# 0 either way, and 0.9.3 prints it on STDERR and exits 1 - so reading stdout
+# alone saw no code at all, and `agent_not_ready` and `agent_blocked` (a trust
+# dialog on a fresh worktree, say) read as plain failures, counted towards
+# giving the dispatch up. So every call here reads both streams as one body
+# (herdr_api), and treats no body at all as a failure too.
 herdr_err() {                           # json -> the error code, or nothing on success
-  jq -r '.error.code // empty' 2>/dev/null <<<"${1:-}"
+  jq -r '.error.code // empty' 2>/dev/null <<<"${1:-}" | head -1
+}
+# A herdr agent call with its reply, wherever herdr printed it, on stdout.
+herdr_api() {                           # herdr args...
+  herdr "$@" 2>&1
 }
 
 # A live agent's name must match [a-z][a-z0-9_-]{0,31} and be unique among live
@@ -3412,7 +3642,7 @@ agent_start() {                         # task_dir pane model effort -> 0 an age
     if [ "$try" = 1 ]; then name=$(agent_name "$slug"); else name=$(agent_name "$slug" "$(date -u +%H%M%S)"); fi
     # Shielded like `wt new`: a Ctrl-C mid-start would otherwise leave a Claude
     # half-launched with nobody to record it.
-    shielded herdr agent start "$name" --kind claude --pane "$pane" --timeout "$PQ_AGENT_START_MS" \
+    shielded herdr_api agent start "$name" --kind claude --pane "$pane" --timeout "$PQ_AGENT_START_MS" \
       -- --model "$model" --effort "$effort" --settings "$(task_home "$d")/settings.json"
     rc=$?
     code=$(herdr_err "$SHIELDED_OUT")
@@ -3436,7 +3666,7 @@ agent_start() {                         # task_dir pane model effort -> 0 an age
 # answered), 1 anything else.
 agent_prompt() {                        # pane text
   local out rc code
-  out=$(herdr agent prompt "$1" "$2" 2>/dev/null); rc=$?
+  out=$(herdr_api agent prompt "$1" "$2"); rc=$?
   code=$(herdr_err "$out")
   if [ -z "$code" ] && { [ "$rc" != 0 ] || [ -z "$out" ]; }; then code="herdr exited $rc with no answer"; fi
   [ -z "$code" ] && return 0
@@ -3470,10 +3700,17 @@ wt_in_errto() {                         # errfile repo wt-subcommand args...
   wt_in "$@" 2> "$errf"
 }
 
+# A task that builds on another (PQ_STACK_PARENT, recorded at the claim) forks
+# from that pull request's branch rather than the default one, and records the
+# exact commit it forked from as PQ_STACK_FORK - its own commits are the ones
+# after it, which is what its contract tells it and what a restack needs. A
+# parent that merged between the claim and the fork is not built on at all: the
+# task forks from the default branch, as any other does, which already holds it.
 dispatch_task() {                       # task_dir  -> 0 launched, 1 failed, 2 waiting on a dialog
-  local d=$1 repo branch model effort pane wtjson prompt
+  local d=$1 repo branch model effort pane wtjson prompt parent
   repo=$(hdr "$d/plan.md" repo);     branch=$(hdr "$d/plan.md" branch)
   model=$(hdr "$d/plan.md" model);   effort=$(hdr "$d/plan.md" effort)
+  parent=$(st "$d" PQ_STACK_PARENT)
   [ -n "$repo" ] && [ -n "$branch" ] || { warn "$(slug_of "$d"): plan.md has no repo/branch"; return 1; }
   [ -d "$repo" ] || { warn "$(slug_of "$d"): repo $repo is gone"; return 1; }
 
@@ -3501,11 +3738,33 @@ dispatch_task() {                       # task_dir  -> 0 launched, 1 failed, 2 w
     GIT_SSH_COMMAND="${GIT_SSH_COMMAND:-ssh -o ConnectTimeout=5 -o BatchMode=yes}" \
       git -C "$repo" fetch --quiet origin 2>/dev/null \
       || warn "$(slug_of "$d"): could not fetch $repo - the worktree may fork from a stale base"
-    msg "$(slug_of "$d"): preparing worktree for $branch"
+    local fork_from=""
+    if [ -n "$parent" ]; then
+      local defb; defb=$(repo_base "$repo")
+      if [ -n "$defb" ] && merged_into "$repo" "$parent" "$defb"; then
+        st_set "$d" PQ_STACK_PARENT ""
+        msg "$(slug_of "$d"): $parent merged meanwhile - forking from $defb"
+        parent=""
+      elif [ "$(pr_get "$repo" "$parent" | cut -f2)" = CLOSED ] && pr_all_closed "$repo" "$parent"; then
+        warn "$(slug_of "$d"): the pull request for $parent was closed since it was claimed - not building on abandoned work; pq rm $(slug_of "$d"), or pq after it again once you know what it should build on"
+        return 1
+      elif ! { git -C "$repo" show-ref --verify --quiet "refs/remotes/origin/$parent" \
+               || { GIT_SSH_COMMAND="${GIT_SSH_COMMAND:-ssh -o ConnectTimeout=5 -o BatchMode=yes}" \
+                      git -C "$repo" fetch --quiet origin "+refs/heads/$parent:refs/remotes/origin/$parent" 2>/dev/null \
+                    && git -C "$repo" show-ref --verify --quiet "refs/remotes/origin/$parent"; }; }; then
+        warn "$(slug_of "$d"): origin/$parent is not there to fork from - the next tick tries again"
+        return 1
+      else
+        fork_from="origin/$parent"
+      fi
+    fi
+    msg "$(slug_of "$d"): preparing worktree for $branch${fork_from:+ off $fork_from}"
     # Shielded: this is the slow one - a full database copy - and the one worth
     # letting finish when you Ctrl-C. wt's own progress still goes to stderr and
-    # straight to the user; only its stdout (the JSON) is captured.
-    shielded wt_in "$repo" new --no-agent --no-focus --json "$branch" \
+    # straight to the user; only its stdout (the JSON) is captured. `--base` is
+    # used as given: wt forks from that ref with no fetch of its own, which is why
+    # the fetch above comes first.
+    shielded wt_in "$repo" new --no-agent --no-focus ${fork_from:+--base "$fork_from"} --json "$branch" \
       || { warn "$(slug_of "$d"): wt new failed"; return 1; }
     wtjson=$SHIELDED_OUT
     pane=$(jq -r '.root_pane_id // empty' <<<"$wtjson" 2>/dev/null)
@@ -3516,6 +3775,11 @@ dispatch_task() {                       # task_dir  -> 0 launched, 1 failed, 2 w
     st_set "$d" PQ_DEV_PANE  "$(jq -r '.dev_pane_id // ""'  <<<"$wtjson")"
     st_set "$d" PQ_URL       "$(jq -r '.url // ""'          <<<"$wtjson")"
     st_set "$d" PQ_PORT      "$(jq -r '.port // ""'         <<<"$wtjson")"
+    # The new branch has no commits yet, so its HEAD is exactly the commit it
+    # forked from.
+    if [ -n "$fork_from" ] && [ -z "$(st "$d" PQ_STACK_FORK)" ]; then
+      st_set "$d" PQ_STACK_FORK "$(git -C "$(st "$d" PQ_WORKTREE)" rev-parse HEAD 2>/dev/null)"
+    fi
     fresh=1
   else
     msg "$(slug_of "$d"): worktree already prepared, resuming at the agent"
@@ -3555,7 +3819,9 @@ dispatch_task() {                       # task_dir  -> 0 launched, 1 failed, 2 w
   # The prompt, as one argv element. A refusal leaves PQ_LAUNCHED empty, which is
   # what the resume path in tick_body already retries - so an agent that came up
   # blocked on a dialog gets its prompt on the first tick after the dialog goes.
-  prompt=$(dispatch_prompt "$(task_home "$d")")
+  local pnum=""
+  [ -n "$parent" ] && pnum=$(pr_get "$repo" "$parent" | cut -f1)
+  prompt=$(dispatch_prompt "$(task_home "$d")" "$parent" "$pnum")
   local code rc
   code=$(agent_prompt "$pane" "$prompt"); rc=$?
   if [ "$rc" = 2 ]; then
@@ -3601,6 +3867,114 @@ dispatch_try() {                        # task_dir -> dispatch_task's status
   return 1
 }
 dispatch_gaveup() { [ "$(st "$1" PQ_DISPATCH_GAVEUP)" = 1 ]; }
+
+# ── stacks ──────────────────────────────────────────────────────────────────
+# A task that builds on another opens its pull request against the parent's
+# branch, which on its own is a plain chained pull request. GitHub's native stack
+# is what adds the rest: the stack map on both pull requests, a merge that lands
+# every layer below the one merged in one operation, and - after a layer below
+# merges - the next one retargeted to the trunk and every layer above rebased
+# onto it, server-side. So once the child's pull request exists, pq adds it to
+# its parent's stack with the official extension, `gh stack link`.
+#
+# Only ever by PR number. `gh stack link` pushes a branch-name argument first,
+# which here would publish the agent's unpushed work. And in one of two forms,
+# because the pair form `gh stack link <parent> <child>` only works while the
+# parent is the bottom: once a stack holds more than the pair, it refuses with
+# "Cannot update stack: this would remove #1 from the stack" (exit 5, seen in
+# the sandbox on 2026-10-16). A parent already in a stack is linked to through
+# the stack's own number, `gh stack link <stack> <child>`, which appends to the
+# top and skips what is already there. Both forms correct a child opened against
+# the wrong base.
+#
+# A parent that is in no stack and is not aimed at the trunk is itself a layer
+# whose link has not happened yet, and is waited for: linking to it would start
+# a stack whose trunk is a feature branch. If its link has given up, so does the
+# child's - it stays a plain chained pull request.
+#
+# Missing extension (`nocli`), stacks off for the repo (`disabled`, gh-stack's
+# exit 9) and three failures in a row (`failed`) are each said once and stop
+# there, recorded as PQ_STACK_LINK. None of them counts into "needs you": the
+# chained pull request still works, and only the stack map and GitHub's
+# automatic restack are lost. It is idempotent by construction - pq stops once
+# PQ_STACK is set, and asks the stacks API first, so a pull request linked by
+# hand, or by a tick that stopped before it could record it, is just recorded.
+#
+# A parent that merged or closed is PR 3's (restack); this does nothing about it.
+STACK_LINK_TRIES=3
+STACK_API_VERSION=2026-03-10
+
+# GitHub's number for the stack holding pull request N, or nothing when it is in
+# none; 1 when gh cannot say.
+stack_of() {                            # repo pr -> stack number
+  ( cd "$1" 2>/dev/null || exit 1
+    gh api -H "X-GitHub-Api-Version: $STACK_API_VERSION" "repos/{owner}/{repo}/stacks?pull_request=$2" \
+      --jq '.[0].number // empty' 2>/dev/null )
+}
+# `gh stack link`, run in the repo, with its whole say on stdout for the caller.
+stack_link_run() {                      # repo bottom-or-stack child
+  cd "$1" || return 1
+  gh stack link "$2" "$3" 2>&1
+}
+
+stack_link() {                          # task_dir dry
+  local d=$1 dry=$2 slug repo parent child pnum pstate pstack stack rc out n owner
+  [ -z "$(st "$d" PQ_REAPED)" ] || return 0
+  parent=$(st "$d" PQ_STACK_PARENT); child=$(st "$d" PQ_PR)
+  [ -n "$parent" ] && [ -n "$child" ] || return 0
+  [ -z "$(st "$d" PQ_STACK)" ] && [ -z "$(st "$d" PQ_STACK_LINK)" ] || return 0
+  slug=$(slug_of "$d"); repo=$(hdr "$d/plan.md" repo)
+  pnum=""; pstate=""
+  IFS=$'\t' read -r pnum pstate _ <<<"$(pr_get "$repo" "$parent")"
+  [ "${pstate:-}" = OPEN ] && [ -n "$pnum" ] || return 0
+  [ "$dry" = 1 ] && { msg "would add #$child to #$pnum's stack"; return 0; }
+  if ! gh stack --help >/dev/null 2>&1; then
+    st_set "$d" PQ_STACK_LINK nocli
+    warn "$slug: gh stack is not installed (gh extension install github/gh-stack) - #$child stays a plain chained pull request on #$pnum"
+    return 0
+  fi
+  # A stacks API that cannot answer is asked again next tick, never read as
+  # "in no stack": that reading picks the pair form, which a longer stack
+  # refuses, and three of those would give the link up for good.
+  stack=$(stack_of "$repo" "$child") || return 0
+  if [ -n "$stack" ]; then
+    st_set "$d" PQ_STACK "$stack"
+    msg "$slug: #$child joined #$pnum's stack (stack $stack)"
+    return 0
+  fi
+  pstack=$(stack_of "$repo" "$pnum") || return 0
+  if [ -z "$pstack" ] && [ "$(pr_base "$repo" "$parent")" != "$(repo_base "$repo")" ]; then
+    # Waited for only while a pq task owns the parent and has not given its own
+    # link up: nothing else will ever put a parent that pq does not run into a
+    # stack, so waiting on one would be forever, and silent.
+    owner=$(task_by_branch "$repo" "$parent") || owner=""
+    if [ -z "$owner" ] || [ -n "$(st "$owner" PQ_STACK_LINK)" ]; then
+      st_set "$d" PQ_STACK_LINK below
+      warn "$slug: #$pnum never joined a stack of its own, so #$child stays a plain chained pull request on it"
+    fi
+    return 0
+  fi
+  shielded stack_link_run "$repo" "${pstack:-$pnum}" "$child"; rc=$?; out=$SHIELDED_OUT
+  if [ "$rc" = 0 ] && stack=$(stack_of "$repo" "$child") && [ -n "$stack" ]; then
+    st_set "$d" PQ_STACK "$stack"
+    [ -z "$(st "$d" PQ_STACK_LINK_FAILS)" ] || st_set "$d" PQ_STACK_LINK_FAILS ""
+    msg "$slug: #$child joined #$pnum's stack (stack $stack)"
+    return 0
+  fi
+  if [ "$rc" = 9 ]; then
+    st_set "$d" PQ_STACK_LINK disabled
+    warn "$slug: stacked pull requests are not enabled for $(basename "$repo") - #$child stays a plain chained pull request on #$pnum"
+    return 0
+  fi
+  [ "$rc" = 0 ] && out="gh stack link said it worked, but the stacks API does not list #$child"
+  n=$(st "$d" PQ_STACK_LINK_FAILS); n=$(( ${n:-0} + 1 ))
+  st_set "$d" PQ_STACK_LINK_FAILS "$n"
+  if [ "$n" -ge "$STACK_LINK_TRIES" ]; then
+    st_set "$d" PQ_STACK_LINK failed
+    warn "$slug: could not add #$child to #$pnum's stack after $n tries ($(tail -1 <<<"$out" | tr -d '\r')) - it stays a plain chained pull request"
+  fi
+  return 0
+}
 
 # ── review gate ─────────────────────────────────────────────────────────────
 # Every pull request a task opens gets one independent review before the
@@ -3861,9 +4235,11 @@ security_cmd() {                        # pr task_home base
 # What the security reviewer is told beside the skill. The base is named because
 # the skill diffs against origin/HEAD - the repository default, whatever the pull
 # request is aimed at - so a pull request aimed anywhere else, as a stacked one
-# is, would otherwise be reviewed along with everything below it. For now every
-# task's base is its repo's default branch, and it is named all the same, so a
-# worktree whose origin/HEAD was never set up still has the right command. The
+# is, would otherwise be reviewed along with everything below it. The base is the
+# pull request's live one (live_base): a stacked task's parent branch, so only
+# its own layer is reviewed, and otherwise the default branch - named all the
+# same, so a worktree whose origin/HEAD was never set up still has the right
+# command. The
 # plan is pointed at because it says why it asked and what to look at, and the
 # `wt` clause is review_brief's: the spike's reviewers ran code to check a
 # finding, and in a Rails worktree that means a database. One line, and
@@ -3872,6 +4248,25 @@ security_brief() {                      # pr task_home base
   local basec=""
   [ -n "${3:-}" ] && basec=" The pull request is against $3, so the change under review is exactly \`git diff origin/$3...HEAD\`: where the diff shown to you differs from that, review what that command shows and nothing else."
   printf '%s' "You are running a security review of pull request #$1 from inside the worktree of the agent that wrote it, which is still working there.$basec The plan the change was built from is $2/plan.md, and it says why it asked for this review and what to focus on. Your only output is your final reply, the markdown report: pq posts it on the pull request and hands it to the author. Change nothing: no file edits, no commits, no checkouts, no pushes, and no gh. Write any scratch file as a new file inside a directory made with \`mktemp -d\`, never inside the worktree. This worktree has its own databases, ports and environment: run project commands through \`wt run <cmd>\`, and anything that runs in the test environment, such as specs, through \`wt test <cmd>\`. A bare \`bundle exec\` or \`bin/rails\` uses the shared databases of the whole machine instead."
+}
+
+# The branch a task's pull request is aimed at right now, from the PR cache - for
+# a stacked task, its parent's branch until GitHub retargets it - falling back to
+# its repo's default branch when there is no row. What both reviewers diff
+# against, so each sees the task's own layer and nothing below it.
+live_base() {                           # task_dir -> base branch name, or ""
+  local b; b=$(pr_base "$(hdr "$1/plan.md" repo)" "$(hdr "$1/plan.md" branch)")
+  [ -n "$b" ] || b=$(task_base "$1")
+  printf '%s' "$b"
+}
+
+# The line every prompt about a pull request opens with. GitHub rewrites a
+# branch in a stack on its own - after a pull request below it merges, and on
+# Rebase stack - so an agent that acts on its own last push can be acting on a
+# branch that is no longer there. On a branch nobody rewrote, it is a no-op.
+sync_first() {                          # branch -> the opening, or nothing with no branch
+  [ -n "${1:-}" ] || return 0
+  printf '%s' "First run git pull --rebase --autostash origin $1: GitHub rebases branches in a stack on its own, so origin may have moved since you last pushed. "
 }
 
 # One `gh` call, right before launching: is this a STUCK pull request, and is it
@@ -4151,10 +4546,10 @@ security_skip() {                       # task_dir why
 # through a file, because `gh pr edit` replaces all of it, and a description
 # retyped from memory drops the evidence images the draft carried. It is also the
 # last chance to put screenshots a draft stacked into the contract's tables.
-review_prompt() {                       # pr result split lines base [security_result security_posted report] [landed reply]
+review_prompt() {                       # pr result split lines base [security_result security_posted report] [landed reply] [branch]
   local pr=$1 result=$2 split=${3:-} lines=${4:-} base=${5:-} splitc="" why text
   local sec=${6:-} sposted=${7:-} report=${8:-} secc="" swhy
-  local landed=${9:-} reply=${10:-} replyc=""
+  local landed=${9:-} reply=${10:-} replyc="" branch=${11:-}
   case "$sec" in
     "") ;;
     ok)
@@ -4176,7 +4571,7 @@ the pull request what you checked. " ;;
   esac
   [ "$split" = 1 ] && splitc="The pull request is a single commit of $lines changed lines. \
 Before marking it ready, restructure the branch into small logical commits, each coherent \
-on its own with a message saying why, and push with --force-with-lease. "
+on its own with a message saying why, and push with --force-with-lease --force-if-includes. "
   local tail="Then, before marking it ready, put an executive summary at the very top of the pull request description, \
 above the intent paragraph, for the person who reviews it next: in under a minute it should tell them where to look \
 and what is worth worrying about. Save the description as it stands (gh pr view $pr --json body -q .body) to a file \
@@ -4204,7 +4599,7 @@ Never wait for input - there is nobody watching."
         1)  posted="its findings as 1 inline review comment" ;;
         *)  posted="its findings as $landed inline review comments" ;;
       esac
-      text="pq has finished an independent review of pull request #$pr and posted $posted. \
+      text="$(sync_first "$branch")pq has finished an independent review of pull request #$pr and posted $posted. \
 Read every one (gh api repos/{owner}/{repo}/pulls/$pr/comments) and \
 resolve each: fix it and push, or reply on that thread with the reasoning for leaving it. \
 Leave no comment unanswered. ${secc}${splitc}${tail}" ;;
@@ -4217,7 +4612,7 @@ Leave no comment unanswered. ${secc}${splitc}${tail}" ;;
         *)       why="the reviewer exited with an error" ;;
       esac
       [ -n "$reply" ] && replyc="Its reply is saved in $reply and may name findings it could not post inline - resolve those as well. "
-      text="pq could not get an independent review of pull request #$pr - $why. \
+      text="$(sync_first "$branch")pq could not get an independent review of pull request #$pr - $why. \
 ${replyc}Review your own diff as a stranger would (git diff origin/${base:-HEAD}...HEAD) for bugs, \
 missing tests and what the plan did not anticipate; fix and push. ${secc}${splitc}${tail}" ;;
   esac
@@ -4282,13 +4677,13 @@ review_task() {                         # task_dir dry
       case "$(st "$d" PQ_SECURITY)" in pending|running) return 0 ;; esac
       [ "$dry" = 1 ] && { msg "would prompt $slug to resolve the review of #$pr"; return 0; }
       local text result base code rc sec=""
-      result=$(st "$d" PQ_REVIEW_RESULT); base=$(task_base "$d")
+      result=$(st "$d" PQ_REVIEW_RESULT); base=$(live_base "$d")
       [ "$(st "$d" PQ_SECURITY)" = "done" ] && sec=$(st "$d" PQ_SECURITY_RESULT)
       local reply=""
       [ "${result:-failed}" != ok ] && [ -s "$d/review.md" ] && reply="$(task_home "$d")/review.md"
       text=$(review_prompt "$pr" "${result:-failed}" "$(st "$d" PQ_REVIEW_SPLIT)" "$(st "$d" PQ_REVIEW_LINES)" "$base" \
                "$sec" "$(st "$d" PQ_SECURITY_POSTED)" "$(task_home "$d")/security.md" \
-               "$(st "$d" PQ_REVIEW_POSTED)" "$reply")
+               "$(st "$d" PQ_REVIEW_POSTED)" "$reply" "$branch")
       code=$(agent_prompt "$(task_pane "$d")" "$text"); rc=$?
       case "$rc" in
         0)
@@ -4490,7 +4885,7 @@ security_step() {                       # task_dir dry pr pstate
       [ "$dry" = 1 ] && { msg "would launch a security review of $slug"; return 0; }
       tries=$(st "$d" PQ_SECURITY_TRIES); tries=${tries:-0}
       st_set "$d" PQ_SECURITY_TRIES "$((tries + 1))"
-      reviewer_launch "$d" security "$cwd" security_cmd "$pr" "$(task_home "$d")" "$(task_base "$d")"
+      reviewer_launch "$d" security "$cwd" security_cmd "$pr" "$(task_home "$d")" "$(live_base "$d")"
       msg "$slug: security-reviewing #$pr with $PQ_REVIEWER_MODEL in the background"
       ;;
     running)
@@ -4676,22 +5071,40 @@ watch_feedback() {                      # repo pr since author -> count<TAB>logi
 }
 
 # What the agent is told about each condition. Quote-free, by the convention
-# dispatch_prompt and review_prompt keep.
-watch_prompt() {                        # kind pr base detail
-  local kind=$1 pr=$2 base=$3 what=$4 tail="Never wait for input - there is nobody watching."
+# dispatch_prompt and review_prompt keep, and each opens with sync_first.
+#
+# A conflict is rebased, never merged, ready or not: any ready pull request can
+# be the bottom of a stack the moment a task building on it opens its own, and
+# a merge commit in it would stop the stack merging. The last sentence is for
+# the agents dispatched before the contract said so, whose contract still
+# forbids rewriting a ready pull request.
+#
+# A stacked task (one with a fork point) rebases only its own layer: `--onto` the
+# base's head from the fork point, because the layer below may itself have been
+# rebased, and a plain rebase would replay its old commits along with this one's.
+watch_prompt() {                        # kind pr base detail [branch [fork base_oid]]
+  local kind=$1 pr=$2 base=$3 what=$4 tail="Never wait for input - there is nobody watching." sync
+  local fork=${6:-} onto=${7:-} how
+  sync=$(sync_first "${5:-}")
+  how="rebase onto the latest $base: git fetch origin $base, then git rebase origin/$base."
+  [ -n "$fork" ] && [ -n "$onto" ] && how="rebase only your own commits, the ones after $fork, onto the latest $base: \
+git fetch origin $base, then git rebase --onto $onto $fork. The layer below may have been rebased itself, \
+and a plain rebase would bring its old commits back."
   case "$kind" in
     conflict)
-      printf '%s' "Pull request #$pr has merge conflicts with $base, so it cannot merge. \
-Merge the latest $base into your branch (git fetch origin $base, then git merge origin/$base), \
-resolve every conflict, run the tests the conflicting code is covered by, and push. \
-It is no longer a draft, so do not rebase and do not force-push. $tail" ;;
+      printf '%s' "${sync}Pull request #$pr has merge conflicts with $base, so it cannot merge. \
+After that pull, $how \
+Resolve every conflict, run the tests the conflicting code is covered by, and push with \
+git push --force-with-lease --force-if-includes. Rebase rather than merge: a merge commit would stop \
+this pull request merging as part of a stack. This replaces any rule in your contract against rebasing \
+or force-pushing a ready pull request. $tail" ;;
     ci)
-      printf '%s' "CI failed on pull request #$pr: $what. \
+      printf '%s' "${sync}CI failed on pull request #$pr: $what. \
 Read why (gh pr checks $pr, then gh run view <run> --log-failed for each failed run), fix the cause and push. \
 If a failure has nothing to do with this change and is a flaky test, rerun only the failed jobs \
 (gh run rerun <run> --failed) and say so in a comment on the pull request. $tail" ;;
     review)
-      printf '%s' "There is new review feedback on pull request #$pr since it was marked ready, from $what. \
+      printf '%s' "${sync}There is new review feedback on pull request #$pr since it was marked ready, from $what. \
 Read all of it (gh api repos/{owner}/{repo}/pulls/$pr/comments for the inline threads, gh pr view $pr --comments for the rest) \
 and resolve each point: fix it and push, or reply on its thread with your reasoning. Leave none unanswered. $tail" ;;
   esac
@@ -4707,7 +5120,16 @@ watch_task() {                          # task_dir dry
   num=""; prstate=""; draft=""
   IFS=$'\t' read -r num prstate draft <<<"$(pr_get "$repo" "$branch")"
   # Merged or closed is reap's; a draft is back in its author's hands; no row this
-  # tick is nothing to judge. None of them costs a call.
+  # tick is nothing to judge. None of them costs a call. A settled pull request
+  # ends the watch, and whatever it had asked or handed over goes with it - left
+  # behind, a merged task read `fixing conflict` in `pq ls` for good.
+  case "${prstate:-}" in
+    MERGED|CLOSED)
+      [ "$dry" = 1 ] && return 0
+      [ -z "$(st "$d" PQ_WATCH_ASKED)" ] || st_set "$d" PQ_WATCH_ASKED ""
+      [ -z "$(st "$d" PQ_WATCH_NEEDS)" ] || st_set "$d" PQ_WATCH_NEEDS ""
+      return 0 ;;
+  esac
   [ "${prstate:-}" = OPEN ] && [ -z "${draft:-}" ] || return 0
   pr=$(st "$d" PQ_PR); [ -n "$pr" ] || pr=$num
   since=$(st "$d" PQ_WATCH_SINCE)
@@ -4773,11 +5195,31 @@ watch_task() {                          # task_dir dry
   case "$pstate" in idle|done|unknown) ;; *) return 0 ;; esac   # working, blocked, or herdr silent
   agent_blocked "$d" && return 0
   [ "$dry" = 1 ] && { msg "would prompt $slug about #$pr - $word"; return 0; }
+  # A stacked task's conflict is rebased from its fork point onto the head of its
+  # base as GitHub reports it now - and that head is its fork point from then on.
+  # Only while the fork point is still below the branch: once GitHub has rebased
+  # it (Rebase stack, a restack after a merge), `--onto` from there would replay
+  # too much, and a plain rebase is the right one - either way the base's head is
+  # where the layer sits afterwards.
+  local fork="" onto="" newfork=""
+  if [ "$need" = conflict ] && [ -n "$(st "$d" PQ_STACK_PARENT)" ] && [ "$baseoid" != "-" ]; then
+    newfork=$baseoid
+    fork=$(st "$d" PQ_STACK_FORK)
+    if [ -n "$fork" ] && [ "$dry" != 1 ] \
+       && GIT_SSH_COMMAND="${GIT_SSH_COMMAND:-ssh -o ConnectTimeout=5 -o BatchMode=yes}" \
+          git -C "$repo" fetch --quiet origin "+refs/heads/$branch:refs/remotes/origin/$branch" 2>/dev/null \
+       && git -C "$repo" merge-base --is-ancestor "$fork" "refs/remotes/origin/$branch" 2>/dev/null; then
+      onto=$baseoid
+    else
+      fork=""
+    fi
+  fi
   local code rc
-  code=$(agent_prompt "$(task_pane "$d")" "$(watch_prompt "$need" "$pr" "$base" "$what")"); rc=$?
+  code=$(agent_prompt "$(task_pane "$d")" "$(watch_prompt "$need" "$pr" "$base" "$what" "$branch" "$fork" "$onto")"); rc=$?
   case "$rc" in
     0)
       st_set "$d" PQ_WATCH_ASKED "$need"; st_set "$d" PQ_WATCH_NEEDS ""; st_set "$d" PQ_WATCH_WAIT ""
+      [ -n "$newfork" ] && st_set "$d" PQ_STACK_FORK "$newfork"
       if [ "$need" = review ]; then st_set "$d" PQ_WATCH_SINCE "$newest"
       else st_set "$d" "$key" "$fp"; st_set "$d" PQ_WATCH_FIXES "$(( tries + 1 ))"; fi
       [ -z "$(st "$d" PQ_WRAPUP_SINCE)" ] || st_set "$d" PQ_WRAPUP_SINCE ""
@@ -5340,6 +5782,15 @@ tick_body() {                           # cap dry
     done
   fi
 
+  # 1.21 Stacks - add each stacked task's pull request to its parent's stack on
+  # GitHub, once it exists - see the `stacks` section. After reconcile, so a
+  # pull request opened this tick is linked this tick; before the gate, so the
+  # reviewers see it in the stack.
+  for d in "$PQ_HOME/done"/*/; do
+    [ -d "$d" ] || continue
+    stack_link "${d%/}" "$dry"
+  done
+
   # 1.22 The review gate, one step per task - see the `review gate` section.
   # After reconcile, so a task that finished this tick is examined this tick;
   # before reap, so a settled PR stops its reviewer
@@ -5413,7 +5864,9 @@ tick_body() {                           # cap dry
     [ -f "$d/after" ] && v=$(after_check "$d")
     [ -n "$v" ] && printf '%s\t%s\n' "$d" "$v" >> "$afterpass"
   done
-  local waiting; waiting=$(awk -F'\t' '$2 !~ /^met/ { n++ } END { print n + 0 }' "$afterpass")
+  # Eligible is not waiting: `stack` is a task that builds on a pull request
+  # already marked ready.
+  local waiting; waiting=$(awk -F'\t' '$2 !~ /^(met|stack )/ { n++ } END { print n + 0 }' "$afterpass")
 
   # 2. Fill. A live agent is a slot, wherever its task now sits - every running/
   #    task (a task blocked on a permission prompt still holds one, the
@@ -5442,7 +5895,10 @@ tick_body() {                           # cap dry
       fi
       verdict=$(awk -F'\t' -v d="$d" '$1 == d { print $2; exit }' "$afterpass")
       case "${verdict:-met}" in
-        met) ;;
+        met|stack\ *) ;;
+        on\ *)
+          [ "$dry" = 1 ] && msg "would skip $slug - waiting for ${verdict#on } to be marked ready"
+          continue ;;
         waiting\ *)
           if [ "$dry" = 1 ]; then
             lbl=${verdict#waiting }; n=${lbl##* }; lbl=${lbl% *}
@@ -5457,7 +5913,8 @@ tick_body() {                           # cap dry
           continue ;;
       esac
       if [ "$dry" = 1 ]; then
-        msg "would dispatch $slug ($(hdr "$d/plan.md" branch))"
+        local on=""; case "$verdict" in stack\ *) on=", building on ${verdict#stack }" ;; esac
+        msg "would dispatch $slug ($(hdr "$d/plan.md" branch))$on"
         # A separate counter from $started: --dry-run changes nothing, and a
         # summary that says "N started" when nothing moved is the one line a
         # human actually reads before trusting the rest of it.
@@ -5468,6 +5925,11 @@ tick_body() {                           # cap dry
       # left queue/ a second tick would happily pick up the very same plan.
       claimed=$(retitle "$d" running) || continue
       st_set "$claimed" PQ_CLAIMED "$(now)"
+      # What it builds on is decided here, at the claim, so a dispatch resumed on
+      # a later tick keeps it - see dispatch_task for what it does with it.
+      case "$verdict" in
+        stack\ *) st_set "$claimed" PQ_STACK_PARENT "$(stack_branch "$claimed" "${verdict#stack }")" ;;
+      esac
       dispatch_try "$claimed"
       [ $? = 1 ] && ! dispatch_gaveup "$claimed" && warn "$slug: left in running/ half-dispatched - the next tick will retry it"
       started=$((started + 1)); free=$((free - 1))
@@ -5492,7 +5954,7 @@ $([ "$unnamed" -gt 0 ] && printf ', %s new' "$unnamed")\
 $([ "$n_named" -gt 0 ] && printf ', %s named' "$n_named")\
 $([ "$started" -gt 0 ] && printf ', %s started' "$started")\
 $([ "$would" -gt 0 ] && printf ', %s would start' "$would")\
-$([ "$waiting" -gt 0 ] && printf ', %s waiting on a merge' "$waiting")\
+$([ "$waiting" -gt 0 ] && printf ', %s waiting' "$waiting")\
 $([ "$n_reviewing" -gt 0 ] && printf ', %s reviewing' "$n_reviewing")\
 $([ "$n_torn" -gt 0 ] && printf ', %s torn down' "$n_torn")\
 $([ "$would_torn" -gt 0 ] && printf ', %s would tear down' "$would_torn")$reap_note\
@@ -5597,7 +6059,7 @@ main() {
     ls)         shift; cmd_ls "$@" ;;
     rm)         shift; cmd_rm "$@" ;;
     evidence)   shift; cmd_evidence "$@" ;;
-    *) die "usage: pq {add | after <task> [<task|branch>... | --clear] | ls [--all] [--json] | tick [--dry-run] | run | cap [N] | rm <task> | evidence [task]}" ;;
+    *) die "usage: pq {add | after <task> [<task|branch> | --clear] | ls [--all] [--json] | tick [--dry-run] | run | cap [N] | rm <task> | evidence [task]}" ;;
   esac
 }
 if [ "${BASH_SOURCE[0]}" = "$0" ]; then main "$@"; fi

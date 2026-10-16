@@ -75,7 +75,8 @@ cleanup() { rm -rf "$PQ_HOME" "$PQ_PLANS_DIR" "$STUBBIN" "${REPO:-}" "${REPO2:-}
 trap cleanup EXIT
 
 # ── a throwaway git repo ────────────────────────────────────────────────────
-REPO=$(mktemp -d)
+# Physical, as pq add resolves it through git worktree list (/private/var, not /var).
+REPO=$(cd "$(mktemp -d)" && pwd -P)
 git init -q -b master "$REPO"
 git -C "$REPO" -c user.email=test@test -c user.name=test commit -q --allow-empty -m init
 mkdir -p "$REPO/.git/refs/remotes/origin"
@@ -198,35 +199,61 @@ pick_plan >/dev/null 2>&1; rc=$?
 eq "$rc" "2" "nothing in PLANS_DIR should return 2, not 1"
 eq "$(gum_calls)" "" "and gum is never asked"
 
-echo "== pick_after: ticked tasks come back as stamps, in order ==" >&2
+echo "== pick_after: nothing comes first, then the candidates, newest first ==" >&2
 reset_tasks
 A=$(mk_task queue 010 task-a "$REPO" tom/task-a)
 mk_task queue 020 task-b "$REPO" tom/task-b >/dev/null
 C=$(mk_task queue 030 task-c "$REPO" tom/task-c)
 
-# `after_vals` and friends are cmd_add's own locals, reached through bash's
-# dynamic scope - this wrapper stands in for cmd_add so pick_after can mutate
-# them the same way it would there.
+# `after_vals` and `repo` are cmd_add's own locals, reached through bash's
+# dynamic scope - this wrapper stands in for cmd_add so pick_after can read and
+# mutate them the same way it would there.
 run_pick_after() {                      # -> echoes the resulting after_vals
   local after_vals="" repo=$REPO
   pick_after
   printf '%s' "$after_vals"
 }
-gum_reset; gum_answer "@1,3"
+gum_reset; gum_answer "@1"
 out=$(run_pick_after 2>/dev/null)
-eq "$out" "$(stamp_of "$A")"$'\n'"$(stamp_of "$C")" "ticking a and c selects their stamps, in that order"
-eq "$(gum_stdin 1 | wc -l | tr -d ' ')" "3" "all three queued tasks are offered"
+eq "$out" "" "picking the first row means no dependency"
+eq "$(gum_stdin 1 | sed -n 1p)" "nothing - start from master" "the first row is nothing, naming the default branch"
+eq "$(gum_stdin 1 | sed -n '2,$p' | awk '{ print $1 }' | tr '\n' ' ')" "task-c task-b task-a " "the candidates follow, newest first"
+case "$(gum_stdin 1 | sed -n 2p)" in *task-c*queue*"stack on it") ok ;; *) bad "a same-repo row reads stack on it (got: $(gum_stdin 1 | sed -n 2p))" ;; esac
 eq "$(gum_stdin 1 | grep -c ' $')" "0" "with no trailing padding on any line"
+case "$(gum_calls)" in *"--no-limit"*) bad "one pick, not a checklist (got: $(gum_calls))" ;; *) ok ;; esac
+case "$(gum_calls)" in *"--selected"*) bad "no --selected: the cursor starts on nothing (got: $(gum_calls))" ;; *) ok ;; esac
+case "$(gum_calls)" in *"--header build on which? Enter picks"*) ok ;; *) bad "the question is build on which (got: $(gum_calls))" ;; esac
 
-echo "== pick_after: nothing ticked selects none, Esc stops ==" >&2
+echo "== pick_after: the nothing row never asks the forge ==" >&2
+# No origin/HEAD: the row names the default branch from origin's refs, or not at
+# all - never through repo_base's gh fallback, which would stall pq add.
+git -C "$REPO" symbolic-ref --delete refs/remotes/origin/HEAD
+printf '#!/bin/sh\necho "$*" >> "%s"\nexit 1\n' "$PQ_HOME/.gh-asked" > "$STUBBIN/gh"
+gum_reset; gum_answer "@1"
+run_pick_after >/dev/null 2>&1
+eq "$(gum_stdin 1 | sed -n 1p)" "nothing - start from master" "origin's master names it"
+[ -e "$PQ_HOME/.gh-asked" ] && bad "gh was asked: $(cat "$PQ_HOME/.gh-asked")" || ok
+git -C "$REPO" update-ref -d refs/remotes/origin/master
+gum_reset; gum_answer "@1"
+run_pick_after >/dev/null 2>&1
+eq "$(gum_stdin 1 | sed -n 1p)" "nothing - start from the default branch" "and with nothing known, it says so"
+git -C "$REPO" update-ref refs/remotes/origin/master refs/heads/master
+git -C "$REPO" symbolic-ref refs/remotes/origin/HEAD refs/remotes/origin/master
+printf '#!/bin/sh\nexit 1\n' > "$STUBBIN/gh"
+
+echo "== pick_after: one pick comes back as its stamp; Enter on nothing, or Esc ==" >&2
+gum_reset; gum_answer "@4"
+eq "$(run_pick_after 2>/dev/null)" "$(stamp_of "$A")" "picking task-a selects its stamp"
+gum_reset; gum_answer "@2"
+eq "$(run_pick_after 2>/dev/null)" "$(stamp_of "$C")" "the row under nothing is the newest"
 gum_reset; gum_answer ""
-eq "$(run_pick_after 2>/dev/null)" "" "Enter with nothing ticked means no blockers"
+eq "$(run_pick_after 2>/dev/null)" "" "an empty answer is nothing too"
 gum_reset; gum_answer "" 130
-( run_pick_after ) >/dev/null 2>&1 && bad "Esc at the blocker question should stop the add" || ok
+( run_pick_after ) >/dev/null 2>&1 && bad "Esc at the question should stop the add" || ok
 
 echo "== pick_after: a done task is offered until its pull request merges or closes ==" >&2
 # Done is where a task waits on its reviewers, and on you - work that has not
-# landed, and a real thing to wait on. Only the verdict pq has recorded is read.
+# landed, and a real thing to build on. Only the verdict pq has recorded is read.
 D=$(mk_task "done" 040 task-review "$REPO" tom/task-review)
 gum_reset; gum_answer ""
 run_pick_after >/dev/null 2>&1
@@ -236,42 +263,63 @@ M=$(mk_task "done" 041 task-closed "$REPO" tom/task-closed)
 st_set "$M" PQ_CLOSED 2026-01-02T00:00:00Z
 gum_reset; gum_answer ""
 run_pick_after >/dev/null 2>&1
-case "$(gum_stdin 1)" in *task-review*) bad "a merged task has nothing left to wait on" ;; *) ok ;; esac
+case "$(gum_stdin 1)" in *task-review*) bad "a merged task has nothing left to build on" ;; *) ok ;; esac
 case "$(gum_stdin 1)" in *task-closed*) bad "nor has a closed one" ;; *) ok ;; esac
 rm -rf "$D" "$M"
 
 echo "== pick_after: a task with no name yet is offered, under its plan's title ==" >&2
 N=$(mk_task new 045 step-1-pr-01a-schema "$REPO" "")
-gum_reset; gum_answer "@4"
+gum_reset; gum_answer "@2"
 out=$(run_pick_after 2>/dev/null)
 case "$(gum_stdin 1)" in *step-1-pr-01a-schema*new*) ok ;; *) bad "a new task should be listed with its state (got: $(gum_stdin 1))" ;; esac
 eq "$out" "$(stamp_of "$N")" "and comes back as its stamp, the one name naming does not change"
 rm -rf "$N"
 
-echo "== pick_after: a running task IS offered - work in flight is a real blocker ==" >&2
+echo "== pick_after: a running task IS offered - work in flight can be built on ==" >&2
 mk_task running 050 task-run "$REPO" tom/task-run >/dev/null
 gum_reset; gum_answer ""
 run_pick_after >/dev/null 2>&1
 case "$(gum_stdin 1)" in *task-run*running*) ok ;; *) bad "a running task should be listed with its state" ;; esac
 
+echo "== pick_after: a task something already builds on is not offered ==" >&2
+reset_tasks
+P=$(mk_task queue 010 built-parent "$REPO" tom/built-parent)
+K=$(mk_task queue 020 built-child "$REPO" tom/built-child)
+printf 'built-parent\t%s\ttom/built-parent\n' "$REPO" > "$K/after"
+U=$(mk_task new 030 unnamed-parent "$REPO" "")
+V=$(mk_task new 040 unnamed-child "$REPO" "")
+printf '%s\n' "$(stamp_of "$U")" > "$V/after.new"
+gum_reset; gum_answer ""
+run_pick_after >/dev/null 2>&1
+case "$(gum_stdin 1)" in *built-parent*) bad "built-parent is built on by built-child, through after" ;; *) ok ;; esac
+case "$(gum_stdin 1)" in *unnamed-parent*) bad "unnamed-parent is built on by unnamed-child, through after.new" ;; *) ok ;; esac
+case "$(gum_stdin 1)" in *built-child*) ok ;; *) bad "the top of a line is still offered (got: $(gum_stdin 1))" ;; esac
+case "$(gum_stdin 1)" in *unnamed-child*) ok ;; *) bad "so is one in new/" ;; esac
+rm -f "$K/after" "$V/after.new"; : "$P"
+
 echo "== pick_after: no candidates at all - gum is not asked ==" >&2
 reset_tasks
 gum_reset
 out=$(run_pick_after 2>/dev/null)
-eq "$out" "" "no candidates, no blockers"
+eq "$out" "" "no candidates, no dependency"
 eq "$(gum_calls)" "" "and no prompt"
 
-echo "== pick_after: a project appears only once candidates span two repos ==" >&2
+echo "== pick_after: a task in another repo is waited for, and names its repo ==" >&2
 mk_task queue 010 task-a "$REPO" tom/task-a >/dev/null
-gum_reset; gum_answer ""
-run_pick_after >/dev/null 2>&1
-case "$(gum_stdin 1)" in *"$(basename "$REPO")"*) bad "one repo needs no project column" ;; *) ok ;; esac
-REPO2=$(mktemp -d)
+REPO2=$(cd "$(mktemp -d)" && pwd -P)
 git init -q -b master "$REPO2"
-mk_task queue 030 task-e "$REPO2" tom/task-e >/dev/null
+W=$(mk_task queue 030 task-e "$REPO2" tom/task-e)
 gum_reset; gum_answer ""
 run_pick_after >/dev/null 2>&1
-case "$(gum_stdin 1)" in *"$(basename "$REPO2")"*) ok ;; *) bad "candidates spanning two repos should name their project" ;; esac
+case "$(gum_stdin 1)" in *task-a*"queue"*"stack on it"*) ok ;; *) bad "the same-repo row is a stack (got: $(gum_stdin 1))" ;; esac
+case "$(gum_stdin 1)" in *task-e*"$(basename "$REPO2"): wait for its merge"*) ok ;; *) bad "the other-repo row names its repo and waits (got: $(gum_stdin 1))" ;; esac
+case "$(gum_stdin 1 | grep task-a)" in *"$(basename "$REPO")"*) bad "a same-repo row needs no repo name" ;; *) ok ;; esac
+# A task in another repo waiting for task-a is a wait, not a stack on it.
+printf 'task-a\t%s\ttom/task-a\n' "$REPO" > "$W/after"
+gum_reset; gum_answer ""
+run_pick_after >/dev/null 2>&1
+case "$(gum_stdin 1)" in *task-a*) ok ;; *) bad "a cross-repo wait does not hide task-a" ;; esac
+rm -f "$W/after"
 
 echo "== add_wizard: model and effort are asked, starting on their defaults ==" >&2
 reset_tasks
@@ -301,9 +349,9 @@ case "$(cat "$PQ_HOME/.esc.err")" in *cancelled*) ok ;; *) bad "and say so" ;; e
 gum_reset; gum_answer "opus"; gum_answer "" 130
 ( run_wizard ) >/dev/null 2>&1 && bad "Esc at the effort question should stop" || ok
 
-echo "== add_wizard: the blocker question runs last ==" >&2
+echo "== add_wizard: the build-on question runs last ==" >&2
 A=$(mk_task queue 010 task-a "$REPO" tom/task-a)
-gum_reset; gum_answer "sonnet"; gum_answer "medium"; gum_answer "@1"
+gum_reset; gum_answer "sonnet"; gum_answer "medium"; gum_answer "@2"
 out=$(run_wizard 2>/dev/null)
 eq "$out" "model=sonnet effort=medium after_vals=[$(stamp_of "$A")"$'\n'"] design=[]" "picking task-a selects it"
 
@@ -370,13 +418,39 @@ gum_reset; gum_answer "@1"; gum_answer ""; gum_answer ""; gum_answer "opus"; gum
 eq "$(find "$PQ_HOME/queue" "$PQ_HOME/new" -mindepth 1 -maxdepth 1 | wc -l | tr -d ' ')" "0" "nothing is added"
 eq "$(find "$PQ_HOME" -maxdepth 1 -name '.add.*' | wc -l | tr -d ' ')" "0" "and no staging is left behind"
 
-echo "== wiring: a blocker ticked in the wizard lands in the task's after file ==" >&2
+echo "== wiring: the task picked in the wizard lands in the task's after file ==" >&2
+reset_tasks
+mk_task queue 005 blocker-cand "$REPO" tom/blocker-cand >/dev/null
+gum_reset; gum_answer "@1"; gum_answer ""; gum_answer ""; gum_answer "sonnet"; gum_answer "medium"; gum_answer "@2"
+( cd "$REPO" && main add ) >/dev/null 2>"$PQ_HOME/.pick.err"
+t=$(find_task marker-wiring-fixture)
+eq "$(cat "$t/after" 2>/dev/null)" "blocker-cand"$'\t'"$REPO"$'\t'"tom/blocker-cand" "one line, the task it builds on"
+case "$(cat "$PQ_HOME/.pick.err")" in *"on:     blocker-cand - starts when its pull request is ready for review"*) ok ;; *) bad "the add says what it builds on (got: $(cat "$PQ_HOME/.pick.err"))" ;; esac
+
+echo "== wiring: nothing picked means no after file at all ==" >&2
 reset_tasks
 mk_task queue 005 blocker-cand "$REPO" tom/blocker-cand >/dev/null
 gum_reset; gum_answer "@1"; gum_answer ""; gum_answer ""; gum_answer "sonnet"; gum_answer "medium"; gum_answer "@1"
+( cd "$REPO" && main add ) >/dev/null 2>"$PQ_HOME/.pick.err"
+t=$(find_task marker-wiring-fixture)
+[ -e "$t/after" ] || [ -e "$t/after.new" ] && bad "nothing picked writes no dependency" || ok
+case "$(cat "$PQ_HOME/.pick.err")" in *"on:  "*|*"after:  "*) bad "and says none" ;; *) ok ;; esac
+
+echo "== wiring: a task in another repo is waited for, and one with no name is held by stamp ==" >&2
+reset_tasks
+mk_task queue 005 web-cand "$REPO2" tom/web-cand >/dev/null
+gum_reset; gum_answer "@1"; gum_answer ""; gum_answer ""; gum_answer "sonnet"; gum_answer "medium"; gum_answer "@2"
+( cd "$REPO" && main add ) >/dev/null 2>"$PQ_HOME/.pick.err"
+t=$(find_task marker-wiring-fixture)
+eq "$(cut -f1,3 "$t/after" 2>/dev/null)" "web-cand"$'\t'"tom/web-cand" "the other repo's task lands in after"
+case "$(cat "$PQ_HOME/.pick.err")" in *"after:  web-cand ($(basename "$REPO2")) - starts once it merges"*) ok ;; *) bad "and the add says it waits for the merge (got: $(cat "$PQ_HOME/.pick.err"))" ;; esac
+reset_tasks
+U=$(mk_task new 005 unnamed-cand "$REPO" "")
+gum_reset; gum_answer "@1"; gum_answer ""; gum_answer ""; gum_answer "sonnet"; gum_answer "medium"; gum_answer "@2"
 ( cd "$REPO" && main add ) >/dev/null 2>&1
 t=$(find_task marker-wiring-fixture)
-case "$(cat "$t/after" 2>/dev/null)" in *tom/blocker-cand*) ok ;; *) bad "the blocker should gate the new task (after: $(cat "$t/after" 2>/dev/null))" ;; esac
+eq "$(cat "$t/after.new" 2>/dev/null)" "$(stamp_of "$U")" "a pick with no name yet is held by its stamp"
+[ -e "$t/after" ] && bad "and has no after line until it is named" || ok
 
 echo "== wiring: adding from a pushed feature branch writes no base: header ==" >&2
 # Every task forks from and aims at its repo's default branch, whatever branch
