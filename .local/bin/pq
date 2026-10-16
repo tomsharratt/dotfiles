@@ -3578,11 +3578,19 @@ EOF
 # `prompt` refuses a target sitting on a dialog (`agent_blocked`) before sending
 # anything - and a prompt passed as argv is never re-parsed by a shell.
 #
-# herdr answers on stdout with JSON and exits 0 EITHER WAY: an error is an
-# `{"error":{"code":...}}` body, not a non-zero status. So every call here reads
-# the body, and treats no body at all as a failure too.
+# herdr answers with JSON, and an error is an `{"error":{"code":...}}` body. Where
+# that body goes has changed under pq: herdr used to print it on stdout and exit
+# 0 either way, and 0.9.3 prints it on STDERR and exits 1 - so reading stdout
+# alone saw no code at all, and `agent_not_ready` and `agent_blocked` (a trust
+# dialog on a fresh worktree, say) read as plain failures, counted towards
+# giving the dispatch up. So every call here reads both streams as one body
+# (herdr_api), and treats no body at all as a failure too.
 herdr_err() {                           # json -> the error code, or nothing on success
-  jq -r '.error.code // empty' 2>/dev/null <<<"${1:-}"
+  jq -r '.error.code // empty' 2>/dev/null <<<"${1:-}" | head -1
+}
+# A herdr agent call with its reply, wherever herdr printed it, on stdout.
+herdr_api() {                           # herdr args...
+  herdr "$@" 2>&1
 }
 
 # A live agent's name must match [a-z][a-z0-9_-]{0,31} and be unique among live
@@ -3605,7 +3613,7 @@ agent_start() {                         # task_dir pane model effort -> 0 an age
     if [ "$try" = 1 ]; then name=$(agent_name "$slug"); else name=$(agent_name "$slug" "$(date -u +%H%M%S)"); fi
     # Shielded like `wt new`: a Ctrl-C mid-start would otherwise leave a Claude
     # half-launched with nobody to record it.
-    shielded herdr agent start "$name" --kind claude --pane "$pane" --timeout "$PQ_AGENT_START_MS" \
+    shielded herdr_api agent start "$name" --kind claude --pane "$pane" --timeout "$PQ_AGENT_START_MS" \
       -- --model "$model" --effort "$effort" --settings "$(task_home "$d")/settings.json"
     rc=$?
     code=$(herdr_err "$SHIELDED_OUT")
@@ -3629,7 +3637,7 @@ agent_start() {                         # task_dir pane model effort -> 0 an age
 # answered), 1 anything else.
 agent_prompt() {                        # pane text
   local out rc code
-  out=$(herdr agent prompt "$1" "$2" 2>/dev/null); rc=$?
+  out=$(herdr_api agent prompt "$1" "$2"); rc=$?
   code=$(herdr_err "$out")
   if [ -z "$code" ] && { [ "$rc" != 0 ] || [ -z "$out" ]; }; then code="herdr exited $rc with no answer"; fi
   [ -z "$code" ] && return 0

@@ -5,8 +5,8 @@
 #
 # Merges test/pq-merged.sh's JSON-returning `wt` stub with test/pq-pane.sh's
 # recording `herdr` stub, plus `agent start` / `agent prompt` arms that answer
-# the way herdr really does: JSON on stdout and exit 0 either way, an error
-# being an {"error":{"code":...}} body.
+# the way herdr 0.9.3 really does: JSON on stdout and exit 0 on success, and an
+# {"error":{"code":...}} body on STDERR with exit 1 on failure.
 #
 # SC2034: the knobs and caches set here are read by the pq sourced below.
 # SC2015: `ok` never fails, so `[ ... ] && ok || bad` is an if/else.
@@ -38,15 +38,15 @@ case "\$1 \$2" in
   "agent start")
     if [ -f "$STUBBIN/.start-fail-once" ]; then
       code=\$(cat "$STUBBIN/.start-fail-once"); rm -f "$STUBBIN/.start-fail-once"
-      printf '{"error":{"code":"%s","message":"stub"},"id":"cli:agent:start"}\n' "\$code"; exit 0
+      printf '{"error":{"code":"%s","message":"stub"},"id":"cli:agent:start"}\n' "\$code" >&2; exit 1
     fi
     if [ -f "$STUBBIN/.start-fail" ]; then
-      printf '{"error":{"code":"%s","message":"stub"},"id":"cli:agent:start"}\n' "\$(cat "$STUBBIN/.start-fail")"; exit 0
+      printf '{"error":{"code":"%s","message":"stub"},"id":"cli:agent:start"}\n' "\$(cat "$STUBBIN/.start-fail")" >&2; exit 1
     fi
     printf '{"id":"cli:agent:start","result":{"agent":{"pane_id":"%s","name":"%s"}}}\n' "\$5" "\$3"; exit 0 ;;
   "agent prompt")
     if [ -f "$STUBBIN/.prompt-fail" ]; then
-      printf '{"error":{"code":"%s","message":"stub"},"id":"cli:agent:prompt"}\n' "\$(cat "$STUBBIN/.prompt-fail")"; exit 0
+      printf '{"error":{"code":"%s","message":"stub"},"id":"cli:agent:prompt"}\n' "\$(cat "$STUBBIN/.prompt-fail")" >&2; exit 1
     fi
     printf '{"id":"cli:agent:prompt","result":{"submitted":true}}\n'; exit 0 ;;
 esac
@@ -333,6 +333,13 @@ DQ=$(mk_task running 007 quiet tom/quiet)
 ( PATH="$STUBBIN/quiet:$PATH" dispatch_task "$DQ" ) >/dev/null 2>&1; rc=$?
 eq "$rc" "1" "a silent herdr fails the dispatch"
 eq "$(st "$DQ" PQ_STARTED)" "" "and records no start"
+
+echo "== an error on stdout with exit 0, as herdr before 0.9.3 answered, still reads ==" >&2
+mkdir -p "$STUBBIN/old"
+printf '#!/bin/sh\nprintf %s\nexit 0\n' "'{\"error\":{\"code\":\"agent_blocked\"}}'" > "$STUBBIN/old/herdr"; chmod +x "$STUBBIN/old/herdr"
+code=$(PATH="$STUBBIN/old:$PATH" agent_prompt w1:p1 hello); rc=$?
+eq "$rc" "2" "agent_blocked on stdout is still a dialog"
+eq "$code" "agent_blocked" "with its code"
 
 echo "== the helpers ==" >&2
 eq "$(herdr_err '{"error":{"code":"agent_blocked"}}')" "agent_blocked" "herdr_err reads the code"
