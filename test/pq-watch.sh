@@ -140,6 +140,8 @@ has "$P" "gh run view <run> --log-failed" "how to read why"
 has "$P" "gh run rerun <run> --failed" "and how to rerun a flake, rather than fix what is not broken"
 hasnt "$P" "lint" "a passing check is not mentioned"
 hasnt "$P" "'" "quote-free"
+case "$P" in "First run git pull --rebase --autostash origin tom/cifail: GitHub rebases branches in a stack on its own"*) ok ;;
+  *) bad "it opens by syncing the branch GitHub may have rewritten (got '$P')" ;; esac
 eq "$(st "$D" PQ_WATCH_ASKED)" "ci" "the ask is recorded"
 eq "$(st "$D" PQ_WATCH_FIXES)" "1" "and counted"
 eq "$(st "$D" PQ_WRAPUP_SINCE)" "" "the wrap-up clock is cleared, as the review follow-up clears it"
@@ -200,7 +202,7 @@ watch_task "$R" 0 >/dev/null 2>&1
 eq "$(prompts)" "0" "a green pull request wants nothing"
 eq "$(agent_cell "$R" "done")" "wrapping up" "and reads as it always did"
 
-echo "== a conflict outranks CI, and asks for a merge, not a rebase ==" >&2
+echo "== a conflict outranks CI, and asks for a rebase, never a merge ==" >&2
 reset_caches; reset_logs
 C=$(mk_ready 12 conflicted w3:p1)
 set_panes "$(printf 'w3:p1\tclaude\tidle')"
@@ -208,8 +210,13 @@ view sha1 base1 CONFLICTING DIRTY "build:FAILURE"
 watch_task "$C" 0 >/dev/null 2>&1
 P=$(prompt_text)
 has "$P" "Pull request #42 has merge conflicts with master" "the conflict is what it is told about"
-has "$P" "git merge origin/master" "merging the base in"
-has "$P" "do not rebase and do not force-push" "not rewriting a ready pull request"
+case "$P" in "First run git pull --rebase --autostash origin tom/conflicted: "*) ok ;; *) bad "after syncing first (got '$P')" ;; esac
+has "$P" "git fetch origin master, then git rebase origin/master" "rebasing onto the base"
+has "$P" "push with git push --force-with-lease --force-if-includes" "pushed so a rewrite it never saw is refused"
+has "$P" "a merge commit would stop this pull request merging as part of a stack" "saying why not a merge"
+has "$P" "This replaces any rule in your contract against rebasing or force-pushing a ready pull request." "overriding an older contract"
+hasnt "$P" "git merge" "never a merge"
+hasnt "$P" "'" "quote-free"
 hasnt "$P" "CI failed" "one thing at a time"
 eq "$(agent_cell "$C" "done")" "fixing conflict" "pq ls"
 reset_logs
@@ -252,6 +259,7 @@ P=$(prompt_text)
 has "$P" "new review feedback on pull request #42 since it was marked ready, from alice, bob" \
   "named by who left it - not the author's own replies, a bot, or the author's conversation comments"
 has "$P" "Leave none unanswered" "and every point answered"
+case "$P" in "First run git pull --rebase --autostash origin tom/feedback: "*) ok ;; *) bad "after syncing first (got '$P')" ;; esac
 eq "$(st "$F" PQ_WATCH_SINCE)" "$later" "the watermark moves past what was handed over"
 eq "$(agent_cell "$F" "done")" "answering review" "pq ls"
 reset_logs

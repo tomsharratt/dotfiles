@@ -493,7 +493,9 @@ wait_rc "$B"; review_task "$B" 0 >/dev/null 2>&1; review_task "$B" 0 >/dev/null 
 P=$(prompt_text)
 has "$P" "single commit of 1200 changed lines" "the prompt says so"
 has "$P" "small logical commits" "and asks for a restructure"
-has "$P" "push with --force-with-lease" "with the push that allows it"
+has "$P" "push with --force-with-lease --force-if-includes" "with the push that allows it, and refuses a rewrite it never saw"
+case "$P" in "First run git pull --rebase --autostash origin tom/big: GitHub rebases branches in a stack on its own"*) ok ;;
+  *) bad "the follow-up opens by syncing the branch (got '$P')" ;; esac
 for shape in "5 900 300" "1 15 5"; do
   reset_tasks; reset_caches; reset_logs
   # shellcheck disable=SC2086
@@ -538,10 +540,24 @@ P=$(prompt_text)
 has "$P" "could not get an independent review of pull request #42" "it says the review did not happen"
 has "$P" "the reviewer exited with an error" "and why"
 has "$P" "git diff origin/master...HEAD" "and asks for a self-review against the base"
+case "$P" in "First run git pull --rebase --autostash origin tom/flaky: "*) ok ;; *) bad "the fallback opens by syncing too (got '$P')" ;; esac
 has "$P" "gh pr ready 42" "and still asks for the PR to be marked ready"
 has "$P" "## Executive summary" "with the executive summary on top first"
 has "$P" "saying plainly if a review pq tried to run did not happen" "whose confidence says the review did not happen"
 hasnt "$P" "inline review comments" "without pretending there are comments to read"
+
+echo "== a stacked task's self-review diffs against the branch its pull request is aimed at ==" >&2
+reset_tasks; reset_caches; reset_logs
+L=$(mk_task "done" 043 layered tom/layered w5:p1)
+st_set "$L" PQ_PR 42; st_set "$L" PQ_REVIEW posted; st_set "$L" PQ_REVIEW_RESULT failed
+st_set "$L" PQ_STACK_PARENT tom/lower
+cache_row "$REPO" tom/layered 42 OPEN draft tom/lower
+set_panes "$(printf 'w5:p1\tclaude\tidle')"
+review_task "$L" 0 >/dev/null 2>&1
+has "$(prompt_text)" "git diff origin/tom/lower...HEAD" "its own layer, not everything below it"
+eq "$(live_base "$L")" "tom/lower" "live_base reads the pull request's base"
+reset_caches
+eq "$(live_base "$L")" "master" "and falls back to the default branch with no row"
 
 echo "== a malformed reply is a failed try too ==" >&2
 reset_tasks; reset_caches; reset_logs; mode malformed

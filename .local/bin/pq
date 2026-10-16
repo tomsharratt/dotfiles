@@ -4079,9 +4079,11 @@ security_cmd() {                        # pr task_home base
 # What the security reviewer is told beside the skill. The base is named because
 # the skill diffs against origin/HEAD - the repository default, whatever the pull
 # request is aimed at - so a pull request aimed anywhere else, as a stacked one
-# is, would otherwise be reviewed along with everything below it. For now every
-# task's base is its repo's default branch, and it is named all the same, so a
-# worktree whose origin/HEAD was never set up still has the right command. The
+# is, would otherwise be reviewed along with everything below it. The base is the
+# pull request's live one (live_base): a stacked task's parent branch, so only
+# its own layer is reviewed, and otherwise the default branch - named all the
+# same, so a worktree whose origin/HEAD was never set up still has the right
+# command. The
 # plan is pointed at because it says why it asked and what to look at, and the
 # `wt` clause is review_brief's: the spike's reviewers ran code to check a
 # finding, and in a Rails worktree that means a database. One line, and
@@ -4090,6 +4092,25 @@ security_brief() {                      # pr task_home base
   local basec=""
   [ -n "${3:-}" ] && basec=" The pull request is against $3, so the change under review is exactly \`git diff origin/$3...HEAD\`: where the diff shown to you differs from that, review what that command shows and nothing else."
   printf '%s' "You are running a security review of pull request #$1 from inside the worktree of the agent that wrote it, which is still working there.$basec The plan the change was built from is $2/plan.md, and it says why it asked for this review and what to focus on. Your only output is your final reply, the markdown report: pq posts it on the pull request and hands it to the author. Change nothing: no file edits, no commits, no checkouts, no pushes, and no gh. Write any scratch file as a new file inside a directory made with \`mktemp -d\`, never inside the worktree. This worktree has its own databases, ports and environment: run project commands through \`wt run <cmd>\`, and anything that runs in the test environment, such as specs, through \`wt test <cmd>\`. A bare \`bundle exec\` or \`bin/rails\` uses the shared databases of the whole machine instead."
+}
+
+# The branch a task's pull request is aimed at right now, from the PR cache - for
+# a stacked task, its parent's branch until GitHub retargets it - falling back to
+# its repo's default branch when there is no row. What both reviewers diff
+# against, so each sees the task's own layer and nothing below it.
+live_base() {                           # task_dir -> base branch name, or ""
+  local b; b=$(pr_base "$(hdr "$1/plan.md" repo)" "$(hdr "$1/plan.md" branch)")
+  [ -n "$b" ] || b=$(task_base "$1")
+  printf '%s' "$b"
+}
+
+# The line every prompt about a pull request opens with. GitHub rewrites a
+# branch in a stack on its own - after a pull request below it merges, and on
+# Rebase stack - so an agent that acts on its own last push can be acting on a
+# branch that is no longer there. On a branch nobody rewrote, it is a no-op.
+sync_first() {                          # branch -> the opening, or nothing with no branch
+  [ -n "${1:-}" ] || return 0
+  printf '%s' "First run git pull --rebase --autostash origin $1: GitHub rebases branches in a stack on its own, so origin may have moved since you last pushed. "
 }
 
 # One `gh` call, right before launching: is this a STUCK pull request, and is it
@@ -4369,10 +4390,10 @@ security_skip() {                       # task_dir why
 # through a file, because `gh pr edit` replaces all of it, and a description
 # retyped from memory drops the evidence images the draft carried. It is also the
 # last chance to put screenshots a draft stacked into the contract's tables.
-review_prompt() {                       # pr result split lines base [security_result security_posted report] [landed reply]
+review_prompt() {                       # pr result split lines base [security_result security_posted report] [landed reply] [branch]
   local pr=$1 result=$2 split=${3:-} lines=${4:-} base=${5:-} splitc="" why text
   local sec=${6:-} sposted=${7:-} report=${8:-} secc="" swhy
-  local landed=${9:-} reply=${10:-} replyc=""
+  local landed=${9:-} reply=${10:-} replyc="" branch=${11:-}
   case "$sec" in
     "") ;;
     ok)
@@ -4394,7 +4415,7 @@ the pull request what you checked. " ;;
   esac
   [ "$split" = 1 ] && splitc="The pull request is a single commit of $lines changed lines. \
 Before marking it ready, restructure the branch into small logical commits, each coherent \
-on its own with a message saying why, and push with --force-with-lease. "
+on its own with a message saying why, and push with --force-with-lease --force-if-includes. "
   local tail="Then, before marking it ready, put an executive summary at the very top of the pull request description, \
 above the intent paragraph, for the person who reviews it next: in under a minute it should tell them where to look \
 and what is worth worrying about. Save the description as it stands (gh pr view $pr --json body -q .body) to a file \
@@ -4422,7 +4443,7 @@ Never wait for input - there is nobody watching."
         1)  posted="its findings as 1 inline review comment" ;;
         *)  posted="its findings as $landed inline review comments" ;;
       esac
-      text="pq has finished an independent review of pull request #$pr and posted $posted. \
+      text="$(sync_first "$branch")pq has finished an independent review of pull request #$pr and posted $posted. \
 Read every one (gh api repos/{owner}/{repo}/pulls/$pr/comments) and \
 resolve each: fix it and push, or reply on that thread with the reasoning for leaving it. \
 Leave no comment unanswered. ${secc}${splitc}${tail}" ;;
@@ -4435,7 +4456,7 @@ Leave no comment unanswered. ${secc}${splitc}${tail}" ;;
         *)       why="the reviewer exited with an error" ;;
       esac
       [ -n "$reply" ] && replyc="Its reply is saved in $reply and may name findings it could not post inline - resolve those as well. "
-      text="pq could not get an independent review of pull request #$pr - $why. \
+      text="$(sync_first "$branch")pq could not get an independent review of pull request #$pr - $why. \
 ${replyc}Review your own diff as a stranger would (git diff origin/${base:-HEAD}...HEAD) for bugs, \
 missing tests and what the plan did not anticipate; fix and push. ${secc}${splitc}${tail}" ;;
   esac
@@ -4500,13 +4521,13 @@ review_task() {                         # task_dir dry
       case "$(st "$d" PQ_SECURITY)" in pending|running) return 0 ;; esac
       [ "$dry" = 1 ] && { msg "would prompt $slug to resolve the review of #$pr"; return 0; }
       local text result base code rc sec=""
-      result=$(st "$d" PQ_REVIEW_RESULT); base=$(task_base "$d")
+      result=$(st "$d" PQ_REVIEW_RESULT); base=$(live_base "$d")
       [ "$(st "$d" PQ_SECURITY)" = "done" ] && sec=$(st "$d" PQ_SECURITY_RESULT)
       local reply=""
       [ "${result:-failed}" != ok ] && [ -s "$d/review.md" ] && reply="$(task_home "$d")/review.md"
       text=$(review_prompt "$pr" "${result:-failed}" "$(st "$d" PQ_REVIEW_SPLIT)" "$(st "$d" PQ_REVIEW_LINES)" "$base" \
                "$sec" "$(st "$d" PQ_SECURITY_POSTED)" "$(task_home "$d")/security.md" \
-               "$(st "$d" PQ_REVIEW_POSTED)" "$reply")
+               "$(st "$d" PQ_REVIEW_POSTED)" "$reply" "$branch")
       code=$(agent_prompt "$(task_pane "$d")" "$text"); rc=$?
       case "$rc" in
         0)
@@ -4708,7 +4729,7 @@ security_step() {                       # task_dir dry pr pstate
       [ "$dry" = 1 ] && { msg "would launch a security review of $slug"; return 0; }
       tries=$(st "$d" PQ_SECURITY_TRIES); tries=${tries:-0}
       st_set "$d" PQ_SECURITY_TRIES "$((tries + 1))"
-      reviewer_launch "$d" security "$cwd" security_cmd "$pr" "$(task_home "$d")" "$(task_base "$d")"
+      reviewer_launch "$d" security "$cwd" security_cmd "$pr" "$(task_home "$d")" "$(live_base "$d")"
       msg "$slug: security-reviewing #$pr with $PQ_REVIEWER_MODEL in the background"
       ;;
     running)
@@ -4894,22 +4915,31 @@ watch_feedback() {                      # repo pr since author -> count<TAB>logi
 }
 
 # What the agent is told about each condition. Quote-free, by the convention
-# dispatch_prompt and review_prompt keep.
-watch_prompt() {                        # kind pr base detail
-  local kind=$1 pr=$2 base=$3 what=$4 tail="Never wait for input - there is nobody watching."
+# dispatch_prompt and review_prompt keep, and each opens with sync_first.
+#
+# A conflict is rebased, never merged, ready or not: any ready pull request can
+# be the bottom of a stack the moment a task building on it opens its own, and
+# a merge commit in it would stop the stack merging. The last sentence is for
+# the agents dispatched before the contract said so, whose contract still
+# forbids rewriting a ready pull request.
+watch_prompt() {                        # kind pr base detail [branch]
+  local kind=$1 pr=$2 base=$3 what=$4 tail="Never wait for input - there is nobody watching." sync
+  sync=$(sync_first "${5:-}")
   case "$kind" in
     conflict)
-      printf '%s' "Pull request #$pr has merge conflicts with $base, so it cannot merge. \
-Merge the latest $base into your branch (git fetch origin $base, then git merge origin/$base), \
-resolve every conflict, run the tests the conflicting code is covered by, and push. \
-It is no longer a draft, so do not rebase and do not force-push. $tail" ;;
+      printf '%s' "${sync}Pull request #$pr has merge conflicts with $base, so it cannot merge. \
+After that pull, rebase onto the latest $base: git fetch origin $base, then git rebase origin/$base. \
+Resolve every conflict, run the tests the conflicting code is covered by, and push with \
+git push --force-with-lease --force-if-includes. Rebase rather than merge: a merge commit would stop \
+this pull request merging as part of a stack. This replaces any rule in your contract against rebasing \
+or force-pushing a ready pull request. $tail" ;;
     ci)
-      printf '%s' "CI failed on pull request #$pr: $what. \
+      printf '%s' "${sync}CI failed on pull request #$pr: $what. \
 Read why (gh pr checks $pr, then gh run view <run> --log-failed for each failed run), fix the cause and push. \
 If a failure has nothing to do with this change and is a flaky test, rerun only the failed jobs \
 (gh run rerun <run> --failed) and say so in a comment on the pull request. $tail" ;;
     review)
-      printf '%s' "There is new review feedback on pull request #$pr since it was marked ready, from $what. \
+      printf '%s' "${sync}There is new review feedback on pull request #$pr since it was marked ready, from $what. \
 Read all of it (gh api repos/{owner}/{repo}/pulls/$pr/comments for the inline threads, gh pr view $pr --comments for the rest) \
 and resolve each point: fix it and push, or reply on its thread with your reasoning. Leave none unanswered. $tail" ;;
   esac
@@ -4992,7 +5022,7 @@ watch_task() {                          # task_dir dry
   agent_blocked "$d" && return 0
   [ "$dry" = 1 ] && { msg "would prompt $slug about #$pr - $word"; return 0; }
   local code rc
-  code=$(agent_prompt "$(task_pane "$d")" "$(watch_prompt "$need" "$pr" "$base" "$what")"); rc=$?
+  code=$(agent_prompt "$(task_pane "$d")" "$(watch_prompt "$need" "$pr" "$base" "$what" "$branch")"); rc=$?
   case "$rc" in
     0)
       st_set "$d" PQ_WATCH_ASKED "$need"; st_set "$d" PQ_WATCH_NEEDS ""; st_set "$d" PQ_WATCH_WAIT ""
