@@ -3131,7 +3131,8 @@ cmd_after() {
                   *)
                     IFS=$'\t' read -r overdict _ <<<"$(after_state "$owner")"
                     case "$overdict" in
-                      waiting\ *|on\ *) desc="waiting on ${overdict##* } of its own" ;;
+                      waiting\ *) desc="waiting on ${overdict##* } of its own" ;;
+                      on\ *)      desc="waiting for ${overdict#on } to be marked ready" ;;
                       *)                 desc="in progress" ;;
                     esac
                     ;;
@@ -3167,7 +3168,7 @@ cmd_after() {
     return 0
   fi
 
-  local owner_repo owner_branch value=$1 resolved label repo branch base b="" other num prstate draft slug
+  local owner_repo owner_branch value=$1 resolved label repo branch base b="" other num slug
   owner_repo=$(hdr "$d/plan.md" repo); owner_branch=$(hdr "$d/plan.md" branch); slug=$(slug_of "$d")
   case "$value" in
     */*) ;;
@@ -3180,6 +3181,9 @@ cmd_after() {
   [ "$repo" = "$owner_repo" ] && [ "$branch" = "$owner_branch" ] && { release_lock; die "a task cannot build on itself"; }
   after_cycle "$owner_repo" "$owner_branch" "$repo" "$branch" \
     && { release_lock; die "'$value' would create a cycle - $slug already leads back to it"; }
+  # The stamp too, whichever way it was named: a task in new/ holds what it
+  # builds on by stamp alone, so a branch given here is matched by its owner's.
+  [ -n "$b" ] || b=$(task_by_branch "$repo" "$branch") || b=""
   if [ "$repo" = "$owner_repo" ] \
      && other=$(built_on_by "$(built_on "$d")" "$repo" "$branch" "${b:+$(stamp_of "$b")}"); then
     release_lock
@@ -3188,13 +3192,14 @@ cmd_after() {
   printf '%s\t%s\t%s\n' "$label" "$repo" "$branch" > "$d/after"
   pr_load_all "$(printf '%s\t%s\n' "$repo" "$branch")"
   base=$(repo_base "$repo")
-  num=""; prstate=""; draft=""
-  IFS=$'\t' read -r num prstate draft <<<"$(pr_get "$repo" "$branch")"
-  if [ -n "$base" ] && merged_into "$repo" "$branch" "$base"; then
+  num=$(pr_get "$repo" "$branch" | cut -f1)
+  # The predicate fill itself uses, so what is said is what will happen.
+  local bst; bst=$(blocker_state "$repo" "$branch" "${base:-}")
+  if [ "$bst" = met ]; then
     msg "$slug after $label: already in $base - nothing to wait for"
   elif [ "$repo" != "$owner_repo" ]; then
     msg "$slug waits for $label ($(basename "$repo")) to merge"
-  elif [ "${prstate:-}" = OPEN ] && [ -z "${draft:-}" ]; then
+  elif [ "$bst" = ready ]; then
     msg "$slug builds on $label - #$num is ready for review, so it starts once a slot is free"
   else
     msg "$slug builds on $label - it starts once $(pr_word "$num") is marked ready"

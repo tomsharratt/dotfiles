@@ -437,6 +437,9 @@ N=$(mk_task new 40 unnamed-child "$REPO" "")
 printf '%s\n' "$(stamp_of "$A")" > "$N/after.new"
 out=$( ( main after one-b one-a ) 2>&1 ) && bad "a stamp held in new/ counts as building on it" || ok
 case "$out" in *"unnamed-child already builds on one-a"*) ok ;; *) bad "naming the task in new/ ($out)" ;; esac
+# The same when the parent is given by branch rather than by slug.
+out=$( ( main after one-b tom/one-a ) 2>&1 ) && bad "given by branch, a stamp held in new/ still counts" || ok
+case "$out" in *"unnamed-child already builds on"*) ok ;; *) bad "naming the task in new/ ($out)" ;; esac
 rm -rf "$N"
 # Across repos it is a wait, not a stack, and many can wait on one merge.
 REPO3=$(mktemp -d); git init -q -b master "$REPO3"
@@ -473,6 +476,13 @@ case "$(describe desc-b "$REPO"$'\t'tom/desc-a$'\t'7$'\t'MERGED$'\t'$'\t'master$
   *"merged - desc-b starts from master"*) ok ;; *) bad "a merged one is where it starts from" ;; esac
 case "$(describe desc-y "$REPO2"$'\t'tom/desc-x$'\t'8$'\t'OPEN$'\t'$'\t'main$'\t'$'\n')" in
   *"#8 open"*"in progress"*) ok ;; *) bad "a merge dependency reads as it always did, ready or not" ;; esac
+# A merge dependency whose owner is itself on a parent says so, not "waiting on <label> of its own".
+Z=$(mk_task queue 50 desc-z "$REPO2" tom/desc-z)
+after_add "$Z" desc-w "$REPO2" tom/desc-w
+mk_task running 45 desc-w "$REPO2" tom/desc-w >/dev/null
+printf 'desc-z\t%s\ttom/desc-z\n' "$REPO2" > "$Y/after"
+zrow="$REPO2"$'\t'tom/desc-z$'\t'9$'\t'OPEN$'\t'draft$'\t'main$'\t'$'\n'
+case "$(describe desc-y "$zrow")" in *"waiting for desc-w to be marked ready"*) ok ;; *) bad "an owner on a parent reads as waiting to be marked ready ($(describe desc-y "$zrow"))" ;; esac
 case "$(main after desc-x 2>&1)" in *"builds on nothing and waits for nothing"*) ok ;; *) bad "a task with none says so" ;; esac
 
 echo "== pq add --after: a blocker named by slug gates the new task ==" >&2
