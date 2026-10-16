@@ -556,6 +556,7 @@ eq "$(prompts)" "2" "a minute on, it is asked about the new one"
 idle; g rebase -q --onto "$PA" "$F" "$CH"; gpush "$CH"
 restack "$S" >/dev/null 2>&1
 eq "$(need "$S")" "" "the agent's restack clears the need, and the handover with it"
+eq "$(st "$S" PQ_STACK_FIXES)$(st "$S" PQ_STACK_FP)" "" "and a need resolved gives the next one its own three tries"
 
 echo "== the head it was asked onto is the fork point, though the parent gained a commit since ==" >&2
 due 28; age_seen "$S"

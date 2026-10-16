@@ -4040,7 +4040,8 @@ stack_link() {                          # task_dir dry
 # before (PQ_STACK_SEEN_FP and PQ_STACK_SEEN_AT), because GitHub's own restack
 # after a merge lands within seconds (#7006: retargeted 12:22:20, pushed
 # 12:22:25) and pq must not race it. The agent gone, an agent that came back
-# with the same need still there, or STACK_FIXES tries, hand it to you instead:
+# with the same need still there, or STACK_FIXES tries at needs it has not
+# resolved in between, hand it to you instead:
 # `restack` in `pq ls`, counted into "needs you", warned once.
 STACK_DEBOUNCE=60
 STACK_FIXES=3
@@ -4137,7 +4138,10 @@ st_clear() {                            # task_dir key...
   for k in "$@"; do [ -z "$(st "$d" "$k")" ] || st_set "$d" "$k" ""; done
 }
 # Everything a need leaves behind. The tries and the last fingerprint asked
-# about stay, as the watch's do: they bound the task, not the one need.
+# about are kept apart: they bound one need across its asks, and go only when a
+# need is resolved (stack_resolved) - a long-lived parent can be conflict-fixed
+# more than three times, and each of those is a need of its own.
+stack_resolved() { st_clear "$1" PQ_STACK_FIXES PQ_STACK_FP; }
 stack_clear() {                         # task_dir
   st_clear "$1" PQ_STACK_DUE PQ_STACK_NEEDS PQ_STACK_SEEN_FP PQ_STACK_SEEN_AT PQ_STACK_WAIT PQ_STACK_TARGET
 }
@@ -4278,9 +4282,9 @@ stack_task() {                          # task_dir dry
       # sits on the parent's head, which is its fork point from here on.
       [ "$dry" = 1 ] && return 0
       [ "$arg" = "$(st "$d" PQ_STACK_FORK)" ] || st_set "$d" PQ_STACK_FORK "$arg"
-      stack_clear "$d" ;;
+      stack_clear "$d"; stack_resolved "$d" ;;
     gained)
-      [ "$dry" = 1 ] || stack_clear "$d" ;;
+      [ "$dry" = 1 ] || { stack_clear "$d"; stack_resolved "$d"; } ;;
     landed)
       [ "$dry" = 1 ] && { msg "would record that #$own is the bottom of its stack now - #$pnum merged"; return 0; }
       stack_clear "$d"; st_clear "$d" PQ_STACK_ASKED
