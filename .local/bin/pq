@@ -3820,6 +3820,76 @@ dispatch_try() {                        # task_dir -> dispatch_task's status
 }
 dispatch_gaveup() { [ "$(st "$1" PQ_DISPATCH_GAVEUP)" = 1 ]; }
 
+# ── stacks ──────────────────────────────────────────────────────────────────
+# A task that builds on another opens its pull request against the parent's
+# branch, which on its own is a plain chained pull request. GitHub's native stack
+# is what adds the rest: the stack map on both pull requests, a merge that lands
+# every layer below the one merged in one operation, and - after a layer below
+# merges - the next one retargeted to the trunk and every layer above rebased
+# onto it, server-side. So once the child's pull request exists, pq adds it to
+# its parent's stack with the official extension, `gh stack link`.
+#
+# Only ever by PR number. `gh stack link` pushes a branch-name argument first,
+# which here would publish the agent's unpushed work. And in one of two forms,
+# because the pair form `gh stack link <parent> <child>` only works while the
+# parent is the bottom: once a stack holds more than the pair, it refuses with
+# "Cannot update stack: this would remove #1 from the stack" (exit 5, seen in
+# the sandbox on 2026-10-16). A parent already in a stack is linked to through
+# the stack's own number, `gh stack link <stack> <child>`, which appends to the
+# top and skips what is already there. Both forms correct a child opened against
+# the wrong base.
+#
+# A parent that is in no stack and is not aimed at the trunk is itself a layer
+# whose link has not happened yet, and is waited for: linking to it would start
+# a stack whose trunk is a feature branch.
+#
+# It is idempotent by construction - pq stops once PQ_STACK is set, and asks the
+# stacks API first, so a pull request linked by hand, or by a tick that stopped
+# before it could record it, is just recorded. A link that does not go through
+# is tried again on the next tick.
+#
+# A parent that merged or closed is PR 3's (restack); this does nothing about it.
+STACK_API_VERSION=2026-03-10
+
+# GitHub's number for the stack holding pull request N, or nothing when it is in
+# none; 1 when gh cannot say.
+stack_of() {                            # repo pr -> stack number
+  ( cd "$1" 2>/dev/null || exit 1
+    gh api -H "X-GitHub-Api-Version: $STACK_API_VERSION" "repos/{owner}/{repo}/stacks?pull_request=$2" \
+      --jq '.[0].number // empty' 2>/dev/null )
+}
+# `gh stack link`, run in the repo, with its whole say on stdout for the caller.
+stack_link_run() {                      # repo bottom-or-stack child
+  cd "$1" || return 1
+  gh stack link "$2" "$3" 2>&1
+}
+
+stack_link() {                          # task_dir dry
+  local d=$1 dry=$2 slug repo parent child pnum pstate pstack stack
+  [ -z "$(st "$d" PQ_REAPED)" ] || return 0
+  parent=$(st "$d" PQ_STACK_PARENT); child=$(st "$d" PQ_PR)
+  [ -n "$parent" ] && [ -n "$child" ] || return 0
+  [ -z "$(st "$d" PQ_STACK)" ] || return 0
+  slug=$(slug_of "$d"); repo=$(hdr "$d/plan.md" repo)
+  pnum=""; pstate=""
+  IFS=$'\t' read -r pnum pstate _ <<<"$(pr_get "$repo" "$parent")"
+  [ "${pstate:-}" = OPEN ] && [ -n "$pnum" ] || return 0
+  [ "$dry" = 1 ] && { msg "would add #$child to #$pnum's stack"; return 0; }
+  if stack=$(stack_of "$repo" "$child") && [ -n "$stack" ]; then
+    st_set "$d" PQ_STACK "$stack"
+    msg "$slug: #$child joined #$pnum's stack (stack $stack)"
+    return 0
+  fi
+  pstack=$(stack_of "$repo" "$pnum") || pstack=""
+  [ -z "$pstack" ] && [ "$(pr_base "$repo" "$parent")" != "$(repo_base "$repo")" ] && return 0
+  shielded stack_link_run "$repo" "${pstack:-$pnum}" "$child"
+  if stack=$(stack_of "$repo" "$child") && [ -n "$stack" ]; then
+    st_set "$d" PQ_STACK "$stack"
+    msg "$slug: #$child joined #$pnum's stack (stack $stack)"
+  fi
+  return 0
+}
+
 # ── review gate ─────────────────────────────────────────────────────────────
 # Every pull request a task opens gets one independent review before the
 # implementer may call it ready - run BY pq, not asked of the agent. The agent
@@ -5587,6 +5657,15 @@ tick_body() {                           # cap dry
       check_quiet "$d"
     done
   fi
+
+  # 1.21 Stacks - add each stacked task's pull request to its parent's stack on
+  # GitHub, once it exists - see the `stacks` section. After reconcile, so a
+  # pull request opened this tick is linked this tick; before the gate, so the
+  # reviewers see it in the stack.
+  for d in "$PQ_HOME/done"/*/; do
+    [ -d "$d" ] || continue
+    stack_link "${d%/}" "$dry"
+  done
 
   # 1.22 The review gate, one step per task - see the `review gate` section.
   # After reconcile, so a task that finished this tick is examined this tick;
