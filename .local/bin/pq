@@ -3310,20 +3310,9 @@ cmd_evidence() {
 # refused; it goes to `herdr agent prompt` as one argv element that no shell ever
 # re-parses, so nothing would break. The convention stays because the review
 # follow-up (review_prompt) shares it, and one rule is easier to keep than two.
-dispatch_prompt() {                     # task_dir [base]
-  # The base clause is only added when there IS one to add - a task aimed at the
-  # repo default gets the prompt it always got, and `gh pr create` picks the right
-  # target by itself. When the base is something else, saying so is not optional:
-  # `gh pr create` defaults to the DEFAULT branch, so the PR would open against a
-  # trunk that is missing everything this branch forked from, and its diff would
-  # swallow the whole integration branch.
-  local base_clause=""
-  [ -n "${2:-}" ] && base_clause="This branch was forked from $2, not from the repository default branch, \
-so open your pull request against $2 - pass --base $2 to gh pr create. \
-Do not rebase onto the default branch. "
+dispatch_prompt() {                     # task_dir
   printf '%s' "Read $1/plan.md and carry it out. \
 $1/contract.md is how to deliver it: read it before you start and follow it to the letter. \
-${base_clause}\
 Never wait for input - there is nobody watching."
 }
 
@@ -3344,9 +3333,9 @@ Never wait for input - there is nobody watching."
 # markdown rule asks, and written once: dispatch_task only calls this when no
 # contract.md exists, so a re-entered dispatch never rewrites a running agent's.
 contract_write() {                      # task_dir
-  local d=$1 repo branch base intent design security url wt slug tmp home
+  local d=$1 repo branch intent design security url wt slug tmp home
   repo=$(hdr "$d/plan.md" repo);   branch=$(hdr "$d/plan.md" branch)
-  base=$(hdr "$d/plan.md" base);   intent=$(hdr "$d/plan.md" intent)
+  intent=$(hdr "$d/plan.md" intent)
   design=$(hdr "$d/plan.md" design); security=$(hdr "$d/plan.md" security)
   url=$(st "$d" PQ_URL); wt=$(st "$d" PQ_WORKTREE); slug=$(slug_of "$d")
   # Every path the agent is given is the STABLE one (task_home): the real
@@ -3374,12 +3363,6 @@ A mechanical change (a rename, a move, generated output) is its own commit, and 
 A non-mechanical commit over about 300 changed lines gets split into smaller ones.
 Never one squashed commit at the end: the commits are how the pull request will be read.
 History may be rewritten (\`git push --force-with-lease\`) only while the pull request is still a draft.
-EOF
-    [ -n "$base" ] && cat <<EOF
-This branch was forked from \`$base\`, not from the default branch.
-Open the pull request against it (\`gh pr create --base $base\`) and never rebase onto the default branch.
-EOF
-    cat <<EOF
 
 ## Verifying, before the pull request
 
@@ -3573,11 +3556,6 @@ dispatch_task() {                       # task_dir  -> 0 launched, 1 failed, 2 w
   local d=$1 repo branch model effort pane wtjson prompt
   repo=$(hdr "$d/plan.md" repo);     branch=$(hdr "$d/plan.md" branch)
   model=$(hdr "$d/plan.md" model);   effort=$(hdr "$d/plan.md" effort)
-  # The DECLARED base only. `task_base` would fall back to the repo default,
-  # which is precisely what `wt new` already does on its own - so passing that
-  # back to it would be a no-op dressed up as a decision, and it is what keeps
-  # every single-trunk dispatch byte-identical to what it was before.
-  local basebr; basebr=$(hdr "$d/plan.md" base)
   [ -n "$repo" ] && [ -n "$branch" ] || { warn "$(slug_of "$d"): plan.md has no repo/branch"; return 1; }
   [ -d "$repo" ] || { warn "$(slug_of "$d"): repo $repo is gone"; return 1; }
 
@@ -3605,27 +3583,11 @@ dispatch_task() {                       # task_dir  -> 0 launched, 1 failed, 2 w
     GIT_SSH_COMMAND="${GIT_SSH_COMMAND:-ssh -o ConnectTimeout=5 -o BatchMode=yes}" \
       git -C "$repo" fetch --quiet origin 2>/dev/null \
       || warn "$(slug_of "$d"): could not fetch $repo - the worktree may fork from a stale base"
-    # A declared base is checked HERE rather than trusted, because the failure is
-    # silent and expensive: `wt new` falls back to origin/HEAD for a base it
-    # cannot resolve, so a typo'd or deleted branch would quietly hand the agent
-    # a worktree forked from the trunk - the exact wrong-fork-point bug this
-    # header exists to prevent, only harder to see because everything "worked".
-    local baseflag=""
-    if [ -n "$basebr" ]; then
-      if git -C "$repo" rev-parse --verify --quiet "refs/remotes/origin/$basebr^{commit}" >/dev/null; then
-        baseflag="--base origin/$basebr"
-        msg "$(slug_of "$d"): forking from origin/$basebr"
-      else
-        warn "$(slug_of "$d"): base origin/$basebr does not exist - refusing to fork from the wrong branch"
-        return 1
-      fi
-    fi
     msg "$(slug_of "$d"): preparing worktree for $branch"
     # Shielded: this is the slow one - a full database copy - and the one worth
     # letting finish when you Ctrl-C. wt's own progress still goes to stderr and
     # straight to the user; only its stdout (the JSON) is captured.
-    # shellcheck disable=SC2086
-    shielded wt_in "$repo" new --no-agent --no-focus $baseflag --json "$branch" \
+    shielded wt_in "$repo" new --no-agent --no-focus --json "$branch" \
       || { warn "$(slug_of "$d"): wt new failed"; return 1; }
     wtjson=$SHIELDED_OUT
     pane=$(jq -r '.root_pane_id // empty' <<<"$wtjson" 2>/dev/null)
@@ -3675,7 +3637,7 @@ dispatch_task() {                       # task_dir  -> 0 launched, 1 failed, 2 w
   # The prompt, as one argv element. A refusal leaves PQ_LAUNCHED empty, which is
   # what the resume path in tick_body already retries - so an agent that came up
   # blocked on a dialog gets its prompt on the first tick after the dialog goes.
-  prompt=$(dispatch_prompt "$(task_home "$d")" "$basebr")
+  prompt=$(dispatch_prompt "$(task_home "$d")")
   local code rc
   code=$(agent_prompt "$pane" "$prompt"); rc=$?
   if [ "$rc" = 2 ]; then

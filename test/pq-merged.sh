@@ -278,42 +278,6 @@ eq "$([ -s "$WT_LOG" ] && printf called || printf quiet)" "quiet" \
   "reap: must not touch a worktree whose work is not in its base"
 repo_base_reset
 
-echo "== dispatch_prompt names the base only when there is one ==" >&2
-p_plain=$(dispatch_prompt /tmp/task)
-case "$p_plain" in
-  *--base*) bad "a task with no base must get the prompt it always got" ;;
-  *) ok ;;
-esac
-p_based=$(dispatch_prompt /tmp/task live-events)
-case "$p_based" in
-  *"--base live-events"*) ok ;;
-  *) bad "a based task's prompt must tell the agent where the PR goes" ;;
-esac
-# Quote-free by convention (see dispatch_prompt's own comment): the prompt goes
-# to herdr as one argv element now, but the review follow-up shares the rule.
-case "$p_based" in
-  *"'"*) bad "the base clause must not introduce a single quote" ;;
-  *) ok ;;
-esac
-
-echo "== dispatch_task forks from the declared base ==" >&2
-reset_tasks; : > "$WT_LOG"
-t=$(mk_task running 50 disp-based "$REPO" tom/disp1 live-events)
-dispatch_task "$t" >/dev/null 2>&1
-grep -q "	--base	origin/live-events	" "$WT_LOG" \
-  && ok || bad "wt new should have been told to fork from origin/live-events"
-: > "$WT_LOG"
-t2=$(mk_task running 51 disp-plain "$REPO" tom/disp2)
-dispatch_task "$t2" >/dev/null 2>&1
-grep -q -- "--base" "$WT_LOG" \
-  && bad "a task with no base must not pass --base at all" || ok
-# A base that does not exist must stop the dispatch, not quietly fork the trunk.
-: > "$WT_LOG"
-t3=$(mk_task running 52 disp-bogus "$REPO" tom/disp3 no-such-branch)
-dispatch_task "$t3" >/dev/null 2>&1 && bad "dispatch should fail on an unresolvable base" || ok
-eq "$([ -s "$WT_LOG" ] && printf called || printf quiet)" "quiet" \
-  "an unresolvable base must never reach wt new"
-
 echo "== a base that no longer resolves must not burn a slot ==" >&2
 # The failure this guards against is the one pq exists to prevent: fill claims a
 # task into running/ BEFORE dispatch is attempted, so a dispatch that refuses
