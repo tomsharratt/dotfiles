@@ -54,7 +54,7 @@ old_render_table() {
 widetbl() {                             # a table whose natural width is well over 80
   local tbl="$PQ_HOME/.wide.$$.tsv"
   { printf 'TASK\tPROJECT\tSTATE\tAGENT\tPR\tAGE\n'
-    printf 'drop-mux-assets-table\tsupercast\tqueue\tafter remove-mux-vid..\t-\t22h\n'
+    printf 'drop-mux-assets-table\tsupercast\tqueue\ton remove-mux-vid..\t-\t22h\n'
     printf 'bulk-email-subscribers-with-a-really-long-name-here\tsupercast\tqueue\tafter fix-bulk-action-filter-injection +1\t-\t1h\n'
     printf 'remove-mux-video-backend\tsupercast\tdone\t-\t#6387 open with a rather long trailing status blob\t22h\n'
   } > "$tbl"

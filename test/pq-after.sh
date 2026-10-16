@@ -499,6 +499,29 @@ if printf '%s' "$ls_json" \
      | jq -e '[.[] | select(.task == "add-json-test")][0] | .blocked == true' >/dev/null 2>&1
 then ok; else bad "pq ls --json should mark the chained task blocked=true"; fi
 
+echo "== pq ls --json: kind, ready, stack_parent and stack ==" >&2
+reset_tasks
+J1=$(mk_task running 10 json-parent "$REPO" tom/json-parent)
+st_set "$J1" PQ_STACK_PARENT tom/json-grand; st_set "$J1" PQ_STACK 7
+J2=$(mk_task queue 20 json-child "$REPO" tom/json-child)
+after_add "$J2" json-parent "$REPO" tom/json-parent
+J3=$(mk_task queue 30 json-app "$REPO2" tom/json-app)
+after_add "$J3" json-parent "$REPO" tom/json-parent
+rows="$REPO"$'\t'tom/json-parent$'\t'5$'\t'OPEN$'\t'$'\t'master$'\t'$'\n'
+# shellcheck disable=SC2329  # called by cmd_ls
+ls_json=$( ( pr_load_all() { PR_CACHE="$PQ_HOME/.test.pr"; PR_ANS="$PQ_HOME/.test.ans"; printf '%s' "$rows" > "$PR_CACHE"; : > "$PR_ANS"; }
+             main ls --json ) 2>/dev/null )
+jqt() { jq -r --arg t "$1" "[.[] | select(.task == \$t)][0] | $2" <<<"$ls_json"; }
+eq "$(jqt json-child '.after[0].kind')" "stack" "a same-repo dependency is a stack"
+eq "$(jqt json-child '.after[0].state')" "ready" "and its state can now be ready"
+eq "$(jqt json-child '.blocked')" "false" "a task that builds on a ready pull request is not blocked"
+eq "$(jqt json-app '.after[0].kind')" "merge" "a dependency in another repo is a merge"
+eq "$(jqt json-app '.blocked')" "true" "and blocked until it merges, ready or not"
+eq "$(jqt json-parent '.stack_parent')" "tom/json-grand" "stack_parent is the branch it builds on"
+eq "$(jqt json-parent '.stack')" "7" "and stack is GitHub's stack number, as a number"
+eq "$(jqt json-child '.stack_parent')" "null" "both null for a task that is not stacked"
+eq "$(jqt json-child '.stack')" "null" "the stack too"
+
 echo "== regression: repo_base_reset actually removes its cache file ==" >&2
 # Through command substitution, like every real caller (base=$(repo_base ...))
 # - calling it as a bare statement would run in the CURRENT shell rather than

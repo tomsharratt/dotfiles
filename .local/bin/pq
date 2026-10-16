@@ -2632,19 +2632,22 @@ after_check() {                         # task_dir
   printf '%s' "$verdict"
 }
 
-# {label, repo, branch, state} for every blocker, for cmd_ls --json - assumes
-# PR_CACHE/PR_ANS already cover every blocker's (repo, branch), same as
-# after_state assumes.
+# {label, repo, branch, kind, state} for the dependency, for cmd_ls --json -
+# kind is `stack` in the task's own repo and `merge` in another (see
+# after_state), and state is blocker_state's word, `ready` included. Assumes
+# PR_CACHE/PR_ANS already cover its (repo, branch), same as after_state assumes.
 after_json() {                          # task_dir
-  local d=$1 label repo branch base st
+  local d=$1 own label repo branch base st kind
   [ -f "$d/after" ] || { printf '[]'; return; }
+  own=$(hdr "$d/plan.md" repo)
   local tmp="$PQ_HOME/.afterjson.$$"; : > "$tmp"
   while IFS=$'\t' read -r label repo branch; do
     [ -n "$label" ] || continue
     base=$(repo_base "$repo")
     st=$(blocker_state "$repo" "$branch" "${base:-}")
-    jq -nc --arg label "$label" --arg repo "$repo" --arg branch "$branch" --arg state "$st" \
-      '{label: $label, repo: $repo, branch: $branch, state: $state}' >> "$tmp"
+    kind=merge; [ "$repo" = "$own" ] && kind=stack
+    jq -nc --arg label "$label" --arg repo "$repo" --arg branch "$branch" --arg kind "$kind" --arg state "$st" \
+      '{label: $label, repo: $repo, branch: $branch, kind: $kind, state: $state}' >> "$tmp"
   done <<<"$(after_list "$d")"
   jq -sc '.' "$tmp"
   rm -f "$tmp"
@@ -3003,6 +3006,7 @@ cmd_ls() {
         --arg review "$(st "$d" PQ_REVIEW)" --arg review_result "$(st "$d" PQ_REVIEW_RESULT)" \
         --arg security "$(st "$d" PQ_SECURITY)" --arg security_result "$(st "$d" PQ_SECURITY_RESULT)" \
         --arg design "$(hdr "$d/plan.md" design)" \
+        --arg stack_parent "$(st "$d" PQ_STACK_PARENT)" --arg stack "$(st "$d" PQ_STACK)" \
         --arg cost "$(cost_sum "$d")" \
         --argjson holding_slot "$holding" \
         --argjson after "$(after_json "$d")" --argjson blocked "$blocked" '
@@ -3015,6 +3019,7 @@ cmd_ls() {
           pr: ($pr|str|if . then tonumber else null end),
           pr_state: ($prstate|str), pr_draft: ($draft == "draft"),
           after: $after, blocked: $blocked, holding_slot: $holding_slot,
+          stack_parent: ($stack_parent|str), stack: ($stack|num),
           merged: ($merged|str), closed: ($closed|str),
           reaped: ($reaped|str), held: ($held|str),
           review: ($review|str), review_result: ($review_result|str),
