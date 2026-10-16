@@ -2178,8 +2178,15 @@ pr_get() {                              # repo branch
 # change. A merged task stamps `PQ_MERGED` and drops out (only local checks
 # remain - no more reason to ask `gh`); a closed one stamps `PQ_CLOSED` and
 # drops out; a worktree already gone stamps `PQ_REAPED` and drops out.
+#
+# A task that builds on another (PQ_STACK_PARENT) brings its parent's branch
+# along, running or done, so dispatch and the stack link can read the parent's
+# row even when the parent is not a pq task. A done one only while
+# reap_watching: once its own pull request has merged, the parent is history
+# that cannot change, and asking about it every tick would be the very call the
+# `running` scope exists to save.
 pr_targets() {                          # [scope: all|running]
-  local scope=${1:-all} d st repo branch
+  local scope=${1:-all} d st repo branch parent
   while IFS= read -r d; do
     [ -n "$d" ] || continue
     st=$(state_of "$d")
@@ -2187,11 +2194,15 @@ pr_targets() {                          # [scope: all|running]
       running)
         repo=$(hdr "$d/plan.md" repo); branch=$(hdr "$d/plan.md" branch)
         [ -n "$repo" ] && [ -n "$branch" ] && printf '%s\t%s\n' "$repo" "$branch"
+        parent=$(st "$d" PQ_STACK_PARENT)
+        [ -n "$repo" ] && [ -n "$parent" ] && printf '%s\t%s\n' "$repo" "$parent"
         ;;
       done)
         [ "$scope" = all ] || reap_watching "$d" || continue
         repo=$(hdr "$d/plan.md" repo); branch=$(hdr "$d/plan.md" branch)
         [ -n "$repo" ] && [ -n "$branch" ] && printf '%s\t%s\n' "$repo" "$branch"
+        parent=$(st "$d" PQ_STACK_PARENT)
+        [ -n "$repo" ] && [ -n "$parent" ] && reap_watching "$d" && printf '%s\t%s\n' "$repo" "$parent"
         ;;
       queue)
         while IFS=$'\t' read -r _ repo branch; do
@@ -3271,10 +3282,20 @@ cmd_evidence() {
 # refused; it goes to `herdr agent prompt` as one argv element that no shell ever
 # re-parses, so nothing would break. The convention stays because the review
 # follow-up (review_prompt) shares it, and one rule is easier to keep than two.
-dispatch_prompt() {                     # task_dir
+#
+# A task that builds on another is told so here as well as in its contract,
+# since where its pull request is aimed is the one thing it must not get wrong:
+# aimed at the default branch, its diff would carry the whole layer below.
+dispatch_prompt() {                     # task_home [parent_branch [parent_pr]]
+  local parent=${2:-} num=${3:-} stackc=""
+  if [ -n "$parent" ]; then
+    stackc="This task builds on pull request ${num:+#$num }($parent), which is ready for review but not merged, \
+and this branch was forked from it: open your pull request against it - pass --base $parent to gh pr create - \
+and pq adds it to that stack. "
+  fi
   printf '%s' "Read $1/plan.md and carry it out. \
 $1/contract.md is how to deliver it: read it before you start and follow it to the letter. \
-Never wait for input - there is nobody watching."
+${stackc}Never wait for input - there is nobody watching."
 }
 
 # ── the delivery contract ────────────────────────────────────────────────────
@@ -3513,10 +3534,17 @@ wt_in_errto() {                         # errfile repo wt-subcommand args...
   wt_in "$@" 2> "$errf"
 }
 
+# A task that builds on another (PQ_STACK_PARENT, recorded at the claim) forks
+# from that pull request's branch rather than the default one, and records the
+# exact commit it forked from as PQ_STACK_FORK - its own commits are the ones
+# after it, which is what its contract tells it and what a restack needs. A
+# parent that merged between the claim and the fork is not built on at all: the
+# task forks from the default branch, as any other does, which already holds it.
 dispatch_task() {                       # task_dir  -> 0 launched, 1 failed, 2 waiting on a dialog
-  local d=$1 repo branch model effort pane wtjson prompt
+  local d=$1 repo branch model effort pane wtjson prompt parent
   repo=$(hdr "$d/plan.md" repo);     branch=$(hdr "$d/plan.md" branch)
   model=$(hdr "$d/plan.md" model);   effort=$(hdr "$d/plan.md" effort)
+  parent=$(st "$d" PQ_STACK_PARENT)
   [ -n "$repo" ] && [ -n "$branch" ] || { warn "$(slug_of "$d"): plan.md has no repo/branch"; return 1; }
   [ -d "$repo" ] || { warn "$(slug_of "$d"): repo $repo is gone"; return 1; }
 
@@ -3544,11 +3572,27 @@ dispatch_task() {                       # task_dir  -> 0 launched, 1 failed, 2 w
     GIT_SSH_COMMAND="${GIT_SSH_COMMAND:-ssh -o ConnectTimeout=5 -o BatchMode=yes}" \
       git -C "$repo" fetch --quiet origin 2>/dev/null \
       || warn "$(slug_of "$d"): could not fetch $repo - the worktree may fork from a stale base"
-    msg "$(slug_of "$d"): preparing worktree for $branch"
+    local fork_from=""
+    if [ -n "$parent" ]; then
+      local defb; defb=$(repo_base "$repo")
+      if [ -n "$defb" ] && merged_into "$repo" "$parent" "$defb"; then
+        st_set "$d" PQ_STACK_PARENT ""
+        msg "$(slug_of "$d"): $parent merged meanwhile - forking from $defb"
+        parent=""
+      elif ! git -C "$repo" show-ref --verify --quiet "refs/remotes/origin/$parent"; then
+        warn "$(slug_of "$d"): origin/$parent is not there to fork from - the next tick tries again"
+        return 1
+      else
+        fork_from="origin/$parent"
+      fi
+    fi
+    msg "$(slug_of "$d"): preparing worktree for $branch${fork_from:+ off $fork_from}"
     # Shielded: this is the slow one - a full database copy - and the one worth
     # letting finish when you Ctrl-C. wt's own progress still goes to stderr and
-    # straight to the user; only its stdout (the JSON) is captured.
-    shielded wt_in "$repo" new --no-agent --no-focus --json "$branch" \
+    # straight to the user; only its stdout (the JSON) is captured. `--base` is
+    # used as given: wt forks from that ref with no fetch of its own, which is why
+    # the fetch above comes first.
+    shielded wt_in "$repo" new --no-agent --no-focus ${fork_from:+--base "$fork_from"} --json "$branch" \
       || { warn "$(slug_of "$d"): wt new failed"; return 1; }
     wtjson=$SHIELDED_OUT
     pane=$(jq -r '.root_pane_id // empty' <<<"$wtjson" 2>/dev/null)
@@ -3559,6 +3603,11 @@ dispatch_task() {                       # task_dir  -> 0 launched, 1 failed, 2 w
     st_set "$d" PQ_DEV_PANE  "$(jq -r '.dev_pane_id // ""'  <<<"$wtjson")"
     st_set "$d" PQ_URL       "$(jq -r '.url // ""'          <<<"$wtjson")"
     st_set "$d" PQ_PORT      "$(jq -r '.port // ""'         <<<"$wtjson")"
+    # The new branch has no commits yet, so its HEAD is exactly the commit it
+    # forked from.
+    if [ -n "$fork_from" ] && [ -z "$(st "$d" PQ_STACK_FORK)" ]; then
+      st_set "$d" PQ_STACK_FORK "$(git -C "$(st "$d" PQ_WORKTREE)" rev-parse HEAD 2>/dev/null)"
+    fi
     fresh=1
   else
     msg "$(slug_of "$d"): worktree already prepared, resuming at the agent"
@@ -3598,7 +3647,9 @@ dispatch_task() {                       # task_dir  -> 0 launched, 1 failed, 2 w
   # The prompt, as one argv element. A refusal leaves PQ_LAUNCHED empty, which is
   # what the resume path in tick_body already retries - so an agent that came up
   # blocked on a dialog gets its prompt on the first tick after the dialog goes.
-  prompt=$(dispatch_prompt "$(task_home "$d")")
+  local pnum=""
+  [ -n "$parent" ] && pnum=$(pr_get "$repo" "$parent" | cut -f1)
+  prompt=$(dispatch_prompt "$(task_home "$d")" "$parent" "$pnum")
   local code rc
   code=$(agent_prompt "$pane" "$prompt"); rc=$?
   if [ "$rc" = 2 ]; then

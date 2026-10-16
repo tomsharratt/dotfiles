@@ -85,6 +85,10 @@ git -C "$REPO" -c user.email=test@test -c user.name=test commit -q --allow-empty
 mkdir -p "$REPO/.git/refs/remotes/origin"
 git -C "$REPO" update-ref refs/remotes/origin/master refs/heads/master
 git -C "$REPO" symbolic-ref refs/remotes/origin/HEAD refs/remotes/origin/master
+# The worktree `wt new` hands back is a real repo, so the commit a stacked task
+# forked from can be read off its HEAD.
+git init -q -b master "$WT_PATH_DIR"
+git -C "$WT_PATH_DIR" -c user.email=test@test -c user.name=test commit -q --allow-empty -m fork-point
 
 unset HERDR_ENV HERDR_SOCKET_PATH HERDR_WORKSPACE_ID
 PQ_DONE_KEEP=99
@@ -346,6 +350,63 @@ has "$p" "Read /tasks/x/plan.md" "the plan path"
 has "$p" "/tasks/x/contract.md" "the contract path"
 hasnt "$p" "--base" "no base clause"
 hasnt "$p" "'" "quote-free"
+p=$(dispatch_prompt /tasks/x tom/below 12)
+has "$p" "builds on pull request #12 (tom/below)" "a stacked task's prompt names the pull request"
+has "$p" "pass --base tom/below to gh pr create - and pq adds it to that stack." "and where to aim its own"
+p=$(dispatch_prompt /tasks/x tom/below)
+has "$p" "builds on pull request (tom/below)" "with no row on file, the number is left out"
+hasnt "$p" "#" "and nothing stands in for it"
+
+echo "== a stacked task forks from its parent's branch and records the commit ==" >&2
+reset_tasks; reset_logs; set_panes ""
+git -C "$REPO" update-ref refs/remotes/origin/tom/parent refs/heads/master
+PR_CACHE="$PQ_HOME/.test.pr"; PR_ANS="$PQ_HOME/.test.ans"
+printf '%s\ttom/parent\t77\tOPEN\t\tmaster\t\n' "$REPO" > "$PR_CACHE"; : > "$PR_ANS"
+DS=$(mk_task running 020 stacked tom/stacked)
+st_set "$DS" PQ_STACK_PARENT tom/parent
+dispatch_task "$DS" >/dev/null 2>"$PQ_HOME/.err"; rc=$?
+eq "$rc" "0" "the stacked dispatch succeeds"
+has "$(tr '\t' ' ' < "$WT_LOG")" "new --no-agent --no-focus --base origin/tom/parent --json tom/stacked" "wt new forks it from origin/<parent>"
+eq "$(st "$DS" PQ_STACK_FORK)" "$(git -C "$WT_PATH_DIR" rev-parse HEAD)" "and the fork point is the new worktree's HEAD"
+eq "$(st "$DS" PQ_STACK_PARENT)" "tom/parent" "the parent stays recorded"
+P=$(prompt_text)
+has "$P" "This task builds on pull request #77 (tom/parent), which is ready for review but not merged" "the prompt names the pull request it builds on"
+has "$P" "pass --base tom/parent to gh pr create" "and where to aim its own"
+hasnt "$P" "'" "still quote-free"
+
+echo "== a resumed stacked dispatch neither forks again nor re-records the fork ==" >&2
+fork=$(st "$DS" PQ_STACK_FORK)
+git -C "$WT_PATH_DIR" -c user.email=test@test -c user.name=test commit -q --allow-empty -m "the agent's own work"
+reset_logs; st_set "$DS" PQ_LAUNCHED ""
+set_panes "$(printf 'w1:p1\tclaude\tidle')"
+dispatch_task "$DS" >/dev/null 2>&1
+grep -q "	new	" "$WT_LOG" && bad "wt new must not run on a resume" || ok
+eq "$(st "$DS" PQ_STACK_FORK)" "$fork" "the fork point is kept as it was"
+git -C "$WT_PATH_DIR" reset -q --hard HEAD~1
+
+echo "== a parent that merged meanwhile is not built on ==" >&2
+reset_tasks; reset_logs; set_panes ""
+printf '%s\ttom/parent\t77\tMERGED\t\tmaster\t\n' "$REPO" > "$PR_CACHE"
+DM=$(mk_task running 021 latecomer tom/latecomer)
+st_set "$DM" PQ_STACK_PARENT tom/parent
+dispatch_task "$DM" >/dev/null 2>"$PQ_HOME/.err"; rc=$?
+eq "$rc" "0" "it dispatches"
+grep -q -- "--base" "$WT_LOG" && bad "from the default branch, with no --base" || ok
+eq "$(st "$DM" PQ_STACK_PARENT)" "" "and it no longer builds on anything"
+eq "$(st "$DM" PQ_STACK_FORK)" "" "so it has no fork point either"
+has "$(cat "$PQ_HOME/.err")" "latecomer: tom/parent merged meanwhile - forking from master" "said once, as it happens"
+hasnt "$(prompt_text)" "builds on" "and its prompt says nothing about a stack"
+
+echo "== a parent branch missing from origin fails the try ==" >&2
+reset_tasks; reset_logs; set_panes ""
+: > "$PR_CACHE"
+DG=$(mk_task running 022 orphaned tom/orphaned)
+st_set "$DG" PQ_STACK_PARENT tom/nowhere
+dispatch_task "$DG" >/dev/null 2>"$PQ_HOME/.err"; rc=$?
+eq "$rc" "1" "the dispatch fails, so the next tick retries"
+grep -q "	new	" "$WT_LOG" && bad "and makes no worktree" || ok
+has "$(cat "$PQ_HOME/.err")" "origin/tom/nowhere is not there to fork from" "saying why"
+PR_CACHE=""; PR_ANS=""
 
 echo "== a directory in running/ with no plan.md is a phantom, not a task ==" >&2
 # What a stale path produces: an agent's `mkdir -p` into a task directory that

@@ -373,6 +373,18 @@ S=$(first_dir "$PQ_HOME/running"/*-fill-stack)
 [ -d "$W" ] && ok || bad "the on task stays queued"
 unset -f pr_load_all
 
+echo "== pr_targets brings a stacked task's parent along, while it can still change ==" >&2
+reset_tasks
+R=$(mk_task running 10 tgt-run "$REPO" tom/tgt-run); st_set "$R" PQ_STACK_PARENT tom/tgt-parent-a
+D=$(mk_task "done" 20 tgt-done "$REPO" tom/tgt-done); st_set "$D" PQ_STACK_PARENT tom/tgt-parent-b
+E=$(mk_task "done" 30 tgt-merged "$REPO" tom/tgt-merged); st_set "$E" PQ_STACK_PARENT tom/tgt-parent-c
+st_set "$E" PQ_MERGED 2026-01-02T00:00:00Z
+targets=$(pr_targets running)
+case "$targets" in *"$REPO"$'\t'tom/tgt-parent-a*) ok ;; *) bad "a running task's parent is looked up ($targets)" ;; esac
+case "$targets" in *tom/tgt-parent-b*) ok ;; *) bad "so is a done one's, while reap still watches it ($targets)" ;; esac
+case "$targets" in *tom/tgt-parent-c*) bad "but not once its own pull request has merged ($targets)" ;; *) ok ;; esac
+case "$(pr_targets all)" in *tom/tgt-parent-c*) bad "not even for pq ls" ;; *) ok ;; esac
+
 echo "== cycle and self-reference rejected by pq after ==" >&2
 reset_tasks
 X=$(mk_task queue 10 cyc-x "$REPO" tom/cyc-x)
