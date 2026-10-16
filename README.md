@@ -155,8 +155,6 @@ When the name Haiku chose is taken, it is asked once more with that name to avoi
 
 Each task records its own project, so one queue serves all of them.
 The project is wherever you were standing when you added the plan, resolved to the main checkout so adding from inside a worktree still queues against the repo the new worktree gets forked from.
-So is the branch: when that checkout is on a branch other than the default, and the branch is on origin, the task forks from it and opens its pull request against it, recorded as a `base:` header.
-To queue against the default from a feature branch, check the default out first.
 Dispatch runs `wt new` in that repo, which picks up its profile, and everything downstream is per-task from there - `pq ls` grows a `PROJECT` column as soon as the queue holds more than one.
 Branch *lookups* are keyed on the repo as well as the name, but a task's slug is a single global namespace, so two live tasks can never share a branch leaf even across two different projects - `tom/fix-timezone` cannot be queued in both at once.
 
@@ -259,7 +257,7 @@ So the file travels with the task.
 The wizard asks for one when a plan built from a design names none, and every absolute or `~`-prefixed path to a `.dc.html`, `.html`, `.png`, `.jpg`, `.jpeg` or `.pdf` that the plan's text mentions is picked up on its own; a mention that does not exist on disk is warned about by name, and a `.html.erb` or a `claude.ai` url is never mistaken for one.
 The rule in `AGENTS.md` closes the loop from the planning side: a plan built from a Claude Design file saves that file to `~/.claude/plans/designs/` and cites the absolute path on its own line, so `pq add` finds it.
 
-The files are copied into `<task>/design/` inside the same staging step that writes `plan.md`, so a task lands with its design or not at all, and the `design:` header lists them - absent, like `base:`, when there are none.
+The files are copied into `<task>/design/` inside the same staging step that writes `plan.md`, so a task lands with its design or not at all, and the `design:` header lists them - absent when there are none.
 A plan that reads as built from a design (it cites `claude.ai/design` or a `.dc.html`) with no file found gets one question at the wizard - the file, or Esc to go without, loudly.
 The contract then tells the implementer exactly what to do with them.
 
@@ -291,7 +289,8 @@ A blocker is a resolved `(label, repo, branch)` triple, not a task reference - i
 That is also what makes a cross-repo blocker work for free, and lets a blocker name a branch that was never added to `pq` at all.
 
 Merge state comes from the forge, never from git ancestry: a squash-merged branch's tip is not an ancestor of its default branch, so `git branch --merged` misses every real merge.
-`pq` asks `gh` instead, and only trusts a `MERGED` pull request whose base is genuinely the repo's default branch - merged into some other branch does not count.
+`pq` asks `gh` instead, and only trusts a `MERGED` pull request whose work is on its repo's default branch: merged into it, or merged into another branch with a merge commit that is on it - which is how a stack merged from its top lands.
+Merged into some other branch and nowhere near the default does not count.
 
 `pq after <task>` answers "why has this not started": per blocker, both the state of the task that owns the branch and the state of its pull request, since either one can be the reason and the fix differs.
 A blocker that has already merged is fine to add - `pq` says so rather than refusing.
@@ -445,7 +444,7 @@ That is warned about once, counts into "needs you", and reads `review lapsed` in
 #### The security review
 
 Some plans ask for a security review as well - "run `/security-review` as well as `/code-review`", with what it should look at - and those get one, run by `pq` the same way.
-The same Haiku call that names a task reads whether its plan asks for one, and a plan that does gets a `security: yes` header (absent, like `base:` and `design:`, when it does not) and is queued `with a security review`.
+The same Haiku call that names a task reads whether its plan asks for one, and a plan that does gets a `security: yes` header (absent, like `design:`, when it does not) and is queued `with a security review`.
 It has to be read rather than matched: plans name the skill as often to waive it as to ask for it - "`/security-review` is not warranted" - so a pattern cannot tell the two apart, and a yes stands only when the plan's text mentions a security review at all.
 The wording was checked against ten real plans, four runs each, and came back right all forty times, including one that asks for it inside an aside about CSRF and `pq`'s own plan, which names it only as follow-up work.
 
@@ -453,6 +452,7 @@ The implementer's contract says `pq` runs the review, and not to run one itself.
 Once the draft is open, `pq` runs `claude -p "/security-review"` in the task's worktree beside the code reviewer, launched on the same tick, on the same `PQ_REVIEWER_MODEL`, timeout, `PQ_REVIEW_MAX_TRIES` and retry but at `xhigh` rather than the code review's `high`, and under the same read-only deny rules, with `gh` denied outright.
 The skill takes no target and posts nothing: it reviews `git diff origin/HEAD...` of wherever it runs and replies with a markdown report.
 So its brief names the diff to go by - `git diff origin/<base>...HEAD`, since `origin/HEAD` is the default branch whatever the pull request is aimed at - and points it at the plan, which says why it asked and what to look at.
+For now every task's base is its repo's default branch, so the two agree; the brief names it all the same, for a worktree whose `origin/HEAD` was never set up.
 Then `pq` delivers the report itself: it is saved as `<task>/security.md` and posted on the pull request as one comment, next to the code review's inline ones.
 
 The two reviews meet at one point: the follow-up waits until both have finished, so the implementer is told once, about both - answer every inline comment and every finding in the security report, by fixing it or saying why it stands - and the slot stays held until then.
@@ -493,7 +493,7 @@ That is the same `wt rm` you would have run by hand, driven unattended.
 
 Settled means either of two things:
 
-- **merged** into the base it was aimed at - checked against the forge, the same predicate blockers use, not `wt gc --settled`'s looser "state == MERGED"
+- **merged** into its repo's default branch - checked against the forge, the same predicate blockers use, not `wt gc --settled`'s looser "state == MERGED"; a merge commit on the default branch counts, which is how a stack merged from its top lands
 - **closed** without merging, every pull request for the branch - closing one is a decision that the work is finished, so it settles the task exactly as a merge does
 
 Closing a pull request is how you say you are done with a piece of work, and there is nothing left for its agent to come back to either way.

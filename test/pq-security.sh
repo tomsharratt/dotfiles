@@ -357,8 +357,8 @@ PID=$(st "$G" PQ_SECURITY_PID)
 [ -n "$PID" ] && review_alive "$PID" && ok || bad "the security reviewer's process group is recorded and alive"
 [ "$PID" != "$(st "$G" PQ_REVIEW_PID)" ] && ok || bad "and it is not the code reviewer's"
 
-echo "== a task on an integration branch has its base named in the brief ==" >&2
-has "$(security_brief 42 /x integration)" "exactly \`git diff origin/integration...HEAD\`: where the diff shown to you differs from that" \
+echo "== a pull request aimed elsewhere, as a stacked one is, has its base named in the brief ==" >&2
+has "$(security_brief 42 /x tom/lower)" "exactly \`git diff origin/tom/lower...HEAD\`: where the diff shown to you differs from that" \
   "the base the pull request is aimed at, not origin/HEAD"
 hasnt "$(security_brief 42 /x "")" "git diff origin/" "and with no base known, no command is invented"
 

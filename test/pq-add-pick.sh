@@ -378,6 +378,22 @@ gum_reset; gum_answer "@1"; gum_answer ""; gum_answer ""; gum_answer "sonnet"; g
 t=$(find_task marker-wiring-fixture)
 case "$(cat "$t/after" 2>/dev/null)" in *tom/blocker-cand*) ok ;; *) bad "the blocker should gate the new task (after: $(cat "$t/after" 2>/dev/null))" ;; esac
 
+echo "== wiring: adding from a pushed feature branch writes no base: header ==" >&2
+# Every task forks from and aims at its repo's default branch, whatever branch
+# the checkout is standing on when you add it.
+reset_tasks
+git -C "$REPO" checkout -q -b tom/feature
+git -C "$REPO" update-ref refs/remotes/origin/tom/feature refs/heads/tom/feature
+gum_reset; gum_answer "@1"; gum_answer ""; gum_answer ""; gum_answer "sonnet"; gum_answer "medium"
+( cd "$REPO" && main add ) >/dev/null 2>"$PQ_HOME/.feature.err"
+t=$(find_task marker-wiring-fixture)
+[ -n "$t" ] && ok || bad "the add from a feature branch should succeed: $(cat "$PQ_HOME/.feature.err")"
+[ -n "$t" ] && eq "$(hdr "$t/plan.md" base)" "" "no base: header, though the repo is on a pushed feature branch"
+case "$(cat "$PQ_HOME/.feature.err")" in *"base:   "*|*"queuing against"*) bad "and nothing said about a base (got: $(cat "$PQ_HOME/.feature.err"))" ;; *) ok ;; esac
+git -C "$REPO" checkout -q master
+git -C "$REPO" branch -q -D tom/feature
+git -C "$REPO" update-ref -d refs/remotes/origin/tom/feature
+
 echo "== wiring: pq add takes no arguments - the wizard is the way in ==" >&2
 reset_tasks
 for arg in "$PQ_PLANS_DIR/wiring.md" --model; do

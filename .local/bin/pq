@@ -13,9 +13,8 @@
 # `pq`, and `pq` reaches it through one narrow seam (`wt new --no-agent --no-focus
 # --json`).
 #
-#   pq add               pick a plan and add it; it forks from the branch the repo is
-#                        on, when that is not the default; it asks the model, the
-#                        effort, what it should wait on (its PR must merge first) and,
+#   pq add               pick a plan and add it; it asks the model, the effort, what
+#                        it should wait on (its PR must merge first) and,
 #                        for a plan built from a design that names no file on disk,
 #                        the design file the implementer builds to - and then it is
 #                        done. The next tick names it and queues it (see "naming")
@@ -46,13 +45,10 @@
 # ancestor of anything, so `git branch --merged` misses every real merge. See
 # `after_state` below for the full predicate.
 #
-# What "merged" means is per-task, not per-repo. A task's `base:` header names the
-# branch it forks from and opens its pull request against - the branch its repo
-# was standing on at `pq add`, when that was not the default; without one it is
-# the repo's default branch.
-# A blocker is met when its work is present in the DEPENDENT's base - the question
-# a fork point actually asks - so a stack landing on an integration branch is
-# gated correctly instead of waiting forever on a trunk it was never aimed at.
+# What "merged" means is the same for every task: its work is present in its
+# repo's default branch, the branch every task forks from and opens its pull
+# request against. A blocker is met when its work is present in ITS OWN repo's
+# default branch.
 # `merged_into` is that predicate, and the one place git ancestry is consulted:
 # on the forge's own MERGE COMMIT, which unlike a branch tip is by construction on
 # the branch it landed on. The forge still decides whether something merged; git
@@ -62,9 +58,9 @@
 # task earns a teardown once its pull request has SETTLED, which is either of two
 # things:
 #
-#   merged into THE BASE IT WAS AIMED AT - its own `base:` header, or its repo's
-#   default branch when it has none; checked against the forge, never `wt`'s
-#   looser "state == MERGED"
+#   merged into its repo's default branch - checked against the forge, never
+#   `wt`'s looser "state == MERGED"; a merge commit on the default branch counts,
+#   which is how a stack merged from its top lands
 #
 #   closed without merging, every pull request for the branch - closing one is a
 #   decision that the work is finished, so it settles the task exactly as a merge
@@ -75,10 +71,6 @@
 # the decision is always yours, and this only acts on one you already made. The
 # one thing that holds a teardown off is the agent still going, or `pq` itself
 # sitting in the workspace about to be closed - see `reap_task` below.
-#
-# "Merged into its base" is deliberately not the same as "merged": a task aimed
-# at an integration branch that lands there HAS shipped as far as it was ever
-# going to, and one aimed at the trunk that landed somewhere else has not.
 #
 # Between a pull request opening and you reading it, `pq` does two more things.
 # Every implementer is dispatched with a delivery CONTRACT (`contract_write`):
@@ -112,8 +104,7 @@
 #                                                          the implementer is ever told, since the real one moves
 #
 #   <task>/plan.md     the settings header + Claude's plan, immutable once queued
-#                     (`base:` is optional and absent on most tasks - see `task_base`;
-#                      `design:` likewise, a comma-separated list of the files in design/;
+#                     (`design:` is optional, a comma-separated list of the files in design/;
 #                      `security: yes` likewise, when the plan asks for a security review - see name_plan;
 #                      `branch:`, `intent:` and `security:` are absent until it is named)
 #          after       blockers: one per line, TSV  label <TAB> repo <TAB> branch
@@ -1462,7 +1453,7 @@ cmd_add() {
   [ $# -eq 0 ] || die "pq add takes no arguments - it asks: '$1'"
   need_gum add
   local plan="" model=$PQ_DEFAULT_MODEL effort=$PQ_DEFAULT_EFFORT
-  local repo="" basebr=""
+  local repo=""
   # A string, not an array: an empty bash array expanded under `set -u` is a
   # portability trap (fixed only in bash 4.4+), so every repeatable option in
   # this script accumulates into a newline-joined string instead. See `repos`
@@ -1499,39 +1490,6 @@ cmd_add() {
     *) die "no plans in $PLANS_DIR to add" ;;
   esac
   [ -f "$plan" ] || die "no such plan: $plan"
-
-  # The base is the branch the repo is STANDING ON, when that is something other
-  # than its default. You plan the work in the branch it belongs to, so the
-  # checkout already knows the answer, and asking you to repeat it every time is a
-  # step that will be forgotten - silently, because a forgotten base queues
-  # against the trunk and only shows up at dispatch. To queue against the default
-  # from a feature branch, check the default out first.
-  #
-  # Read from $repo, NOT from $PWD, deliberately. $repo is already resolved to the
-  # MAIN checkout above so that adding from inside a worktree still queues against
-  # the parent - and taking the branch from $PWD would undo that in the worst
-  # possible way: planning from inside a task's worktree would silently base the
-  # new task on THAT task's in-flight branch, which is stacked pull requests, a
-  # much bigger decision than an inferred default should ever make on its own.
-  #
-  # Three things stop this firing when it should not:
-  #   detached HEAD      rev-parse prints "HEAD"; there is no branch to inherit
-  #   already the default  nothing to record - absent means the default
-  #   not on origin      `wt new --base origin/X` cannot fork it and no pull
-  #                      request can target it, so it is not a usable base yet
-  #
-  # Held, not printed here: it is said beside the rest of what was added.
-  local base_note="" cur def
-  cur=$(git -C "$repo" rev-parse --abbrev-ref HEAD 2>/dev/null)
-  def=$(repo_base "$repo")
-  if [ -n "$cur" ] && [ "$cur" != HEAD ] && [ -n "$def" ] && [ "$cur" != "$def" ]; then
-    if git -C "$repo" rev-parse --verify --quiet "refs/remotes/origin/$cur^{commit}" >/dev/null 2>&1; then
-      basebr=$cur
-      base_note="base:   $cur (the branch $(basename "$repo") is on - check out $def first to queue against it)"
-    else
-      warn "$(basename "$repo") is on $cur, which is not on origin - queuing against $def instead; push it first to queue against it"
-    fi
-  fi
 
   # The design set, before the wizard: what the plan's text names and exists on
   # disk. Whether the plan reads as built from a design at all is what the
@@ -1609,12 +1567,9 @@ cmd_add() {
   {
     printf -- '---\n'
     printf 'repo:     %s\n'   "$repo"
-    # Omitted entirely when unset rather than written empty: `task_base` reads
-    # this key, and an absent one is what makes it fall through to the repo
-    # default.
-    [ -n "$basebr" ] && printf 'base:     %s\n' "$basebr"
-    # Same absent-means-none pattern as `base:` - written only when there is
-    # a design set, so every task without one keeps the header it always had.
+    # Omitted entirely when unset rather than written empty - written only when
+    # there is a design set, so every task without one keeps the header it
+    # always had.
     [ -n "$design_hdr" ] && printf 'design:   %s\n' "$design_hdr"
     printf 'model:    %s\n'   "$model"
     printf 'effort:   %s\n'   "$effort"
@@ -1642,7 +1597,6 @@ cmd_add() {
   trap - EXIT
 
   msg "plan:   $plan"
-  [ -n "$base_note" ] && msg "$base_note"
   [ -n "$design_hdr" ] && msg "design: $design_hdr"
   msg "added:  new/$(basename "$dir")  ($model, effort $effort) - the next tick names it and queues it"
   repo_base_reset
@@ -2320,34 +2274,13 @@ repo_base() {                           # repo -> default branch name (bare), or
 # base_fetch's own memo goes with it: same lifetime, same reasoning.
 repo_base_reset() { rm -f "$PQ_HOME/.base.$$" "$PQ_HOME/.basefetch.$$" 2>/dev/null; }
 
-# The branch this task forks from and aims its pull request at: its own `base:`
-# header when it has one, otherwise its repo's default branch. Everything pq used
-# to ask `repo_base` directly now asks this instead, and a task with no `base:`
-# gets byte-for-byte the old answer - which is what keeps a single-trunk repo's
-# behaviour completely unchanged.
+# The branch this task forks from and aims its pull request at, and the one its
+# work is judged merged against: its repo's default branch, for every task.
 #
 # Empty means unresolvable, and every caller has to fail closed on that, exactly
 # as they already do for repo_base - see after_state's "nobase" detail.
 task_base() {                           # task_dir -> base branch name, or "" when unresolvable
-  local d=$1 b
-  b=$(hdr "$d/plan.md" base)
-  [ -n "$b" ] && { printf '%s' "$b"; return 0; }
-  repo_base "$(hdr "$d/plan.md" repo)"
-}
-
-# Which base ONE blocker of $d is judged against. The whole point of the change:
-# a blocker is met when its work is in the branch the dependent will fork from,
-# not when it reached some repo-wide trunk the dependent may not even be aiming
-# at.
-#
-# Cross-repo blockers are the exception, and they have to be. A task in
-# supercast can wait on one in supercast-ios, and "will my base contain
-# it" is meaningless across two repositories that share no history - so those
-# keep being judged against their OWN repo's default branch, which is the only
-# trunk they have in common with anything.
-blocker_base() {                        # task_dir blocker_repo -> the base to judge it against
-  local d=$1 brepo=$2
-  if [ "$brepo" = "$(hdr "$d/plan.md" repo)" ]; then task_base "$d"; else repo_base "$brepo"; fi
+  repo_base "$(hdr "$1/plan.md" repo)"
 }
 
 # Pure: reads only PR_CACHE. 0 when a PR for this branch merged into base.
@@ -2427,18 +2360,14 @@ base_fetch() {                          # repo base
 # Two arms, cheapest first:
 #
 #   1. A MERGED row whose baseRefName IS $base. Pure, cache-only, no git at all,
-#      and the only arm a repo with a single integration target ever reaches -
-#      so the common path costs exactly what it did before this existed.
+#      and the arm almost every merge reaches.
 #   2. That row's MERGE COMMIT is an ancestor of $base. This is what carries a
-#      stack whose lower parts landed on the trunk BEFORE the integration branch
-#      was cut: part 3 merged to master, part 4 is based on `live-events`, and
-#      master's own commit is sitting in `live-events` history. Exact matching
-#      calls that unmet and freezes the queue; containment gets it right.
-#
-# Testing whether $base CONTAINS the repo default instead would be cheaper and is
-# wrong: an integration branch is cut once and then diverges, so origin/master
-# stops being an ancestor of it within a day (measured: master 3 ahead,
-# live-events 1 ahead) while the merge commit is still plainly in both.
+#      stack merged from its top: GitHub lands every layer in one operation, but
+#      records each upper pull request as merged into the branch BELOW it, not
+#      into the trunk (supercast #6999 reads MERGED with
+#      baseRefName=multi-newsletters-1-data-model) - while its merge commit is
+#      plainly on master. Exact matching calls that unmet and freezes the queue;
+#      containment gets it right.
 #
 # This does not reopen the "never git ancestry" rule at the top of this file. That
 # rule is about a branch TIP, and it is right - a squash-merged branch's tip is
@@ -2523,7 +2452,7 @@ after_state() {                         # task_dir
   if [ ! -f "$d/after" ]; then printf 'met\t'; return; fi
   while IFS=$'\t' read -r label repo branch; do
     [ -n "$label" ] || continue
-    base=$(blocker_base "$d" "$repo")
+    base=$(repo_base "$repo")
     if [ -z "$base" ]; then
       nobase=$repo
       n_unmet=$((n_unmet + 1)); [ -n "$first_wait" ] || first_wait=$label
@@ -2593,44 +2522,6 @@ after_check() {                         # task_dir
   printf '%s' "$verdict"
 }
 
-# The base half of the same gate, and the reason it exists at all: fill CLAIMS a
-# task into `running/` before dispatch is attempted, so a dispatch that refuses
-# leaves it there with no PR and no PQ_LAUNCHED. `active_slots` counts `running/`
-# unconditionally, and the next reconcile reads it as an interrupted dispatch and
-# retries - forever, holding one of three slots all night for a task that cannot
-# start. Refusing from `queue/` instead costs nothing and reports itself.
-#
-# This is not a rare case. It is the NORMAL end of the workflow `base:` exists
-# for: you merge the integration branch into the trunk and delete it, and every
-# task still queued behind it now names a branch that is gone.
-#
-# Only a DECLARED base is checked. A task without one forks wherever `wt` would
-# have sent it anyway, and there is nothing here that could be missing.
-#
-# The local remote-tracking ref is the whole test, deliberately: it is exactly
-# what `dispatch_task` will fork from, so agreeing with it is the point. A
-# deleted remote branch whose stale ref nobody pruned therefore still reads as
-# present - and that case does NOT burn a slot (the fork succeeds), it surfaces
-# as the agent's own `gh pr create --base` failing into a draft PR, which is a
-# visible `done/` row rather than a silent stall.
-#
-# Warns once on the transition and clears on recovery, the same once-only flag
-# after_check uses, so a base that comes back re-arms the warning.
-base_check() {                          # task_dir -> "basegone <branch>" | ""
-  local d=$1 b repo was
-  b=$(hdr "$d/plan.md" base)
-  [ -n "$b" ] || return 0
-  repo=$(hdr "$d/plan.md" repo)
-  was=$(st "$d" PQ_BASE_GONE)
-  if git -C "$repo" rev-parse --verify --quiet "refs/remotes/origin/$b^{commit}" >/dev/null 2>&1; then
-    [ -z "$was" ] || st_set "$d" PQ_BASE_GONE ""
-    return 0
-  fi
-  [ "$was" = 1 ] || { st_set "$d" PQ_BASE_GONE 1
-    warn "$(slug_of "$d"): base origin/$b is gone - merged and deleted? pq rm $(slug_of "$d"), then add it again from the branch it should fork from"; }
-  printf 'basegone %s' "$b"
-}
-
 # {label, repo, branch, state} for every blocker, for cmd_ls --json - assumes
 # PR_CACHE/PR_ANS already cover every blocker's (repo, branch), same as
 # after_state assumes.
@@ -2640,7 +2531,7 @@ after_json() {                          # task_dir
   local tmp="$PQ_HOME/.afterjson.$$"; : > "$tmp"
   while IFS=$'\t' read -r label repo branch; do
     [ -n "$label" ] || continue
-    base=$(blocker_base "$d" "$repo")
+    base=$(repo_base "$repo")
     st=$(blocker_state "$repo" "$branch" "${base:-}")
     jq -nc --arg label "$label" --arg repo "$repo" --arg branch "$branch" --arg state "$st" \
       '{label: $label, repo: $repo, branch: $branch, state: $state}' >> "$tmp"
@@ -2767,9 +2658,9 @@ agent_cell() {                          # task_dir state
   local d=$1 st=$2 pane status blocked
   case "$st" in
     new)
-      # What naming last recorded, never asked again here - the same rule as a
-      # queued task's base below. `naming failed` and `blocker gone` want you;
-      # anything else is a tick away, or waits on the blocker it names.
+      # What naming last recorded, never asked again here - a listing must not
+      # touch git or write to state.env. `naming failed` and `blocker gone` want
+      # you; anything else is a tick away, or waits on the blocker it names.
       case "$(st "$d" PQ_NAME_WHY)" in
         gaveup) printf 'naming failed'; return ;;
         gone)   printf 'blocker gone'; return ;;
@@ -2784,16 +2675,6 @@ agent_cell() {                          # task_dir state
       return
       ;;
     queue)
-      # A base that has gone missing outranks any blocker verdict: the task cannot
-      # start either way, and this is the one that needs YOU rather than time.
-      # Read from the stamp, never probed here - `base_check` in the tick is the
-      # writer, exactly as `block_cell` reads the agent's record rather than inspecting a
-      # pane. A listing must not touch git or write to state.env.
-      #
-      # Without this a task whose base was merged and deleted would show `-` and
-      # count as healthy, which is precisely the silent stall the rest of this
-      # column exists to prevent.
-      [ "$(st "$d" PQ_BASE_GONE)" = 1 ] && { printf 'base gone'; return; }
       [ -f "$d/after" ] || { printf -- '-'; return; }
       local verdict lbl cnt
       IFS=$'\t' read -r verdict _ <<<"$(after_state "$d")"
@@ -2967,7 +2848,7 @@ cmd_ls() {
     agent=$(agent_cell "$d" "$st")
     case "$agent" in
       permission|gone|exited|blocked|unknown|quiet|error|failed) needs=$((needs + 1)) ;;
-      dead\ *|stalled\ *|held\ *|base\ *)             needs=$((needs + 1)) ;;
+      dead\ *|stalled\ *|held\ *)                     needs=$((needs + 1)) ;;
       naming\ failed|blocker\ gone)                   needs=$((needs + 1)) ;;
       review\ lapsed|ci\ failed|conflict|new\ review)  needs=$((needs + 1)) ;;
     esac
@@ -2982,14 +2863,14 @@ cmd_ls() {
     esac
     num=""; prstate=""; draft=""
     IFS=$'\t' read -r num prstate draft <<<"$(pr_get "$repo" "$branch")"
-    local tbase; tbase=$(task_base "$d")
     case "${prstate:-}" in
-      # A merged PR that is NOT in this task's base is the one row that used to
-      # read as finished while the queue quietly disagreed with it - `#6460
-      # merged` on screen, `waiting` in the predicate, and nothing anywhere
-      # reconciling the two. Say where it went instead.
+      # A merged PR that is NOT in its repo's default branch is the one row
+      # that used to read as finished while the queue quietly disagreed with it
+      # - `#6460 merged` on screen, `waiting` in the predicate, and nothing
+      # anywhere reconciling the two. Say where it went instead. The base is
+      # looked up here, in this arm only, so no other row pays for it.
       MERGED) pr="#$num merged"
-              merged_into "$repo" "$branch" "$tbase" \
+              merged_into "$repo" "$branch" "$(task_base "$d")" \
                 || pr="#$num merged->$(pr_base "$repo" "$branch")" ;;
       OPEN)   pr="#$num ${draft:-open}" ;;
       CLOSED) pr="#$num closed" ;;
@@ -3003,7 +2884,6 @@ cmd_ls() {
       jq -nc --arg task "$slug" --arg state "$st" --arg branch "$branch" \
         --arg repo "$repo" --arg model "$model" --arg effort "$effort" \
         --arg intent "$intent" --arg added "$added" --arg dir "$d" \
-        --arg base "$tbase" \
         --arg agent "$agent" --arg pr "${num:-}" --arg prstate "${prstate:-}" \
         --arg draft "$draft" --arg stamp "$(stamp_of "$d")" \
         --arg merged "$merged" --arg closed "$closed" \
@@ -3017,7 +2897,7 @@ cmd_ls() {
         def str: if . == "" then null else . end;
         def num: if . == "" or . == null then null else tonumber end;
         { task: $task, stamp: ($stamp|tonumber), state: $state, dir: $dir,
-          repo: $repo, branch: ($branch|str), base: ($base|str), model: $model, effort: $effort,
+          repo: $repo, branch: ($branch|str), model: $model, effort: $effort,
           intent: ($intent|str), added: ($added|str),
           agent: ($agent | if . == "-" then null else . end),
           pr: ($pr|str|if . then tonumber else null end),
@@ -3095,7 +2975,7 @@ cmd_after() {
     local label repo branch base bst owner ownerst num prstate draft prtxt desc overdict
     while IFS=$'\t' read -r label repo branch; do
       [ -n "$label" ] || continue
-      base=$(blocker_base "$d" "$repo")
+      base=$(repo_base "$repo")
       bst=$(blocker_state "$repo" "$branch" "${base:-}")
       owner=$(task_by_branch "$repo" "$branch") || owner=""
       ownerst=${owner:+$(state_of "$owner")}; ownerst=${ownerst:--}
@@ -3166,7 +3046,7 @@ cmd_after() {
       && { release_lock; die "'$value' would create a cycle - $(slug_of "$d") already leads back to it"; }
     after_add "$d" "$label" "$repo" "$branch"
     pr_load_all "$(printf '%s\t%s\n' "$repo" "$branch")"
-    base=$(blocker_base "$d" "$repo")
+    base=$(repo_base "$repo")
     if [ -n "$base" ] && merged_into "$repo" "$branch" "$base"; then
       msg "$(slug_of "$d") after $label: already in $base - nothing to wait for"
     else
@@ -3348,20 +3228,9 @@ cmd_evidence() {
 # refused; it goes to `herdr agent prompt` as one argv element that no shell ever
 # re-parses, so nothing would break. The convention stays because the review
 # follow-up (review_prompt) shares it, and one rule is easier to keep than two.
-dispatch_prompt() {                     # task_dir [base]
-  # The base clause is only added when there IS one to add - a task aimed at the
-  # repo default gets the prompt it always got, and `gh pr create` picks the right
-  # target by itself. When the base is something else, saying so is not optional:
-  # `gh pr create` defaults to the DEFAULT branch, so the PR would open against a
-  # trunk that is missing everything this branch forked from, and its diff would
-  # swallow the whole integration branch.
-  local base_clause=""
-  [ -n "${2:-}" ] && base_clause="This branch was forked from $2, not from the repository default branch, \
-so open your pull request against $2 - pass --base $2 to gh pr create. \
-Do not rebase onto the default branch. "
+dispatch_prompt() {                     # task_dir
   printf '%s' "Read $1/plan.md and carry it out. \
 $1/contract.md is how to deliver it: read it before you start and follow it to the letter. \
-${base_clause}\
 Never wait for input - there is nobody watching."
 }
 
@@ -3382,9 +3251,9 @@ Never wait for input - there is nobody watching."
 # markdown rule asks, and written once: dispatch_task only calls this when no
 # contract.md exists, so a re-entered dispatch never rewrites a running agent's.
 contract_write() {                      # task_dir
-  local d=$1 repo branch base intent design security url wt slug tmp home
+  local d=$1 repo branch intent design security url wt slug tmp home
   repo=$(hdr "$d/plan.md" repo);   branch=$(hdr "$d/plan.md" branch)
-  base=$(hdr "$d/plan.md" base);   intent=$(hdr "$d/plan.md" intent)
+  intent=$(hdr "$d/plan.md" intent)
   design=$(hdr "$d/plan.md" design); security=$(hdr "$d/plan.md" security)
   url=$(st "$d" PQ_URL); wt=$(st "$d" PQ_WORKTREE); slug=$(slug_of "$d")
   # Every path the agent is given is the STABLE one (task_home): the real
@@ -3412,12 +3281,6 @@ A mechanical change (a rename, a move, generated output) is its own commit, and 
 A non-mechanical commit over about 300 changed lines gets split into smaller ones.
 Never one squashed commit at the end: the commits are how the pull request will be read.
 History may be rewritten (\`git push --force-with-lease\`) only while the pull request is still a draft.
-EOF
-    [ -n "$base" ] && cat <<EOF
-This branch was forked from \`$base\`, not from the default branch.
-Open the pull request against it (\`gh pr create --base $base\`) and never rebase onto the default branch.
-EOF
-    cat <<EOF
 
 ## Verifying, before the pull request
 
@@ -3611,11 +3474,6 @@ dispatch_task() {                       # task_dir  -> 0 launched, 1 failed, 2 w
   local d=$1 repo branch model effort pane wtjson prompt
   repo=$(hdr "$d/plan.md" repo);     branch=$(hdr "$d/plan.md" branch)
   model=$(hdr "$d/plan.md" model);   effort=$(hdr "$d/plan.md" effort)
-  # The DECLARED base only. `task_base` would fall back to the repo default,
-  # which is precisely what `wt new` already does on its own - so passing that
-  # back to it would be a no-op dressed up as a decision, and it is what keeps
-  # every single-trunk dispatch byte-identical to what it was before.
-  local basebr; basebr=$(hdr "$d/plan.md" base)
   [ -n "$repo" ] && [ -n "$branch" ] || { warn "$(slug_of "$d"): plan.md has no repo/branch"; return 1; }
   [ -d "$repo" ] || { warn "$(slug_of "$d"): repo $repo is gone"; return 1; }
 
@@ -3643,27 +3501,11 @@ dispatch_task() {                       # task_dir  -> 0 launched, 1 failed, 2 w
     GIT_SSH_COMMAND="${GIT_SSH_COMMAND:-ssh -o ConnectTimeout=5 -o BatchMode=yes}" \
       git -C "$repo" fetch --quiet origin 2>/dev/null \
       || warn "$(slug_of "$d"): could not fetch $repo - the worktree may fork from a stale base"
-    # A declared base is checked HERE rather than trusted, because the failure is
-    # silent and expensive: `wt new` falls back to origin/HEAD for a base it
-    # cannot resolve, so a typo'd or deleted branch would quietly hand the agent
-    # a worktree forked from the trunk - the exact wrong-fork-point bug this
-    # header exists to prevent, only harder to see because everything "worked".
-    local baseflag=""
-    if [ -n "$basebr" ]; then
-      if git -C "$repo" rev-parse --verify --quiet "refs/remotes/origin/$basebr^{commit}" >/dev/null; then
-        baseflag="--base origin/$basebr"
-        msg "$(slug_of "$d"): forking from origin/$basebr"
-      else
-        warn "$(slug_of "$d"): base origin/$basebr does not exist - refusing to fork from the wrong branch"
-        return 1
-      fi
-    fi
     msg "$(slug_of "$d"): preparing worktree for $branch"
     # Shielded: this is the slow one - a full database copy - and the one worth
     # letting finish when you Ctrl-C. wt's own progress still goes to stderr and
     # straight to the user; only its stdout (the JSON) is captured.
-    # shellcheck disable=SC2086
-    shielded wt_in "$repo" new --no-agent --no-focus $baseflag --json "$branch" \
+    shielded wt_in "$repo" new --no-agent --no-focus --json "$branch" \
       || { warn "$(slug_of "$d"): wt new failed"; return 1; }
     wtjson=$SHIELDED_OUT
     pane=$(jq -r '.root_pane_id // empty' <<<"$wtjson" 2>/dev/null)
@@ -3713,7 +3555,7 @@ dispatch_task() {                       # task_dir  -> 0 launched, 1 failed, 2 w
   # The prompt, as one argv element. A refusal leaves PQ_LAUNCHED empty, which is
   # what the resume path in tick_body already retries - so an agent that came up
   # blocked on a dialog gets its prompt on the first tick after the dialog goes.
-  prompt=$(dispatch_prompt "$(task_home "$d")" "$basebr")
+  prompt=$(dispatch_prompt "$(task_home "$d")")
   local code rc
   code=$(agent_prompt "$pane" "$prompt"); rc=$?
   if [ "$rc" = 2 ]; then
@@ -4018,12 +3860,13 @@ security_cmd() {                        # pr task_home base
 
 # What the security reviewer is told beside the skill. The base is named because
 # the skill diffs against origin/HEAD - the repository default, whatever the pull
-# request is aimed at - so a task on an integration branch would otherwise be
-# reviewed as the whole integration branch. It is named for a default-branch
-# task too, so a worktree whose origin/HEAD was never set up still has the right
-# command. The plan is pointed at because it says why it asked and what to look
-# at, and the `wt` clause is review_brief's: the spike's reviewers ran code to
-# check a finding, and in a Rails worktree that means a database. One line, and
+# request is aimed at - so a pull request aimed anywhere else, as a stacked one
+# is, would otherwise be reviewed along with everything below it. For now every
+# task's base is its repo's default branch, and it is named all the same, so a
+# worktree whose origin/HEAD was never set up still has the right command. The
+# plan is pointed at because it says why it asked and what to look at, and the
+# `wt` clause is review_brief's: the spike's reviewers ran code to check a
+# finding, and in a Rails worktree that means a database. One line, and
 # quote-free by the same convention as dispatch_prompt.
 security_brief() {                      # pr task_home base
   local basec=""
@@ -4971,8 +4814,8 @@ watch_cell() {                          # task_dir
 # its port, its redis index, its puma-dev entry, and the Herdr workspace holding
 # the agent's pane. Reclaiming all of that used to be a human errand, `wt rm` by
 # hand or `wt gc --settled` if you remembered it existed. This is the other end of
-# dispatch: once a task's pull request has settled - merged into the base it was
-# aimed at, or closed without merging - `pq` tears down what it built, the same
+# dispatch: once a task's pull request has settled - merged into its repo's
+# default branch, or closed without merging - `pq` tears down what it built, the same
 # `wt rm` you would have run yourself, driven unattended.
 #
 # `pq` still never touches a worktree it did not create, never merges or closes a
@@ -5562,18 +5405,12 @@ tick_body() {                           # cap dry
   # tick that noticed, and it warms the per-task verdict fill reuses below
   # rather than recomputing it.
   local afterpass="$PQ_HOME/.after.$$"; : > "$afterpass"
-  local v bgone
+  local v
   for d in "$PQ_HOME/queue"/*/; do
     [ -d "$d" ] || continue
     d=${d%/}
     v=""
     [ -f "$d/after" ] && v=$(after_check "$d")
-    # A base that no longer resolves OUTRANKS any blocker verdict: the task
-    # cannot start either way, and this is the one of the two that needs you
-    # rather than time. Run after after_check, never instead of it, so the
-    # blocker bookkeeping (PQ_AFTER_DEAD and its clearing) stays consistent.
-    bgone=$(base_check "$d")
-    [ -n "$bgone" ] && v=$bgone
     [ -n "$v" ] && printf '%s\t%s\n' "$d" "$v" >> "$afterpass"
   done
   local waiting; waiting=$(awk -F'\t' '$2 !~ /^met/ { n++ } END { print n + 0 }' "$afterpass")
@@ -5617,9 +5454,6 @@ tick_body() {                           # cap dry
           continue ;;
         dead\ *)
           [ "$dry" = 1 ] && msg "would skip $slug - blocker ${verdict#dead } is dead"
-          continue ;;
-        basegone\ *)
-          [ "$dry" = 1 ] && msg "would skip $slug - base origin/${verdict#basegone } is gone"
           continue ;;
       esac
       if [ "$dry" = 1 ]; then

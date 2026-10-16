@@ -3,7 +3,7 @@
 # longer dropped, the contract is written once, and the agent is started and
 # prompted through herdr's agent API rather than typed into the pane.
 #
-# Merges test/pq-base.sh's JSON-returning `wt` stub with test/pq-pane.sh's
+# Merges test/pq-merged.sh's JSON-returning `wt` stub with test/pq-pane.sh's
 # recording `herdr` stub, plus `agent start` / `agent prompt` arms that answer
 # the way herdr really does: JSON on stdout and exit 0 either way, an error
 # being an {"error":{"code":...}} body.
@@ -85,8 +85,6 @@ git -C "$REPO" -c user.email=test@test -c user.name=test commit -q --allow-empty
 mkdir -p "$REPO/.git/refs/remotes/origin"
 git -C "$REPO" update-ref refs/remotes/origin/master refs/heads/master
 git -C "$REPO" symbolic-ref refs/remotes/origin/HEAD refs/remotes/origin/master
-git -C "$REPO" branch -q live-events master
-git -C "$REPO" update-ref refs/remotes/origin/live-events refs/heads/live-events
 
 unset HERDR_ENV HERDR_SOCKET_PATH HERDR_WORKSPACE_ID
 PQ_DONE_KEEP=99
@@ -98,8 +96,8 @@ reset_tasks() {
 reset_tasks
 reset_logs() { : > "$HERDR_LOG"; : > "$WT_LOG"; rm -f "$STUBBIN/.start-fail" "$STUBBIN/.start-fail-once" "$STUBBIN/.prompt-fail"; }
 
-mk_task() {                             # state prio slug branch [base] [design] -> task_dir
-  local state=$1 prio=$2 slug=$3 branch=$4 base=${5:-} design=${6:-}
+mk_task() {                             # state prio slug branch [design] -> task_dir
+  local state=$1 prio=$2 slug=$3 branch=$4 design=${5:-}
   local dir
   dir="$PQ_HOME/$state/$(printf '%014d' $(( 20260101000000 + 10#$prio )))-$slug"
   mkdir -p "$dir"
@@ -107,7 +105,6 @@ mk_task() {                             # state prio slug branch [base] [design]
     printf -- '---\n'
     printf 'repo:     %s\n' "$REPO"
     printf 'branch:   %s\n' "$branch"
-    [ -n "$base" ] && printf 'base:     %s\n' "$base"
     [ -n "$design" ] && printf 'design:   %s\n' "$design"
     printf 'model:    sonnet\n'
     printf 'effort:   xhigh\n'
@@ -138,6 +135,7 @@ eq "$rc" "0" "dispatch should succeed"
 grep -q "	new	" "$WT_LOG" && ok || bad "wt new should have been called"
 grep -q -- "--no-dev" "$WT_LOG" && bad "wt new must no longer be told --no-dev - the implementer needs a running app" || ok
 grep -q -- "--no-agent" "$WT_LOG" && ok || bad "pq starts its own agent, so wt must not"
+grep -q -- "--base" "$WT_LOG" && bad "wt new forks from the default branch, so it is never passed --base" || ok
 eq "$(st "$D" PQ_PANE)" "w1:p1" "the root pane is recorded"
 eq "$(st "$D" PQ_DEV_PANE)" "w1:p2" "the dev pane is recorded too"
 eq "$(st "$D" PQ_URL)" "https://task.test" "and the url"
@@ -163,7 +161,7 @@ has "$P" "$H/contract.md is how to deliver it" "and at the contract, the same wa
 hasnt "$P" "$D/" "never the state directory, which is gone the moment reconcile moves the task"
 has "$P" "Never wait for input - there is nobody watching." "and says nobody is watching"
 hasnt "$P" "'" "quote-free by convention"
-hasnt "$P" "--base" "no base clause for a task on the default branch"
+hasnt "$P" "--base" "no base clause: every task aims at its repo's default branch"
 eq "$(grep -c "^agent	prompt	" "$HERDR_LOG")" "1" "one prompt"
 eq "$(awk -F'\t' '$1 == "agent" && $2 == "prompt" { print $3 }' "$HERDR_LOG")" "w1:p1" "aimed at the task's pane"
 
@@ -200,7 +198,7 @@ has "$(cat "$C")" "| Before | After |" "a before beside its after"
 has "$(cat "$C")" "| 1440 | 390 |" "and a new screen's widths beside each other"
 has "$(cat "$C")" "blank line before and after every table" "so a caption is never read as a row"
 hasnt "$(cat "$C")" "| Design | Implemented |" "no design/impl table without a design"
-hasnt "$(cat "$C")" "forked from" "no base clause without a base"
+hasnt "$(cat "$C")" "forked from" "no base clause"
 grep -q -- '—' "$C" && bad "no em dashes" || ok
 # The width is set with emulate: resize quietly clamps it to what the window
 # allows, and two sessions lost time to a 390px screenshot that was not.
@@ -221,9 +219,9 @@ set_panes "$(printf 'w1:p1\tclaude\tidle')"
 dispatch_task "$D" >/dev/null 2>&1
 grep -q MARKER-KEEP "$C" && ok || bad "a re-entered dispatch must never rewrite a running agent's contract"
 
-echo "== the contract carries the design and base sections when the header does ==" >&2
+echo "== the contract carries the design section when the header does ==" >&2
 reset_tasks; reset_logs; set_panes ""
-DB=$(mk_task running 002 based tom/based live-events "Onboarding Refresh.dc.html, shot.png")
+DB=$(mk_task running 002 designed tom/designed "Onboarding Refresh.dc.html, shot.png")
 dispatch_task "$DB" >/dev/null 2>&1
 C="$DB/contract.md"
 has "$(cat "$C")" "## Design fidelity" "a design task gets the design section"
@@ -232,11 +230,6 @@ has "$(cat "$C")" "$PQ_HOME/tasks/$(basename "$DB")/design/" "and where they are
 has "$(cat "$C")" "NN-<screen>-design.png" "and how to name the comparison pairs"
 has "$(cat "$C")" "## Design fidelity\` table" "the PR section asks for the fidelity table"
 has "$(cat "$C")" "| Design | Implemented |" "and lays the design/impl pairs side by side"
-has "$(cat "$C")" "forked from \`live-events\`" "a based task gets the base clause"
-has "$(cat "$C")" "gh pr create --base live-events" "with the flag to pass"
-P=$(prompt_text)
-has "$P" "--base live-events" "and the prompt carries the base too"
-grep -q "	--base	origin/live-events	" "$WT_LOG" && ok || bad "wt new forks from the base"
 
 echo "== re-entry with PQ_STARTED set logs no second start ==" >&2
 reset_logs
@@ -351,9 +344,7 @@ echo "== dispatch_prompt ==" >&2
 p=$(dispatch_prompt /tasks/x)
 has "$p" "Read /tasks/x/plan.md" "the plan path"
 has "$p" "/tasks/x/contract.md" "the contract path"
-hasnt "$p" "--base" "no base clause without a base"
-p=$(dispatch_prompt /tasks/x live-events)
-has "$p" "--base live-events" "the base clause with one"
+hasnt "$p" "--base" "no base clause"
 hasnt "$p" "'" "quote-free"
 
 echo "== a directory in running/ with no plan.md is a phantom, not a task ==" >&2
