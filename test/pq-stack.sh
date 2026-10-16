@@ -508,8 +508,8 @@ eq "$(st "$S" PQ_STACK_FP)" "$(fp "$P" "$F")" "for this need"
 eq "$(st "$S" PQ_WRAPUP_SINCE)" "" "and its slot is held while it works"
 T=$(prompt_text)
 has "$T" "Pull request #10 (tom/pa-20), which this one is stacked on, was rebased" "the onto-parent text"
-has "$T" "First run git pull --rebase --autostash origin tom/ch-20" "the sync line"
-has "$T" "then git fetch origin tom/pa-20. If git merge-base --is-ancestor origin/tom/pa-20 HEAD now succeeds, it already sits on it: stop there." "the guard, on a fresh parent"
+case "$T" in "First run git pull --rebase --autostash origin tom/ch-20: "*) ok ;; *) bad "it opens with the sync line (got '$T')" ;; esac
+has "$T" "After that pull, run git fetch origin tom/pa-20. If git merge-base --is-ancestor origin/tom/pa-20 HEAD now succeeds, it already sits on it: stop there." "the guard, on a fresh parent"
 has "$T" "git rebase --onto origin/tom/pa-20 $F." "--onto with the full fork sha"
 has "$T" "git push --force-with-lease --force-if-includes" "the push flags"
 has "$T" "this replaces any rule in your contract against rebasing a ready pull request" "and what it replaces"
@@ -594,8 +594,8 @@ out=$(restack "$S" 2>&1)
 has "$out" "ch-25: #10 merged but #11 still carries its old commits - asked its agent to move it onto main" "said"
 T=$(prompt_text)
 has "$T" "Pull request #10 (tom/pa-25), which this one was stacked on, has merged into main, but this branch still carries its commits" "the onto-default text"
-has "$T" "First run git pull --rebase --autostash origin tom/ch-25." "the sync line"
-has "$T" "git fetch origin main, then git rebase --onto origin/main $F." "--onto main with the full fork sha"
+case "$T" in "First run git pull --rebase --autostash origin tom/ch-25: "*) ok ;; *) bad "it opens with the sync line (got '$T')" ;; esac
+has "$T" "After that pull, move your own commits onto main: git fetch origin main, then git rebase --onto origin/main $F." "--onto main with the full fork sha"
 has "$T" "git push --force-with-lease --force-if-includes" "the push flags"
 has "$T" "If the pull request is not aimed at main yet, aim it there: gh pr edit 11 --base main." "the retarget"
 has "$T" "This replaces any rule in your contract against rebasing a ready pull request." "and what it replaces"

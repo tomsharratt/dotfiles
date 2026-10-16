@@ -294,6 +294,9 @@ epoch() { date -u '+%s'; }
 # set the clock) and `-f` (input format) are not GNU flags, and pq is a darwin
 # tool. Prints nothing rather than 0 on a bad stamp, so a caller can tell "no
 # stamp" from "the epoch".
+# A fingerprint of a few words, as a single word state.env can hold (see st_set):
+# what says whether a need pq has seen before is the same one.
+fingerprint() { local IFS=' '; printf '%s' "$*" | cksum | awk '{ print $1 }'; }
 epoch_of() {                            # iso8601 -> epoch seconds, or empty
   [ -n "${1:-}" ] || return 0
   date -j -u -f '%Y-%m-%dT%H:%M:%SZ' "$1" '+%s' 2>/dev/null || return 0
@@ -4042,28 +4045,28 @@ stack_link() {                          # task_dir dry
 STACK_DEBOUNCE=60
 STACK_FIXES=3
 
-# What the agent is told, quote-free like every other prompt. `kind` is the
-# need's PQ_STACK_ONTO; `fork` the full fork point, which is where the layer's
-# own commits start. Each opens by syncing, since GitHub may have rebased this
-# branch too, and says outright that it replaces the contract's rule against
+# What the agent is told, quote-free like every other prompt. `kind` is
+# `parent` or `default`; `fork` the full fork point, which is where the layer's
+# own commits start. Each opens with sync_first, since GitHub may have rebased
+# this branch too, and says outright that it replaces the contract's rule against
 # rewriting a ready pull request - a contract is written once, at dispatch.
 # The parent is fetched before the guard, not after it: a stale origin/<parent>
 # still names the old head the layer forked from, which the guard would pass.
 restack_prompt() {                      # kind pr parent_pr parent default branch fork
-  local kind=$1 pr=$2 ppr=$3 parent=$4 defb=$5 branch=$6 fork=$7
+  local kind=$1 pr=$2 ppr=$3 parent=$4 defb=$5 branch=$6 fork=$7 sync
   local tail="Never wait for input - there is nobody watching."
+  sync=$(sync_first "$branch")
   case "$kind" in
     parent)
-      printf '%s' "Pull request #$ppr ($parent), which this one is stacked on, was rebased, so this branch no longer sits on it. \
-First run git pull --rebase --autostash origin $branch, since GitHub may have rebased this branch too, then git fetch origin $parent. \
+      printf '%s' "${sync}Pull request #$ppr ($parent), which this one is stacked on, was rebased, so this branch no longer sits on it. \
+After that pull, run git fetch origin $parent. \
 If git merge-base --is-ancestor origin/$parent HEAD now succeeds, it already sits on it: stop there. \
 Otherwise move your own commits onto it: git rebase --onto origin/$parent $fork. \
 Resolve every conflict, run the tests the conflicting code is covered by, and push with git push --force-with-lease --force-if-includes. \
 This pull request is in a stack, so rebasing it is expected even though it is ready - this replaces any rule in your contract against rebasing a ready pull request. $tail" ;;
     default)
-      printf '%s' "Pull request #$ppr ($parent), which this one was stacked on, has merged into $defb, but this branch still carries its commits as they were before the merge, because GitHub could not restack it. \
-First run git pull --rebase --autostash origin $branch. \
-Then move your own commits onto $defb: git fetch origin $defb, then git rebase --onto origin/$defb $fork. \
+      printf '%s' "${sync}Pull request #$ppr ($parent), which this one was stacked on, has merged into $defb, but this branch still carries its commits as they were before the merge, because GitHub could not restack it. \
+After that pull, move your own commits onto $defb: git fetch origin $defb, then git rebase --onto origin/$defb $fork. \
 Resolve every conflict, run the tests the conflicting code is covered by, and push with git push --force-with-lease --force-if-includes. \
 If the pull request is not aimed at $defb yet, aim it there: gh pr edit $pr --base $defb. \
 This replaces any rule in your contract against rebasing a ready pull request. $tail" ;;
@@ -4082,7 +4085,6 @@ stack_contains() {                      # repo ancestor descendant -> 0 | 1 | 2
   git -C "$1" merge-base --is-ancestor "$2" "$3" 2>/dev/null
   case $? in 0) return 0 ;; 1) return 1 ;; *) return 2 ;; esac
 }
-stack_fp() { printf '%s %s' "$1" "$2" | cksum | awk '{ print $1 }'; }
 
 # Which of the cases above a stacked task is in, as verdict<TAB>arg: `linear P`,
 # `gained`, `rebased FP`, `landed`, `stale FP` (merged, still carrying the old
@@ -4108,7 +4110,7 @@ stack_verdict() {                       # task_dir
     [ "$rc" = 0 ] && { printf 'landed\t'; return 0; }
     stack_contains "$repo" "$F" "$C"; rc=$?
     case "$rc" in
-      0) printf 'stale\t%s' "$(stack_fp "$defb" "$F")" ;;
+      0) printf 'stale\t%s' "$(fingerprint "$defb" "$F")" ;;
       1) printf 'landed\t' ;;
     esac
     return 0
@@ -4124,7 +4126,7 @@ stack_verdict() {                       # task_dir
   stack_contains "$repo" "$F" "$P"; rc=$?
   case "$rc" in
     0) printf 'gained\t' ;;
-    1) printf 'rebased\t%s' "$(stack_fp "$P" "$F")" ;;
+    1) printf 'rebased\t%s' "$(fingerprint "$P" "$F")" ;;
   esac
 }
 
@@ -5448,15 +5450,14 @@ watch_task() {                          # task_dir dry
   IFS=$'\t' read -r head base baseoid conflict ci failed jobs author <<<"$detail"
   pstate=$(pane_state "$(task_pane "$d")")
 
-  # What is most in the way, and the fingerprint that says whether it is new - a
-  # checksum, since state.env holds words (see st_set).
+  # What is most in the way, and the fingerprint that says whether it is new.
   local need="" fp="" what="" newest=""
   # A conflict while a restack is due is the restack's to fix - see "restacking
   # a layer" - so it is not raised here; CI and feedback still are.
   if [ "$conflict" = 1 ] && [ -z "$(st "$d" PQ_STACK_DUE)" ]; then
-    need=conflict; fp=$(printf '%s %s' "$head" "$baseoid" | cksum | awk '{ print $1 }')
+    need=conflict; fp=$(fingerprint "$head" "$baseoid")
   elif [ "$ci" = fail ]; then
-    need=ci; fp=$(printf '%s %s' "$head" "$jobs" | cksum | awk '{ print $1 }'); what=$failed
+    need=ci; fp=$(fingerprint "$head" "$jobs"); what=$failed
   else
     local fb n
     fb=$(watch_feedback "$repo" "$pr" "$since" "$author") || fb=""
