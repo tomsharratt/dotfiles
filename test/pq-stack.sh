@@ -619,5 +619,25 @@ out=$(restack "$S" 1 2>&1)
 has "$out" "would leave ch-27's restack to you" "a handover: says it would"
 eq "$(cat "$S/state.env")" "$before" "and writes nothing"
 
+echo "== pq ls: restacking, restack and parent closed, the needs-you count and --json ==" >&2
+reset_tasks; idle
+ls_task() {                             # prio word -> task_dir
+  CH=tom/ls-$2; PA=tom/below-$2; F=$(g rev-parse main)
+  local d; d=$(mk_stacked "$1"); st_set "$d" PQ_PANE w1:p1; printf '%s' "$d"
+}
+LA=$(ls_task 41 asked);   st_set "$LA" PQ_STACK_ASKED 1
+LR=$(ls_task 42 restack); st_set "$LR" PQ_STACK_NEEDS restack
+LC=$(ls_task 43 closed);  st_set "$LC" PQ_STACK_NEEDS closed
+LN=$(ls_task 44 none)
+eq "$(agent_cell "$LA" "done")" "restacking" "its agent is on it"
+eq "$(agent_cell "$LR" "done")" "restack" "handed to you"
+eq "$(agent_cell "$LC" "done")" "parent closed" "the parent closed"
+hasnt "$(agent_cell "$LN" "done")" "restack" "nothing to restack: none of them"
+out=$(PQ_WIDTH=200 cmd_ls 2>&1)
+has "$out" "(2 needs you)" "restack and parent closed count into needs you, restacking does not"
+json=$(cmd_ls --json 2>/dev/null)
+eq "$(jq -r '[.[] | {(.task): .restack}] | add | [.["ls-asked"], .["ls-restack"], .["ls-closed"], .["ls-none"]] | map(tostring) | join(" ")' <<<"$json")" \
+  "asked restack closed null" "--json: a restack key"
+
 printf '\n%d passed, %d failed\n' "$pass" "$fail" >&2
 [ "$fail" -eq 0 ]

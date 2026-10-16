@@ -2859,6 +2859,11 @@ agent_cell() {                          # task_dir state
       if [ "$(pane_state "$(task_pane "$d")")" = blocked ]; then printf 'blocked'; return; fi
       blocked=$(quiet_cell "$d" "$(pane_state "$(task_pane "$d")")")
       if [ -n "$blocked" ]; then printf '%s' "$blocked"; return; fi
+      # A layer that has to follow its parent, ahead of the gate it holds:
+      # `restacking` while its agent is on it, `restack` and `parent closed`
+      # once it is yours.
+      blocked=$(stack_cell "$d")
+      if [ -n "$blocked" ]; then printf '%s' "$blocked"; return; fi
       # The review gate, ahead of the slot report: `review due`, `reviewing 7m`,
       # `security review 3m`, `reviewed`, `review failed`, `resolving`, `review lapsed` all say more
       # than `wrapping up` about WHY the slot is held, and `review lapsed` is a
@@ -2982,6 +2987,7 @@ cmd_ls() {
       dead\ *|stalled\ *|held\ *)                     needs=$((needs + 1)) ;;
       naming\ failed|blocker\ gone)                   needs=$((needs + 1)) ;;
       review\ lapsed|ci\ failed|conflict|new\ review)  needs=$((needs + 1)) ;;
+      restack|parent\ closed)                         needs=$((needs + 1)) ;;
     esac
     # Which rows are spending the cap. `running` unconditionally, the same way
     # active_slots counts it; a done row only while its agent is still there.
@@ -3023,6 +3029,7 @@ cmd_ls() {
         --arg security "$(st "$d" PQ_SECURITY)" --arg security_result "$(st "$d" PQ_SECURITY_RESULT)" \
         --arg design "$(hdr "$d/plan.md" design)" \
         --arg stack_parent "$(st "$d" PQ_STACK_PARENT)" --arg stack "$(st "$d" PQ_STACK)" \
+        --arg restack "$(stack_json "$d")" \
         --arg cost "$(cost_sum "$d")" \
         --argjson holding_slot "$holding" \
         --argjson after "$(after_json "$d")" --argjson blocked "$blocked" '
@@ -3035,7 +3042,7 @@ cmd_ls() {
           pr: ($pr|str|if . then tonumber else null end),
           pr_state: ($prstate|str), pr_draft: ($draft == "draft"),
           after: $after, blocked: $blocked, holding_slot: $holding_slot,
-          stack_parent: ($stack_parent|str), stack: ($stack|num),
+          stack_parent: ($stack_parent|str), stack: ($stack|num), restack: ($restack|str),
           merged: ($merged|str), closed: ($closed|str),
           reaped: ($reaped|str), held: ($held|str),
           review: ($review|str), review_result: ($review_result|str),
@@ -4195,6 +4202,19 @@ stack_restack() {                       # task_dir dry onto fp own pnum
         warn "$slug: could not tell its agent that $word ($code) - retrying each tick"; } ;;
   esac
   return 0
+}
+
+# What `pq ls` says about it, and its --json word: asked, restack or closed.
+stack_json() {                          # task_dir
+  if [ -n "$(st "$1" PQ_STACK_ASKED)" ]; then printf 'asked'; return; fi
+  case "$(st "$1" PQ_STACK_NEEDS)" in restack|closed) st "$1" PQ_STACK_NEEDS ;; esac
+}
+stack_cell() {                          # task_dir
+  case "$(stack_json "$1")" in
+    asked)   printf 'restacking' ;;
+    restack) printf 'restack' ;;
+    closed)  printf 'parent closed' ;;
+  esac
 }
 
 # One stacked task, one tick: every done task that is not reaped, has a parent
