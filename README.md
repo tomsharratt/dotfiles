@@ -650,7 +650,9 @@ So both check first, before anything is released.
 `wt rm` at a terminal lists the work and asks whether to discard it, and no is the default.
 `wt gc --settled` leaves such a worktree where it is, even under `-y`, and says which ones it left.
 An untracked file counts, and an ignored one does not.
-A commit counts when no remote-tracking ref reaches it, unless the forge still names it as a pull request's head: a branch deleted on merge and then pruned would otherwise read as never pushed at all.
+A commit counts when no remote-tracking ref reaches it, unless the forge has held it, or a commit after it, as one of the branch's pull request heads: a branch deleted on merge and then pruned would otherwise read as never pushed at all.
+Every head counts, not only the last, because in a stack the forge force-pushes over a layer after its worktree's last push - Rebase stack, or GitHub restacking it once the layer below merges - so the worktree is left holding the head that push replaced.
+Counting only the last held the worktrees of #7117, #7121 and #7123, with their agents, for hours after their stack merged.
 
 `wt gc --sweep` reclaims project-owned resources (databases, puma-dev entries) whose worktree is gone entirely, so no state file points at them any more.
 It previews what it would reclaim first, since - unlike the other two passes - it deletes on a naming pattern rather than on a recorded fact.

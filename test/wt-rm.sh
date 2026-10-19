@@ -326,19 +326,31 @@ case "$out" in *"removed leftover directory $ROOT/$RN/husk"*) ok ;; *) bad "and 
 # exit code of its own so pq can tell a refusal from a failure, before anything
 # at all is released - the teardown drops the database first.
 #
-# `gh` answers "which commit heads each pull request" from $PR_HEADS, one
-# `branch sha` per line, which is how the pruned-remote case below is staged.
+# `gh` answers "which commits has each pull request had as its head" from
+# $PR_HEADS, one `branch head|before sha` per line: `head` is the head it has
+# now, `before` one a force-push replaced. The stub builds the GraphQL reply
+# from them and runs wt's own `-q` over it, so the jq that reads the reply is
+# under test too - which is how the pruned and rewritten cases below are staged.
 PR_HEADS="$STUBBIN/.pr-heads"
 : > "$PR_HEADS"
 cat > "$STUBBIN/gh" <<EOF
 #!/bin/sh
-head=""
+[ "\$1 \$2" = "api graphql" ] || exit 1
+branch="" q=""
 while [ \$# -gt 0 ]; do
-  [ "\$1" = --head ] && { head=\$2; shift; }
+  case "\$1" in
+    -f) case "\$2" in branch=*) branch=\${2#branch=} ;; esac; shift ;;
+    -q) q=\$2; shift ;;
+  esac
   shift
 done
-[ -n "\$head" ] || exit 1
-awk -v b="\$head" '\$1 == b { print \$2 }' "$PR_HEADS"
+[ -n "\$branch" ] && [ -n "\$q" ] || exit 1
+awk -v b="\$branch" '\$1 == b { print \$2, \$3 }' "$PR_HEADS" |
+  jq -Rs 'split("\n") | map(select(length > 0) | split(" "))
+    | {data: {repository: {pullRequests: {nodes: (if length == 0 then [] else
+        [{headRefOid: (map(select(.[0] == "head"))[0][1] // null),
+          timelineItems: {nodes: map(select(.[0] == "before") | {beforeCommit: {oid: .[1]}, afterCommit: null})}}]
+      end)}}}}' | jq -r "\$q"
 EOF
 chmod +x "$STUBBIN/gh"
 export PATH="$STUBBIN:$PATH"
@@ -404,18 +416,61 @@ echo "== a branch the forge pruned after its merge is not a false alarm ==" >&2
 # takes the remote-tracking ref too - so every commit reads as on no remote. The
 # forge still names the tip as the pull request's head, and that settles it.
 p=$(mk_wt pruned)
-printf 'tom/pruned %s\n' "$(git -C "$p" rev-parse HEAD)" > "$PR_HEADS"
+printf 'tom/pruned head %s\n' "$(git -C "$p" rev-parse HEAD)" > "$PR_HEADS"
 rm_yes pruned; rc=$?
 eq "$rc" 0 "a tip the forge holds as a pull request's head was pushed"
 [ ! -d "$p" ] && ok || bad "so the worktree is removed"
 : > "$PR_HEADS"
 
+echo "== ...nor one the forge rewrote before the merge ==" >&2
+# In a stack the forge force-pushes over a layer after its worktree's last push
+# - Rebase stack, or GitHub restacking it once the layer below merges - and the
+# pull request then merges from that rewritten head: the worktree still holds
+# the tip it pushed, which is now only a head the force-push replaced. #7117,
+# #7121 and #7123 were each held for that, after merging as one stack.
+p=$(mk_wt rewritten)
+{ printf 'tom/rewritten before %s\n' "$(git -C "$p" rev-parse HEAD)"
+  printf 'tom/rewritten head %s\n' "$(git -C "$REPO" rev-parse master)"; } > "$PR_HEADS"
+rm_yes rewritten; rc=$?
+eq "$rc" 0 "a tip a force-push replaced on the forge was pushed"
+[ ! -d "$p" ] && ok || bad "so the worktree is removed"
+: > "$PR_HEADS"
+
+echo "== ...nor a tip behind a head the forge recorded ==" >&2
+# Pushed, then built on and pushed again from somewhere else, then rewritten:
+# the tip is an ancestor of a recorded head this repo has the object for.
+p=$(mk_wt behind)
+git -C "$p" -c user.email=test@test -c user.name=test commit -q --allow-empty -m "pushed from elsewhere"
+later=$(git -C "$p" rev-parse HEAD)
+git -C "$p" reset -q --hard HEAD~1
+printf 'tom/behind before %s\n' "$later" > "$PR_HEADS"
+rm_yes behind; rc=$?
+eq "$rc" 0 "a tip a recorded head contains was pushed"
+[ ! -d "$p" ] && ok || bad "so the worktree is removed"
+: > "$PR_HEADS"
+
 echo "== ...but a local commit on top of that head still counts ==" >&2
 p=$(mk_wt pruned2)
-printf 'tom/pruned2 %s\n' "$(git -C "$p" rev-parse HEAD)" > "$PR_HEADS"
+printf 'tom/pruned2 head %s\n' "$(git -C "$p" rev-parse HEAD)" > "$PR_HEADS"
 git -C "$p" -c user.email=test@test -c user.name=test commit -q --allow-empty -m "never pushed"
 rm_yes pruned2; rc=$?
 eq "$rc" 3 "a commit past the pull request's head was never pushed"
+: > "$PR_HEADS"
+
+echo "== ...and so does one past a head a force-push replaced ==" >&2
+p=$(mk_wt rewritten2)
+printf 'tom/rewritten2 before %s\n' "$(git -C "$p" rev-parse HEAD)" > "$PR_HEADS"
+git -C "$p" -c user.email=test@test -c user.name=test commit -q --allow-empty -m "never pushed"
+rm_yes rewritten2; rc=$?
+eq "$rc" 3 "a commit past a replaced head was never pushed"
+branch_exists rewritten2 && ok || bad "the branch holding it must survive"
+: > "$PR_HEADS"
+
+echo "== another branch's pull request vouches for nothing ==" >&2
+p=$(mk_wt orphan)
+printf 'tom/someone-else before %s\n' "$(git -C "$p" rev-parse HEAD)" > "$PR_HEADS"
+rm_yes orphan; rc=$?
+eq "$rc" 3 "only this branch's own pull requests count"
 : > "$PR_HEADS"
 
 echo "== at a terminal, wt rm asks instead - and N keeps everything ==" >&2

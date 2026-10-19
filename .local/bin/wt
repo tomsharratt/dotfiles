@@ -655,7 +655,7 @@ rm_leftover() {                         # path
 # One false alarm is ruled out: the forge deletes a pull request's branch once it
 # merges, and a pruning fetch then takes the remote-tracking ref with it, so every
 # commit of a branch that was pushed in full reads as on no remote. When the forge
-# still names the tip as a pull request's head, it was pushed. Asked only when
+# has held the tip as a pull request's head, it was pushed. Asked only when
 # there are commits to vouch for, and offline or without gh it cannot vouch - the
 # safe direction to be wrong in.
 unpushed_work() {                       # repo path branch -> what would be lost, or nothing
@@ -663,18 +663,41 @@ unpushed_work() {                       # repo path branch -> what would be lost
   git -C "$p" rev-parse --is-inside-work-tree >/dev/null 2>&1 || return 0
   files=$(git -C "$p" status --porcelain 2>/dev/null | grep -c .)
   commits=$(git -C "$p" rev-list --count HEAD --not --remotes 2>/dev/null) || commits=0
-  [ "${commits:-0}" -gt 0 ] && pr_head_is "$repo" "$branch" "$(git -C "$p" rev-parse HEAD 2>/dev/null)" && commits=0
+  [ "${commits:-0}" -gt 0 ] && pr_pushed "$repo" "$branch" "$(git -C "$p" rev-parse HEAD 2>/dev/null)" && commits=0
   [ "${files:-0}" -gt 0 ] && out="$files uncommitted file$([ "$files" = 1 ] || printf s)"
   [ "${commits:-0}" -gt 0 ] && out="${out:+$out, }$commits unpushed commit$([ "$commits" = 1 ] || printf s)"
   printf '%s' "$out"
 }
-# Whether some pull request for BRANCH has SHA as its head - the forge's word that
-# the commit was pushed, which outlives the branch it was pushed to.
-pr_head_is() {                          # repo branch sha
+# Whether SHA is, or is behind, a commit some pull request for BRANCH has had as
+# its head - the forge's word that it was pushed, which outlives the branch it
+# was pushed to. Every head, not just the last: in a stack the forge
+# force-pushes over a layer after its worktree's last push - Rebase stack, or
+# GitHub restacking it once the layer below merges - so the worktree holds a head
+# that push replaced, and that alone held #7117, #7121 and #7123's worktrees
+# after their stack merged. A head this repo has no object for can only vouch
+# for itself.
+pr_pushed() {                           # repo branch sha
   [ -n "${2:-}" ] && [ "$2" != "-" ] && [ -n "${3:-}" ] || return 1
   command -v gh >/dev/null 2>&1 || return 1
-  ( cd "$1" 2>/dev/null && gh pr list --head "$2" --state all --limit 10 \
-      --json headRefOid -q '.[].headRefOid' 2>/dev/null ) | grep -qx "$3"
+  local oid
+  # shellcheck disable=SC2016  # a GraphQL query: its $ are GraphQL's
+  while IFS= read -r oid; do
+    [ "$oid" = "$3" ] && return 0
+    git -C "$1" merge-base --is-ancestor "$3" "$oid" 2>/dev/null && return 0
+  done < <(cd "$1" 2>/dev/null && gh api graphql -F owner='{owner}' -F name='{repo}' -f branch="$2" -f query='
+    query($owner: String!, $name: String!, $branch: String!) {
+      repository(owner: $owner, name: $name) {
+        pullRequests(headRefName: $branch, states: [OPEN, CLOSED, MERGED], first: 10) {
+          nodes {
+            headRefOid
+            timelineItems(itemTypes: [HEAD_REF_FORCE_PUSHED_EVENT], last: 100) {
+              nodes { ... on HeadRefForcePushedEvent { beforeCommit { oid } } }
+            }
+          }
+        }
+      }
+    }' -q '.data.repository.pullRequests.nodes[] | .headRefOid, (.timelineItems.nodes[].beforeCommit.oid // empty)' 2>/dev/null)
+  return 1
 }
 # The work itself, for a question asked at a terminal: `git status` lines, then
 # the unpushed commits when unpushed_work counted any.
