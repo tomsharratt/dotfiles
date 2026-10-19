@@ -12,9 +12,10 @@ case "$(uname -s)" in
   *)      fonts_src="$HOME/.local/share/fonts" ;;
 esac
 
-# Don't pull volatile runtime files (herdr's sockets, logs, and session state)
-# back into the repo, and keep --delete from clobbering tracked files with them.
-config_excludes=(--exclude='*.sock' --exclude='*.log' --exclude='/session.json' --exclude='/release-notes.json' --exclude='/.plugins.lock')
+# Don't pull volatile runtime files (herdr's sockets, logs, session state and
+# session snapshots) back into the repo, and keep --delete from clobbering
+# tracked files with them.
+config_excludes=(--exclude='*.sock' --exclude='*.log' --exclude='/session.json' --exclude='/release-notes.json' --exclude='/.plugins.lock' --exclude='/session-snapshots/')
 
 for dir in "$repo"/.config/*/; do
   [ -d "$dir" ] || continue
