@@ -501,6 +501,30 @@ eq "$(st "$d16d" PQ_REAP_HELD)" "" "the hold clears"
 case "$third" in *"wt: removed"*) ok ;; *) bad "wt's own progress still reaches the log on a real teardown (got '$third')" ;; esac
 rm -rf "$wt16d"
 
+echo "== ...or once the worktree is removed by hand, the hold goes with it ==" >&2
+# The purchase-summary tasks: merged, held dirty, then `wt rm` at a terminal took
+# the worktree and its branch. With the branch gone and no row loaded for a task
+# that already has its verdict, nothing could re-derive one, so they sat in
+# `pq ls` as `held dirty` for days.
+reset_caches; reset_wt_log
+wt16h=$(mktemp -d)
+d16h=$(mk_done 10 case16h "$REPO" tom/case16h "$wt16h")
+st_set "$d16h" PQ_PANE pane-16h
+cache_row "$REPO" tom/case16h 18 MERGED "" master
+PIDX_OK=1; PIDX=$'pane-16h\tclaude\tidle'
+WT_STUB_RC=3 WT_STUB_ERR="wt: 'tom/case16h' holds work that is not pushed (1 uncommitted file)" reap_task "$d16h" 0 >/dev/null 2>&1
+eq "$(st "$d16h" PQ_REAP_HELD)" "dirty" "held first, as above"
+merged_at=$(st "$d16h" PQ_MERGED)
+rm -rf "$wt16h"
+reset_caches; reset_wt_log                          # no row: reap_watching stopped asking
+reap_task "$d16h" 0 >/dev/null 2>&1
+[ ! -s "$WT_LOG" ] && ok || bad "wt is never invoked for a worktree that is already gone"
+eq "$(st "$d16h" PQ_REAP_HELD)" "" "the hold clears with the worktree"
+[ -n "$(st "$d16h" PQ_REAPED)" ] && ok || bad "the verdict on file is enough to stamp PQ_REAPED"
+eq "$(st "$d16h" PQ_MERGED)" "$merged_at" "and the merge keeps the time it was first seen"
+eq "$(agent_cell "$d16h" "done")" "-" "pq ls stops saying held dirty"
+archivable "$d16h" && ok || bad "and it can finally leave done/"
+
 echo "== a real wt rm failure still reads as one, with wt's reason in the log ==" >&2
 reset_caches; reset_wt_log
 wt16f=$(mktemp -d)

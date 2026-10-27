@@ -588,6 +588,7 @@ Three things hold a teardown off, all checked only once the verdict is in:
 
 `pq ls` shows a held task as `held agent`, `held here`, `held dirty`, or `held nobase` (its repo's default branch could not be resolved).
 A `dirty` hold is said once, with what wt found, and every tick after asks wt again, so pushing the work - or discarding it with `wt rm` at a terminal - is what lets the teardown go.
+Once the worktree is gone, the hold goes with it, and the verdict already on file is what settles the task: the branch went with the worktree, so there is nothing left to ask about it.
 A task with nothing left to reclaim shows `-`, the same as any other task that needs nothing from you - a closed one included, since its teardown is automatic now and the `PR` column already reads `#N closed`.
 There is no off switch, for the same reason `pq` has none for dispatch-hours or the usage gate: one mechanism, not two.
 

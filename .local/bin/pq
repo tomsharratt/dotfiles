@@ -5844,11 +5844,20 @@ reap_task() {                           # task_dir dry -> 0 torn down, 2 would (
   #    never recorded and the row could never archive. With no verdict we say so
   #    once and come back next tick, exactly as a task with a live worktree and
   #    an open pull request already does.
+  #
+  #    A verdict already on file is the verdict. That is the task held after it
+  #    settled, until somebody removed the worktree by hand: `wt rm` deleted the
+  #    branch, so merged_into can never match it again, and reap_watching stopped
+  #    loading its row once PQ_MERGED was stamped - so asking again found nothing,
+  #    forever, and the purchase-summary tasks sat in `pq ls` as `held dirty`,
+  #    about worktrees that had been gone for days.
   wt=$(st "$d" PQ_WORKTREE)
   if [ -z "$wt" ] || [ ! -d "$wt" ]; then
     repo=$(hdr "$d/plan.md" repo); branch=$(hdr "$d/plan.md" branch)
     local verdict=""
-    if [ -n "$repo" ] && [ -n "$branch" ]; then
+    if [ -n "$(st "$d" PQ_MERGED)" ]; then verdict=merged
+    elif [ -n "$(st "$d" PQ_CLOSED)" ]; then verdict=closed
+    elif [ -n "$repo" ] && [ -n "$branch" ]; then
       base=$(task_base "$d")
       if [ -n "$base" ] && merged_into "$repo" "$branch" "$base"; then verdict=merged
       elif pr_all_closed "$repo" "$branch"; then verdict=closed
@@ -5870,9 +5879,11 @@ reap_task() {                           # task_dir dry -> 0 torn down, 2 would (
       return 1
     fi
     case "$verdict" in
-      merged) st_set "$d" PQ_MERGED "$(now)" ;;
-      closed) st_set "$d" PQ_CLOSED "$(now)" ;;
+      merged) [ -n "$(st "$d" PQ_MERGED)" ] || st_set "$d" PQ_MERGED "$(now)" ;;
+      closed) [ -n "$(st "$d" PQ_CLOSED)" ] || st_set "$d" PQ_CLOSED "$(now)" ;;
     esac
+    # Whatever held the teardown went with the worktree.
+    [ -z "$(st "$d" PQ_REAP_HELD)" ] || st_set "$d" PQ_REAP_HELD ""
     st_set "$d" PQ_REAPED "$(now)"
     msg "$slug: worktree already gone - recorded as $verdict"
     return 1
