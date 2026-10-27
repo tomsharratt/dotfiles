@@ -99,8 +99,10 @@ snapshot() {                            # ws path ... -> which checkout each wor
 snapshot w27 "$WTROOT/aaa-victim" w29 "$WTROOT/zzz-target"
 
 # A profile that records whose resources a teardown was handed, so a wrong-target
-# teardown is visible rather than merely possible.
+# teardown is visible rather than merely possible. It regenerates db/schema.rb, as
+# supercast's does, for the unpushed-work cases further down.
 cat > "$XDG_CONFIG_HOME/wt/profiles/$RN.sh" <<EOF
+WT_REGENERATED="db/schema.rb"
 wt_teardown() { printf '%s\n' "\${WT_SLUG:-}" >> "$STUBBIN/.teardown"; }
 EOF
 : > "$STUBBIN/.teardown"
@@ -402,6 +404,51 @@ rm_yes untracked; rc=$?
 eq "$rc" 3 "a file nobody added must be refused"
 [ -f "$p/new-file.rb" ] && ok || bad "the untracked file must still be there"
 
+# A pushed worktree whose db/schema.rb is committed and then re-dumped, the way
+# every db:migrate re-dumps it in this machine's postgres dialect.
+mk_regen() {                            # name -> its path
+  local p; p=$(mk_wt "$1")
+  mkdir -p "$p/db"; printf 'ANY ((ARRAY[a, b])::text[])\n' > "$p/db/schema.rb"
+  git -C "$p" add db/schema.rb
+  git -C "$p" -c user.email=test@test -c user.name=test commit -q -m "schema"
+  mk_pushed "$1"
+  printf 'ANY (ARRAY[(a)::text, (b)::text])\n' > "$p/db/schema.rb"
+  printf '%s' "$p"
+}
+
+echo "== a file the profile regenerates is not work on its own ==" >&2
+# retire-live-follower-access: merged, and held for nothing but this.
+p=$(mk_regen regen)
+: > "$STUBBIN/.teardown"
+rm_yes regen; rc=$?
+eq "$rc" 0 "a re-dumped schema alone must not hold the worktree"
+[ ! -d "$p" ] && ok || bad "its directory must be gone"
+eq "$(cat "$STUBBIN/.teardown")" "tom-regen" "and its resources released"
+
+echo "== ...staged, it is still not work ==" >&2
+p=$(mk_regen regen-staged)
+git -C "$p" add db/schema.rb
+rm_yes regen-staged; rc=$?
+eq "$rc" 0 "a re-dumped schema somebody staged is still regenerated"
+
+echo "== ...but the work beside it still holds the worktree, and is all that is named ==" >&2
+p=$(mk_regen regen-migration)
+mkdir -p "$p/db/migrate"; printf 'class AddThing; end\n' > "$p/db/migrate/20261027_add_thing.rb"
+rm_yes regen-migration; rc=$?
+eq "$rc" 3 "an uncommitted migration beside the schema is work"
+[ -f "$p/db/migrate/20261027_add_thing.rb" ] && ok || bad "the migration must still be there"
+# shellcheck disable=SC2329  # called by the cmd_rm beside it
+out=$( ( at_terminal() { return 0; }; cd "$REPO" && cmd_rm tom/regen-migration ) <<<$'n\n' 2>&1 >/dev/null)
+case "$out" in *"1 uncommitted file"*"db/migrate/"*) ok ;; *) bad "only the migration is counted and listed (got '$out')" ;; esac
+case "$out" in *"schema.rb"*) bad "the regenerated schema is not work to list (got '$out')" ;; *) ok ;; esac
+
+echo "== ...and a regenerated file nobody ever committed is work too ==" >&2
+p=$(mk_wt regen-new); mk_pushed regen-new
+mkdir -p "$p/db"; printf 'new\n' > "$p/db/schema.rb"
+rm_yes regen-new; rc=$?
+eq "$rc" 3 "only a modification of a committed file is let go, not a new one"
+[ -f "$p/db/schema.rb" ] && ok || bad "the new file must still be there"
+
 echo "== a clean, pushed worktree is removed as before ==" >&2
 p=$(mk_wt clean); mk_pushed clean
 : > "$STUBBIN/.teardown"
@@ -492,12 +539,13 @@ echo "== wt gc --settled leaves a settled worktree holding unpushed work where i
 p=$(mk_wt settled-dirty); mk_pushed settled-dirty
 printf 'unsaved\n' > "$p/edited.txt"
 q=$(mk_wt settled-clean); mk_pushed settled-clean
-# Both pull requests merged; gc_settled asks through pr_load's batch list.
+s=$(mk_regen settled-regen)
+# All three pull requests merged; gc_settled asks through pr_load's batch list.
 cat > "$STUBBIN/gh" <<'EOF'
 #!/bin/sh
 case "$*" in
   *"pr list --state all --limit 200"*)
-    printf '[{"number":1,"state":"MERGED","headRefName":"tom/settled-dirty"},{"number":2,"state":"MERGED","headRefName":"tom/settled-clean"}]\n' ;;
+    printf '[{"number":1,"state":"MERGED","headRefName":"tom/settled-dirty"},{"number":2,"state":"MERGED","headRefName":"tom/settled-clean"},{"number":3,"state":"MERGED","headRefName":"tom/settled-regen"}]\n' ;;
   *) printf '[]\n' ;;
 esac
 EOF
@@ -506,6 +554,7 @@ out=$( (cd / && gc_settled 1) 2>&1 >/dev/null)
 [ -f "$p/edited.txt" ] && ok || bad "a settled worktree with uncommitted work must be left alone, even under -y"
 branch_exists settled-dirty && ok || bad "and its branch kept"
 [ ! -d "$q" ] && ok || bad "a clean settled worktree beside it is still reclaimed"
+[ ! -d "$s" ] && ok || bad "and so is one holding nothing but a regenerated schema"
 case "$out" in *"tom/settled-dirty"*"1 uncommitted file"*) ok ;; *) bad "gc must say which worktree it left and why (got '$out')" ;; esac
 
 printf '\n%d passed, %d failed\n' "$pass" "$fail"

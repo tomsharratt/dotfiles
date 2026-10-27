@@ -650,6 +650,9 @@ So both check first, before anything is released.
 `wt rm` at a terminal lists the work and asks whether to discard it, and no is the default.
 `wt gc --settled` leaves such a worktree where it is, even under `-y`, and says which ones it left.
 An untracked file counts, and an ignored one does not.
+Nor does a modification to a file the repo's profile lists in `WT_REGENERATED`, because the dev environment rewrites it from what is already committed.
+supercast's lists `db/schema.rb`: every `db:migrate` re-dumps it in this machine's postgres dialect, so a worktree that changed nothing about the schema can still show it modified, and that alone held a merged task's teardown.
+A real schema change still holds the worktree, because it comes with a migration, which is a new file - and a regenerated file that is new, deleted or renamed counts like any other.
 A commit counts when no remote-tracking ref reaches it, unless the forge has held it, or a commit after it, as one of the branch's pull request heads: a branch deleted on merge and then pruned would otherwise read as never pushed at all.
 Every head counts, not only the last, because in a stack the forge force-pushes over a layer after its worktree's last push - Rebase stack, or GitHub restacking it once the layer below merges - so the worktree is left holding the head that push replaced.
 Counting only the last held the worktrees of #7117, #7121 and #7123, with their agents, for hours after their stack merged.

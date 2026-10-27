@@ -15,6 +15,14 @@
 WT_RESOURCES="port redis"   # allocate an isolated port + redis db index (from wt's 3101 - 3000 stays with the canonical checkout)
 # shellcheck disable=SC2034
 WT_REDIS_MAX=14             # reserve db 15 for the spec suite (config/initializers/redis.rb)
+# Every db:migrate re-dumps db/schema.rb from this machine's postgres - wt_provision
+# runs one, and so does an agent adding a migration - and postgres 18 renders some
+# partial-index clauses differently from whichever one dumped the committed file. So
+# a worktree that changed nothing about the schema can still show it modified, and
+# that alone held a merged task's teardown. A real schema change comes with its
+# migration, a new file, which still counts as work.
+# shellcheck disable=SC2034
+WT_REGENERATED="db/schema.rb"
 
 # The dev db has a hyphen; a bareword pg db name can't, so the slug's dashes
 # become underscores for the worktree's db.

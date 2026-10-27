@@ -43,6 +43,9 @@
 #                               ports are handed out from WT_PORT_BASE (3101) up
 #   WT_REDIS_MAX=15             highest redis db index to hand out (default 15); lower it
 #                               to reserve indices for something else, e.g. a spec suite
+#   WT_REGENERATED="db/schema.rb"  tracked files the dev environment rewrites from what
+#                               is committed (default: none); a modification to one is
+#                               not work, so it never holds up `wt rm` or `wt gc --settled`
 # and define any of these functions, which run with the worktree's facts
 # exported (WT_NAME WT_SLUG WT_PATH WT_REPO WT_REPO_NAME WT_DOMAIN WT_PORT WT_REDIS):
 #   wt_provision   prepare the worktree so its dev server can boot in isolation
@@ -314,7 +317,7 @@ load_profile() {                        # repo_name
   # Every tunable a profile may set is reset here for the same reason the functions are:
   # `wt ls` and `wt gc` load one profile after another in a single process, and a value
   # left behind by the previous repo is indistinguishable from one this repo chose.
-  WT_RESOURCES="" WT_REDIS_MAX=15
+  WT_RESOURCES="" WT_REDIS_MAX=15 WT_REGENERATED=""
   f="$PROFILE_DIR/$1.sh"
   [ -f "$f" ] || return 0
   # shellcheck disable=SC1090
@@ -650,7 +653,8 @@ rm_leftover() {                         # path
 # no upstream to be ahead of, and it is the likeliest of all to hold the only copy
 # of its work. An untracked file counts, because a new file an agent never added
 # is exactly as gone afterwards as an edit it never committed; ignored files do
-# not, since a worktree is full of them (tmp/, log/, a linked node_modules).
+# not, since a worktree is full of them (tmp/, log/, a linked node_modules). Nor
+# does a file the profile lists in WT_REGENERATED - see uncommitted_work.
 #
 # One false alarm is ruled out: the forge deletes a pull request's branch once it
 # merges, and a pruning fetch then takes the remote-tracking ref with it, so every
@@ -661,12 +665,32 @@ rm_leftover() {                         # path
 unpushed_work() {                       # repo path branch -> what would be lost, or nothing
   local repo=$1 p=$2 branch=$3 files commits out=""
   git -C "$p" rev-parse --is-inside-work-tree >/dev/null 2>&1 || return 0
-  files=$(git -C "$p" status --porcelain 2>/dev/null | grep -c .)
+  files=$(uncommitted_work "$repo" "$p" | grep -c .)
   commits=$(git -C "$p" rev-list --count HEAD --not --remotes 2>/dev/null) || commits=0
   [ "${commits:-0}" -gt 0 ] && pr_pushed "$repo" "$branch" "$(git -C "$p" rev-parse HEAD 2>/dev/null)" && commits=0
   [ "${files:-0}" -gt 0 ] && out="$files uncommitted file$([ "$files" = 1 ] || printf s)"
   [ "${commits:-0}" -gt 0 ] && out="${out:+$out, }$commits unpushed commit$([ "$commits" = 1 ] || printf s)"
   printf '%s' "$out"
+}
+# The `git status` lines of the worktree at PATH that are work: all of them but a
+# file the repo's profile lists in WT_REGENERATED, while that file is only
+# modified. The dev environment rewrites such a file from what is already
+# committed - supercast's db/schema.rb is re-dumped by every db:migrate, in this
+# machine's postgres dialect - so the change is nobody's work, and it held
+# retire-live-follower-access's teardown after its pull request had merged, with
+# nothing else in the worktree. Anything else about such a file still counts - new,
+# deleted, renamed - and a real change to what it is generated from shows up on its
+# own: a schema change brings a migration, which is a new file.
+#
+# The profile is read in a subshell, so asking never swaps out the caller's own:
+# `wt gc --settled` asks about every repo's worktrees from one process.
+uncommitted_work() {                    # repo path
+  local regen
+  regen=$(load_profile "$(basename "$1")"; printf '%s' "${WT_REGENERATED:-}")
+  git -C "$2" status --porcelain 2>/dev/null | awk -v regen="$regen" '
+    BEGIN { n = split(regen, r, " "); for (i = 1; i <= n; i++) skip[r[i]] = 1 }
+    substr($0, 1, 2) ~ /^(M |MM| M)$/ && (substr($0, 4) in skip) { next }
+    { print }'
 }
 # Whether SHA is, or is behind, a commit some pull request for BRANCH has had as
 # its head - the forge's word that it was pushed, which outlives the branch it
@@ -699,11 +723,11 @@ pr_pushed() {                           # repo branch sha
     }' -q '.data.repository.pullRequests.nodes[] | .headRefOid, (.timelineItems.nodes[].beforeCommit.oid // empty)' 2>/dev/null)
   return 1
 }
-# The work itself, for a question asked at a terminal: `git status` lines, then
-# the unpushed commits when unpushed_work counted any.
-unpushed_list() {                       # path summary
-  git -C "$1" status --porcelain 2>/dev/null | head -20
-  case "$2" in *unpushed*) git -C "$1" log --oneline HEAD --not --remotes 2>/dev/null | head -20 ;; esac
+# The work itself, for a question asked at a terminal: the `git status` lines
+# unpushed_work counted, then the unpushed commits when it counted any.
+unpushed_list() {                       # repo path summary
+  uncommitted_work "$1" "$2" | head -20
+  case "$3" in *unpushed*) git -C "$2" log --oneline HEAD --not --remotes 2>/dev/null | head -20 ;; esac
 }
 
 # Stop what wt's own tabs in the workspace are running - the dev server, or a
@@ -1531,7 +1555,7 @@ cmd_rm() {
   if [ -n "$lost" ]; then
     [ "$yes" = 1 ] && refuse "'$name' holds work that is not pushed ($lost) - not removing it; push it, or run 'wt rm $name' at a terminal to discard it"
     warn "'$name' holds work that is not pushed - $lost:"
-    unpushed_list "$path" "$lost" | sed 's/^/  /' >&2
+    unpushed_list "$repo" "$path" "$lost" | sed 's/^/  /' >&2
   fi
 
   # Ask both questions up front. Closing the workspace (reap_one's last step) tears
