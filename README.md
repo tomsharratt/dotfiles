@@ -187,7 +187,7 @@ The list is read before the wizard and checked once more just before the task is
 Type a word from what the plan was about to narrow the list, then Enter.
 
 The chosen plan opens in a pager to read (`q` or Esc closes it), and then it asks `use this plan?`.
-Declining returns to the list rather than aborting the whole command, and Esc at the list quits.
+Declining returns to the list rather than aborting the whole command, and Esc at the list quits - twice, since the first only leaves the search box.
 Once you confirm, it asks the things that actually shape how a task runs:
 
 - which model should run it - `sonnet`, `opus` or `fable`, starting on `sonnet`;

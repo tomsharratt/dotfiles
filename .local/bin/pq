@@ -1356,7 +1356,8 @@ ui_file() {                             # directory
 # its first `# H1` - and fuzzy search replaces paging: type a word from what the
 # plan was about. A plan a task was added from is not in the list at all, so the
 # same plan is never queued twice. Choosing one opens it in the pager to read,
-# then asks. Declining goes back to the list; Esc there is what quits.
+# then asks. Declining goes back to the list; Esc there is what quits - the
+# second Esc, as gum has it: the first only leaves the search box.
 pick_plan() {
   local rows disp sel idx path
   rows=$(recent_plans)
