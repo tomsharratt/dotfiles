@@ -487,14 +487,14 @@ case "$(main after desc-x 2>&1)" in *"builds on nothing and waits for nothing"*)
 
 echo "== pq add --after: a blocker named by slug gates the new task ==" >&2
 reset_tasks
-PLAN_FILE="$PQ_HOME/.test-plan.md"
-printf '# Test plan\n\nDo the thing.\n' > "$PLAN_FILE"
-add_as "$PLAN_FILE" tom/add-chain-a --repo "$REPO" 2>"$PQ_HOME/.add.stderr"
+# A plan of its own for each add, as the picker hands out: pq adds no plan twice.
+for p in a b json; do printf '# Test plan %s\n\nDo the thing.\n' "$p" > "$PQ_HOME/.plan-$p.md"; done
+add_as "$PQ_HOME/.plan-a.md" tom/add-chain-a --repo "$REPO" 2>"$PQ_HOME/.add.stderr"
 add_rc=$?
 [ "$add_rc" -eq 0 ] && ok || bad "pq add should succeed (rc=$add_rc): $(cat "$PQ_HOME/.add.stderr")"
 if find_task add-chain-a >/dev/null 2>&1; then ok; else bad "the added task should be found by its slug"; fi
 
-add_as "$PLAN_FILE" tom/add-chain-b --repo "$REPO" --after add-chain-a 2>"$PQ_HOME/.add.stderr"
+add_as "$PQ_HOME/.plan-b.md" tom/add-chain-b --repo "$REPO" --after add-chain-a 2>"$PQ_HOME/.add.stderr"
 b_rc=$?
 [ "$b_rc" -eq 0 ] && ok || bad "chained pq add should succeed: $(cat "$PQ_HOME/.add.stderr")"
 b_dir=$(find_task add-chain-b 2>/dev/null)
@@ -503,7 +503,7 @@ verdict=$(after_state "$b_dir" 2>/dev/null); verdict=${verdict%%$'\t'*}
 eq "$verdict" "on add-chain-a" "B should be on A right after being chained"
 
 echo "== an --after blocker is recorded, and pq ls --json sees the task blocked ==" >&2
-add_as "$PLAN_FILE" tom/add-json-test --repo "$REPO" --after add-chain-a 2>"$PQ_HOME/.add.stderr"
+add_as "$PQ_HOME/.plan-json.md" tom/add-json-test --repo "$REPO" --after add-chain-a 2>"$PQ_HOME/.add.stderr"
 eq "$(cut -f1 "$(find_task add-json-test)/after")" "add-chain-a" "the blocker is recorded under its own label"
 
 ls_json=$(main ls --json 2>/dev/null)

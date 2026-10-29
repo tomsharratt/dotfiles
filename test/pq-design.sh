@@ -143,7 +143,8 @@ cmp -s "$DC" "$t/design/Onboarding Refresh.dc.html" && ok || bad "the copy must 
 eq "$(readlink "$PQ_HOME/tasks/$(basename "$t")")" "$t" "add makes the stable tasks/ link"
 
 echo "== a task with no design writes no design: header at all ==" >&2
-add_as "$PLAN" tom/d0 --repo "$REPO" 2>/dev/null
+PLAN0="$PQ_HOME/.p0.md"; mkplan "$PLAN0" plain "Body."
+add_as "$PLAN0" tom/d0 --repo "$REPO" 2>/dev/null
 t=$(find_task d0)
 grep -q '^design:' "$t/plan.md" && bad "no design set must mean no header, not an empty one" || ok
 [ -d "$t/design" ] && bad "no design set must mean no design/ directory" || ok
@@ -217,7 +218,8 @@ DOC="$DES/Full Board.dc.html"
 printf '<!DOCTYPE html>\n<html lang="en"><body>board</body></html>\n' > "$DOC"
 MENTION="$DES/Mention.dc.html"
 printf '<title>M</title>\n<pre>&lt;html&gt; is not here, but <html lang="x"> is</pre>\n' > "$MENTION"
-add_as "$PLAN" tom/d7 --repo "$REPO" --design "$DOC" --design "$MENTION" 2>/dev/null
+PLAN8="$PQ_HOME/.p8.md"; mkplan "$PLAN8" plain "Body."
+add_as "$PLAN8" tom/d7 --repo "$REPO" --design "$DOC" --design "$MENTION" 2>/dev/null
 t=$(find_task d7)
 cmp -s "$DOC" "$t/design/Full Board.dc.html" && ok || bad "a design with its own doctype is copied as it is"
 cmp -s "$MENTION" "$t/design/Mention.dc.html" && ok || bad "a design with an <html> tag anywhere is copied as it is"
@@ -323,7 +325,8 @@ eq "$(find "$PQ_HOME/new" -mindepth 1 -maxdepth 1 | wc -l | tr -d ' ')" "1" "lea
 echo "== pq ls --json carries the design set ==" >&2
 reset_tasks
 add_as "$PLAN" tom/dj --repo "$REPO" --design "$DES/shot.png" --design "$DC" >/dev/null 2>&1
-add_as "$PLAN" tom/dj0 --repo "$REPO" >/dev/null 2>&1
+PLAN9="$PQ_HOME/.p9.md"; mkplan "$PLAN9" plain "Body."
+add_as "$PLAN9" tom/dj0 --repo "$REPO" >/dev/null 2>&1
 PLAN7="$PQ_HOME/.p7.md"
 mkplan "$PLAN7" plain "Design file: $ART" "Design artifact: $ART_URL" "Older: https://claude.ai/artifact/AbC123"
 add_as "$PLAN7" tom/dja --repo "$REPO" >/dev/null 2>&1

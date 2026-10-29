@@ -55,14 +55,14 @@ reset_tasks() {
   mkdir -p "$PQ_HOME/new" "$PQ_HOME/queue" "$PQ_HOME/running" "$PQ_HOME/done"
 }
 
-PLAN="$PQ_HOME/.test-plan.md"
-printf '# Test plan\n\nDo the thing.\n' > "$PLAN"
-
 # The picker and the namer are stood in for: the claude stub above fails
 # closed, so name_plan would never derive a name, and cmd_add would otherwise
 # die before it ever allocates a stamp. Prints the slug the branch reduces to.
+# A plan of its own for each add, as the picker hands out: pq adds no plan twice.
 add_task() {                             # branch -> slug
-  add_as "$PLAN" "$1" --repo "$REPO" 2>/dev/null && branch_to_slug "$1"
+  local plan="$PQ_HOME/.plan-${1//\//-}.md"
+  printf '# Test plan\n\nDo the thing.\n' > "$plan"
+  add_as "$plan" "$1" --repo "$REPO" 2>/dev/null && branch_to_slug "$1"
 }
 
 queue_slugs() {

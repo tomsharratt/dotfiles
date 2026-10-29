@@ -13,7 +13,7 @@
 # `pq`, and `pq` reaches it through one narrow seam (`wt new --no-agent --no-focus
 # --json`).
 #
-#   pq add               pick a plan and add it; it asks the model, the effort, what
+#   pq add               pick a plan not yet added and add it; it asks the model, the effort, what
 #                        it builds on (a task in its own repo, once that pull request
 #                        is ready) or waits for (one in another repo, once it merges)
 #                        and, for a plan built from a design that names no file on disk,
@@ -889,6 +889,37 @@ recent_plans() {                        # -> epoch<TAB>path, newest first
     | sort -t$'\t' -k1,1nr -k2,2
 }
 
+# The plan every task was added from - its `source:` - one per line. Archive
+# included: a plan is spent once it has been added, whatever its task has done
+# since, and `pq rm` of that task is what makes it addable again. One awk over
+# every plan.md, read the way hdr reads one, for the reason plan_rows is one
+# awk: this runs before the picker can draw, and a fork per task is a fork per
+# line of `pq ls --all`.
+added_plans() {                         # -> one source path per line
+  all_tasks all | awk '
+    {
+      f = $0 "/plan.md"; n = 0
+      while ((getline line < f) > 0) {
+        if (++n == 1) { if (line != "---") break; continue }
+        if (line == "---") break
+        i = index(line, ":")
+        if (i && substr(line, 1, i - 1) == "source") {
+          v = substr(line, i + 1); sub(/^[ \t]+/, "", v); print v; break
+        }
+      }
+      close(f)
+    }'
+}
+
+# recent_plans' rows, less those a task was added from. An exact match on the
+# path, looked up rather than grepped, so one path never hides another it is a
+# prefix of.
+unadded_plans() {                       # epoch<TAB>path on stdin -> the same rows, fewer
+  ADDED=$(added_plans) awk -F'\t' '
+    BEGIN { n = split(ENVIRON["ADDED"], a, "\n"); for (i = 1; i <= n; i++) added[a[i]] = 1 }
+    !($2 in added)'
+}
+
 # Ask a small model for a branch name and a one-line statement of intent, from the
 # plan itself. Both are things a human reads later - the branch on a pull request,
 # the intent at the top of its description - and neither can be derived from the
@@ -1316,18 +1347,24 @@ ui_file() {                             # directory
 }
 
 # Exit codes carry meaning, the way reap_task's already do: 0 chose one (its
-# path on stdout), 1 cancelled or declined, 2 nothing in $PLANS_DIR to pick from
-# - the caller stops on that one, with nothing to add.
+# path on stdout), 1 cancelled or declined, 2 nothing in $PLANS_DIR to pick from,
+# 3 nothing there that has not been added already - the caller stops on either
+# of the last two, with nothing to add.
 #
 # $PLANS_DIR is every plan ever written, named by the prompt that started its
 # session ("floofy-hugging-dragonfly.md"), so the list shows each plan's title -
 # its first `# H1` - and fuzzy search replaces paging: type a word from what the
-# plan was about. Choosing one opens it in the pager to read, then asks. Declining
-# goes back to the list; Esc there is what quits.
+# plan was about. A plan a task was added from is not in the list at all, so the
+# same plan is never queued twice. Choosing one opens it in the pager to read,
+# then asks. Declining goes back to the list; Esc there is what quits.
 pick_plan() {
   local rows disp sel idx path
   rows=$(recent_plans)
   [ -n "$rows" ] || return 2
+  # Before plan_rows, not after: the line picked is mapped back to its path by
+  # its line number in $rows.
+  rows=$(unadded_plans <<<"$rows")
+  [ -n "$rows" ] || return 3
   disp=$(plan_rows <<<"$rows")
   while :; do
     sel=$(ui_filter --header "pick a plan" --placeholder "search plans" --height 15 <<<"$disp") || return 1
@@ -1606,6 +1643,7 @@ cmd_add() {
   case $? in
     0) plan=$picked ;;
     1) die "no plan chosen" ;;
+    3) die "every plan in $PLANS_DIR has been added already" ;;
     *) die "no plans in $PLANS_DIR to add" ;;
   esac
   [ -f "$plan" ] || die "no such plan: $plan"
@@ -1669,6 +1707,13 @@ cmd_add() {
       after_lines="${after_lines}$(slug_of "$b")"$'\t'"$(hdr "$b/plan.md" repo)"$'\t'"$(hdr "$b/plan.md" branch)"$'\n'
     fi
   done <<<"$after_vals"
+
+  # The picker left out every plan already added, but the wizard can sit open for
+  # as long as you take to answer it, and a second `pq add` can add this same plan
+  # in that time. Asked again here, as the dependency is above, before anything
+  # is written.
+  grep -qFx -- "$plan" <<<"$(added_plans)" \
+    && die "this plan was added while you were answering - nothing was added"
 
   # Allocated here, immediately before the directory is built - not earlier,
   # alongside the rest of the parse - so the stamp records when the task

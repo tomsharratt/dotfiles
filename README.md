@@ -159,7 +159,7 @@ Dispatch runs `wt new` in that repo, which picks up its profile, and everything 
 Branch *lookups* are keyed on the repo as well as the name, but a task's slug is a single global namespace, so two live tasks can never share a branch leaf even across two different projects - `tom/fix-timezone` cannot be queued in both at once.
 
 ```
-pq add                   pick a plan and add it; asks model, effort, what to build on and, for a design plan, the design file - the next tick names it
+pq add                   pick a plan not yet added and add it; asks model, effort, what to build on and, for a design plan, the design file - the next tick names it
 pq after <task>          what a task builds on or waits for, and where that stands
 pq after <task> T        set it, for a task still in queue/ - replacing any it had
 pq after <task> --clear  drop it
@@ -180,6 +180,10 @@ Its questions are gum's (`brew install gum`), and `pq add` and `pq rm` are the o
 
 At a terminal it opens a fuzzy-searchable list of the plans in `~/.claude/plans`, newest first, each with its age and its title - the first `# H1` in the file, since Claude Code names the file itself from your opening prompt and that name is rarely what the plan is actually about.
 "Newest" means whichever is newer, mtime or birth time, so a plan edited this morning outranks one merely created today, and a plan restored by `cp -p`, `rsync -a`, or a git checkout doesn't fall to the bottom on a stale mtime.
+A plan a task was already added from is left out, so the same plan is never queued twice.
+That holds whatever became of the task - queued, running, done or archived - and `pq rm` of the task is what makes its plan addable again.
+When every plan has been added, `pq add` says so and asks nothing.
+The list is read before the wizard and checked once more just before the task is written, so if a second `pq add` takes the same plan while you are still answering, whichever finishes last stops without adding anything.
 Type a word from what the plan was about to narrow the list, then Enter.
 
 The chosen plan opens in a pager to read (`q` or Esc closes it), and then it asks `use this plan?`.

@@ -87,15 +87,16 @@ reset_plans() { rm -rf "$PQ_PLANS_DIR"; mkdir -p "$PQ_PLANS_DIR"; }
 mkplan() { printf '# %s\n\nBody.\n' "$2" > "$PQ_PLANS_DIR/$1"; }        # filename title
 
 reset_tasks() {
-  rm -rf "$PQ_HOME/new" "$PQ_HOME/queue" "$PQ_HOME/running" "$PQ_HOME/done"
-  mkdir -p "$PQ_HOME/new" "$PQ_HOME/queue" "$PQ_HOME/running" "$PQ_HOME/done"
+  rm -rf "$PQ_HOME/new" "$PQ_HOME/queue" "$PQ_HOME/running" "$PQ_HOME/done" "$PQ_HOME/archive"
+  mkdir -p "$PQ_HOME/new" "$PQ_HOME/queue" "$PQ_HOME/running" "$PQ_HOME/done" "$PQ_HOME/archive"
 }
 reset_tasks
 
 # A task built by hand, bypassing the real dispatch path - same idiom as
-# test/pq-reap.sh's mk_done, just parameterised over the state.
-mk_task() {                             # state prio slug repo branch -> task_dir
-  local state=$1 prio=$2 slug=$3 repo=$4 branch=$5
+# test/pq-reap.sh's mk_done, just parameterised over the state. `source` is the
+# plan it was added from, written only when given.
+mk_task() {                             # state prio slug repo branch [source] -> task_dir
+  local state=$1 prio=$2 slug=$3 repo=$4 branch=$5 source=${6:-}
   # $prio is relative order, not a stamp - it is offset into a real
   # timestamp so a fixture reads like a task pq made.
   # $((10#$prio)) rather than a bare $prio: inside $(( )) a leading-zero
@@ -111,6 +112,7 @@ mk_task() {                             # state prio slug repo branch -> task_di
     printf 'model:    sonnet\n'
     printf 'effort:   xhigh\n'
     printf 'intent:   test fixture\n'
+    [ -n "$source" ] && printf 'source:   %s\n' "$source"
     printf 'added:    2026-01-01T00:00:00Z\n'
     printf -- '---\n\nplan body\n'
   } > "$dir/plan.md"
@@ -198,6 +200,51 @@ gum_reset
 pick_plan >/dev/null 2>&1; rc=$?
 eq "$rc" "2" "nothing in PLANS_DIR should return 2, not 1"
 eq "$(gum_calls)" "" "and gum is never asked"
+
+echo "== pick_plan: a plan a task was added from is not offered, whatever became of the task ==" >&2
+# The two left to offer are the oldest, so a row mapped back to its path through
+# the unfiltered list would come back as one of the plans hidden above them.
+reset_plans
+reset_tasks
+mkplan free-a.md "Free plan A"; sleep 1.1
+mkplan free-b.md "Free plan B"; sleep 1.1
+for s in new queue running "done" archive; do
+  mkplan "added-$s.md" "Added plan $s"
+  mk_task "$s" 010 "added-$s" "$REPO" "tom/added-$s" "$PQ_PLANS_DIR/added-$s.md" >/dev/null
+done
+# Only the header says what a task was added from - a plan quoting a `source:`
+# line in its body hides nothing - and a hand-made directory with no plan.md
+# hides nothing either.
+H=$(mk_task queue 020 quotes-source "$REPO" tom/quotes-source)
+printf 'source:   %s\n' "$PQ_PLANS_DIR/free-a.md" >> "$H/plan.md"
+mkdir -p "$PQ_HOME/queue/00000000000001-bare"
+gum_reset; gum_answer "@2"; gum_answer ""; gum_answer ""
+eq "$(pick_plan 2>/dev/null)" "$PQ_PLANS_DIR/free-a.md" "row 2 of what is offered is the older free plan"
+disp=$(gum_stdin 1)
+eq "$(cut -c 11- <<<"$disp" | tr '\n' '|')" "Free plan B|Free plan A|" \
+  "only the plans no task was added from - new, queue, running, done and archive all count"
+gum_reset; gum_answer "@1"; gum_answer ""; gum_answer ""
+eq "$(pick_plan 2>/dev/null)" "$PQ_PLANS_DIR/free-b.md" "and row 1 the newer"
+
+echo "== pick_plan: once its task is removed, a plan is offered again ==" >&2
+gum_reset; gum_answer ""
+main rm added-done >/dev/null 2>&1 && ok || bad "pq rm of the done task should succeed"
+gum_reset; gum_answer "" 130
+pick_plan >/dev/null 2>&1
+case "$(gum_stdin 1)" in *"Added plan done"*) ok ;; *) bad "its plan should be offered again (got: $(gum_stdin 1))" ;; esac
+case "$(gum_stdin 1)" in *"Added plan queue"*|*"Added plan archive"*) bad "the others stay hidden" ;; *) ok ;; esac
+rm -rf "$PQ_HOME/queue/00000000000001-bare"
+
+echo "== pick_plan: every plan added already returns 3 ==" >&2
+reset_plans
+reset_tasks
+mkplan spent.md "Spent plan"
+mk_task archive 010 spent "$REPO" tom/spent "$PQ_PLANS_DIR/spent.md" >/dev/null
+gum_reset
+pick_plan >/dev/null 2>&1; rc=$?
+eq "$rc" "3" "nothing left to add returns 3, not the empty directory's 2"
+eq "$(gum_calls)" "" "and gum is never asked"
+reset_tasks
 
 echo "== pick_after: nothing comes first, then the candidates, newest first ==" >&2
 reset_tasks
@@ -467,6 +514,31 @@ case "$(cat "$PQ_HOME/.feature.err")" in *"base:   "*|*"queuing against"*) bad "
 git -C "$REPO" checkout -q master
 git -C "$REPO" branch -q -D tom/feature
 git -C "$REPO" update-ref -d refs/remotes/origin/tom/feature
+
+echo "== wiring: with every plan added already, pq add says so and asks nothing ==" >&2
+reset_tasks
+mk_task archive 005 wired "$REPO" tom/wired "$PQ_PLANS_DIR/wiring.md" >/dev/null
+gum_reset
+( cd "$REPO" && main add ) >/dev/null 2>"$PQ_HOME/.spent.err" && bad "pq add with nothing left to add should stop" || ok
+case "$(cat "$PQ_HOME/.spent.err")" in
+  *"every plan in $PQ_PLANS_DIR has been added already"*) ok ;;
+  *) bad "and say every plan has been added (got: $(cat "$PQ_HOME/.spent.err"))" ;;
+esac
+eq "$(gum_calls)" "" "and nothing is asked"
+eq "$(find "$PQ_HOME/new" -mindepth 1 -maxdepth 1 | wc -l | tr -d ' ')" "0" "nothing is added"
+
+echo "== wiring: a plan another pq add takes while the wizard is open is not added twice ==" >&2
+reset_tasks
+gum_reset; gum_answer "@1"; gum_answer ""; gum_answer ""
+# shellcheck disable=SC2329  # called by cmd_add, not here
+( add_wizard() { mk_task queue 005 raced "$REPO" tom/raced "$PQ_PLANS_DIR/wiring.md" >/dev/null; }
+  cd "$REPO" && main add ) >/dev/null 2>"$PQ_HOME/.race.err" && bad "the second add of one plan should stop" || ok
+case "$(cat "$PQ_HOME/.race.err")" in
+  *"this plan was added while you were answering - nothing was added"*) ok ;;
+  *) bad "and say why (got: $(cat "$PQ_HOME/.race.err"))" ;;
+esac
+eq "$(find "$PQ_HOME/new" -mindepth 1 -maxdepth 1 | wc -l | tr -d ' ')" "0" "nothing lands in new/"
+eq "$(find "$PQ_HOME" -maxdepth 1 -name '.add.*' | wc -l | tr -d ' ')" "0" "and no staging is left behind"
 
 echo "== wiring: pq add takes no arguments - the wizard is the way in ==" >&2
 reset_tasks
