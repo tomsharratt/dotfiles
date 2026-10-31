@@ -89,6 +89,19 @@ die()  { printf '\033[38;2;235;111;146mwt: %s\033[0m\n' "$*" >&2; exit 1; }
 # `wt rm --yes` unattended (pq's teardown) can hold the worktree and say why,
 # instead of reading it as a teardown that broke and retrying it.
 refuse() { printf '\033[38;2;235;111;146mwt: %s\033[0m\n' "$*" >&2; exit 3; }
+# Out of a resource the profile isolates - every port or redis index already held by
+# a worktree - rather than a failure: exit 75 (sysexits' EX_TEMPFAIL), because one
+# comes free as soon as a worktree goes, so a caller dispatching unattended (pq) can
+# wait for that instead of counting the try towards giving up on the task.
+exhausted() {                           # port|redis
+  local what
+  case "$1" in
+    port)  what="no free port available" ;;
+    redis) what="no free redis db (1-${WT_REDIS_MAX:-15}) available" ;;
+  esac
+  printf '\033[38;2;235;111;146mwt: %s - every one is held by a worktree; wt ls shows which, wt gc --settled reclaims the merged ones\033[0m\n' "$what" >&2
+  exit 75
+}
 
 # Whether there is someone at a terminal to ask. A function rather than a bare
 # `[ -t 0 ]`, so a test can stand in for the terminal and answer the prompts.
@@ -369,8 +382,8 @@ prepare_state() {                       # name path repo repo_name [workspace_id
   WT_STATE_FILE=$sf
   for res in ${WT_RESOURCES:-}; do
     case "$res" in
-      port)  [ -n "${WT_PORT:-}" ]  || WT_PORT=$(alloc_port)   || die "no free port available" ;;
-      redis) [ -n "${WT_REDIS:-}" ] || WT_REDIS=$(alloc_redis) || die "no free redis db (1-${WT_REDIS_MAX:-15}) available" ;;
+      port)  [ -n "${WT_PORT:-}" ]  || WT_PORT=$(alloc_port)   || exhausted port ;;
+      redis) [ -n "${WT_REDIS:-}" ] || WT_REDIS=$(alloc_redis) || exhausted redis ;;
     esac
   done
   # WT_PATH first, because it is the key every other lookup finds this file BY. Written
@@ -387,6 +400,29 @@ prepare_state() {                       # name path repo repo_name [workspace_id
   [ -n "$ws" ]         && state_set "$WT_STATE_FILE" WT_WORKSPACE "$ws"
   [ -n "${WT_PORT:-}" ]  && state_set "$WT_STATE_FILE" WT_PORT  "$WT_PORT"
   [ -n "${WT_REDIS:-}" ] && state_set "$WT_STATE_FILE" WT_REDIS "$WT_REDIS"
+}
+
+# Stop now, before Herdr creates anything, if a resource the profile declares has run
+# out. prepare_state allocates only once the worktree and its workspace exist, so a pool
+# that has run dry there leaves both behind with no state file: invisible to `wt rm`
+# and gc, and reopened as-is by the next `wt new`, which then ignores --base because the
+# branch already exists. A worktree being reopened keeps what it already holds, so only
+# what it would still be handed is checked - it is found the way prepare_state finds it,
+# by the path git has it at, then by the slug its branch implies. The index is read
+# without sidx_load's duplicate check, which prepare_state makes a moment later - said
+# here as well, it would be said twice.
+need_room() {                           # repo repo_name name
+  local path sf="" res
+  SIDX=$(state_index)
+  path=$(repo_worktrees "$1" | awk -F'\t' -v b="$3" '$2 == b { print $1; exit }')
+  [ -n "$path" ] && sf=$(sf_for_path "$path")
+  [ -n "$sf" ] || sf=$(state_file "$2" "$(slugify "$3")")
+  for res in ${WT_RESOURCES:-}; do
+    case "$res" in
+      port)  [ -n "$(state_get "$sf" WT_PORT)" ]  || alloc_port  >/dev/null || exhausted port ;;
+      redis) [ -n "$(state_get "$sf" WT_REDIS)" ] || alloc_redis >/dev/null || exhausted redis ;;
+    esac
+  done
 }
 
 # Export the worktree facts, then run a profile function (with any extra args) if
@@ -1082,6 +1118,7 @@ cmd_new() {
   [ -n "$repo" ] || die "not inside a git repo: $PWD"
   repo_name=$(basename "$repo")
   load_profile "$repo_name"
+  need_room "$repo" "$repo_name" "$name"
 
   # Resolve the branch, then create the worktree+workspace in Herdr. Three cases,
   # matching the tmux-era wt: reuse an existing local branch, adopt an existing

@@ -34,6 +34,8 @@ The trade-off: status is shown only for agents running inside a Herdr pane.
 
 Isolation is per project, described by a *profile*.
 `wt` itself is project-agnostic: it resolves the branch, allocates a free port and redis db index, and calls the profile's steps.
+When one has run out - supercast hands out fourteen redis indexes, one per worktree - `wt new` stops before Herdr creates anything and exits 75, so a caller can tell a full pool from a failure.
+`wt ls` shows what holds them, and `wt gc --settled` reclaims the worktrees whose pull requests have merged or closed.
 A repo's profile is `~/.config/wt/profiles/<repo>.sh`, tracked here.
 A profile declares which resources to allocate and defines `wt_provision`, `wt_dev`, `wt_open`, and `wt_teardown`.
 A repo with no profile still gets a worktree + Claude - it just has no dev server.
