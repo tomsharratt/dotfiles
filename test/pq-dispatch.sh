@@ -52,9 +52,19 @@ case "\$1 \$2" in
 esac
 exit 1
 EOF
+# With .noroom it answers the way wt does once every redis index is held: the
+# reason on stderr, nothing on stdout, exit 75 - after, with .gcline, one line
+# of gc reclaiming an orphan on the way, once. Otherwise it says it is ready on
+# stderr, as wt does, so a test can see whether that output reached the user.
 cat > "$STUBBIN/wt-stub" <<EOF
 #!/bin/sh
 { printf '%s\t' "\$PWD"; for a in "\$@"; do printf '%s\t' "\$a"; done; printf '\n'; } >> "$WT_LOG"
+if [ -f "$STUBBIN/.noroom" ]; then
+  [ -f "$STUBBIN/.gcline" ] && { rm -f "$STUBBIN/.gcline"; printf 'wt: dropped database gone_task\n' >&2; }
+  printf 'wt: no free redis db (1-14) available - every one is held by a worktree; wt ls shows which, wt gc --settled reclaims the merged ones\n' >&2
+  exit 75
+fi
+printf 'wt: ready: stub\n' >&2
 dev=w1:p2; [ -f "$STUBBIN/.nodev" ] && dev=""
 printf '{"root_pane_id":"w1:p1","dev_pane_id":"%s","path":"%s","workspace_id":"w1","url":"https://task.test","port":3101}\n' "\$dev" "$WT_PATH_DIR"
 exit 0
@@ -99,7 +109,7 @@ reset_tasks() {
   mkdir -p "$PQ_HOME/new" "$PQ_HOME/queue" "$PQ_HOME/running" "$PQ_HOME/done"
 }
 reset_tasks
-reset_logs() { : > "$HERDR_LOG"; : > "$WT_LOG"; rm -f "$STUBBIN/.start-fail" "$STUBBIN/.start-fail-once" "$STUBBIN/.prompt-fail"; }
+reset_logs() { : > "$HERDR_LOG"; : > "$WT_LOG"; rm -f "$STUBBIN/.start-fail" "$STUBBIN/.start-fail-once" "$STUBBIN/.prompt-fail" "$STUBBIN/.noroom" "$STUBBIN/.gcline"; }
 
 mk_task() {                             # state prio slug branch [design [artifact]] -> task_dir
   local state=$1 prio=$2 slug=$3 branch=$4 design=${5:-} artifact=${6:-}
@@ -350,6 +360,48 @@ dispatch_task "$DP" >/dev/null 2>&1; rc=$?
 eq "$rc" "0" "the retry succeeds"
 eq "$(herdr_calls)" "agent prompt;" "with only the prompt"
 [ -n "$(st "$DP" PQ_LAUNCHED)" ] && ok || bad "and the launch is recorded"
+
+echo "== wt with no room waits: never counted, said once, and dispatched once there is room ==" >&2
+# What gave a stacked task up three ticks after its claim: every redis index
+# was held by a worktree whose pull request was waiting to be merged, and each
+# "wt new failed" counted towards DISPATCH_TRIES.
+reset_tasks; reset_logs; set_panes ""
+: > "$STUBBIN/.noroom"
+DR=$(mk_task running 008 roomless tom/roomless)
+st_set "$DR" PQ_CLAIMED 2026-01-01T00:00:00Z
+dispatch_try "$DR" >/dev/null 2>"$PQ_HOME/.err"; rc=$?
+eq "$rc" "2" "the try waits - not the task's failure"
+eq "$(st "$DR" PQ_DISPATCH_FAILS)" "" "and is not counted"
+eq "$(st "$DR" PQ_DISPATCH_WAIT)" "room" "the wait is recorded"
+has "$(cat "$PQ_HOME/.err")" "no free redis db" "wt's reason is shown the first time"
+has "$(cat "$PQ_HOME/.err")" "roomless: no room for its worktree" "and the wait is named"
+hasnt "$(cat "$PQ_HOME/.err")" "wt new failed" "not as a failure"
+eq "$(agent_cell "$DR" running)" "no room" "pq ls says so"
+eq "$(running_count)" "1" "it keeps its slot - what it waits for is the next thing to run"
+: > "$STUBBIN/.gcline"
+for i in 1 2 3 4; do dispatch_try "$DR" >/dev/null 2>"$PQ_HOME/.err.$i"; done
+has "$(cat "$PQ_HOME/.err.1")" "wt: dropped database gone_task" "anything else wt says while pq waits still reaches the log"
+eq "$(grep -c '	new	' "$WT_LOG")" "5" "wt is asked again every tick"
+eq "$(st "$DR" PQ_DISPATCH_FAILS)" "" "five waits count for nothing"
+dispatch_gaveup "$DR" && bad "and it is never given up on" || ok
+retries=$(cat "$PQ_HOME/.err.1" "$PQ_HOME/.err.2" "$PQ_HOME/.err.3" "$PQ_HOME/.err.4")
+hasnt "$retries" "no free redis db" "a retry keeps wt's same reason out of the log"
+hasnt "$retries" "no room" "and pq's"
+hasnt "$retries" "preparing worktree" "and the line it says before calling wt"
+PR_CACHE="$PQ_HOME/.test.pr"; PR_ANS="$PQ_HOME/.test.ans"; : > "$PR_CACHE"; : > "$PR_ANS"
+PQ_SUMMARY=""
+tick_body 1 0 >"$PQ_HOME/.tick" 2>&1
+hasnt "$(cat "$PQ_HOME/.tick")" "dispatch was interrupted" "the tick does not call a wait an interrupted dispatch"
+hasnt "$(cat "$PQ_HOME/.tick")" "no free redis db" "and stays quiet about it"
+PR_CACHE=""; PR_ANS=""
+rm -f "$STUBBIN/.noroom"
+dispatch_try "$DR" >/dev/null 2>"$PQ_HOME/.err"; rc=$?
+eq "$rc" "0" "once there is room it dispatches"
+eq "$(st "$DR" PQ_DISPATCH_WAIT)" "" "the wait is cleared"
+has "$(cat "$PQ_HOME/.err")" "roomless: preparing worktree for tom/roomless" "what pq says before calling wt is said after all"
+has "$(cat "$PQ_HOME/.err")" "wt: ready: stub" "and wt's own output, kept aside, reaches the user"
+[ -n "$(st "$DR" PQ_LAUNCHED)" ] && ok || bad "and the launch is recorded"
+[ -e "$PQ_HOME/.wterr.$$" ] && bad "the kept-aside stderr is cleaned up" || ok
 
 echo "== herdr answering nothing at all is a failure, not a success ==" >&2
 # herdr exits 0 with a JSON body either way; an empty body with exit 0 is the

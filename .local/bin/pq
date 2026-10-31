@@ -158,6 +158,7 @@ set -uo pipefail
 PQ_HOME="${PQ_HOME:-${XDG_STATE_HOME:-$HOME/.local/state}/pq}"
 PLANS_DIR="${PQ_PLANS_DIR:-$HOME/.claude/plans}"
 WT="${PQ_WT:-$HOME/.local/bin/wt}"
+WT_NO_ROOM=75                           # wt's exit when every port or redis index is held - see dispatch_task
 STATES="new queue running done archive"
 
 # Fixed values, not knobs: nothing has ever set one of these but a test, and a
@@ -2990,9 +2991,11 @@ agent_cell() {                          # task_dir state
   pane=$(task_pane "$d")
   # Claimed but not yet launched: either mid-dispatch right now, or an interrupted
   # tick left it half-done and the next reconcile will finish it - unless pq has
-  # given up on it, which wants you.
+  # given up on it, which wants you, or wt has no room for its worktree yet.
   if [ -z "$(st "$d" PQ_LAUNCHED)" ]; then
-    if dispatch_gaveup "$d"; then printf 'failed'; else printf 'starting'; fi
+    if dispatch_gaveup "$d"; then printf 'failed'
+    elif [ "$(st "$d" PQ_DISPATCH_WAIT)" = room ]; then printf 'no room'
+    else printf 'starting'; fi
     return
   fi
   status=$(pane_state "$pane")
@@ -3834,7 +3837,7 @@ wt_in_errto() {                         # errfile repo wt-subcommand args...
 # after it, which is what its contract tells it and what a restack needs. A
 # parent that merged between the claim and the fork is not built on at all: the
 # task forks from the default branch, as any other does, which already holds it.
-dispatch_task() {                       # task_dir  -> 0 launched, 1 failed, 2 waiting on a dialog
+dispatch_task() {                       # task_dir  -> 0 launched, 1 failed, 2 waiting (on a dialog, or for room)
   local d=$1 repo branch model effort pane wtjson prompt parent
   repo=$(hdr "$d/plan.md" repo);     branch=$(hdr "$d/plan.md" branch)
   model=$(hdr "$d/plan.md" model);   effort=$(hdr "$d/plan.md" effort)
@@ -3886,14 +3889,47 @@ dispatch_task() {                       # task_dir  -> 0 launched, 1 failed, 2 w
         fork_from="origin/$parent"
       fi
     fi
-    msg "$(slug_of "$d"): preparing worktree for $branch${fork_from:+ off $fork_from}"
     # Shielded: this is the slow one - a full database copy - and the one worth
     # letting finish when you Ctrl-C. wt's own progress still goes to stderr and
     # straight to the user; only its stdout (the JSON) is captured. `--base` is
     # used as given: wt forks from that ref with no fetch of its own, which is why
     # the fetch above comes first.
-    shielded wt_in "$repo" new --no-agent --no-focus ${fork_from:+--base "$fork_from"} --json "$branch" \
-      || { warn "$(slug_of "$d"): wt new failed"; return 1; }
+    #
+    # wt has no room when every redis index (or port) the profile isolates is held
+    # by a worktree - fourteen for supercast, and a long stack of green pull
+    # requests waiting to be merged holds them all. That is not the task's failure:
+    # one comes free when a worktree goes, as a task's does once its pull request
+    # settles, so it waits, like a prompt on a dialog - never counted towards
+    # giving up, and still holding its slot, since what it waits for is the very
+    # next thing to run. It used to count, and gave a stacked task up three ticks
+    # after its claim. Asked again every tick, and wt answers before Herdr creates
+    # anything (need_room), so a retry has nothing to undo - but its "no free redis
+    # db" would land in the log every tick. So while waiting wt's stderr is kept
+    # aside: that one line (wt's `exhausted`) is dropped and anything else, a
+    # worktree gc reclaimed on the way say, shown; once wt gets past it, all of it
+    # is, after the line pq says before calling wt.
+    local wtargs=(new --no-agent --no-focus ${fork_from:+--base "$fork_from"} --json "$branch")
+    local prep wtrc=0
+    prep="$(slug_of "$d"): preparing worktree for $branch${fork_from:+ off $fork_from}"
+    if [ "$(st "$d" PQ_DISPATCH_WAIT)" = room ]; then
+      shielded wt_in_errto "$PQ_HOME/.wterr.$$" "$repo" "${wtargs[@]}" || wtrc=$?
+      if [ "$wtrc" = "$WT_NO_ROOM" ]; then
+        grep -v 'every one is held by a worktree' "$PQ_HOME/.wterr.$$" >&2
+      else
+        msg "$prep"; cat "$PQ_HOME/.wterr.$$" >&2
+      fi
+      rm -f "$PQ_HOME/.wterr.$$"
+    else
+      msg "$prep"
+      shielded wt_in "$repo" "${wtargs[@]}" || wtrc=$?
+    fi
+    if [ "$wtrc" = "$WT_NO_ROOM" ]; then
+      [ "$(st "$d" PQ_DISPATCH_WAIT)" = room ] || { st_set "$d" PQ_DISPATCH_WAIT room
+        warn "$(slug_of "$d"): no room for its worktree - it starts once a worktree is freed, as one is when a pull request settles"; }
+      return 2
+    fi
+    [ "$wtrc" = 0 ] || { warn "$(slug_of "$d"): wt new failed"; return 1; }
+    [ "$(st "$d" PQ_DISPATCH_WAIT)" != room ] || st_set "$d" PQ_DISPATCH_WAIT ""
     wtjson=$SHIELDED_OUT
     pane=$(jq -r '.root_pane_id // empty' <<<"$wtjson" 2>/dev/null)
     [ -n "$pane" ] || { warn "$(slug_of "$d"): wt returned no pane"; return 1; }
@@ -3976,8 +4012,9 @@ dispatch_task() {                       # task_dir  -> 0 launched, 1 failed, 2 w
 # So failures in a row are counted, and past DISPATCH_TRIES the task is left for
 # you: PQ_DISPATCH_GAVEUP, said once, `failed` in `pq ls`, no longer resumed, and
 # no longer holding a slot, since nothing is running in it. `pq rm` drops it. A
-# prompt waiting on a dialog is not a failure (dispatch_task says so with 2), and a
-# dispatch that goes through clears the count.
+# prompt waiting on a dialog is not a failure, nor is a worktree waiting for room
+# (dispatch_task says either with 2), and a dispatch that goes through clears the
+# count.
 DISPATCH_TRIES=3
 dispatch_try() {                        # task_dir -> dispatch_task's status
   local d=$1 rc n
@@ -6316,7 +6353,7 @@ tick_body() {                           # cap dry
         dispatch_gaveup "$d" && continue
         if [ "$dry" = 1 ]; then msg "would resume the interrupted dispatch of $slug"
         else
-          [ "$(st "$d" PQ_DISPATCH_WAIT)" = blocked ] || warn "$slug: dispatch was interrupted - resuming"
+          [ -n "$(st "$d" PQ_DISPATCH_WAIT)" ] || warn "$slug: dispatch was interrupted - resuming"
           dispatch_try "$d" || true
         fi
         continue
