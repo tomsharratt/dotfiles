@@ -23,9 +23,14 @@ run_cleanup() {
 }
 trap run_cleanup EXIT
 export TEST_BASE="$RUN_ROOT"
+# asdf's install is read from where it really is, and its global versions are
+# copied in, as sandbox.sh does for a file run on its own (see there).
+export ASDF_DATA_DIR="${ASDF_DATA_DIR:-$HOME/.asdf}"
+REAL_TOOL_VERSIONS="$HOME/.tool-versions"
 export HOME="$RUN_ROOT/home" XDG_STATE_HOME="$RUN_ROOT/home/.local/state" XDG_CONFIG_HOME="$RUN_ROOT/home/.config"
 export PQ_HOME="$XDG_STATE_HOME/pq" PQ_PLANS_DIR="$HOME/.claude/plans"
 mkdir -p "$HOME"
+[ -f "$REAL_TOOL_VERSIONS" ] && cp "$REAL_TOOL_VERSIONS" "$HOME/.tool-versions"
 printf 'run.sh: test root %s (HOME=%s PQ_HOME=%s PQ_PLANS_DIR=%s)\n' "$RUN_ROOT" "$HOME" "$PQ_HOME" "$PQ_PLANS_DIR" >&2
 
 rc=0
