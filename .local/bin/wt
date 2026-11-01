@@ -74,7 +74,7 @@
 #                  When WT_SWEEP_DRY is set it must change NOTHING and instead
 #                  print one line per resource it would reclaim, to stdout - that
 #                  is what `wt gc --sweep` shows you before asking to proceed
-# Helpers available to profiles: msg, warn, wt_state_set KEY VALUE.
+# Helpers available to profiles: msg, warn, wt_state_set KEY VALUE, base_ref PATH.
 # A repo with no profile still gets a worktree + Claude; it just has no dev server.
 
 set -uo pipefail

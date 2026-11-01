@@ -26,7 +26,9 @@ WT_REDIS_RESERVED="15"
 # partial-index clauses differently from whichever one dumped the committed file. So
 # a worktree that changed nothing about the schema can still show it modified, and
 # that alone held a merged task's teardown. A real schema change comes with its
-# migration, a new file, which still counts as work.
+# migration, a new file, which still counts as work. The migrates wt runs itself -
+# provisioning's and the dev boot's - go further and put the committed file back when
+# the re-dump can only be that noise (see _wt_migrate).
 # shellcheck disable=SC2034
 WT_REGENERATED="db/schema.rb"
 
@@ -136,6 +138,108 @@ _wt_puma_dev_route() {
   return 0
 }
 
+# The migrations in this worktree's db/migrate that DB has not run, one path per line
+# (relative to the worktree), oldest first, and nothing when it is current. Non-zero
+# when the database cannot be read at all - postgres down, the database gone, no
+# schema_migrations table - so a caller can tell "nothing pending" from "cannot tell".
+#
+# Asked of postgres directly rather than through `bin/rails db:migrate:status`, which
+# boots the whole app: several seconds on every dev boot to learn, almost always, that
+# there is nothing to do. One query and a glob take milliseconds.
+_wt_pending_migrations() {              # db
+  local applied f
+  applied=$(psql -XqtA -d "$1" -c 'SELECT version FROM schema_migrations' 2>/dev/null) || return 1
+  for f in "$WT_PATH"/db/migrate/[0-9]*_*.rb; do
+    [ -e "$f" ] && printf '%s\n' "${f##*/}"
+  done | awk -F_ 'NR == FNR { if ($0 != "") done[$0]; next }
+                  !($1 in done) { print "db/migrate/" $0 }' <(printf '%s\n' "$applied") -
+}
+
+# Whether db:migrate applying PENDING can change db/schema.rb only by the re-dump noise
+# WT_REGENERATED describes, so the committed file is the one to keep. True when
+# schema.rb is exactly as committed and every pending migration is, byte for byte, one
+# the default branch already has: that branch's schema.rb describes each of them, and a
+# worktree rebased onto it carries that schema.rb. That is the common case, and the one
+# that broke a worktree: master gains a migration after the worktree's database was
+# copied, the branch is rebased onto it, and the migrate that catches the database up
+# leaves schema.rb dirty with nothing in it but postgres 18's rendering.
+#
+# Anything else is the branch's own, and its re-dump is kept: a schema.rb it had already
+# changed, or a migration that is new on the branch, edited, or not even committed -
+# where the re-dump may be the only record of the schema change. No default branch to
+# compare with also counts as the branch's own, the safe direction to be wrong in.
+_wt_schema_redump_only() {              # pending (newline-separated paths)
+  local st base f
+  [ -f "$WT_PATH/db/schema.rb" ] || return 1
+  st=$(git -C "$WT_PATH" status --porcelain -- db/schema.rb 2>/dev/null) || return 1
+  [ -z "$st" ] || return 1
+  base=$(base_ref "$WT_PATH"); [ -n "$base" ] || return 1
+  while IFS= read -r f; do
+    [ -n "$f" ] || continue
+    git -C "$WT_PATH" ls-files --error-unmatch -- "$f" >/dev/null 2>&1 || return 1
+    git -C "$WT_PATH" cat-file -e "$base:$f" 2>/dev/null || return 1
+    git -C "$WT_PATH" diff --quiet "$base" -- "$f" 2>/dev/null || return 1
+  done <<<"$1"
+  return 0
+}
+
+# Run db:migrate on DB, returning its status, with its output in _WT_MIGRATE_OUT for the
+# caller to show when it fails. With RESTORE=1 - the
+# caller's _wt_schema_redump_only verdict - db/schema.rb is put back exactly as it was
+# afterwards, and the annotate gem's model re-annotation (supercast runs it after every
+# development db:migrate) is skipped, since what the default branch already has changes
+# no file either. Sets _WT_SCHEMA_RESTORED=1 when the re-dump really did differ and was
+# undone, for the caller to say so.
+_wt_migrate() {                         # db restore(0|1)
+  local db=$1 restore=$2 snap="" rc
+  _WT_SCHEMA_RESTORED="" _WT_MIGRATE_OUT=""
+  if [ "$restore" = 1 ]; then
+    snap=$(mktemp) || snap=""
+    if [ -n "$snap" ] && ! cp "$WT_PATH/db/schema.rb" "$snap"; then rm -f "$snap"; snap=""; fi
+  fi
+  if [ -n "$snap" ]; then
+    _WT_MIGRATE_OUT=$(cd "$WT_PATH" && DATABASE_URL="postgres:///$db" skip_on_db_migrate=1 bin/rails db:migrate 2>&1)
+  else
+    _WT_MIGRATE_OUT=$(cd "$WT_PATH" && DATABASE_URL="postgres:///$db" bin/rails db:migrate 2>&1)
+  fi
+  rc=$?
+  if [ -n "$snap" ]; then
+    cmp -s "$snap" "$WT_PATH/db/schema.rb" || { cp "$snap" "$WT_PATH/db/schema.rb" && _WT_SCHEMA_RESTORED=1; }
+    rm -f "$snap"
+  fi
+  return "$rc"
+}
+
+# Catch the worktree's database up with its migrations before the dev server boots on
+# it. Nothing else does: provisioning migrates once, against the copy it makes, and the
+# branch keeps moving afterwards - rebased onto a master that has gained a migration,
+# its server came back from a restart serving ActiveRecord::PendingMigrationError on
+# every page and its sidekiq jobs failing on PG::UndefinedColumn, until somebody ran the
+# migrate by hand - which then left db/schema.rb dirty with postgres's re-dump noise.
+#
+# Silent and quick when there is nothing pending, which is nearly every boot. A
+# migration that fails does not stop the server: the error is shown here, loudly, and
+# the app itself shows the pending migration, which is a better place to see it than a
+# dev pane that never came up.
+_wt_dev_migrate() {                     # db
+  local db=$1 pending n s restore=0
+  if ! pending=$(_wt_pending_migrations "$db"); then
+    warn "could not read $db's schema_migrations - not checking it for pending migrations"
+    return 0
+  fi
+  [ -n "$pending" ] || return 0
+  n=$(grep -c . <<<"$pending"); s=s; [ "$n" = 1 ] && s=""
+  _wt_schema_redump_only "$pending" && restore=1
+  if _wt_migrate "$db" "$restore"; then
+    msg "migrated $n pending migration$s$([ -n "$_WT_SCHEMA_RESTORED" ] && printf -- ' - db/schema.rb left as committed')"
+  else
+    warn "db:migrate FAILED on $n pending migration$s - starting the dev server anyway; the app will show it until it is fixed:"
+    tail -n 30 <<<"$_WT_MIGRATE_OUT" | sed 's/^/    /' >&2
+    warn "fix the migration, then: wt restart - the dev boot migrates again"
+  fi
+  return 0
+}
+
 wt_provision() {
   local canonical=$WT_REPO db tdb key rel
   db=$(_wt_db); tdb=$(_wt_test_db)
@@ -178,11 +282,18 @@ wt_provision() {
     warn "seeding $db from the dev db failed"; return 1
   fi
 
-  # 4. Apply this branch's own migrations to the isolated db (safe - nothing shared).
+  # 4. Apply this branch's own migrations to the isolated db (safe - nothing shared),
+  #    keeping the committed db/schema.rb when the re-dump can only be postgres's
+  #    noise - see _wt_schema_redump_only. A pending list that cannot be read keeps
+  #    the re-dump, and still migrates.
+  local pending restore=0
   msg "migrating $db"
-  if ! ( cd "$WT_PATH" && DATABASE_URL="postgres:///$db" bin/rails db:migrate >/dev/null ); then
+  pending=$(_wt_pending_migrations "$db") && _wt_schema_redump_only "$pending" && restore=1
+  if ! _wt_migrate "$db" "$restore"; then
+    tail -n 30 <<<"$_WT_MIGRATE_OUT" >&2
     warn "db:migrate failed - fix before testing"; return 1
   fi
+  [ -n "$_WT_SCHEMA_RESTORED" ] && msg "db/schema.rb left as committed - its re-dump differed only in postgres's rendering"
 
   # 5. This worktree's own test database. Schema only, never a copy of dev: a test
   #    database is meant to start empty, and rails_helper's maintain_test_schema!
@@ -393,6 +504,9 @@ wt_dev() {
     oldpid=$(tr -dc '0-9' < "$pidfile" 2>/dev/null)
     { [ -z "$oldpid" ] || ! kill -0 "$oldpid" 2>/dev/null; } && rm -f "$pidfile"
   fi
+  # The database caught up with the branch's migrations first, or the app 500s on
+  # every page with PendingMigrationError - see _wt_dev_migrate.
+  _wt_dev_migrate "$db"
   # Procfile.dev pins the web port to 3000, so it can't be shared. Generate a
   # per-worktree copy that binds this worktree's port instead - see _wt_procfile.
   _wt_procfile "$WT_PATH/Procfile.dev" "$WT_PORT" > "$pf"
