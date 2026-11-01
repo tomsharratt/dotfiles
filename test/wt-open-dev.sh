@@ -278,5 +278,43 @@ case "$(cat "$CLOSED")" in *w1:*) bad "w1 holds another checkout now - none of i
 case "$(cat "$TABCREATE_LOG")" in *"--workspace wFALLBACK"*) ok ;; *) bad "it finds the worktree's workspace by path instead (got: $(cat "$TABCREATE_LOG"))" ;; esac
 printf '[]' > "$WSS"
 
+echo "== wt stop: the dev tab is closed, and nothing is started in its place ==" >&2
+# pq runs this once a task's pull request is ready: the stack is puma, sidekiq and
+# two watchers per worktree, and none of it is needed until somebody looks.
+reset 1; write_state 3101 w1; write_profile 1
+printf '[{"tab_id":"w1:t1","workspace_id":"w1","label":"1"},{"tab_id":"w1:tDev","workspace_id":"w1","label":"dev"}]' > "$TABS"
+jq -n --arg p "$WTP" '[{workspace_id: "w1", worktree: {checkout_path: $p}}]' > "$WSS"
+printf '[{"pane_id":"w1:pAgent","tab_id":"w1:t1"},{"pane_id":"w1:pDevOld","tab_id":"w1:tDev"}]' > "$PANES"
+: > "$CLOSED"
+out=$( "$WT" stop "$WTP" 2>&1 ); rc=$?
+eq "$rc" "0" "wt stop succeeds"
+eq "$(cat "$CLOSED")" "w1:tDev" "it closes the dev tab and nothing else - not the agent's"
+eq "$(tabs_made)" "0" "and starts nothing"
+case "$out" in *"wt open or wt restart starts it again"*) ok ;; *) bad "it says how to bring it back (got: $out)" ;; esac
+[ -f "$SF" ] && grep -q '^WT_PORT=3101$' "$SF" && ok || bad "the worktree keeps its state - port and all"
+
+echo "== ...and with no dev tab, there is nothing to stop and that is fine ==" >&2
+: > "$CLOSED"
+out=$( cd "$WTP" && "$WT" stop 2>&1 ); rc=$?
+eq "$rc" "0" "stopping a stopped server is not an error"
+eq "$(cat "$CLOSED")" "" "nothing is closed"
+case "$out" in *"no dev server running"*) ok ;; *) bad "it says nothing was running (got: $out)" ;; esac
+
+echo "== ...and wt open brings a stopped server back ==" >&2
+reset 1; write_state 3101 w1; write_profile 1
+out=$(run_open); rc=$?
+eq "$rc" "0" "wt open succeeds on a stopped worktree"
+eq "$(tabs_made)" "1" "it starts the server again in a fresh dev tab"
+
+echo "== ...and so does wt restart, which is what an agent is told to run ==" >&2
+reset 1; write_state 3101 w1; write_profile 1
+jq -n --arg p "$WTP" '[{workspace_id: "w1", worktree: {checkout_path: $p}}]' > "$WSS"
+: > "$CLOSED"
+out=$( cd "$WTP" && WT_DEV_WAIT=2 "$WT" restart 2>&1 ); rc=$?
+eq "$rc" "0" "wt restart succeeds with no server to stop"
+eq "$(tabs_made)" "1" "and starts one"
+case "$out" in *"dev server up"*) ok ;; *) bad "waiting for it to come up (got: $out)" ;; esac
+printf '[]' > "$WSS"
+
 printf '\n%d passed, %d failed\n' "$pass" "$fail" >&2
 [ "$fail" -eq 0 ]

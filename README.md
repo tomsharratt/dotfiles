@@ -68,7 +68,11 @@ Commands:
 wt new [name]        create/open an isolated worktree, provision, start dev + Claude
 wt dev  <path>       run a worktree's dev server (this is the dev pane's command)
 wt restart [path]    restart the worktree's dev server in its dev tab, and wait for it -
-                     after a new gem, an initializer, anything a running stack misses
+                     after a new gem, an initializer, anything a running stack misses;
+                     it also starts a server that was stopped
+wt stop [path]       stop the worktree's dev server and close its dev tab, keeping
+                     everything else - worktree, databases, port, redis indexes;
+                     wt open or wt restart starts it again
 wt run  [cmd...]     run a command with the worktree's isolated env loaded
 wt test [cmd...]     the same, with RAILS_ENV=test, so the command gets the
                      worktree's own test database rather than its dev copy

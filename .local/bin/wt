@@ -18,7 +18,10 @@
 #        --json          print the worktree's facts (path, panes, port, url) to stdout
 #   wt dev  <path>       run the worktree's dev server (the dev pane's command)
 #   wt restart [path]    restart the worktree's dev server in its dev tab - after a
-#                        new gem, an initializer, anything a running stack misses
+#                        new gem, an initializer, anything a running stack misses;
+#                        it starts a stopped one too
+#   wt stop [path]       stop the worktree's dev server and close its dev tab, keeping
+#                        the worktree, its databases, port and redis indexes
 #   wt run  [cmd...]     run a command with the worktree's isolated env loaded
 #                        (e.g. `wt run bin/rails console`); no cmd -> a shell
 #   wt open [subdomain]  open this worktree's dev url in the browser - at a
@@ -1519,6 +1522,35 @@ cmd_restart() {
   dev_autostart
 }
 
+# Stop a worktree's dev server and keep everything else: the worktree, its databases,
+# its port, its redis indexes, its puma-dev entry. A dev stack is puma, sidekiq and the
+# css and js watchers, and one per worktree adds up behind a queue of pull requests
+# waiting on review, none of which need it until somebody looks - pq runs this once a
+# task's pull request is ready. It is stop_tabs on the `dev` tab, the first half of
+# cmd_restart, and either `wt open` or `wt restart` brings the server back. Nothing to
+# stop is not an error: the answer to "make sure it is not running" is yes either way.
+cmd_stop() {
+  need_herdr
+  local path repo repo_name name ws
+  path=$(git -C "${1:-$PWD}" rev-parse --show-toplevel 2>/dev/null) || die "not inside a git worktree: ${1:-$PWD}"
+  repo=$(main_worktree "$path"); repo_name=$(basename "$repo"); name=$(cur_branch "$path")
+  load_profile "$repo_name"
+  load_state_for_path "$path" "$repo_name" "$name" || true
+  ws=${WT_WORKSPACE:-}
+  ws_is_for "$ws" "$path" || ws=$(herdr_ws_for "$repo" "$path" "$name")
+  if [ -z "$ws" ] || [ "$ws" = null ]; then
+    msg "no herdr workspace holds $path - no dev server to stop"
+    return 0
+  fi
+  if [ -z "$(dev_tab_for "$ws")" ]; then
+    msg "no dev server running in $ws"
+    return 0
+  fi
+  msg "stopping the dev server in $ws"
+  stop_tabs "$ws" dev
+  msg "dev server stopped - wt open or wt restart starts it again"
+}
+
 # gum draws its UI on stderr and prints only the answer, so a pick can sit in a
 # command substitution. Same amber as pq's prompts; the one place wt asks a person
 # anything.
@@ -1832,6 +1864,7 @@ main() {
     new)        shift; cmd_new "$@" ;;
     dev)        shift; cmd_dev "$@" ;;
     restart)    shift; cmd_restart "$@" ;;
+    stop)       shift; cmd_stop "$@" ;;
     run)        shift; cmd_run "$@" ;;
     test)       shift; cmd_test "$@" ;;
     open)       shift; cmd_open "$@" ;;
@@ -1839,7 +1872,7 @@ main() {
     rm)         shift; cmd_rm "$@" ;;
     ls)         shift; cmd_ls "$@" ;;
     gc)         shift; cmd_gc "$@" ;;
-    *) die "usage: wt {new [--no-agent] [--no-focus] [--base REF] [--json] [name] | dev <path> | restart [path] | run [cmd...] | test [cmd...] | open [subdomain] | provision <path> | rm [-y] [name] | ls | gc [--settled] [--sweep] [-y]}" ;;
+    *) die "usage: wt {new [--no-agent] [--no-focus] [--base REF] [--json] [name] | dev <path> | restart [path] | stop [path] | run [cmd...] | test [cmd...] | open [subdomain] | provision <path> | rm [-y] [name] | ls | gc [--settled] [--sweep] [-y]}" ;;
   esac
 }
 if [ "${BASH_SOURCE[0]}" = "$0" ]; then main "$@"; fi
