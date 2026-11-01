@@ -28,6 +28,8 @@ HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 # it BEFORE pq is sourced, since pq computes PQ_HOME and PLANS_DIR from them at load
 # time; and after the source each one is checked, so a pq that one day resolves a
 # path differently stops this file rather than letting it touch the real ones.
+# shellcheck source=test/sandbox.sh
+source "$HERE/sandbox.sh"
 T_ROOT=$(mktemp -d)
 export HOME="$T_ROOT/home" XDG_STATE_HOME="$T_ROOT/state" XDG_CONFIG_HOME="$T_ROOT/config"
 T_PQ="$T_ROOT/pq"; export PQ_HOME="$T_PQ" PQ_PLANS_DIR="$T_ROOT/plans"
@@ -62,13 +64,14 @@ export PQ_WT="$STUBBIN/wt-stub"
 # shellcheck source=/dev/null
 source "$HERE/../.local/bin/pq"
 pr_load_all() { :; }
+sandbox_guard
 
-[ "$PQ_HOME" = "$T_PQ" ] || { printf 'ABORT: pq resolved PQ_HOME=%s, not %s\n' "$PQ_HOME" "$T_PQ" >&2; rm -rf "$T_ROOT"; exit 1; }
+[ "$PQ_HOME" = "$T_PQ" ] || { printf 'ABORT: pq resolved PQ_HOME=%s, not %s\n' "$PQ_HOME" "$T_PQ" >&2; sandbox_cleanup; exit 1; }
 for p in "$PQ_HOME" "$PLANS_DIR" "$HOME"; do
   case "$p" in
     "$T_ROOT"/*) ;;
     *) printf 'ABORT: pq resolved %s, outside this test'"'"'s temp dir %s - refusing to run\n' "$p" "$T_ROOT" >&2
-       rm -rf "$T_ROOT"; exit 1 ;;
+       sandbox_cleanup; exit 1 ;;
   esac
 done
 
@@ -78,7 +81,7 @@ bad() { fail=$((fail + 1)); printf 'FAIL: %s\n' "$1" >&2; }
 eq() { [ "$1" = "$2" ] && ok || bad "$3 (got '$1', want '$2')"; }
 has() { case "$1" in *"$2"*) ok ;; *) bad "$3 (got '$1')" ;; esac; }
 
-cleanup() { rm -rf "$T_ROOT"; }
+cleanup() { sandbox_cleanup; }
 trap cleanup EXIT
 unset HERDR_ENV HERDR_SOCKET_PATH HERDR_WORKSPACE_ID
 

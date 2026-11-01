@@ -23,6 +23,8 @@
 set -uo pipefail
 
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+# shellcheck source=test/sandbox.sh
+source "$HERE/sandbox.sh"
 
 pass=0 fail=0
 ok()  { pass=$((pass + 1)); }
@@ -31,7 +33,7 @@ eq() { [ "$1" = "$2" ] && ok || bad "$3 (got '$1', want '$2')"; }
 has() { case "$1" in *"$2"*) ok ;; *) bad "$3 (got '$1')" ;; esac; }
 
 FIX=$(mktemp -d)
-cleanup() { rm -rf "$FIX"; }
+cleanup() { sandbox_cleanup; }
 trap cleanup EXIT
 
 # Exported BEFORE the source below: wt computes STATE_DIR and PROFILE_DIR (and
@@ -65,6 +67,7 @@ source "$HERE/../.local/bin/wt"
 # and allocate indexes, and must only ever do it in the fixture.
 [ "$STATE_DIR" = "$STATE" ] || { printf 'ABORT: wt resolved STATE_DIR=%s, not %s\n' "$STATE_DIR" "$STATE" >&2; exit 1; }
 case "$PROFILE_DIR" in "$FIX"/*) ;; *) printf 'ABORT: wt resolved PROFILE_DIR=%s outside %s\n' "$PROFILE_DIR" "$FIX" >&2; exit 1 ;; esac
+sandbox_guard
 [ "$(command -v redis-cli)" = "$FIX/bin/redis-cli" ] || { printf 'ABORT: redis-cli is not the stub - refusing to reach a real redis\n' >&2; exit 1; }
 
 held() {                                # slug redis [redis_test]
