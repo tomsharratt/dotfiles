@@ -113,6 +113,7 @@
 #                     (`design:` is optional, a comma-separated list of the files in design/;
 #                      `artifact:` likewise, the claude.ai links that design was reviewed at, only beside `design:`;
 #                      `security: yes` likewise, when the plan asks for a security review - see name_plan;
+#                      `review:` and `budget:` likewise, the plan's own Review: and Budget: lines - see plan_review;
 #                      `branch:`, `intent:` and `security:` are absent until it is named)
 #          after       its dependency, one line, TSV  label <TAB> repo <TAB> branch
 #          after.new   only in new/: a dependency that had no name yet when it was added,
@@ -1554,6 +1555,40 @@ design_links() {                        # plan_file -> urls, one per line
   return 0
 }
 
+# ── review tier and budget ──────────────────────────────────────────────────
+# How much of a human a pull request needs is clearest while its plan is being
+# approved, not when the diff lands, so the planning session writes it into the
+# plan, on its own line the way it writes `Design file:` (see AGENTS.md):
+#
+#   Review: deep | skim | visual      deep reads the code; skim reads the guide and
+#                                     skims the diff; visual is reviewed from its screenshots
+#   Budget: <N> app lines             the lines it expects to add outside tests,
+#                                     generated files and lockfiles
+#
+# Read with a pattern, not by the namer: the plan states them in a fixed form, so
+# there is nothing to interpret, and `pq add` stays a wizard with nothing slow in
+# it. The first such line outside a code fence wins; markdown emphasis, a list
+# marker or a quote in front of it is allowed, prose that merely starts with the
+# word is not - only one of the three words counts as a tier.
+plan_review() {                         # plan_file -> deep | skim | visual, or nothing
+  plan_line "$1" review | awk '{ v = tolower($1); sub(/[^a-z].*/, "", v) }
+                                 v == "deep" || v == "skim" || v == "visual" { print v; exit }'
+}
+plan_budget() {                         # plan_file -> a whole number, or nothing
+  plan_line "$1" budget | awk 'match($0, /[0-9][0-9,]*/) { v = substr($0, RSTART, RLENGTH); gsub(/,/, "", v); print v + 0; exit }'
+}
+# The value of every `<Key>:` line outside a code fence, in order, emphasis and
+# list markers stripped, the key matched without regard to case. Every one, so a
+# prose line that happens to open with the key does not hide the real one after it.
+plan_line() {                           # plan_file key
+  awk -v k="$2" '
+    /^[ \t]*(```|~~~)/ { fence = !fence; next }
+    fence { next }
+    { l = $0; gsub(/[*_`]/, "", l); sub(/^[ \t>+-]*/, "", l)
+      if (tolower(substr(l, 1, length(k) + 1)) == k ":") {
+        v = substr(l, length(k) + 2); sub(/^[ \t]+/, "", v); print v } }' "$1" 2>/dev/null
+}
+
 # One design file into a task's design/: an artifact's source, which has neither
 # a doctype nor an <html> tag, inside the host's wrapper (see ARTIFACT_HEAD), and
 # anything else byte for byte. A file that only mentions such a tag somewhere is
@@ -1661,6 +1696,10 @@ cmd_add() {
   # design in design/ was reviewed, and with no design/ there is nothing for it
   # to stand beside.
   local artifact_hdr; artifact_hdr=$(design_links "$plan" | paste -sd, - | sed 's/,/, /g')
+  # What the plan says about its review, read here and never asked: a plan
+  # without a tier is reviewed as deep, and the add says so (see "review tier").
+  local review_hdr budget_hdr
+  review_hdr=$(plan_review "$plan"); budget_hdr=$(plan_budget "$plan")
 
   add_wizard
 
@@ -1748,6 +1787,9 @@ cmd_add() {
     # always had.
     [ -n "$design_hdr" ] && printf 'design:   %s\n' "$design_hdr"
     [ -n "$design_hdr" ] && [ -n "$artifact_hdr" ] && printf 'artifact: %s\n' "$artifact_hdr"
+    # The same for the review tier and the budget: absent when the plan names none.
+    [ -n "$review_hdr" ] && printf 'review:   %s\n' "$review_hdr"
+    [ -n "$budget_hdr" ] && printf 'budget:   %s\n' "$budget_hdr"
     printf 'model:    %s\n'   "$model"
     printf 'effort:   %s\n'   "$effort"
     printf 'source:   %s\n'   "$plan"
@@ -1775,6 +1817,11 @@ cmd_add() {
 
   msg "plan:   $plan"
   [ -n "$design_hdr" ] && msg "design: $design_hdr${artifact_hdr:+ - reviewed at $artifact_hdr}"
+  if [ -n "$review_hdr" ]; then
+    msg "review: $review_hdr${budget_hdr:+, budget $budget_hdr app lines}"
+  else
+    warn "review: the plan names no Review: tier - its pull request will be labelled for a deep review"
+  fi
   [ -n "$dep_say" ] && msg "$dep_say"
   msg "added:  new/$(basename "$dir")  ($model, effort $effort) - the next tick names it and queues it"
   repo_base_reset
@@ -2294,13 +2341,13 @@ pr_load() {                             # repo branch...
     (
       cd "$repo" 2>/dev/null || exit 1
       raw=$(gh pr list --head "$b" --state all --limit 5 \
-              --json number,state,isDraft,baseRefName,mergeCommit,createdAt 2>/dev/null) || exit 1
+              --json number,state,isDraft,baseRefName,mergeCommit,createdAt,headRefOid 2>/dev/null) || exit 1
       printf '%s\t%s\n' "$repo" "$b" > "$PR_ANS.$n"
       jq -r --arg b "$b" --arg r "$repo" --argjson since "$since" \
          '.[] | select($since == 0 or ((.createdAt // "" | try fromdateiso8601 catch 0) >= $since))
               | [$r, $b, (.number|tostring), .state,
                  (if .isDraft then "draft" else "" end), .baseRefName,
-                 (.mergeCommit.oid // "")] | @tsv' <<<"$raw"
+                 (.mergeCommit.oid // ""), (.headRefOid // "")] | @tsv' <<<"$raw"
     ) > "$PR_CACHE.$n" &
     pids[n]=$!; n=$((n + 1))
   done
@@ -2335,6 +2382,13 @@ pr_since() {                            # repo branch -> epoch seconds, 0 for no
 pr_get() {                              # repo branch
   awk -F'\t' -v r="$1" -v b="$2" \
     '$1 == r && $2 == b { print $3 "\t" $4 "\t" $5; exit }' "${PR_CACHE:-/dev/null}" 2>/dev/null
+}
+# The head commit of the same row, or nothing when the row carries none - which
+# is how the review tier knows a ready pull request has moved without a call of
+# its own (see "review tier").
+pr_head() {                             # repo branch
+  awk -F'\t' -v r="$1" -v b="$2" \
+    '$1 == r && $2 == b { print $8; exit }' "${PR_CACHE:-/dev/null}" 2>/dev/null
 }
 
 # Every (repo, branch) pair pq needs PR/answered state for THIS pass, plus the
@@ -3119,7 +3173,10 @@ cmd_ls() {
       MERGED) pr="#$num merged"
               merged_into "$repo" "$branch" "$(task_base "$d")" \
                 || pr="#$num merged->$(pr_base "$repo" "$branch")" ;;
-      OPEN)   pr="#$num ${draft:-open}" ;;
+      # A ready pull request with its review tier says the tier instead of
+      # `open`: it is the word that decides when you read it.
+      OPEN)   local tc; tc=$([ -z "$draft" ] && tier_cell "$d")
+              pr="#$num ${draft:-${tc:-open}}" ;;
       CLOSED) pr="#$num closed" ;;
       *)      pr="-" ;;
     esac
@@ -3138,6 +3195,9 @@ cmd_ls() {
         --arg review "$(st "$d" PQ_REVIEW)" --arg review_result "$(st "$d" PQ_REVIEW_RESULT)" \
         --arg security "$(st "$d" PQ_SECURITY)" --arg security_result "$(st "$d" PQ_SECURITY_RESULT)" \
         --arg design "$(hdr "$d/plan.md" design)" --arg artifact "$(hdr "$d/plan.md" artifact)" \
+        --arg tier "$(st "$d" PQ_TIER)" --arg tier_why "$(tier_why "$d")" \
+        --arg app_lines "$(st "$d" PQ_TIER_LINES)" --arg oversize "$(st "$d" PQ_TIER_OVER)" \
+        --arg plan_review "$(hdr "$d/plan.md" review)" --arg budget "$(hdr "$d/plan.md" budget)" \
         --arg stack_parent "$(st "$d" PQ_STACK_PARENT)" --arg stack "$(st "$d" PQ_STACK)" \
         --arg restack "$(stack_json "$d")" \
         --arg cost "$(cost_sum "$d")" \
@@ -3157,6 +3217,9 @@ cmd_ls() {
           reaped: ($reaped|str), held: ($held|str),
           review: ($review|str), review_result: ($review_result|str),
           security: ($security|str), security_result: ($security_result|str),
+          plan_review: ($plan_review|str), budget: ($budget|num),
+          tier: ($tier|str), tier_why: ($tier_why|str), app_lines: ($app_lines|num),
+          oversize: ($oversize == "1"),
           design: (if $design == "" then [] else ($design | split(", ")) end),
           artifact: (if $artifact == "" then [] else ($artifact | split(", ")) end) }
         + ($cost | split("\t") as $c
@@ -5841,6 +5904,196 @@ watch_cell() {                          # task_dir
   esac
 }
 
+# ── review tier ─────────────────────────────────────────────────────────────
+# Every pull request pq delivers used to look the same in the review queue: eleven
+# ready at once, each a few hundred lines of app code under twice that in tests,
+# and nothing to say which ones wanted reading and which ones the screenshots
+# already answered. So each one is labelled, once it is ready, with how much of a
+# human it needs:
+#
+#   review: deep     read the code - a migration, money, access, feed tokens, security
+#   review: skim     read the guide and skim the diff
+#   review: visual   the screenshots are the review
+#
+# The plan's own `review:` header is the starting point (see plan_review), because
+# the tier is clearest while the plan is being approved; a plan that names none
+# starts at deep. What the diff turned out to be can only raise it, never lower it,
+# and every signal is one pq can read for itself:
+#
+#   a migration      a file under db/migrate/ or migrations/ outside the tests   -> deep
+#   security: yes    the plan asked for a security review                        -> deep
+#   open threads     review threads left unresolved and not outdated - the
+#                    findings the implementer declined, since the follow-up has it
+#                    resolve each one it fixed and leave the rest open           -> skim at least
+#   oversize         more than TIER_CAP app lines                                -> skim at least
+#
+# App lines are the lines added outside tests and outside generated files and
+# lockfiles: tests are two thirds of a typical pull request here, and nobody
+# reads a schema dump. Over the cap also earns an `oversize` label of its own.
+# The cap is a constant, not a knob; the budget a plan states is what planning
+# splits work by (AGENTS.md), and is only reported against here.
+#
+# The tier goes where it is seen while triaging: a label, a line pq owns at the
+# top of the description - "**Review: deep** - 1 migration, 165 app lines",
+# found again by its trailing marker so it is replaced rather than repeated - and
+# the PR column of `pq ls`. It is worked out on the first tick the pull request
+# is ready and its gate is over, and again whenever its head moves, which the
+# tick's own PR row says without a call of its own (pr_head).
+TIER_CAP=400
+TIER_MARK='<!-- pq:tier -->'
+
+tier_rank() { case "$1" in visual) printf 1 ;; skim) printf 2 ;; *) printf 3 ;; esac; }
+tier_word() { case "$1" in 1) printf visual ;; 2) printf skim ;; *) printf deep ;; esac; }
+
+# The pull request's files, every page, reduced to app<TAB>migrations: the lines
+# added outside tests and generated files, and how many migration files it adds
+# or changes. Paths only, so it is project-agnostic; the patterns are the usual
+# homes of tests, schema dumps, lockfiles and snapshots across Rails and JS repos.
+# shellcheck disable=SC2016  # jq, not a shell expansion
+TIER_FILES_JQ='
+  def test_path: test("(^|/)(spec|test|tests|__tests__)/") or test("(_spec|_test|\\.test|\\.spec)\\.[^/]+$");
+  def generated: test("(^|/)db/[a-z_]*(schema\\.rb|structure\\.sql)$") or test("\\.lock$")
+                 or test("(^|/)(package-lock\\.json|pnpm-lock\\.yaml|npm-shrinkwrap\\.json)$")
+                 or test("\\.snap$") or test("(^|/)__snapshots__/");
+  def migration: test("(^|/)db/migrate/") or test("(^|/)migrations/");
+  [ .[] | arrays | .[] ] as $f
+  | [ ([ $f[] | select((.filename | test_path | not) and (.filename | generated | not)) | .additions ] | add // 0),
+      ([ $f[] | select((.filename | test_path | not) and (.filename | migration) and .status != "removed") ] | length) ]
+  | @tsv'
+tier_files() {                          # repo pr -> app<TAB>migrations
+  local raw
+  raw=$(cd "$1" 2>/dev/null && gh api --paginate "repos/{owner}/{repo}/pulls/$2/files" 2>/dev/null) || return 1
+  jq -sr "$TIER_FILES_JQ" <<<"$raw" 2>/dev/null
+}
+
+# Review threads still open: unresolved, and not outdated - a thread whose lines
+# the branch has since changed is most likely a finding that was fixed by an
+# implementer that never pressed Resolve, which every implementer before this
+# section did.
+tier_threads() {                        # repo pr -> count
+  local raw
+  # shellcheck disable=SC2016  # GraphQL variables, not shell ones
+  raw=$(cd "$1" 2>/dev/null && gh api graphql --paginate -F owner='{owner}' -F name='{repo}' -F pr="$2" -f query='
+    query($owner: String!, $name: String!, $pr: Int!, $endCursor: String) {
+      repository(owner: $owner, name: $name) { pullRequest(number: $pr) {
+        reviewThreads(first: 100, after: $endCursor) {
+          nodes { isResolved isOutdated }
+          pageInfo { hasNextPage endCursor } } } } }' 2>/dev/null) || return 1
+  jq -sr '[ .[].data.repository.pullRequest.reviewThreads.nodes[]? | select((.isResolved | not) and (.isOutdated | not)) ] | length' \
+    <<<"$raw" 2>/dev/null
+}
+
+# The tier, and the line saying why, from what was read. Pure, so the tests can
+# hold it to every combination without a forge.
+tier_of() {                             # plan_tier budget security app migrations threads -> tier<TAB>oversize<TAB>why
+  local plan=$1 budget=$2 security=$3 app=${4:-0} migrations=${5:-0} threads=${6:-0} rank floor parts="" over=0 s
+  rank=$(tier_rank "${plan:-deep}"); floor=$rank
+  [ "$migrations" -gt 0 ] 2>/dev/null && floor=3
+  [ "$security" = yes ] && floor=3
+  [ "$app" -gt "$TIER_CAP" ] 2>/dev/null && over=1
+  { [ "$threads" -gt 0 ] 2>/dev/null || [ "$over" = 1 ]; } && [ "$floor" -lt 2 ] && floor=2
+  if [ -z "$plan" ]; then parts="no tier in the plan"
+  elif [ "$floor" -gt "$rank" ]; then parts="planned $plan"
+  else parts="as planned"; fi
+  s=s; [ "$migrations" = 1 ] && s=""
+  [ "$migrations" -gt 0 ] 2>/dev/null && parts="$parts, $migrations migration$s"
+  [ "$security" = yes ] && parts="$parts, security review"
+  s=s; [ "$threads" = 1 ] && s=""
+  [ "$threads" -gt 0 ] 2>/dev/null && parts="$parts, $threads open review thread$s"
+  if [ "$over" = 1 ]; then parts="$parts, $app app lines - over the $TIER_CAP cap"
+  elif [ -n "$budget" ]; then parts="$parts, $app of $budget budgeted app lines"
+  else parts="$parts, $app app lines"; fi
+  printf '%s\t%s\t%s' "$(tier_word "$floor")" "$over" "$parts"
+}
+
+# The labels, created in the repo the first time an edit finds one missing -
+# `--force` updates one that exists, so a recoloured label is put back.
+tier_labels() {                         # (in the repo)
+  gh label create "review: deep"   --color B60205 --description "Read the code: migration, money, access, security" --force >/dev/null 2>&1 &&
+  gh label create "review: skim"   --color FBCA04 --description "Read the review guide and skim the diff" --force >/dev/null 2>&1 &&
+  gh label create "review: visual" --color 0E8A16 --description "The screenshots are the review" --force >/dev/null 2>&1 &&
+  gh label create "oversize"       --color 5319E7 --description "Over $TIER_CAP lines of app code" --force >/dev/null 2>&1
+}
+
+# Labels and the description's line, in the repo. The labels in one edit, every
+# other tier's removed in it; the description only when its line changed, read
+# and written whole through a file, since `gh pr edit` replaces all of it.
+tier_apply() {                          # repo pr tier oversize line
+  local repo=$1 pr=$2 tier=$3 over=$4 line=$5 t add rm="" body new tmp rc
+  add="review: $tier"
+  for t in deep skim visual; do [ "$t" = "$tier" ] || rm="${rm:+$rm,}review: $t"; done
+  if [ "$over" = 1 ]; then add="$add,oversize"; else rm="$rm,oversize"; fi
+  ( cd "$repo" 2>/dev/null || exit 1
+    gh pr edit "$pr" --add-label "$add" --remove-label "$rm" >/dev/null 2>&1 \
+      || { tier_labels && gh pr edit "$pr" --add-label "$add" --remove-label "$rm" >/dev/null 2>&1; } ) || return 1
+  body=$(cd "$repo" 2>/dev/null && gh pr view "$pr" --json body -q .body 2>/dev/null) || return 1
+  new=$(printf '%s\n' "$body" | awk -v m="$TIER_MARK" 'index($0, m) { next } { print }' \
+          | awk 'NF { seen = 1 } seen')
+  new=$(printf '%s %s\n\n%s' "$line" "$TIER_MARK" "$new")
+  [ "$new" = "$body" ] && return 0
+  tmp=$(mktemp "${TMPDIR:-/tmp}/pq-tier.XXXXXX") || return 1
+  printf '%s\n' "$new" > "$tmp"
+  (cd "$repo" 2>/dev/null && gh pr edit "$pr" --body-file "$tmp" >/dev/null 2>&1); rc=$?
+  rm -f "$tmp"
+  return "$rc"
+}
+
+# One task, one tick. A pull request that is open, not a draft, and past its
+# gate: the first time, then only when its head has moved. A failure is said
+# once and tried again on the next tick.
+tier_task() {                           # task_dir dry
+  local d=$1 dry=$2 slug repo branch num prstate draft pr head
+  [ -z "$(st "$d" PQ_REAPED)" ] || return 0
+  review_settled "$d" || return 0
+  repo=$(hdr "$d/plan.md" repo); branch=$(hdr "$d/plan.md" branch)
+  num=""; prstate=""; draft=""
+  IFS=$'\t' read -r num prstate draft <<<"$(pr_get "$repo" "$branch")"
+  [ "${prstate:-}" = OPEN ] && [ -z "${draft:-}" ] || return 0
+  pr=$(st "$d" PQ_PR); [ -n "$pr" ] || pr=$num
+  [ -n "$pr" ] || return 0
+  head=$(pr_head "$repo" "$branch")
+  # Labelled already: again only on a head the label was not worked out for - and
+  # a row that carries no head says nothing either way.
+  if [ -n "$(st "$d" PQ_TIER)" ]; then
+    [ -n "$head" ] && [ "$head" != "$(st "$d" PQ_TIER_HEAD)" ] || return 0
+  fi
+  slug=$(slug_of "$d")
+  [ "$dry" = 1 ] && { msg "would label $slug's #$pr with its review tier"; return 0; }
+  local files threads app migrations verdict tier over why line was
+  if ! files=$(tier_files "$repo" "$pr") || [ -z "$files" ]; then
+    tier_failed "$d" files "could not read the files of #$pr"; return 0
+  fi
+  if ! threads=$(tier_threads "$repo" "$pr") || [ -z "$threads" ]; then
+    tier_failed "$d" threads "could not read the review threads of #$pr"; return 0
+  fi
+  IFS=$'\t' read -r app migrations <<<"$files"
+  verdict=$(tier_of "$(hdr "$d/plan.md" review)" "$(hdr "$d/plan.md" budget)" "$(hdr "$d/plan.md" security)" \
+                    "$app" "$migrations" "$threads")
+  IFS=$'\t' read -r tier over why <<<"$verdict"
+  line="**Review: $tier** - $why"
+  tier_apply "$repo" "$pr" "$tier" "$over" "$line" || { tier_failed "$d" label "could not label #$pr"; return 0; }
+  was=$(st "$d" PQ_TIER)
+  # The why is prose, which state.env cannot hold (see st_set), so it is kept
+  # beside it, as the review's own reply is.
+  printf '%s\n' "$why" > "$d/tier.txt"
+  st_set "$d" PQ_TIER "$tier"; st_set "$d" PQ_TIER_HEAD "$head"
+  st_set "$d" PQ_TIER_LINES "$app"; st_set "$d" PQ_TIER_OVER "$over"; st_set "$d" PQ_TIER_ERR ""
+  if [ "$was" != "$tier" ]; then msg "$slug: #$pr is a $tier review - $why"; fi
+  return 0
+}
+tier_failed() {                         # task_dir code why
+  [ -n "$(st "$1" PQ_TIER_ERR)" ] || warn "$(slug_of "$1"): $3 for its review tier - trying again next tick"
+  st_set "$1" PQ_TIER_ERR "$2"
+}
+tier_why() { cat "$1/tier.txt" 2>/dev/null; }   # task_dir -> the reasons, or nothing
+
+# What `pq ls` shows in place of `open` once a ready pull request has its tier.
+tier_cell() {                           # task_dir -> "deep", "skim oversize", or nothing
+  local t; t=$(st "$1" PQ_TIER)
+  [ -n "$t" ] || return 0
+  printf '%s%s' "$t" "$([ "$(st "$1" PQ_TIER_OVER)" = 1 ] && printf ' oversize')"
+}
+
 # ── reap ────────────────────────────────────────────────────────────────────
 # `pq` frees a slot the moment a pull request exists, in any state, and stops
 # caring - everything the task was built on survives: the worktree, its database,
@@ -6420,6 +6673,14 @@ tick_body() {                           # cap dry
   for d in "$PQ_HOME/done"/*/; do
     [ -d "$d" ] || continue
     watch_task "${d%/}" "$dry"
+  done
+
+  # 1.24 The review tier of each pull request past its gate - see its section.
+  # After the gate, so a pull request marked ready this tick is labelled this
+  # tick; it holds nothing up, and a settled pull request is simply not labelled.
+  for d in "$PQ_HOME/done"/*/; do
+    [ -d "$d" ] || continue
+    tier_task "${d%/}" "$dry"
   done
 
   # 1.25 Reap - tear down what merged, once the agent has stopped and pq is not
