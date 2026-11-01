@@ -15,7 +15,8 @@
 #
 #   pq add               pick a plan not yet added and add it; it asks the model, the effort, what
 #                        it builds on (a task in its own repo, once that pull request
-#                        is ready) or waits for (one in another repo, once it merges)
+#                        is ready) or waits for (one in another repo, or a design
+#                        task, once it merges)
 #                        and, for a plan built from a design that names no file on disk,
 #                        the design file the implementer builds to - and then it is
 #                        done. The next tick names it and queues it (see "naming")
@@ -41,7 +42,10 @@
 # A task may name one dependency: another task it BUILDS ON, in its own repo -
 # eligible once that pull request is marked ready, forked from its branch, and
 # joined to its stack on GitHub (see "linking into GitHub's stack") - or, in
-# another repo, one it WAITS FOR, eligible once that has merged. Blocked is
+# another repo, one it WAITS FOR, eligible once that has merged. A design task
+# (`kind: design`, see plan_kind) is waited for in its own repo too: merging it
+# is how its design is approved, and what builds on it then forks from the
+# default branch, which holds its components. Blocked is
 # derived, not stored - a blocked task sits in `queue/` like any other, and fill
 # just skips it, the same way the cap is soft arithmetic rather than a drain
 # state. Merge state comes from the forge (`gh`),
@@ -724,6 +728,11 @@ retitle() {                             # task_dir new_state [new_slug]
 # survive A ageing out of `done/`, and survive a slug being reused; it is also
 # what makes a cross-repo blocker work for free, and what lets a blocker name a
 # branch that is not in `pq` at all.
+#
+# A fourth field, `design`, marks a blocker that is a design task (see
+# plan_kind) - captured at the same moment and for the same reason, so a task
+# built on a design still waits for its merge after `pq rm` of the design task.
+# Absent on every other line, so a line written before it reads as it did.
 
 # The branch a slug reduces to, same rule naming uses for a task's own name -
 # lowercased, non `[a-z0-9-]` squashed to `-`, runs collapsed, edges trimmed.
@@ -740,11 +749,31 @@ after_list() {                          # task_dir
 # Append a blocker if its (repo, branch) is not already present - that pair is
 # the real identity, not the label, so re-adding the same branch under a
 # different label is a no-op rather than a duplicate.
-after_add() {                           # task_dir label repo branch
+after_add() {                           # task_dir label repo branch [kind]
   local d=$1
   awk -F'\t' -v r="$3" -v b="$4" '$2 == r && $3 == b { f = 1; exit } END { exit !f }' \
     "$d/after" 2>/dev/null && return 0
-  printf '%s\t%s\t%s\n' "$2" "$3" "$4" >> "$d/after"
+  after_line "$2" "$3" "$4" "${5:-}" >> "$d/after"
+}
+
+# One `after` line: the triple, and `design` after it for a design task's branch.
+after_line() {                          # label repo branch [kind]
+  if [ "${4:-}" = design ]; then printf '%s\t%s\t%s\tdesign\n' "$1" "$2" "$3"
+  else printf '%s\t%s\t%s\n' "$1" "$2" "$3"; fi
+}
+
+# The design a task waits for, from its `after` file: `label<TAB>repo<TAB>branch`,
+# or nothing when it waits for none.
+design_dep() {                          # task_dir
+  awk -F'\t' '$4 == "design" { print $1 "\t" $2 "\t" $3; exit }' "$1/after" 2>/dev/null
+  return 0
+}
+
+# A task's kind as its header says it: `design` for a design task (see
+# plan_kind), nothing otherwise. Read when a line naming it is written, and kept.
+task_kind() {                           # task_dir -> design, or nothing
+  [ "$(hdr "$1/plan.md" kind)" = design ] && printf 'design'
+  return 0
 }
 
 # The task directory, in ANY state, whose plan.md names this exact (repo,
@@ -795,7 +824,7 @@ after_cycle() {                         # owner_repo owner_branch repo branch [v
   t=$(task_by_branch "$repo" "$branch") || return 1
   shift 4
   for v in "$@"; do [ "$v" = "$t" ] && return 1; done
-  while IFS=$'\t' read -r _ r2 b2; do
+  while IFS=$'\t' read -r _ r2 b2 _; do
     [ -n "$r2" ] || continue
     after_cycle "$owner_repo" "$owner_branch" "$r2" "$b2" "$t" "$@" && return 0
   done <<<"$(after_list "$t")"
@@ -819,7 +848,7 @@ dependents_of() {                       # repo branch
   local d r b
   while IFS= read -r d; do
     [ -n "$d" ] && [ -f "$d/after" ] || continue
-    while IFS=$'\t' read -r _ r b; do
+    while IFS=$'\t' read -r _ r b _; do
       [ "$r" = "$1" ] && [ "$b" = "$2" ] && printf '%s\n' "$(slug_of "$d")"
     done <<<"$(after_list "$d")"
   done <<<"$(all_tasks)"
@@ -1158,7 +1187,10 @@ name_task() {                           # task_dir dry -> 0 queued
       # Not named yet, so this waits with it - and says nothing: the blocker's
       # own line says why. A dry run reads it as named, as the real pass would.
       [ "$(state_of "$b")" = new ] && [ "$dry" != 1 ] && return 1
-      blines="$blines$(slug_of "$b")"$'\t'"$(hdr "$b/plan.md" repo)"$'\t'"$(hdr "$b/plan.md" branch)"$'\n'
+      # A design task carries its kind into the line. This is the usual way one
+      # gets there: a series is added a minute apart, so the design is still in
+      # new/ when the plan after it picks it.
+      blines="$blines$(after_line "$(slug_of "$b")" "$(hdr "$b/plan.md" repo)" "$(hdr "$b/plan.md" branch)" "$(task_kind "$b")")"$'\n'
     done < "$d/after.new"
   fi
   [ "$dry" = 1 ] && { msg "would name $slug"; return 1; }
@@ -1197,8 +1229,8 @@ name_task() {                           # task_dir dry -> 0 queued
   # Cycles are caught here rather than at `pq add`: it is the name that closes
   # one, when the branch this task is about to own is one something it waits on
   # is already waiting for.
-  local label arepo abranch
-  while IFS=$'\t' read -r label arepo abranch; do
+  local label arepo abranch akind
+  while IFS=$'\t' read -r label arepo abranch _; do
     [ -n "$arepo" ] || continue
     after_cycle "$repo" "$branch" "$arepo" "$abranch" \
       && { name_failed "$d" cycle "could not name it $branch - it waits on $label, which already leads back to that branch"; return 1; }
@@ -1221,8 +1253,8 @@ name_task() {                           # task_dir dry -> 0 queued
     name_failed "$d" write "could not write its plan.md"
     return 1
   fi
-  while IFS=$'\t' read -r label arepo abranch; do
-    [ -n "$label" ] && after_add "$d" "$label" "$arepo" "$abranch"
+  while IFS=$'\t' read -r label arepo abranch akind; do
+    [ -n "$label" ] && after_add "$d" "$label" "$arepo" "$abranch" "$akind"
   done <<<"$blines"
   # What was only ever about naming goes with it: a queued task starts with no
   # state.env, as one always has.
@@ -1395,9 +1427,12 @@ pick_plan() {
 # there, so Enter never stacks a task by accident; the candidates follow newest
 # first, so a chain's previous link is one row down. A candidate in the task's
 # own repo is built on - "stack on it" - and one in another repo is waited for -
-# "<repo>: wait for its merge" (see after_state). A same-repo candidate that
-# another live task already builds on is not offered at all: a stack is a single
-# line (see built_on).
+# "<repo>: wait for its merge" (see after_state). So is a design task in its own
+# repo - "design: wait for its merge" - since merging it is how it is approved,
+# and what builds on it starts from the default branch, which then holds its
+# components. A same-repo candidate that another live task already builds on is
+# not offered at all, a design included: a stack is a single line, and so is the
+# series a design opens (see built_on).
 #
 # Anything whose work has not landed can be picked: a task in new/, queue/ or
 # running/, and one in done/ whose pull request has neither merged nor closed -
@@ -1423,7 +1458,11 @@ pick_after() {
     drepo=$(hdr "$d/plan.md" repo)
     if [ "$drepo" = "$own" ]; then
       built_on_by "$taken" "$drepo" "$(hdr "$d/plan.md" branch)" "$(stamp_of "$d")" >/dev/null && continue
-      rows="${rows}$(stamp_of "$d")"$'\t'"$(slug_of "$d")"$'\t'"$st"$'\t'"stack on it"$'\n'
+      if [ "$(task_kind "$d")" = design ]; then
+        rows="${rows}$(stamp_of "$d")"$'\t'"$(slug_of "$d")"$'\t'"$st"$'\t'"design: wait for its merge"$'\n'
+      else
+        rows="${rows}$(stamp_of "$d")"$'\t'"$(slug_of "$d")"$'\t'"$st"$'\t'"stack on it"$'\n'
+      fi
     else
       rows="${rows}$(stamp_of "$d")"$'\t'"$(slug_of "$d")"$'\t'"$st"$'\t'"$(basename "$drepo"): wait for its merge"$'\n'
     fi
@@ -1757,7 +1796,9 @@ cmd_add() {
   while IFS= read -r av; do
     [ -n "$av" ] || continue
     b=$(task_by_stamp "$av") || die "the task you picked to build on has been removed since - nothing was added"
-    if [ "$(hdr "$b/plan.md" repo)" = "$repo" ]; then
+    if [ "$(task_kind "$b")" = design ]; then
+      dep_say="after:  $(slug_of "$b") (design) - starts from $(local_base "$repo") once its pull request merges"
+    elif [ "$(hdr "$b/plan.md" repo)" = "$repo" ]; then
       dep_say="on:     $(slug_of "$b") - starts when its pull request is ready for review"
     else
       dep_say="after:  $(slug_of "$b") ($(basename "$(hdr "$b/plan.md" repo)")) - starts once it merges"
@@ -1770,7 +1811,7 @@ cmd_add() {
       # with none - and `while read` silently skips a final line that has no
       # trailing newline, so after_state would read the file as empty and the
       # blocker would never gate anything.
-      after_lines="${after_lines}$(slug_of "$b")"$'\t'"$(hdr "$b/plan.md" repo)"$'\t'"$(hdr "$b/plan.md" branch)"$'\n'
+      after_lines="${after_lines}$(after_line "$(slug_of "$b")" "$(hdr "$b/plan.md" repo)" "$(hdr "$b/plan.md" branch)" "$(task_kind "$b")")"$'\n'
     fi
   done <<<"$after_vals"
 
@@ -2467,7 +2508,7 @@ pr_targets() {                          # [scope: all|running]
         [ -n "$repo" ] && [ -n "$parent" ] && reap_watching "$d" && printf '%s\t%s\n' "$repo" "$parent"
         ;;
       queue)
-        while IFS=$'\t' read -r _ repo branch; do
+        while IFS=$'\t' read -r _ repo branch _; do
           [ -n "$repo" ] && [ -n "$branch" ] && printf '%s\t%s\n' "$repo" "$branch"
         done <<<"$(after_list "$d")"
         ;;
@@ -2722,7 +2763,7 @@ blocker_state() {                       # repo branch base
 # after_state <task_dir> -> "verdict\tdetail" where verdict is
 # met | stack <label> | on <label> | waiting <label> <n_unmet> | stalled <label>
 # | dead <label>, and detail
-# is one of dead|orphan|stalled|nobase:<repo>|"" - the finer-grained reason a
+# is one of dead|orphan|stalled|nobase:<repo>|design|"" - the finer-grained reason a
 # caller needs for a warning message but that would overload the verdict text
 # itself. Both are printed on the SAME line, tab-separated, rather than through
 # a side-channel global: every caller reaches this through command
@@ -2730,13 +2771,16 @@ blocker_state() {                       # repo branch base
 # vanish the moment it returned - the same trap repo_base's cache sidesteps by
 # being a file instead of a variable.
 #
-# A dependency's kind is derived from where it lives, never stored. One in the
-# task's own repo is a STACK dependency - the task builds on it: it is eligible
-# once that pull request is marked ready (`stack <label>`), forked from its
-# branch, and until then it is `on <label>`; once it has merged the task is
-# simply `met` and starts from the default branch. One in another repo is a
-# MERGE dependency, since a stack cannot cross repos: it waits for the merge,
-# and `ready` is still `waiting` there.
+# A dependency's kind is derived from where it lives, and from whether it is a
+# design. One in the task's own repo is a STACK dependency - the task builds on
+# it: it is eligible once that pull request is marked ready (`stack <label>`),
+# forked from its branch, and until then it is `on <label>`; once it has merged
+# the task is simply `met` and starts from the default branch. One in another
+# repo is a MERGE dependency, since a stack cannot cross repos: it waits for the
+# merge, and `ready` is still `waiting` there. So is a design task's, in any repo
+# (the `design` field of its line): merging the design is how it is approved, so
+# what builds on it waits for that, reads `waiting` with the detail `design`,
+# and then starts from the default branch, which holds its components.
 #
 # Nothing new writes more than one line, but an old task may carry two, so
 # this still aggregates: dead/orphan outranks stalled outranks a merge still to
@@ -2744,12 +2788,12 @@ blocker_state() {                       # repo branch base
 # differs and the worse case is the one worth surfacing first - dead is the
 # one that will never resolve on its own.
 after_state() {                         # task_dir
-  local d=$1 own label repo branch base bst
+  local d=$1 own label repo branch base bst detail
   local first_dead="" first_dead_detail="" first_stalled="" first_wait="" n_unmet=0 nobase=""
-  local first_on="" first_stack=""
+  local first_on="" first_stack="" kind wait_design=""
   if [ ! -f "$d/after" ]; then printf 'met\t'; return; fi
   own=$(hdr "$d/plan.md" repo)
-  while IFS=$'\t' read -r label repo branch; do
+  while IFS=$'\t' read -r label repo branch kind; do
     [ -n "$label" ] || continue
     base=$(repo_base "$repo")
     if [ -z "$base" ]; then
@@ -2766,11 +2810,14 @@ after_state() {                         # task_dir
         ;;
       stalled) n_unmet=$((n_unmet + 1)); [ -n "$first_stalled" ] || first_stalled=$label ;;
       ready|waiting|unknown)
-        if [ "$repo" = "$own" ]; then
+        if [ "$repo" = "$own" ] && [ "$kind" != design ]; then
           if [ "$bst" = ready ]; then [ -n "$first_stack" ] || first_stack=$label
           else [ -n "$first_on" ] || first_on=$label; fi
         else
-          n_unmet=$((n_unmet + 1)); [ -n "$first_wait" ] || first_wait=$label
+          n_unmet=$((n_unmet + 1))
+          if [ -z "$first_wait" ]; then
+            first_wait=$label; [ "$kind" = design ] && wait_design=1
+          fi
         fi ;;
     esac
   done <<<"$(after_list "$d")"
@@ -2779,7 +2826,10 @@ after_state() {                         # task_dir
   elif [ -n "$first_stalled" ]; then
     printf 'stalled %s\tstalled' "$first_stalled"
   elif [ "$n_unmet" -gt 0 ]; then
-    printf 'waiting %s %d\t%s' "$first_wait" "$n_unmet" "${nobase:+nobase:$nobase}"
+    if [ -n "$nobase" ]; then detail="nobase:$nobase"
+    elif [ -n "$wait_design" ]; then detail=design
+    else detail=""; fi
+    printf 'waiting %s %d\t%s' "$first_wait" "$n_unmet" "$detail"
   elif [ -n "$first_on" ]; then
     printf 'on %s\t' "$first_on"
   elif [ -n "$first_stack" ]; then
@@ -2839,19 +2889,19 @@ after_check() {                         # task_dir
 }
 
 # {label, repo, branch, kind, state} for the dependency, for cmd_ls --json -
-# kind is `stack` in the task's own repo and `merge` in another (see
-# after_state), and state is blocker_state's word, `ready` included. Assumes
+# kind is `stack` in the task's own repo, `merge` in another and `design` for a
+# design task's branch, which is waited for the same way (see after_state), and state is blocker_state's word, `ready` included. Assumes
 # PR_CACHE/PR_ANS already cover its (repo, branch), same as after_state assumes.
 after_json() {                          # task_dir
-  local d=$1 own label repo branch base st kind
+  local d=$1 own label repo branch base st kind lkind
   [ -f "$d/after" ] || { printf '[]'; return; }
   own=$(hdr "$d/plan.md" repo)
   local tmp="$PQ_HOME/.afterjson.$$"; : > "$tmp"
-  while IFS=$'\t' read -r label repo branch; do
+  while IFS=$'\t' read -r label repo branch lkind; do
     [ -n "$label" ] || continue
     base=$(repo_base "$repo")
     st=$(blocker_state "$repo" "$branch" "${base:-}")
-    kind=merge; [ "$repo" = "$own" ] && kind=stack
+    kind=merge; [ "$repo" = "$own" ] && kind=stack; [ "$lkind" = design ] && kind=design
     jq -nc --arg label "$label" --arg repo "$repo" --arg branch "$branch" --arg kind "$kind" --arg state "$st" \
       '{label: $label, repo: $repo, branch: $branch, kind: $kind, state: $state}' >> "$tmp"
   done <<<"$(after_list "$d")"
@@ -2995,14 +3045,24 @@ agent_cell() {                          # task_dir state
       ;;
     queue)
       [ -f "$d/after" ] || { printf -- '-'; return; }
-      local verdict lbl cnt
-      IFS=$'\t' read -r verdict _ <<<"$(after_state "$d")"
+      local verdict detail lbl cnt
+      IFS=$'\t' read -r verdict detail <<<"$(after_state "$d")"
       case "$verdict" in
         # Eligible, and building on it once a slot frees: nothing to wait on.
         met|stack\ *) printf -- '-' ;;
         on\ *) printf 'on %s' "$(cell "${verdict#on }" "$PQ_LABEL_MAX")" ;;
         waiting\ *)
           lbl=${verdict#waiting }; cnt=${lbl##* }; lbl=${lbl% *}
+          # A design is named by its pull request once it has one - that is
+          # what is waiting for your merge - and by its task until then.
+          if [ "$detail" = design ]; then
+            local drepo dbranch dnum
+            IFS=$'\t' read -r _ drepo dbranch <<<"$(design_dep "$d")"
+            dnum=$(pr_get "$drepo" "$dbranch" | cut -f1)
+            if [ -n "$dnum" ]; then printf 'design #%s' "$dnum"
+            else printf 'design %s' "$(cell "$lbl" "$PQ_LABEL_MAX")"; fi
+            return
+          fi
           lbl=$(cell "$lbl" "$PQ_LABEL_MAX")
           if [ "$cnt" -gt 1 ] 2>/dev/null; then printf 'after %s +%d' "$lbl" "$((cnt - 1))"
           else printf 'after %s' "$lbl"; fi
@@ -3309,6 +3369,9 @@ $([ "$narch" -gt 0 ] && printf ', %s archived%s' "$narch" "$([ "$all" = 1 ] || p
 #
 # A same-repo dependency something else already builds on is refused: a stack
 # is a single line, and GitHub only ever adds a pull request to its top.
+#
+# A design task is waited for, never stacked on (see after_state): its line
+# carries `design`, taken from the task that owns the branch when it is set.
 cmd_after() {
   local d; d=$(find_task "${1:-}") || exit 1; shift
   [ "$(state_of "$d")" = new ] && die "$(slug_of "$d") has no name yet - the next tick names it and queues it; pq after it then"
@@ -3319,9 +3382,9 @@ cmd_after() {
       return 0
     fi
     pr_load_all "$(after_list "$d" | awk -F'\t' '{ print $2 "\t" $3 }')"
-    local own label repo branch base bst owner ownerst num prstate draft prtxt desc overdict slug
+    local own label repo branch kind base bst owner ownerst num prstate draft prtxt desc overdict slug
     own=$(hdr "$d/plan.md" repo); slug=$(slug_of "$d")
-    while IFS=$'\t' read -r label repo branch; do
+    while IFS=$'\t' read -r label repo branch kind; do
       [ -n "$label" ] || continue
       base=$(repo_base "$repo")
       bst=$(blocker_state "$repo" "$branch" "${base:-}")
@@ -3341,7 +3404,14 @@ cmd_after() {
         orphan)  desc="orphan - nothing will ever open a PR for this branch" ;;
         unknown) desc="gh has not answered yet" ;;
         *)
-          if [ "$repo" = "$own" ]; then
+          if [ "$kind" = design ]; then
+            case "$bst" in
+              met) desc="merged - $slug starts from ${base:-its default branch}, which holds its components" ;;
+              *)
+                if [ -n "$num" ]; then desc="waiting for design #$num to merge"
+                else desc="waiting for the design to open its pull request, and then for it to merge"; fi ;;
+            esac
+          elif [ "$repo" = "$own" ]; then
             case "$bst" in
               met)   desc="merged - $slug starts from ${base:-its default branch}" ;;
               ready) desc="ready - $slug builds on it" ;;
@@ -3393,7 +3463,7 @@ cmd_after() {
     return 0
   fi
 
-  local owner_repo owner_branch value=$1 resolved label repo branch base b="" other num slug
+  local owner_repo owner_branch value=$1 resolved label repo branch base b="" other num slug kind=""
   owner_repo=$(hdr "$d/plan.md" repo); owner_branch=$(hdr "$d/plan.md" branch); slug=$(slug_of "$d")
   case "$value" in
     */*) ;;
@@ -3409,12 +3479,13 @@ cmd_after() {
   # The stamp too, whichever way it was named: a task in new/ holds what it
   # builds on by stamp alone, so a branch given here is matched by its owner's.
   [ -n "$b" ] || b=$(task_by_branch "$repo" "$branch") || b=""
+  [ -n "$b" ] && kind=$(task_kind "$b")
   if [ "$repo" = "$owner_repo" ] \
      && other=$(built_on_by "$(built_on "$d")" "$repo" "$branch" "${b:+$(stamp_of "$b")}"); then
     release_lock
     die "$other already builds on $label - a stack is a single line, so build on $other instead"
   fi
-  printf '%s\t%s\t%s\n' "$label" "$repo" "$branch" > "$d/after"
+  after_line "$label" "$repo" "$branch" "$kind" > "$d/after"
   pr_load_all "$(printf '%s\t%s\n' "$repo" "$branch")"
   base=$(repo_base "$repo")
   num=$(pr_get "$repo" "$branch" | cut -f1)
@@ -3422,6 +3493,8 @@ cmd_after() {
   local bst; bst=$(blocker_state "$repo" "$branch" "${base:-}")
   if [ "$bst" = met ]; then
     msg "$slug after $label: already in $base - nothing to wait for"
+  elif [ "$kind" = design ]; then
+    msg "$slug waits for design $label - it starts from ${base:-the default branch} once $(pr_word "$num") merges"
   elif [ "$repo" != "$owner_repo" ]; then
     msg "$slug waits for $label ($(basename "$repo")) to merge"
   elif [ "$bst" = ready ]; then
