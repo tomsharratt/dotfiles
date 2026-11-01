@@ -722,7 +722,7 @@ reset_tasks; reset_caches; reset_logs
 G=$(mk_gated 140 dry w1:p1)
 set_panes "$(printf 'w1:p1\tclaude\tidle')"
 st_set "$G" PQ_REVIEW running
-OUT=$(security_step "$G" 1 42 idle 2>&1)
+OUT=$(report_step "$G" 1 42 idle security 2>&1)
 has "$OUT" "would launch a security review of dry" "the would-line"
 eq "$(st "$G" PQ_SECURITY)" "pending" "nothing changed"
 sleep 0.3

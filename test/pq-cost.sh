@@ -89,22 +89,23 @@ mkdir -p "$N/cost"
 eq "$(cost_sum "$N")" "" "an empty ledger: nothing either"
 Q=$(mk_task queue 20260101000004 named)
 cost_record "$Q" name n-1 0.006; cost_record "$Q" name n-2 0.004
-eq "$(cost_sum "$Q")" $'0.01\tfalse\t0.01\t\t\t' "a queued task: naming, and nothing else yet"
+eq "$(cost_sum "$Q")" $'0.01\tfalse\t0.01\t\t\t\t' "a queued task: naming, and nothing else yet"
 eq "$(cost_total "$Q")" "\$0.01" "shown to the cent"
 st_set "$Q" PQ_STARTED "2026-01-01T00:00:00Z"
 eq "$(cut -f2 <<<"$(cost_sum "$Q")")" true "started with no implementer record: a lower bound"
 eq "$(cost_total "$Q")" "\$0.01+" "and says so"
 cost_record "$Q" implementer s-1 2.5
-eq "$(cost_sum "$Q")" $'2.51\tfalse\t0.01\t2.5\t\t' "with one, the whole cost"
+eq "$(cost_sum "$Q")" $'2.51\tfalse\t0.01\t2.5\t\t\t' "with one, the whole cost"
 cost_record "$Q" implementer s-2 0.5
 cost_record "$Q" review r-1 1.2
 cost_record "$Q" security s-3 0.9
-eq "$(cost_sum "$Q")" $'5.11\tfalse\t0.01\t3\t1.2\t0.9' "every kind, each summed across its sessions"
+cost_record "$Q" visual v-1 0.5
+eq "$(cost_sum "$Q")" $'5.61\tfalse\t0.01\t3\t1.2\t0.9\t0.5' "every kind, each summed across its sessions"
 cost_record "$Q" review review-try-2 null
-eq "$(cut -f1,2,5 <<<"$(cost_sum "$Q")")" $'5.11\ttrue\t1.2' "an unknown try adds nothing and makes it a lower bound"
-eq "$(cost_total "$Q")" "\$5.11+" "shown as one"
+eq "$(cut -f1,2,5 <<<"$(cost_sum "$Q")")" $'5.61\ttrue\t1.2' "an unknown try adds nothing and makes it a lower bound"
+eq "$(cost_total "$Q")" "\$5.61+" "shown as one"
 printf '[]' > "$Q/cost/stray.json"
-eq "$(cut -f1 <<<"$(cost_sum "$Q")")" 5.11 "a record that is not one is ignored"
+eq "$(cut -f1 <<<"$(cost_sum "$Q")")" 5.61 "a record that is not one is ignored"
 
 echo "== pq ls: no COST column until some task has a ledger ==" >&2
 rm -rf "$PQ_HOME/queue" "$PQ_HOME/done"; mkdir -p "$PQ_HOME/queue" "$PQ_HOME/done"
@@ -123,7 +124,7 @@ echo "== pq ls --json: the total, whether it is a lower bound, and its parts =="
 cost_record "$P1" implementer s-1 2; cost_record "$P1" review review-try-1 null
 json=$(main ls --json 2>/dev/null)
 eq "$(jq -c '.[] | select(.task == "plain-one") | [.cost_usd, .cost_partial, .cost]' <<<"$json")" \
-  '[2.012,true,{"name":0.012,"implementer":2,"review":null,"security":null}]' "a ledger, every part, and a review whose only try is unknown is null, not free"
+  '[2.012,true,{"name":0.012,"implementer":2,"review":null,"security":null,"visual":null}]' "a ledger, every part, and a review whose only try is unknown is null, not free"
 eq "$(jq -c '.[] | select(.task == "plain-two") | [.cost_usd, .cost_partial, .cost]' <<<"$json")" \
   '[null,false,null]' "no ledger: null, not zero"
 

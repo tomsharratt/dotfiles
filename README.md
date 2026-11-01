@@ -12,6 +12,7 @@ Personal dotfiles for macOS. Manages:
 - `~/.config/wt/profiles/<repo>.sh` - per-project provisioning + dev-server steps for `wt` (e.g. `supercast.sh`, `supercast-ios.sh`, `supercast-android.sh`).
 - `~/.local/bin/pq` - plan queue: holds Claude Code plans and runs them as unattended implementer sessions, one worktree each, via `wt`.
 - `~/.claude/settings.json` - Claude Code settings. Agent status now comes from Herdr's built-in Claude integration (`herdr integration install claude`), which installs a `SessionStart` hook. Git-tracked for reference but applied manually - `install.sh` does not touch `~/.claude`.
+- `~/.claude/skills/design-review` - the `/design-review` skill: an independent review of a built UI against its design, run by `pq` on every task built from a design and usable on its own. Applied manually, as a symlink: `ln -s ~/projects/dotfiles/.claude/skills/design-review ~/.claude/skills/design-review`.
 - `AGENTS.md` - global agent instructions, read by Claude Code via the `~/.claude/CLAUDE.md` symlink (mirrors `~/AGENTS.md`). Git-tracked for reference but applied manually - the sync scripts don't touch it.
 - Hack Nerd Font.
 
@@ -629,6 +630,24 @@ It was verified before it shipped, in scratch repositories, with the exact comma
 A change with a SQL injection and two cross-tenant reads came back with all three, at confidence 9 or 10, in under three minutes for about a dollar.
 A clean change came back with none.
 A change forked from an integration branch that carried a command injection of its own was shown the whole integration branch by the skill, went by the brief's diff instead, and left the base's injection out of scope.
+
+#### The design review
+
+Code got two independent reviews before a person saw it, and the design got none.
+The only comparison against the design was the implementer grading its own screenshots, and differences it had noticed shipped anyway - "Dialog confirm is purple where the design has red" sat in one pull request's own description.
+So a task built from a design - one that carries design files, a design task, or one built on a merged design pull request - gets a design review beside the code review, run by `pq` the same way as the security review.
+
+It is a skill, `/design-review`, kept in this repository under `.claude/skills/design-review` and linked into `~/.claude/skills`, so it can be run by hand on any pull request or branch as well.
+It takes its own screenshots and measurements and never the implementer's: it lists every frame and state of the design, screenshots each at its native width, finds the page or preview that draws it in the running app, screenshots that at the same width and in the same state, and measures what differs with computed styles, so a finding reads "20px/600 in the design, 18px/500 built" rather than "looks smaller".
+It replies with a report - a coverage table of every frame, the findings ranked must-fix first with the file that draws each, the deviations the description already owns, and a one-line verdict.
+Posting is `--comment`'s, which `pq` never passes.
+
+`pq` runs `claude -p "/design-review N --out <task>/visual"` in the task's worktree, at `high`, launched on the same tick as the code review, while the dev server is still up.
+Its brief says what the reference is for the kind of task: a design task's previews are held to the board, a task built on a merged design is held to that design's previews - the board being the draft they came from - and any other task to the board in `<task>/design/`.
+It runs in a browser session of its own (`CHROME_DEVTOOLS_AXI_SESSION=pq-visual-<task>`), so it never drives an implementer's browser, and it may not post, edit, push, call `gh api`, or run `wt open`, which would open the user's own browser.
+Its report is saved as `visual.md` - the stem is `visual`, since `design` is already the task's directory of design files - and posted on the pull request as one comment, and it shares everything else with the security review: the same ladder, the same tries and retry, the same check that a reply is a whole report, and the same single follow-up, which waits for every review and then names each report in turn.
+A design review that does not happen asks the implementer to compare its screens against the design once more itself.
+`pq ls` reads `design review 4m` while the gate waits on it, and `design review failed` if it did not happen; `--json` carries `visual` and `visual_result`, and the cost ledger a `visual` part.
 
 #### Watching a ready pull request
 
