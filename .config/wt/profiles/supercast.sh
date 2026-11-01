@@ -7,14 +7,20 @@
 # App wiring this relies on (already in the supercast repo):
 #   - database.yml dev reads ENV["DATABASE_URL"]           -> per-worktree db
 #   - config/initializers/sidekiq.rb reads ENV["REDIS_URL"] -> per-worktree redis db
+#   - config/initializers/redis.rb reads ENV["REDIS_TEST_DB"] in test (15 without it)
+#                                                      -> per-worktree test redis db
 #   - development.rb + session_store.rb honor ENV["LOCAL_DOMAIN"] -> per-worktree url
 #   - Procfile.dev binds ${PORT:-3000}                      -> per-worktree port
 #   - config/application.rb has config.hosts.clear          -> any *.test host is allowed
 
-# shellcheck disable=SC2034  # WT_RESOURCES and WT_REDIS_MAX are read by the wt sourcing this
-WT_RESOURCES="port redis"   # allocate an isolated port + redis db index (from wt's 3101 - 3000 stays with the canonical checkout)
+# shellcheck disable=SC2034  # WT_RESOURCES and WT_REDIS_RESERVED are read by the wt sourcing this
+WT_RESOURCES="port redis redis_test"   # an isolated port (from wt's 3101 - 3000 stays with the canonical
+                                       # checkout), a redis db index for the dev server and one for the specs
+# config/initializers/redis.rb gives the spec suite REDIS_TEST_DB, and 15 when that is
+# unset - which it is in the canonical checkout, and in a worktree from before
+# redis_test until its next dev boot. So 15 is never a worktree's.
 # shellcheck disable=SC2034
-WT_REDIS_MAX=14             # reserve db 15 for the spec suite (config/initializers/redis.rb)
+WT_REDIS_RESERVED="15"
 # Every db:migrate re-dumps db/schema.rb from this machine's postgres - wt_provision
 # runs one, and so does an agent adding a migration - and postgres 18 renders some
 # partial-index clauses differently from whichever one dumped the committed file. So
@@ -277,6 +283,15 @@ wt_env() {
   fi
   export DATABASE_URL
   export REDIS_URL="redis://localhost:6379/${WT_REDIS:-0}"
+  # The spec suite's redis db is this worktree's own too. Exported whatever RAILS_ENV
+  # says, so a bare `bundle exec rspec` from a `wt run` shell lands on it as well; and
+  # unset when the worktree has none yet, so a value inherited from another worktree's
+  # shell is never used - supercast then falls back to 15, where it always was.
+  if [ -n "${WT_REDIS_TEST:-}" ]; then
+    export REDIS_TEST_DB="$WT_REDIS_TEST"
+  else
+    unset REDIS_TEST_DB
+  fi
   # The domain is the dev server's alone. The test suite has its own - application.yml's
   # `test: domain: lvh.me`, which the specs build their hosts and urls from - and figaro
   # skips a key already in ENV, so exporting the worktree's here beat it: the test
@@ -316,9 +331,12 @@ wt_env() {
 # and a worktree made before it existed picks it up on its next `wt restart`.
 _WT_RSPEC_MARK="# Written by wt's supercast profile, and rewritten on every dev boot - delete this line to keep your own."
 _wt_rspec() {
-  local f="$WT_PATH/.rspec"
+  local f="$WT_PATH/.rspec" redis_test_line=""
   git -C "$WT_PATH" check-ignore -q .rspec 2>/dev/null || return 0
   [ -e "$f" ] && [ "$(head -1 "$f")" != "$_WT_RSPEC_MARK" ] && return 0
+  # The test redis db as wt_env sets it, kept when set on purpose; with no index of
+  # its own yet the worktree sets nothing, and supercast falls back to 15.
+  [ -n "${WT_REDIS_TEST:-}" ] && redis_test_line="  ENV[\"REDIS_TEST_DB\"] ||= \"$WT_REDIS_TEST\""
   cat > "$f" <<EOF
 $_WT_RSPEC_MARK
 # A bare "bundle exec rspec" here gets what "wt test" gives it: this worktree's own
@@ -328,6 +346,7 @@ $_WT_RSPEC_MARK
     ENV["DATABASE_URL"] = "postgres://localhost/$(_wt_test_db)"
   end
   ENV["REDIS_URL"] ||= "redis://localhost:6379/${WT_REDIS:-0}"
+$redis_test_line
   ENV.delete("LOCAL_DOMAIN")
   ENV.delete("domain")
 -%>
@@ -377,7 +396,7 @@ wt_dev() {
   # Procfile.dev pins the web port to 3000, so it can't be shared. Generate a
   # per-worktree copy that binds this worktree's port instead - see _wt_procfile.
   _wt_procfile "$WT_PATH/Procfile.dev" "$WT_PORT" > "$pf"
-  msg "dev  ->  https://$WT_DOMAIN (:$PORT)  db=$db  redis/${WT_REDIS:-0}"
+  msg "dev  ->  https://$WT_DOMAIN (:$PORT)  db=$db  redis/${WT_REDIS:-0}  test redis/${WT_REDIS_TEST:-15}"
   # -d: foreman defaults its working dir to the Procfile's dir; point it at the
   # worktree since the generated Procfile lives outside the repo. Not exec'd, so
   # when the server stops (crash or Ctrl-C) `wt dev` drops to a shell you can
@@ -448,10 +467,16 @@ wt_teardown() {
   # reports removing an entry that never existed (every worktree created outside wt).
   [ -e "$HOME/.puma-dev/$WT_SLUG" ] && rm -f "$HOME/.puma-dev/$WT_SLUG" \
     && msg "removed puma-dev entry $WT_SLUG"
-  # Flush this worktree's redis db so a future worktree reusing the index inherits
-  # no stale Sidekiq state. Guarded to > 0 so db 0 (the canonical dev db) is never touched.
+  # Flush this worktree's redis dbs so a future worktree reusing either index inherits
+  # no stale Sidekiq state or spec keys. Guarded to > 0 so db 0 (the canonical dev db)
+  # is never touched, and the test index to anything but 15, the canonical checkout's
+  # spec db, which a worktree is never handed (WT_REDIS_RESERVED) - so a state file
+  # claiming it is wrong, and flushing on its say-so would hit another suite's run.
   if [ "${WT_REDIS:-0}" -gt 0 ] 2>/dev/null; then
     redis-cli -n "$WT_REDIS" flushdb >/dev/null 2>&1 && msg "flushed redis db $WT_REDIS"
+  fi
+  if [ "${WT_REDIS_TEST:-0}" -gt 0 ] 2>/dev/null && [ "$WT_REDIS_TEST" != 15 ]; then
+    redis-cli -n "$WT_REDIS_TEST" flushdb >/dev/null 2>&1 && msg "flushed test redis db $WT_REDIS_TEST"
   fi
   _wt_drop_reported "$db" "database "
   _wt_drop_reported "$tdb" "test database "

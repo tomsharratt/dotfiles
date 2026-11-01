@@ -47,6 +47,7 @@ trap cleanup EXIT
 WT_SLUG=tom-login-code-submit-button
 WT_PORT=3104
 WT_REDIS=3
+WT_REDIS_TEST=17
 WT_DOMAIN=tom-login-code-submit-button.test
 DEV_DB=$(_wt_db)
 TEST_DB=$(_wt_test_db)
@@ -100,8 +101,17 @@ echo "== PORT and REDIS_URL are the same in either environment ==" >&2
 for env in "" test; do
   eq "$(envvar "$env" PORT)" "3104" "PORT is unchanged (RAILS_ENV='$env')"
   eq "$(envvar "$env" REDIS_URL)" "redis://localhost:6379/3" \
-    "REDIS_URL is unchanged (RAILS_ENV='$env') - the test redis index is NOT isolated"
+    "REDIS_URL is unchanged (RAILS_ENV='$env') - it is the dev server's and sidekiq's"
 done
+
+echo "== the spec suite's redis db is the worktree's own test index ==" >&2
+# supercast's config/initializers/redis.rb reads REDIS_TEST_DB in test, and falls
+# back to 15 - the canonical checkout's - without it.
+for env in "" test; do
+  eq "$(envvar "$env" REDIS_TEST_DB)" "17" "REDIS_TEST_DB is the worktree's test index (RAILS_ENV='$env')"
+done
+eq "$( ( WT_REDIS_TEST=""; export REDIS_TEST_DB=9; envvar test REDIS_TEST_DB ) )" "" \
+  "a worktree with no test index yet sets none, and lets no other worktree's through"
 
 echo "== the worktree's domain is the dev server's, and never the test suite's ==" >&2
 # The seven failures every session re-proved under `wt test` were this. figaro
@@ -158,27 +168,30 @@ eq "$(unpushed_work "$WT_PATH" "$WT_PATH" master)" "" "the .rspec leaves nothing
 
 # The file through ERB and rspec-core's own comment filter, as rspec reads it.
 # Prints the environment it leaves, then whatever it would pass rspec as options.
-rspec_env() {                           # env assignments... -> db|redis|domain?|local?|options
-  env -u DATABASE_URL -u REDIS_URL -u domain -u LOCAL_DOMAIN "$@" ruby -rerb -e '
+rspec_env() {                           # env assignments... -> db|redis|test redis|domain?|local?|options
+  env -u DATABASE_URL -u REDIS_URL -u REDIS_TEST_DB -u domain -u LOCAL_DOMAIN "$@" ruby -rerb -e '
     s = ERB.new(File.read(ARGV[0]), trim_mode: "-").result(binding)
     opts = s.split(/\n+/).reject { |l| l =~ /\A\s*#/ }.join(" ").strip
-    puts [ENV["DATABASE_URL"], ENV["REDIS_URL"], ENV.key?("domain"), ENV.key?("LOCAL_DOMAIN"), opts].join("|")
+    puts [ENV["DATABASE_URL"], ENV["REDIS_URL"], ENV["REDIS_TEST_DB"], ENV.key?("domain"), ENV.key?("LOCAL_DOMAIN"), opts].join("|")
   ' "$WT_PATH/.rspec"
 }
-eq "$(rspec_env)" "postgres://localhost/$TEST_DB|redis://localhost:6379/3|false|false|" \
+eq "$(rspec_env)" "postgres://localhost/$TEST_DB|redis://localhost:6379/3|17|false|false|" \
   "with nothing set, the worktree's own test database and redis index, and no options"
 eq "$(rspec_env DATABASE_URL="postgres:///$DEV_DB" domain=x.test LOCAL_DOMAIN=x.test)" \
-  "postgres://localhost/$TEST_DB|redis://localhost:6379/3|false|false|" \
+  "postgres://localhost/$TEST_DB|redis://localhost:6379/3|17|false|false|" \
   "a \`wt run\` shell's dev database and domain are replaced, not inherited"
-eq "$(rspec_env DATABASE_URL=postgres://localhost/mine_test REDIS_URL=redis://localhost:6379/9)" \
-  "postgres://localhost/mine_test|redis://localhost:6379/9|false|false|" \
-  "a DATABASE_URL and REDIS_URL set on purpose are kept"
+eq "$(rspec_env DATABASE_URL=postgres://localhost/mine_test REDIS_URL=redis://localhost:6379/9 REDIS_TEST_DB=40)" \
+  "postgres://localhost/mine_test|redis://localhost:6379/9|40|false|false|" \
+  "a DATABASE_URL, REDIS_URL and REDIS_TEST_DB set on purpose are kept"
 eq "$(rspec_env DATABASE_URL="$(envvar test DATABASE_URL)")" \
-  "postgres://localhost/$TEST_DB|redis://localhost:6379/3|false|false|" \
+  "postgres://localhost/$TEST_DB|redis://localhost:6379/3|17|false|false|" \
   "and \`wt test\`'s own is unchanged"
 
-WT_REDIS=5 _wt_rspec
-case "$(cat "$WT_PATH/.rspec")" in *"6379/5"*) ok ;; *) bad "wt's own .rspec is rewritten on the next boot" ;; esac
+WT_REDIS=5 WT_REDIS_TEST=18 _wt_rspec
+case "$(cat "$WT_PATH/.rspec")" in *"6379/5"*'"18"'*) ok ;; *) bad "wt's own .rspec is rewritten on the next boot" ;; esac
+WT_REDIS_TEST="" _wt_rspec
+eq "$(rspec_env)" "postgres://localhost/$TEST_DB|redis://localhost:6379/3||false|false|" \
+  "a worktree with no test index yet sets no REDIS_TEST_DB, and supercast falls back to 15"
 printf -- '--format documentation\n' > "$WT_PATH/.rspec"
 _wt_rspec
 eq "$(cat "$WT_PATH/.rspec")" "--format documentation" "a .rspec without wt's marker is someone else's, and left alone"

@@ -98,10 +98,18 @@ EOF
 chmod +x "$HOME/.local/bin/herdr"
 ln -sf "$WT" "$HOME/.local/bin/wt"
 
-# ── a profile with a pool of two redis indexes ──────────────────────────────
+# ── a redis serving three databases: a pool of two indexes past db 0 ────────
+# wt sizes the pool from `redis-cli config get databases`; the stub answers 3,
+# and never reaches the machine's real redis.
+cat > "$HOME/.local/bin/redis-cli" <<'EOF'
+#!/usr/bin/env bash
+case "$*" in "config get databases") printf 'databases\n3\n' ;; esac
+exit 0
+EOF
+chmod +x "$HOME/.local/bin/redis-cli"
+export PATH="$HOME/.local/bin:$PATH"
 cat > "$PROFILE_DIR/$REPO_NAME.sh" <<'EOF'
 WT_RESOURCES="redis"
-WT_REDIS_MAX=2
 EOF
 
 # ── two live worktrees holding both ─────────────────────────────────────────
@@ -145,6 +153,24 @@ out=$(wt_new my/new-task 2>"$FIX/err"); rc=$?
 eq "$rc" "0" "there is room again"
 eq "$(printf '%s' "$out" | jq -r '.redis // empty')" "1" "and the freed index goes to the new worktree"
 grep -q '^WT_REDIS=1$' "$STATE_DIR/$REPO_NAME--my-new-task.env" 2>/dev/null && ok || bad "recorded in its state file"
+
+echo "== a worktree wanting a dev and a test index needs room for both ==" >&2
+# One index is free again, but a profile declaring redis_test as well hands each
+# worktree two - so one free index is still no room, and saying so before Herdr
+# creates anything is the whole point of need_room.
+cat > "$PROFILE_DIR/$REPO_NAME.sh" <<'EOF'
+WT_RESOURCES="redis redis_test"
+EOF
+git -C "$REPO" worktree remove --force "$WTROOT/two-task"
+: > "$HERDR_LOG"
+out=$(wt_new both/task 2>"$FIX/err"); rc=$?
+eq "$rc" "75" "one free index is no room for two"
+grep -q '^worktree create ' "$HERDR_LOG" && bad "and herdr is not asked to create anything" || ok
+rm -f "$STATE_DIR/$REPO_NAME--my-new-task.env"
+git -C "$REPO" worktree remove --force "$WTROOT/my-new-task"
+out=$(wt_new both/task 2>"$FIX/err"); rc=$?
+eq "$rc" "0" "with both free there is room"
+eq "$(printf '%s' "$out" | jq -r '"\(.redis) \(.redis_test)"')" "1 2" "and it is handed both, one each"
 
 printf '\n%d passed, %d failed\n' "$pass" "$fail" >&2
 [ "$fail" -eq 0 ]

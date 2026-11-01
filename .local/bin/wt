@@ -40,14 +40,18 @@
 # For repo <name>, wt sources ~/.config/wt/profiles/<name>.sh (tracked in
 # dotfiles), when there is one. A profile may set:
 #   WT_RESOURCES="port redis"   isolated resources to allocate (default: none);
-#                               ports are handed out from WT_PORT_BASE (3101) up
-#   WT_REDIS_MAX=15             highest redis db index to hand out (default 15); lower it
-#                               to reserve indices for something else, e.g. a spec suite
+#                               ports are handed out from WT_PORT_BASE (3101) up;
+#                               `redis` is a db index for the dev server and
+#                               `redis_test` a second one for the spec suite, both
+#                               from 1 up to the last database the running redis serves
+#   WT_REDIS_RESERVED="15"      redis db indexes never to hand out (default: none),
+#                               e.g. the one a spec suite falls back to outside wt
 #   WT_REGENERATED="db/schema.rb"  tracked files the dev environment rewrites from what
 #                               is committed (default: none); a modification to one is
 #                               not work, so it never holds up `wt rm` or `wt gc --settled`
 # and define any of these functions, which run with the worktree's facts
-# exported (WT_NAME WT_SLUG WT_PATH WT_REPO WT_REPO_NAME WT_DOMAIN WT_PORT WT_REDIS):
+# exported (WT_NAME WT_SLUG WT_PATH WT_REPO WT_REPO_NAME WT_DOMAIN WT_PORT WT_REDIS
+# WT_REDIS_TEST):
 #   wt_provision   prepare the worktree so its dev server can boot in isolation
 #   wt_dev         exec the dev server (long-running)
 #   wt_env         export the worktree's isolated env (db / redis / url / port);
@@ -97,7 +101,7 @@ exhausted() {                           # port|redis
   local what
   case "$1" in
     port)  what="no free port available" ;;
-    redis) what="no free redis db (1-${WT_REDIS_MAX:-15}) available" ;;
+    redis) what="no free redis db (1-$(redis_top)${WT_REDIS_RESERVED:+, less $WT_REDIS_RESERVED reserved}) available" ;;
   esac
   printf '\033[38;2;235;111;146mwt: %s - every one is held by a worktree; wt ls shows which, wt gc --settled reclaims the merged ones\033[0m\n' "$what" >&2
   exit 75
@@ -206,7 +210,7 @@ load_state() {                          # state_file_path
 # process several of them in a loop.
 wt_reset() {
   WT_NAME="" WT_SLUG="" WT_PATH="" WT_REPO="" WT_REPO_NAME="" WT_DOMAIN="" \
-  WT_PORT="" WT_REDIS="" WT_WORKSPACE="" WT_URL="" WT_DB="" WT_STATE_FILE=""
+  WT_PORT="" WT_REDIS="" WT_REDIS_TEST="" WT_WORKSPACE="" WT_URL="" WT_DB="" WT_STATE_FILE=""
 }
 # Read one key out of a state file without disturbing the caller's own WT_* variables.
 #
@@ -302,15 +306,34 @@ alloc_port() {
   done
   return 1
 }
-# Redis db indices run 1..WT_REDIS_MAX (redis serves 0-15 and db 0 is the canonical dev
-# db, so 1 is the floor). A profile lowers the ceiling to reserve indices for something
-# else - supercast keeps 15 for its spec suite - and honoring that matters most exactly
-# when nobody is watching: hand out a reserved index to a worktree and the collision
-# surfaces as a flaky test run, not as a wt error.
+# The highest redis db index there is: one less than the databases the running server
+# serves. Asked of redis rather than written down, because the ceiling used to be a
+# number in a profile (supercast's 14) beside redis's own default of 16 - and raising
+# `databases` in redis.conf then did nothing until somebody also found and raised the
+# profile's copy. A redis wt cannot reach, or an answer that is not a count, is read as
+# redis's default 16: the pool that was always there, rather than none at all.
+redis_top() {
+  local n
+  n=$(redis-cli config get databases 2>/dev/null | sed -n 2p | tr -dc '0-9')
+  [ -n "$n" ] || n=16
+  printf '%s' $(( n - 1 ))
+}
+# Redis db indexes run 1..redis_top: db 0 is the canonical dev db, so 1 is the floor.
+# A profile reserves what it must keep with WT_REDIS_RESERVED - supercast keeps 15,
+# which its spec suite falls back to wherever wt has handed it nothing - and honoring
+# that matters most exactly when nobody is watching: hand out a reserved index to a
+# worktree and the collision surfaces as a flaky test run, not as a wt error.
+#
+# Held means held by any worktree in either role, dev (WT_REDIS) or test
+# (WT_REDIS_TEST), and also by this process: prepare_state hands out both of a
+# worktree's indexes before it writes either to the state file, so without that the
+# second allocation would be handed the index the first had just taken.
 alloc_redis() {
-  local i used max=${WT_REDIS_MAX:-15}
-  used=$(awk -F= '/^WT_REDIS=/{print $2}' "$STATE_DIR"/*.env 2>/dev/null)
-  for ((i=1; i<=max; i++)); do grep -qx "$i" <<<"$used" && continue; printf '%s' "$i"; return 0; done
+  local i used top
+  top=$(redis_top)
+  used=$(awk -F= '/^WT_REDIS(_TEST)?=/{print $2}' "$STATE_DIR"/*.env 2>/dev/null)
+  used+=$'\n'"${WT_REDIS:-}"$'\n'"${WT_REDIS_TEST:-}"$'\n'"$(tr ' ' '\n' <<<"${WT_REDIS_RESERVED:-}")"
+  for ((i=1; i<=top; i++)); do grep -qx "$i" <<<"$used" && continue; printf '%s' "$i"; return 0; done
   return 1
 }
 
@@ -330,7 +353,7 @@ load_profile() {                        # repo_name
   # Every tunable a profile may set is reset here for the same reason the functions are:
   # `wt ls` and `wt gc` load one profile after another in a single process, and a value
   # left behind by the previous repo is indistinguishable from one this repo chose.
-  WT_RESOURCES="" WT_REDIS_MAX=15 WT_REGENERATED=""
+  WT_RESOURCES="" WT_REDIS_RESERVED="" WT_REGENERATED=""
   f="$PROFILE_DIR/$1.sh"
   [ -f "$f" ] || return 0
   # shellcheck disable=SC1090
@@ -340,7 +363,8 @@ load_profile() {                        # repo_name
 # Establish (or top up) a worktree's identity + allocated resources, persisted to
 # its state file. Idempotent: existing port/redis are kept, only missing declared
 # resources are allocated. load_profile must have run first (for WT_RESOURCES).
-# Sets WT_NAME WT_SLUG WT_PATH WT_REPO WT_REPO_NAME WT_DOMAIN WT_PORT WT_REDIS WT_STATE_FILE.
+# Sets WT_NAME WT_SLUG WT_PATH WT_REPO WT_REPO_NAME WT_DOMAIN WT_PORT WT_REDIS
+# WT_REDIS_TEST WT_STATE_FILE.
 #
 # The slug is fixed for the life of the worktree, and the state file is found by PATH
 # rather than by the slug today's branch implies. Both halves of that matter, because a
@@ -367,7 +391,7 @@ prepare_state() {                       # name path repo repo_name [workspace_id
   # the separate shell that runs wt_provision, so nothing legitimately sets them
   # here and whatever survives would be emitted by --json as if it were ours.
   # shellcheck disable=SC2034  # WT_DB is exported (load_state's set -a), so clearing it reaches the profile
-  WT_PORT="" WT_REDIS="" WT_SLUG="" WT_URL="" WT_DB=""
+  WT_PORT="" WT_REDIS="" WT_REDIS_TEST="" WT_SLUG="" WT_URL="" WT_DB=""
   sidx_load
   sf=$(sf_for_path "$path")
   if [ -n "$sf" ]; then
@@ -384,6 +408,7 @@ prepare_state() {                       # name path repo repo_name [workspace_id
     case "$res" in
       port)  [ -n "${WT_PORT:-}" ]  || WT_PORT=$(alloc_port)   || exhausted port ;;
       redis) [ -n "${WT_REDIS:-}" ] || WT_REDIS=$(alloc_redis) || exhausted redis ;;
+      redis_test) [ -n "${WT_REDIS_TEST:-}" ] || WT_REDIS_TEST=$(alloc_redis) || exhausted redis ;;
     esac
   done
   # WT_PATH first, because it is the key every other lookup finds this file BY. Written
@@ -400,6 +425,8 @@ prepare_state() {                       # name path repo repo_name [workspace_id
   [ -n "$ws" ]         && state_set "$WT_STATE_FILE" WT_WORKSPACE "$ws"
   [ -n "${WT_PORT:-}" ]  && state_set "$WT_STATE_FILE" WT_PORT  "$WT_PORT"
   [ -n "${WT_REDIS:-}" ] && state_set "$WT_STATE_FILE" WT_REDIS "$WT_REDIS"
+  [ -n "${WT_REDIS_TEST:-}" ] && state_set "$WT_STATE_FILE" WT_REDIS_TEST "$WT_REDIS_TEST"
+  return 0
 }
 
 # Stop now, before Herdr creates anything, if a resource the profile declares has run
@@ -411,8 +438,13 @@ prepare_state() {                       # name path repo repo_name [workspace_id
 # by the path git has it at, then by the slug its branch implies. The index is read
 # without sidx_load's duplicate check, which prepare_state makes a moment later - said
 # here as well, it would be said twice.
+#
+# A worktree handed both a dev and a test redis index needs two free ones, so each one
+# found is held in the locals below, which alloc_redis counts as taken - the same way
+# prepare_state's own two allocations keep out of each other's way. Locals, so what is
+# only being checked here is never mistaken for the worktree's allocation.
 need_room() {                           # repo repo_name name
-  local path sf="" res
+  local path sf="" res WT_REDIS="" WT_REDIS_TEST=""
   SIDX=$(state_index)
   path=$(repo_worktrees "$1" | awk -F'\t' -v b="$3" '$2 == b { print $1; exit }')
   [ -n "$path" ] && sf=$(sf_for_path "$path")
@@ -420,7 +452,8 @@ need_room() {                           # repo repo_name name
   for res in ${WT_RESOURCES:-}; do
     case "$res" in
       port)  [ -n "$(state_get "$sf" WT_PORT)" ]  || alloc_port  >/dev/null || exhausted port ;;
-      redis) [ -n "$(state_get "$sf" WT_REDIS)" ] || alloc_redis >/dev/null || exhausted redis ;;
+      redis) [ -n "$(state_get "$sf" WT_REDIS)" ] || WT_REDIS=$(alloc_redis) || exhausted redis ;;
+      redis_test) [ -n "$(state_get "$sf" WT_REDIS_TEST)" ] || WT_REDIS_TEST=$(alloc_redis) || exhausted redis ;;
     esac
   done
 }
@@ -428,7 +461,7 @@ need_room() {                           # repo repo_name name
 # Export the worktree facts, then run a profile function (with any extra args) if
 # it is defined.
 run_profile_fn() {                      # fn [args...]  (WT_* must already be set)
-  export WT_NAME WT_SLUG WT_PATH WT_REPO WT_REPO_NAME WT_DOMAIN WT_PORT WT_REDIS WT_STATE_FILE
+  export WT_NAME WT_SLUG WT_PATH WT_REPO WT_REPO_NAME WT_DOMAIN WT_PORT WT_REDIS WT_REDIS_TEST WT_STATE_FILE
   declare -F "$1" >/dev/null || return 0
   local fn=$1; shift
   "$fn" "$@"
@@ -1259,7 +1292,7 @@ cmd_new() {
       --arg repo "$WT_REPO" --arg repo_name "$WT_REPO_NAME" \
       --arg ws "$ws" --arg root_pane "$root_pane" --arg dev_pane "${dpane:-}" \
       --arg domain "${WT_DOMAIN:-}" --arg url "${WT_URL:-}" \
-      --arg port "${WT_PORT:-}" --arg redis "${WT_REDIS:-}" '
+      --arg port "${WT_PORT:-}" --arg redis "${WT_REDIS:-}" --arg redis_test "${WT_REDIS_TEST:-}" '
       def num: if . == "" then null else tonumber end;
       # herdr renders an absent field as the string "null" through `jq -r`; JSON null is
       # what a caller can actually test for.
@@ -1267,9 +1300,31 @@ cmd_new() {
       { branch: $branch, slug: $slug, path: $path,
         repo: $repo, repo_name: $repo_name,
         workspace_id: ($ws | str), root_pane_id: $root_pane, dev_pane_id: ($dev_pane | str),
-        port: ($port | num), redis: ($redis | num),
+        port: ($port | num), redis: ($redis | num), redis_test: ($redis_test | num),
         domain: ($domain | str),
         url: (if $url != "" then $url elif $domain != "" then "https://" + $domain else null end) }'
+  fi
+}
+
+# Hand a worktree the test redis index its profile declares but its state file lacks -
+# every worktree that was alive when `redis_test` arrived. `wt provision` would allocate
+# it too, but supercast's provisioning drops and recreates the dev database, so the dev
+# boot does it instead: `wt restart`, and `wt open` starting a stopped server, both
+# arrive here. A pool with no room is a warning, never a reason to keep the server
+# down - the profile falls back to the index its spec suite uses outside wt, which is
+# where the worktree was before. Only the test index: a worktree missing its port or
+# dev index is not one a boot can repair.
+top_up_test_redis() {
+  [ -n "${WT_STATE_FILE:-}" ] && [ -f "$WT_STATE_FILE" ] || return 0
+  [ -z "${WT_REDIS_TEST:-}" ] || return 0
+  case " ${WT_RESOURCES:-} " in *" redis_test "*) ;; *) return 0 ;; esac
+  local i
+  if i=$(alloc_redis); then
+    WT_REDIS_TEST=$i
+    state_set "$WT_STATE_FILE" WT_REDIS_TEST "$i"
+    msg "handed this worktree test redis db $i"
+  else
+    warn "no free redis db for this worktree's test suite - it shares the profile's fallback until one frees (wt ls shows what holds them)"
   fi
 }
 
@@ -1280,6 +1335,7 @@ cmd_dev() {
   load_profile "$repo_name"
   load_state_for_path "$path" "$repo_name" "$name" \
     || warn "no saved state for this worktree - run 'wt provision $path' first"
+  top_up_test_redis
   WT_PATH=$path WT_REPO=$repo WT_REPO_NAME=$repo_name
   # Keep the pane open with the error instead of flashing shut if the server dies.
   devfail() { warn "$*"; cd "$WT_PATH" 2>/dev/null || true; exec "$SHELL" -l; }

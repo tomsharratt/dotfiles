@@ -279,5 +279,28 @@ case "$out" in
   *) ok ;;
 esac
 
+echo "== wt_teardown flushes both of a worktree's redis dbs ==" >&2
+# The next worktree handed either index must start empty: no stale Sidekiq jobs in
+# the dev one, no spec keys in the test one. redis-cli is stubbed for this case
+# alone, so the flushes are recorded rather than sent to the machine's redis.
+REDIS_LOG="$STUBBIN/.redis"
+: > "$REDIS_LOG"
+cat > "$STUBBIN/redis-cli" <<EOF
+#!/bin/sh
+printf '%s\n' "\$*" >> "$REDIS_LOG"
+exit 0
+EOF
+chmod +x "$STUBBIN/redis-cli"
+printf '%s\n%s\n' "$td_db" "$td_tdb" > "$DB_LIST"
+WT_REDIS=4 WT_REDIS_TEST=20 wt_teardown >/dev/null 2>&1
+eq "$(tr '\n' ' ' < "$REDIS_LOG")" "-n 4 flushdb -n 20 flushdb " "the dev index and the test index are both flushed"
+: > "$REDIS_LOG"
+WT_REDIS=4 WT_REDIS_TEST="" wt_teardown >/dev/null 2>&1
+eq "$(tr '\n' ' ' < "$REDIS_LOG")" "-n 4 flushdb " "a worktree from before test indexes flushes only its dev one"
+: > "$REDIS_LOG"
+WT_REDIS=0 WT_REDIS_TEST=15 wt_teardown >/dev/null 2>&1
+eq "$(cat "$REDIS_LOG")" "" "15 is the canonical checkout's spec db, and db 0 its dev db - neither is ever flushed"
+rm -f "$STUBBIN/redis-cli"
+
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]

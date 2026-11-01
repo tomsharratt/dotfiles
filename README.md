@@ -33,8 +33,10 @@ The trade-off: status is shown only for agents running inside a Herdr pane.
 `wt new <name>` forks a branch off the up-to-date default branch, opens it as a Herdr workspace, provisions it, then starts Claude in the workspace's main pane and the dev server in its own `dev` tab.
 
 Isolation is per project, described by a *profile*.
-`wt` itself is project-agnostic: it resolves the branch, allocates a free port and redis db index, and calls the profile's steps.
-When one has run out - supercast hands out fourteen redis indexes, one per worktree - `wt new` stops before Herdr creates anything and exits 75, so a caller can tell a full pool from a failure.
+`wt` itself is project-agnostic: it resolves the branch, allocates a free port and redis db indexes, and calls the profile's steps.
+The redis pool is sized by redis itself: every index from 1 up to the last database the running server has (`CONFIG GET databases`), except db 0, the canonical dev db, and any index the profile reserves with `WT_REDIS_RESERVED`.
+With `databases 64` (see Requirements) and supercast's two indexes per worktree, that is room for 31 supercast worktrees; with redis's default 16 it would be 7.
+When one has run out, `wt new` stops before Herdr creates anything and exits 75, so a caller can tell a full pool from a failure.
 `wt ls` shows what holds them, and `wt gc --settled` reclaims the worktrees whose pull requests have merged or closed.
 A repo's profile is `~/.config/wt/profiles/<repo>.sh`, tracked here.
 A profile declares which resources to allocate and defines `wt_provision`, `wt_dev`, `wt_open`, and `wt_teardown`.
@@ -45,6 +47,7 @@ For `supercast` (`~/.config/wt/profiles/supercast.sh`) each worktree gets:
 - its own postgres database - a logical copy of `supercast-web_development`, so migrations and data changes never touch the shared dev db or the other worktrees;
 - its own **test** database, so `wt test bundle exec rspec` never shares `supercast-web_test` with another worktree - see "Running tests in a worktree" below;
 - its own redis db index, so Sidekiq queues don't collide;
+- its own **test** redis db index, so a spec run never shares a redis database with another worktree's;
 - its own puma-dev url `https://<name>.test` on its own port.
 
 So `wt new premier-video` and `wt new spotify-reconcile` can run side by side, each serving its own url against its own database, with no handoff between them.
@@ -111,11 +114,14 @@ A `DATABASE_URL` set on purpose is kept; an unset one, or the worktree's dev dat
 The file is rewritten on every dev boot, so a worktree made before it existed gets one on its next `wt restart`.
 A `.rspec` without wt's marker line is someone else's and is left alone, and none is written where git would not ignore it, since a dirty worktree is one `wt rm` refuses.
 
-One thing is still shared: the test **redis** index.
-`config/initializers/redis.rb` builds `Redis.new(db: 15)` in test, and in redis-rb an explicit `db:` beats `REDIS_URL`.
-`spec/rails_helper.rb` then runs `flushdb` before every example, which `REDIS_NAMESPACE` cannot scope: redis-namespace passes `flushdb` through to the whole database.
-So a spec using `$redis` can have its keys flushed by a concurrent run in another worktree.
-Fixing that needs a supercast change - its test redis database taken from the environment - and a second redis index per worktree from wt, more than redis's default 16 databases hold beside `WT_REDIS_MAX=14`.
+The test **redis** database is the worktree's own as well.
+supercast's `config/initializers/redis.rb` gives every spec process its own `Redis::Namespace` (`test:<pid>:<scope>`) with `deprecations: true`, so a command that would escape it, `flushdb` included, raises rather than running, and `spec/rails_helper.rb` clears only that namespace between examples.
+That already keeps two concurrent runs out of each other's keys; what it shared was the database underneath, db 15, for every worktree and the canonical checkout alike.
+supercast now reads that index from `REDIS_TEST_DB`, falling back to 15, and the profile allocates each worktree a second index (`WT_REDIS_TEST`) for it.
+`wt test` exports it, and the `.rspec` sets it for a bare `bundle exec rspec` when nothing else has.
+The canonical checkout sets nothing and keeps 15, which is why the profile reserves 15 (`WT_REDIS_RESERVED="15"`) and wt never hands it to a worktree.
+A worktree made before this has no test index yet and falls back to 15 too, until its next dev boot (`wt restart`, or `wt open` starting a stopped server) or `wt provision` allocates it one.
+`wt rm` flushes both indexes, so the next worktree handed either starts empty.
 
 `wt new` layers things on top of "prepare a worktree", and two of them can be dropped so the command can be driven by a script rather than by `prefix+t`:
 
@@ -608,7 +614,7 @@ The reasons are kept in `<task>/tier.txt`, beside `state.env`, which only holds 
 
 #### Tearing a task down
 
-Once a `done` task's pull request has **settled**, `pq` tears it down: the worktree, its database, its port, its redis index, its puma-dev entry, and the Herdr workspace holding its agent's pane.
+Once a `done` task's pull request has **settled**, `pq` tears it down: the worktree, its databases, its port, its redis indexes, its puma-dev entry, and the Herdr workspace holding its agent's pane.
 That is the same `wt rm` you would have run by hand, driven unattended.
 
 Settled means either of two things:
@@ -677,7 +683,7 @@ Nothing in `archive/` is ever deleted or swept up again by a later tick - it is 
 
 ### Reclaiming resources
 
-Herdr has no worktree-removal hook, so removing a worktree through Herdr's own UI (rather than `wt rm`) would otherwise leak its database, port, and redis db.
+Herdr has no worktree-removal hook, so removing a worktree through Herdr's own UI (rather than `wt rm`) would otherwise leak its databases, port, and redis indexes.
 `wt gc` reconciles this: it checks each recorded worktree and, for any whose directory no longer exists, runs the profile's teardown and frees the reservation.
 It also removes what is left under Herdr's worktree root (`~/.herdr/worktrees/<repo>/`) that is not a worktree at all - a directory with no `.git` in it, which is what a process writing into a removed worktree's path leaves behind.
 One that still carries a `.git` file, broken or not, may hold work, and is left for you.
@@ -721,6 +727,9 @@ brew install neovim ghostty tree-sitter-cli ripgrep fd asdf gum
 - `ripgrep`, `fd` - used by Telescope for find/grep.
 - `asdf` - manages Ruby and Node runtimes; Mason needs both to install LSP servers.
 - `gum` - the prompts of `pq add` and `pq rm`.
+
+`wt` also needs redis to serve more than its default 16 databases, since each supercast worktree holds two indexes.
+Set `databases 64` in `/opt/homebrew/etc/redis.conf` and restart redis (`brew services restart redis`); `wt` reads the count from the running server, so nothing else changes.
 
 ### asdf: set user-level defaults
 
