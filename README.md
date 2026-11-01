@@ -192,7 +192,7 @@ Branch *lookups* are keyed on the repo as well as the name, but a task's slug is
 
 ```
 pq add                   pick a plan not yet added and add it; asks model, effort, what to build on and, for a design plan, the design file;
-                         reads the plan's Review: and Budget: lines - the next tick names it
+                         reads the plan's Kind:, Review: and Budget: lines - the next tick names it
 pq after <task>          what a task builds on or waits for, and where that stands
 pq after <task> T        set it, for a task still in queue/ - replacing any it had
 pq after <task> --clear  drop it
@@ -233,11 +233,12 @@ Its first row is `nothing - start from <default branch>`, and the cursor starts 
 The candidates follow, newest first, so a chain's previous link is one row down.
 A task in the same repo reads `stack on it`: the new task starts as soon as that pull request is marked ready for review, forked from its branch, and joins its stack.
 A task in another repo reads `<repo>: wait for its merge`, since a stack cannot cross repos.
+A design task in the same repo reads `design: wait for its merge`: merging it is how its design is approved, and the new task then starts from the default branch, which holds its components (see "The design pull request" below).
 A task in the same repo that something else already builds on is not offered at all: a stack is a single line, and GitHub only ever adds a pull request to its top.
 
 Anything whose work has not landed can be picked: a task in `new/`, `queue/` or `running/`, and one in `done/` whose pull request has neither merged nor closed, since that is where a task sits while it is reviewed.
 Only the verdict `pq` has already recorded is read, so the list costs no round trip to the forge.
-The add closes by saying what it set: `on: <task> - starts when its pull request is ready for review`, or `after: <task> (<repo>) - starts once it merges`.
+The add closes by saying what it set: `on: <task> - starts when its pull request is ready for review`, `after: <task> (<repo>) - starts once it merges`, or `after: <task> (design) - starts from <default branch> once its pull request merges`.
 
 The repo is the one you are standing in.
 Outside any repo it asks which of the repos pq already knows.
@@ -292,12 +293,13 @@ The width is set with `emulate --viewport "390x844x1"` (or `1440x900x1`), never 
 **Design fidelity**, when the task carries design files: open each in the browser, screenshot the target artboard at its native width, build to it, then screenshot the implementation at the same width and state and compare side by side - layout, spacing, sizes, colour, type, radius, icons, copy, and every state the artboard shows - until nothing differs or a difference is deliberate and recorded.
 **A short draft pull request**: `pq evidence` publishes the screenshots, and the pull request opens as a draft in a fixed shape.
 The intent line comes first, then `## Needs you` - at most three bullets: declined findings, paths not verified, deliberate design deviations, a migration or a flag to know about - or `Nothing`.
-Then `## Screens`, the screenshots, which are the main content, opened by the design's claude.ai link for a design task.
+Then `## Screens`, the screenshots, which are the main content, opened by the design's claude.ai link for a task built from a design.
 The review guide - the commits in reading order, one line each, and where the risk is - sits collapsed in a `<details>` block, since the commit messages already carry it and it is there for whoever wants it.
 The visible prose is held to about 150 words.
 Descriptions used to run to four to sixteen thousand characters, often more reading than the app code they described, while the screenshots were the part that got looked at.
-The screenshots go side by side in two-column tables, never stacked in one long column: `| Before | After |` with a row per width, `| 1440 | 390 |` for a new screen, and `| Design | Implemented |` for a design task's pairs.
-A design task no longer writes a design-fidelity table: the pairs in `## Screens` show it, and only the deliberate deviations are written down, in `## Needs you`.
+The screenshots go side by side in two-column tables, never stacked in one long column: `| Before | After |` with a row per width, `| 1440 | 390 |` for a new screen, and `| Design | Implemented |` for the pairs of a task built from a design.
+A design pull request pairs `| Design | Built |` instead, and a task built on one `| Preview | Implemented |` (see "The design pull request" below).
+No task writes a design-fidelity table any more: the pairs in `## Screens` show it, and only the deliberate deviations are written down, in `## Needs you`.
 Exactly one pull request, from the task's own branch, since that is the only one `pq` reviews and watches; and no `/code-review` of the implementer's own, since `pq`'s independent one stands in for whatever the repository's conventions ask for.
 The top line of the description, which ends in `<!-- pq:tier -->`, is `pq`'s (see "The review tier" below), and the contract says to leave it alone.
 Once the pull request is ready, `pq` stops the worktree's dev server, and the contract says `wt restart` brings it back for anything that needs the app again.
@@ -330,6 +332,33 @@ Every `claude.ai` artifact link the plan mentions rides along in the `artifact:`
 The contract tells the implementer the link is not for it - the page is private, and its browser is a fresh Chrome that is not signed in to claude.ai - and to build only from the copies in `design/`, which it opens and compares against as below.
 The link is for whoever reads the pull request: its `## Screens` section opens with it, so the result can be held up against the design as it was reviewed.
 
+#### The design pull request
+
+Pages built from an artifact copy always came out feeling under-designed.
+The artifact is hand-drawn HTML, not the app's components, so every implementer translated it on its own, one page at a time, and none of them stopped to polish the components themselves.
+So a series with screens now starts with a design pull request, and the design is approved as real components before any page is built from it.
+
+The planning session writes that first plan with `Kind: design` and `Review: visual` on their own lines (`AGENTS.md` asks for both), and still draws the artifact during the interview and cites it in every plan of the series, as above.
+`pq add` reads `Kind: design` by pattern, the way it reads `Review:`, into the header as `kind: design`, and asks nothing more; any other kind, or none, writes no `kind:` line at all.
+A design plan that names no tier is `review: visual` rather than deep, and the add says where that came from.
+
+Its contract replaces the design-fidelity section with one for building the design.
+It asks for every artboard and every state the design shows - empty, loading, error, hover, each variant - built as the app's real components, reusing the ones it already has, each with a preview: in supercast a ViewComponent with its preview under `spec/components/previews`, browsed in Lookbook.
+Nothing is wired: no routes, controllers, models, migrations, jobs or data changes, so there is no page with a before, and the agent verifies the previews instead of walking paths.
+Every preview is screenshot at 1440 and 390 with `emulate --viewport` and goes in `## Screens` beside its artboard, `| Design | Built |`.
+Then comes a polish pass before the pull request opens: every preview against its artboard again, and against two or three of the most polished screens the app already has near this feature, fixing spacing, type, colour, radius, states and copy until it reads as finished product rather than a wireframe.
+Anything the design asked for that the existing component library could not do goes in `## Needs you`.
+
+Tom approves the design by merging the pull request, and that merge is the only signal `pq` reads.
+No label and no review approval triggers anything: Tom cannot approve his own pull requests, and he does not want labels as triggers; the review-tier labels stay display only.
+The task built on a design waits for that merge and then forks from the default branch, which now holds the components (see "Building on another task" below), so the rest of the series stacks in a line from there as usual.
+
+Its contract names the design pull request, which fill records at the claim (`PQ_DESIGN_PR`), and lists the previews it added, read from the pull request's files: anything under a `previews/` directory or named `*_preview.*`.
+When the forge does not answer it names the pull request alone, with the command that lists its files.
+The implementer opens those previews in its own dev server and compares each page against the preview of the same screen, at the same width and in the same state - the same CSS draws both, so they should match like for like - and pairs them `| Preview | Implemented |`.
+The copy in `design/` is now the earlier draft the previews were built from, and where the two differ the previews win.
+It uses the design's components as they are, and a page that truly needs one changed says why in `## Needs you`.
+
 #### Evidence
 
 Screenshots are what let a pull request be judged without checking it out, and a description can only show an image that has a url.
@@ -353,10 +382,14 @@ Some work is several pull requests where the second needs the first's code - a s
 A dependency used to wait for a merge: the second task was not dispatched until the first's pull request had merged, so every link of a series waited on your review and merge before the next one even started, and you were the bottleneck of every series.
 Now a task builds on another one in the same repo, on top of GitHub's native stacked pull requests: it starts as soon as that pull request is marked ready for review, forked from its branch, and joins its stack.
 
-A task has at most one dependency, picked at the wizard or set later with `pq after B A` once both are queued, and its kind is derived from where it lives rather than stored:
+A task has at most one dependency, picked at the wizard or set later with `pq after B A` once both are queued, and its kind follows from where it lives and whether it is a design:
 
 - **in the same repo, B builds on A** - B reads `on A` until A's pull request is marked ready (open, not a draft), and is then eligible; once A has merged, B is plainly met and starts from the default branch like any other task;
-- **in another repo, B waits for A** - a stack cannot cross repos, so B is eligible once A's pull request has merged into A's repo's default branch, and reads `after A` until then.
+- **in another repo, B waits for A** - a stack cannot cross repos, so B is eligible once A's pull request has merged into A's repo's default branch, and reads `after A` until then;
+- **A is a design task, B waits for A** - in the same repo too, because merging the design is how it is approved: B reads `design #N` in `pq ls` (`design A` before A has a pull request) until A merges, and is then met and starts from the default branch, which holds A's components (see "The design pull request" above).
+
+The design wait is the cross-repo wait, not a mechanism of its own: the same predicate, the same `waiting` verdict, and nothing recorded at the claim but the design's pull request number for the contract.
+A design task still takes exactly one dependent, like any task in a stack, because the series it opens is a single line.
 
 A task B builds on is dispatched from A's branch: fill records the branch at the claim (`PQ_STACK_PARENT`), so a dispatch resumed on a later tick keeps it, and dispatch forks the worktree from `origin/<A's branch>` and records the exact commit it forked from (`PQ_STACK_FORK`).
 B's own commits are the ones after that commit.
@@ -375,8 +408,9 @@ The planning rule in `AGENTS.md` keeps a series that way from the start: one pla
 A stacked pull request is merged from GitHub's merge box or with `gh stack merge <pr> --yes --squash`; `gh pr merge` refuses one ("must be merged using the asynchronous merge REST API").
 Merging a layer lands every unmerged layer below it in one operation, and after a bottom layer merges GitHub retargets the next one to the trunk and force-pushes a rebased copy of every layer above, server-side.
 
-The dependency lives in a third file, `after`, alongside `plan.md` and `state.env`: one line, `label<TAB>repo<TAB>branch`.
+The dependency lives in a third file, `after`, alongside `plan.md` and `state.env`: one line, `label<TAB>repo<TAB>branch`, with a fourth field, `design`, when A is a design task.
 It is a resolved `(label, repo, branch)` triple, not a task reference - captured at the moment you pick it, so it survives `pq rm A`, survives A ageing out of `done/`, and survives a slug being reused.
+The `design` field is captured the same way and for the same reason, from A's `kind:` header: at the wizard, at `pq after`, and, for a design still in `new/` when the next plan of its series picks it - the usual case, since a series is added a minute apart - when the task waiting on it is named.
 That is also what makes a cross-repo wait work for free, and lets `pq after` name a branch that was never added to `pq` at all.
 
 Merge state comes from the forge, never from git ancestry: a squash-merged branch's tip is not an ancestor of its default branch, so `git branch --merged` misses every real merge.
@@ -384,7 +418,7 @@ Merge state comes from the forge, never from git ancestry: a squash-merged branc
 That second arm is how a stack merged from its top lands: GitHub records each upper pull request as merged into the branch below it, not into the trunk, while its merge commit is plainly on the trunk - so exact matching would read it as unmerged and freeze the queue.
 Merged into some other branch and nowhere near the default does not count.
 
-`pq after <task>` answers "why has this not started": the state of the task that owns the branch and the state of its pull request, since either one can be the reason and the fix differs, and what that means for this kind - "waiting for #N to be marked ready", "ready - <task> builds on it", "merged - <task> starts from <default>", or, for a wait across repos, the merge it is waiting on.
+`pq after <task>` answers "why has this not started": the state of the task that owns the branch and the state of its pull request, since either one can be the reason and the fix differs, and what that means for this kind - "waiting for #N to be marked ready", "ready - <task> builds on it", "merged - <task> starts from <default>", for a design "waiting for design #N to merge" and then "merged - <task> starts from <default>, which holds its components", or, for a wait across repos, the merge it is waiting on.
 A dependency that has already merged is fine to set - `pq` says so rather than refusing.
 Self-reference and cycles are rejected at the moment you try to create them.
 
@@ -618,6 +652,7 @@ So once its gate is over, each one is labelled with how much of a human it needs
 The plan sets the starting point, because the tier is clearest while the plan is being approved.
 `AGENTS.md` has every plan state `Review: deep|skim|visual` and `Budget: <N> app lines` on their own lines, the way it states `Design file:`, and `pq add` reads both into the task's header as `review:` and `budget:` - by pattern, not by the namer, and without a question.
 A plan that names no tier starts at deep, and the add warns that it will; its header reads `review: none`.
+A design plan (`Kind: design`, see "The design pull request" above) that names none is the exception: it starts at visual, since its previews' screenshots are the whole review.
 Every task added since tiers arrived has a `review:` header, so a task without one was added before them, and it is never labelled: its plan was never asked for a tier, so it would come out deep on every pull request already waiting in review, a label that says nothing.
 
 What the diff turned out to be can only raise the tier, never lower it, and every signal is one `pq` reads for itself:

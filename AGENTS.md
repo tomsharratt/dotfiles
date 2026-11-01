@@ -25,6 +25,9 @@ Pass any later answer that changes a screen to the fork with SendMessage while i
 Writing that file and publishing it are allowed in plan mode; if the fork reports either was blocked, write and publish its draft yourself.
 Do not present the plan for approval until the design is published and the plan cites both on their own lines, in every plan file of a series that touches those screens: `Design file: /Users/...` and `Design artifact: https://claude.ai/artifact/...`.
 A plan that only describes a design in prose leaves the implementer with nothing to compare against; `pq` hands the file to the implementer and the link to whoever reviews the pull request.
+A series with screens starts with a design pull request: its plan states `Kind: design` and `Review: visual` on their own lines, builds every screen and state the artifact shows as the app's real components with previews, and wires nothing - no routes, controllers, models, migrations or data changes.
+Tom approves the design by merging it, and the later plans build their pages from those components and compare them against its previews.
+The artifact is still drawn during the interview and cited in every plan of the series.
 - When work needs several pull requests, plan them as a series in a single line: one plan file per pull request, each building only on the one before it.
 Never plan a pull request that builds on two others, or two that build on the same one - GitHub stacked pull requests, which `pq` uses for a series, only form a single line, so independent pieces go one after another.
 Each plan file is all its implementer sees, so repeat the shared context, evidence and decisions in every file of the series.
