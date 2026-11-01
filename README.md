@@ -161,7 +161,8 @@ Dispatch runs `wt new` in that repo, which picks up its profile, and everything 
 Branch *lookups* are keyed on the repo as well as the name, but a task's slug is a single global namespace, so two live tasks can never share a branch leaf even across two different projects - `tom/fix-timezone` cannot be queued in both at once.
 
 ```
-pq add                   pick a plan not yet added and add it; asks model, effort, what to build on and, for a design plan, the design file - the next tick names it
+pq add                   pick a plan not yet added and add it; asks model, effort, what to build on and, for a design plan, the design file;
+                         reads the plan's Review: and Budget: lines - the next tick names it
 pq after <task>          what a task builds on or waits for, and where that stands
 pq after <task> T        set it, for a task still in queue/ - replacing any it had
 pq after <task> --clear  drop it
@@ -259,11 +260,19 @@ For the same reason every prompt `pq` sends about a pull request - the review fo
 **Verification in the browser**: the app is served at the worktree's own url from its `dev` tab, and the implementer walks every path the change touches, captures each screen before and after with `chrome-devtools-axi`, and is told to fix anything that looks off even when the plan did not name it.
 The width is set with `emulate --viewport "390x844x1"` (or `1440x900x1`), never `resize`, which quietly clamps the width to the window's and so produced "390px" screenshots that were not.
 **Design fidelity**, when the task carries design files: open each in the browser, screenshot the target artboard at its native width, build to it, then screenshot the implementation at the same width and state and compare side by side - layout, spacing, sizes, colour, type, radius, icons, copy, and every state the artboard shows - until nothing differs or a difference is deliberate and recorded.
-**A draft pull request with a guide**: `pq evidence` publishes the screenshots, the pull request opens as a draft with the intent line first, a `## Review guide` (the commits in reading order, where the risk is, what is mechanical) and a `## Visual evidence` section - plus, for a design task, a `## Design fidelity` table and the deliberate deviations.
+**A short draft pull request**: `pq evidence` publishes the screenshots, and the pull request opens as a draft in a fixed shape.
+The intent line comes first, then `## Needs you` - at most three bullets: declined findings, paths not verified, deliberate design deviations, a migration or a flag to know about - or `Nothing`.
+Then `## Screens`, the screenshots, which are the main content, opened by the design's claude.ai link for a design task.
+The review guide - the commits in reading order, one line each, and where the risk is - sits collapsed in a `<details>` block, since the commit messages already carry it and it is there for whoever wants it.
+The visible prose is held to about 150 words.
+Descriptions used to run to four to sixteen thousand characters, often more reading than the app code they described, while the screenshots were the part that got looked at.
 The screenshots go side by side in two-column tables, never stacked in one long column: `| Before | After |` with a row per width, `| 1440 | 390 |` for a new screen, and `| Design | Implemented |` for a design task's pairs.
+A design task no longer writes a design-fidelity table: the pairs in `## Screens` show it, and only the deliberate deviations are written down, in `## Needs you`.
 Exactly one pull request, from the task's own branch, since that is the only one `pq` reviews and watches; and no `/code-review` of the implementer's own, since `pq`'s independent one stands in for whatever the repository's conventions ask for.
+The top line of the description, which ends in `<!-- pq:tier -->`, is `pq`'s (see "The review tier" below), and the contract says to leave it alone.
+Once the pull request is ready, `pq` stops the worktree's dev server, and the contract says `wt restart` brings it back for anything that needs the app again.
 
-Anything about `pq` itself that got in the implementer's way goes in the pull request, under a `## pq` heading, and never in its memory - a note saved there outlives the fix, and one telling agents to `rm -rf` a stray task directory outlived the fix that made it unnecessary by a week.
+Anything about `pq` itself that got in the implementer's way goes in the pull request, in a collapsed `<details><summary>pq</summary>` block at the bottom, and never in its memory - a note saved there outlives the fix, and one telling agents to `rm -rf` a stray task directory outlived the fix that made it unnecessary by a week.
 
 The pull request stays a draft until the review gate below has run and the implementer has answered it.
 An agent that gets stuck, or finds the plan does not fit, commits what it has and opens a draft whose title begins with `STUCK:` - the gate leaves those alone, and `pq ls` reads the chain behind one as stalled.
@@ -289,7 +298,7 @@ So a design file with neither a doctype nor an `<html>` tag - exactly an artifac
 
 Every `claude.ai` artifact link the plan mentions rides along in the `artifact:` header, written only beside `design:`, since a link with nothing in `design/` has nothing to stand beside.
 The contract tells the implementer the link is not for it - the page is private, and its browser is a fresh Chrome that is not signed in to claude.ai - and to build only from the copies in `design/`, which it opens and compares against as below.
-The link is for whoever reads the pull request: its `## Design fidelity` section opens with it, so the result can be held up against the design as it was reviewed.
+The link is for whoever reads the pull request: its `## Screens` section opens with it, so the result can be held up against the design as it was reviewed.
 
 #### Evidence
 
@@ -483,10 +492,10 @@ So its contract says `pq`'s review stands in for the repository's and that it ru
 The order of that prompt is load-bearing, and was wrong for the gate's first few runs.
 The skill reads the first non-flag token as the level and everything after it as the target, so sending the pull request first (`/code-review N <level> --comment`) meant the level was ignored - silently falling back to `codeReviewLastEffort` in `~/.claude.json`, the level last typed at an interactive prompt, which is what "Reusing xhigh effort (the level you typed last)" at the top of those transcripts was reporting - and the target became the string `N <level>` rather than the pull request number.
 It read as harmless only because the level last typed on this machine happened to be `xhigh` as well, the level the gate ran at then.
-Then `pq` prompts the implementer, through herdr's agent API, to read every comment and resolve each - fix it and push, or reply on the thread with the reasoning for leaving it - and to mark the draft ready with `gh pr ready`.
-Before it does, the implementer puts a `## Executive summary` at the very top of the description, above the intent, for whoever reviews it next.
-It has four parts: a confidence pulse (high, medium or low, and why), the few changes to focus the review on, what to settle before merging (declined findings, decisions not yet agreed, anything unverified), and anything else worth knowing, such as a migration or a flag.
-The draft never has one, because what it says only exists once the reviews are answered.
+Then `pq` prompts the implementer, through herdr's agent API, to read every comment and answer each - fix it, push, and mark its thread resolved, or reply on the thread with the reasoning for leaving it and leave it open - and to mark the draft ready with `gh pr ready`.
+Resolving what was fixed and leaving open what was declined is what lets `pq` count the declined findings for the review tier; until this, no implementer resolved a thread at all.
+Before marking it ready, the implementer makes one last pass over the description, editing it in place rather than adding to it: the intent, `## Needs you` and `## Screens` brought up to date with what the review changed, every declined finding linked from `## Needs you` with anything still unverified, screenshots the fixes made stale retaken, all within the same cap.
+It used to put a `## Executive summary` on top instead, which repeated the body and made it longer; with the body this short, the final pass is all the summary it needs.
 The body is edited through a file rather than retyped, so every section and image the draft opened with stays, and screenshots it left stacked are moved into tables.
 Nobody reviews the review.
 The point is that a second pair of eyes has been over the diff, and the first pair has had to answer them, before you read either.
@@ -566,6 +575,36 @@ An agent that comes back from a failure without a new commit or a rerun, one tha
 While the agent is on it, the row reads `fixing ci`, `fixing conflict` or `answering review`.
 A stacked task whose layer below has moved is not prompted about a conflict at all while its restack is due, since the restack is the fix (see "Building on another task"); its row reads `restacking`, `restack` or `parent closed` instead.
 An agent whose slot had already been released takes it back while it works, so the cap can be passed by one for as long as a fix takes - the same soft overshoot the review follow-up accepts, since fixing a pull request that is about to merge is worth more than starting the next task a turn sooner.
+
+#### The review tier
+
+Every ready pull request used to look the same in the review queue - eleven at once, each a few hundred lines of app code under twice that in tests - with nothing to say which wanted reading and which the screenshots already answered.
+So once its gate is over, each one is labelled with how much of a human it needs:
+
+- `review: deep` - read the code: a migration or data change, money, access, authorization or tenancy, feed tokens, security
+- `review: skim` - read the review guide and skim the diff
+- `review: visual` - the screenshots are the review
+
+The plan sets the starting point, because the tier is clearest while the plan is being approved.
+`AGENTS.md` has every plan state `Review: deep|skim|visual` and `Budget: <N> app lines` on their own lines, the way it states `Design file:`, and `pq add` reads both into the task's header as `review:` and `budget:` - by pattern, not by the namer, and without a question.
+A plan that names no tier starts at deep, and the add warns that it will.
+
+What the diff turned out to be can only raise the tier, never lower it, and every signal is one `pq` reads for itself:
+
+- a migration - a file under `db/migrate/` or `migrations/` outside the tests - makes it deep
+- a `security: yes` plan makes it deep
+- open review threads - unresolved and not outdated, which is what a declined finding is now that the follow-up has fixed threads resolved - make it at least skim
+- more than 400 app lines makes it at least skim, and adds an `oversize` label
+
+App lines are the lines added outside tests and outside generated files and lockfiles - `spec/`, `test/`, `*_spec.*`, `*.test.*` and the like, `db/schema.rb`, `*.lock`, snapshots - because tests are about two thirds of a typical pull request here and nobody reads a schema dump.
+The 400 cap is a constant; the budget a plan states is what planning splits work by, about 300 app lines per pull request, and it is only reported against here.
+
+The tier is shown where you triage: the label, a line `pq` owns at the very top of the description - `**Review: deep** - planned skim, 1 migration, 165 of 200 budgeted app lines` - found again by its trailing `<!-- pq:tier -->` marker so it is replaced rather than repeated, and the PR column of `pq ls`, which reads `#7344 deep` where it read `#7344 open` (`skim oversize` when it is both).
+`pq ls --json` carries `tier`, `tier_why`, `app_lines`, `oversize`, `plan_review` and `budget`.
+It is worked out on the first tick the pull request is open, not a draft and past its gate, and again whenever its head moves - the tick's own pull request lookup carries the head commit, so a pull request that has not moved costs no call at all.
+The labels are created in a repository the first time an edit finds one missing.
+A failure to read the files or threads, or to label, is warned about once and tried again on the next tick.
+The reasons are kept in `<task>/tier.txt`, beside `state.env`, which only holds single words.
 
 #### Tearing a task down
 

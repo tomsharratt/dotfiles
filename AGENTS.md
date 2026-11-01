@@ -28,6 +28,12 @@ A plan that only describes a design in prose leaves the implementer with nothing
 - When work needs several pull requests, plan them as a series in a single line: one plan file per pull request, each building only on the one before it.
 Never plan a pull request that builds on two others, or two that build on the same one - GitHub stacked pull requests, which `pq` uses for a series, only form a single line, so independent pieces go one after another.
 Each plan file is all its implementer sees, so repeat the shared context, evidence and decisions in every file of the series.
+- Size each pull request to stay under about 300 app lines - lines added outside tests, generated files and lockfiles - and split the work into more plans when one would be bigger.
+Every plan states, on their own lines, how much of a human its pull request needs and how big it is expected to be: `Review: deep`, `Review: skim` or `Review: visual`, and `Budget: <N> app lines`.
+`deep` means read the code: migrations or data changes, money, access, authorization or tenancy, feed tokens, security.
+`skim` means read the review guide and skim the diff: logic with a small blast radius, mechanical changes.
+`visual` means the screenshots are the review: UI, copy and styling with no risky backend change.
+`pq` labels the pull request from these and raises the tier when the diff turns out riskier, so choose the lowest one that is honest.
 
 ## Tom's opinions
 
