@@ -114,6 +114,7 @@
 #                      `artifact:` likewise, the claude.ai links that design was reviewed at, only beside `design:`;
 #                      `security: yes` likewise, when the plan asks for a security review - see name_plan;
 #                      `review:` and `budget:` likewise, the plan's own Review: and Budget: lines - see plan_review;
+#                      `kind: design` likewise, only for a design plan - see plan_kind;
 #                      `branch:`, `intent:` and `security:` are absent until it is named)
 #          after       its dependency, one line, TSV  label <TAB> repo <TAB> branch
 #          after.new   only in new/: a dependency that had no name yet when it was added,
@@ -1574,6 +1575,20 @@ plan_review() {                         # plan_file -> deep | skim | visual, or 
   plan_line "$1" review | awk '{ v = tolower($1); sub(/[^a-z].*/, "", v) }
                                  v == "deep" || v == "skim" || v == "visual" { print v; exit }'
 }
+# A design plan - the first of a series with screens - says so on a line of its
+# own, the same way (see AGENTS.md):
+#
+#   Kind: design                      it builds the design's screens as the app's
+#                                     real components with previews, and wires nothing
+#
+# Its pull request is reviewed by looking at it and approved by merging it, so a
+# task built on it waits for that merge and forks from the default branch, which
+# then holds the components, rather than stacking on it (see after_state); its
+# contract is the design one (see contract_write), and its tier is visual unless
+# the plan says otherwise. Only the one word counts; any other kind is no kind.
+plan_kind() {                           # plan_file -> design, or nothing
+  plan_line "$1" kind | awk '{ v = tolower($1); sub(/[^a-z].*/, "", v) } v == "design" { print v; exit }'
+}
 plan_budget() {                         # plan_file -> a whole number, or nothing
   plan_line "$1" budget | awk 'match($0, /[0-9][0-9,]*/) { v = substr($0, RSTART, RLENGTH); gsub(/,/, "", v); print v + 0; exit }'
 }
@@ -1702,6 +1717,14 @@ cmd_add() {
   # what marks a task added before tiers existed, which tier_task leaves alone.
   local review_hdr budget_hdr
   review_hdr=$(plan_review "$plan"); budget_hdr=$(plan_budget "$plan")
+  # A design plan says so too (see plan_kind), read the same way. Its pull request
+  # is the screenshots of its previews, so with no tier of its own it is visual
+  # rather than deep, and the add says where that came from.
+  local kind_hdr review_said=""
+  kind_hdr=$(plan_kind "$plan")
+  if [ "$kind_hdr" = design ] && [ -z "$review_hdr" ]; then
+    review_hdr=visual; review_said=" (a design plan that names no tier)"
+  fi
 
   add_wizard
 
@@ -1784,6 +1807,9 @@ cmd_add() {
   {
     printf -- '---\n'
     printf 'repo:     %s\n'   "$repo"
+    # Only for a design plan, like `design:` below: every other task keeps the
+    # header it always had.
+    [ -n "$kind_hdr" ] && printf 'kind:     %s\n' "$kind_hdr"
     # Omitted entirely when unset rather than written empty - written only when
     # there is a design set, so every task without one keeps the header it
     # always had.
@@ -1820,8 +1846,9 @@ cmd_add() {
 
   msg "plan:   $plan"
   [ -n "$design_hdr" ] && msg "design: $design_hdr${artifact_hdr:+ - reviewed at $artifact_hdr}"
+  [ -n "$kind_hdr" ] && msg "kind:   design - it builds the design as components with previews; what builds on it waits for its merge"
   if [ -n "$review_hdr" ]; then
-    msg "review: $review_hdr${budget_hdr:+, budget $budget_hdr app lines}"
+    msg "review: $review_hdr$review_said${budget_hdr:+, budget $budget_hdr app lines}"
   else
     warn "review: the plan names no Review: tier - its pull request will be labelled for a deep review"
   fi
