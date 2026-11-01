@@ -55,6 +55,20 @@ The app needs no changes for this: its `database.yml`, `sidekiq.rb`, and `develo
 The profile injects the port by generating a per-worktree Procfile (the tracked `Procfile.dev` pins the web port to 3000), written outside the repo so the checkout stays clean.
 Provisioning also restarts puma-dev whenever a slug's port actually moves, because puma-dev reads `~/.puma-dev/<slug>` only once per hostname and then caches that proxy for the life of the daemon - nothing short of a restart evicts it, so a moved port otherwise leaves the url 502ing against a dead port while the dev server runs happily on the new one.
 
+The worktree's database keeps up with the branch's migrations.
+Provisioning migrates the fresh copy once, and every dev boot - `wt dev`, which `wt restart` and `wt open`'s autostart both run - applies whatever has become pending since, before foreman starts.
+Without that, a worktree whose branch was rebased onto a master that had gained a migration came back from a restart serving `ActiveRecord::PendingMigrationError` on every page, with its sidekiq jobs failing on `PG::UndefinedColumn`.
+The check is one psql query against `schema_migrations` beside a listing of `db/migrate`, so a boot with nothing pending boots no Rails and stays fast.
+When something is pending the boot says what it migrated in one line, and that migrate spends part of the 60 seconds (`WT_DEV_WAIT`) `wt restart` and `wt open` wait for the port.
+A migration that fails does not keep the server down: the dev pane shows its error, loudly, and the server starts anyway, so the app shows the pending migration where you are already looking.
+Fix the migration and `wt restart`, and the boot migrates again.
+
+Every `db:migrate` re-dumps `db/schema.rb` in this machine's postgres dialect (see `WT_REGENERATED` under "Reclaiming resources"), so both of these migrates put the committed file back, byte for byte, when the re-dump can only be that noise.
+That is when `schema.rb` was clean and every pending migration is, unchanged, one the default branch already has - so the committed `schema.rb` already describes it.
+They skip the annotate gem's model re-annotation then too, for the same reason.
+A `schema.rb` the branch had already changed, or a pending migration that is new on the branch, edited or not yet committed, keeps whatever its migrate dumped, since that may be the only record of the schema change.
+A `wt run bin/rails db:migrate` by hand still leaves the re-dump, so letting the boot do it is the cleaner fix.
+
 For the two mobile repos (`~/.config/wt/profiles/supercast-ios.sh`, `supercast-android.sh`) there is nothing to isolate per worktree, because both apps build a fixed bundle id/applicationId - a second install on the same device just replaces the first.
 So instead of per-worktree isolation, each profile targets the one shared simulator or emulator, and the last `wt open` wins: it builds that worktree's branch, installs it, and launches it, so "look at this branch on a device" is a single command, and rerunning it is the reload.
 There is no *device* lifecycle tied to a worktree, so neither profile ever creates or removes a simulator/emulator on `wt new`/`wt rm`.
@@ -66,7 +80,8 @@ Commands:
 
 ```
 wt new [name]        create/open an isolated worktree, provision, start dev + Claude
-wt dev  <path>       run a worktree's dev server (this is the dev pane's command)
+wt dev  <path>       run a worktree's dev server (this is the dev pane's command),
+                     applying any pending migrations to its database first
 wt restart [path]    restart the worktree's dev server in its dev tab, and wait for it -
                      after a new gem, an initializer, anything a running stack misses;
                      it also starts a server that was stopped
@@ -106,6 +121,10 @@ A bare `bundle exec rspec` set nothing at all and fell through to the single mac
 
 So each worktree now provisions a second database, and `wt test` is what points `DATABASE_URL` at it.
 Use `wt test` for anything running under `RAILS_ENV=test`, and plain `wt run` for everything else - `bin/rails console`, `runner`, `db:migrate` - which still wants the dev copy.
+
+The test database keeps up with the branch's migrations by itself, so the dev boot leaves it alone.
+`spec/rails_helper.rb` calls `ActiveRecord::Migration.maintain_test_schema!`, which reloads it from `db/schema.rb` whenever that file differs from the one it last loaded, under `wt test` and a bare `bundle exec rspec` alike.
+A `schema.rb` the boot put back is the default branch's, which already describes the migration it applied.
 
 `wt test` leaves the domain to the test suite.
 The dev server needs `domain` and `LOCAL_DOMAIN` set to the worktree's own host, but the suite has its own (`application.yml`'s `test: domain: lvh.me`), and figaro will not override a key already in the environment - so exporting the worktree's under `wt test` scoped the test session cookie to `<slug>.test`, rack-test dropped it on every request to `x.lvh.me`, and seven specs failed there and nowhere else.
@@ -724,6 +743,7 @@ So both check first, before anything is released.
 An untracked file counts, and an ignored one does not.
 Nor does a modification to a file the repo's profile lists in `WT_REGENERATED`, because the dev environment rewrites it from what is already committed.
 supercast's lists `db/schema.rb`: every `db:migrate` re-dumps it in this machine's postgres dialect, so a worktree that changed nothing about the schema can still show it modified, and that alone held a merged task's teardown.
+The migrates `wt` runs itself, provisioning's and the dev boot's, put the committed file back when the re-dump can only be that noise, so this is mostly left for the migrates an agent runs by hand.
 A real schema change still holds the worktree, because it comes with a migration, which is a new file - and a regenerated file that is new, deleted or renamed counts like any other.
 A commit counts when no remote-tracking ref reaches it, unless the forge has held it, or a commit after it, as one of the branch's pull request heads: a branch deleted on merge and then pruned would otherwise read as never pushed at all.
 Every head counts, not only the last, because in a stack the forge force-pushes over a layer after its worktree's last push - Rebase stack, or GitHub restacking it once the layer below merges - so the worktree is left holding the head that push replaced.
