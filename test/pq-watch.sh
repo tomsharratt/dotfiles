@@ -319,6 +319,8 @@ P=$(prompt_text)
 has "$P" "new review feedback on pull request #42 since it was marked ready, from alice, bob" \
   "named by who left it - not the author's own replies, a bot, or the author's conversation comments"
 has "$P" "Leave none unanswered" "and every point answered"
+has "$P" "mark its thread resolved, or reply on its thread with your reasoning and leave it unresolved" \
+  "a fixed point's thread is resolved and a declined one left open, as the review tier reads them"
 case "$P" in "First run git pull --rebase --autostash origin tom/feedback: "*) ok ;; *) bad "after syncing first (got '$P')" ;; esac
 eq "$(st "$F" PQ_WATCH_SINCE)" "$later" "the watermark moves past what was handed over"
 eq "$(agent_cell "$F" "done")" "answering review" "pq ls"

@@ -3702,6 +3702,8 @@ Set the width with \`emulate\`, never \`resize\`: \`resize\` quietly clamps the 
 Export \`CHROME_DEVTOOLS_AXI_CHROME_ARGS=--ignore-certificate-errors\` first, so the \`.test\` domain's certificate does not stop it.
 Be picky: anything that looks off gets fixed, even when the plan did not name it.
 Save screenshots into \`$home/evidence/\`, named \`NN-<screen>-before.png\` and \`NN-<screen>-after.png\`, at 1440px wide and, for any responsive surface, at 390px too.
+Once your pull request is marked ready, pq stops this worktree's dev server, since nothing needs it while the pull request waits for review.
+If anything after that needs the app again - a review comment, a failing check - run \`wt restart\`, which starts it in the \`dev\` tab.
 EOF
     else
       cat <<EOF
@@ -3726,7 +3728,7 @@ EOF
 The plan names the artboards that matter.
 Open each file with \`chrome-devtools-axi open file://$home/design/<file>\`, set the artboard's native width with \`emulate --viewport\`, screenshot it, and build to it.
 Then screenshot your implementation at the same width and in the same state, and compare the two side by side: layout, spacing, sizes, colour, type, radius, icons, copy, and every state the artboard shows (hover, empty, error, blocked).
-Fix every difference and compare again, until nothing differs or a difference is deliberate - an existing component convention, accessibility, responsiveness - and recorded in the pull request.
+Fix every difference and compare again, until nothing differs or a difference is deliberate - an existing component convention, accessibility, responsiveness - and named under \`## Needs you\` in the pull request.
 Save the pairs into \`$home/evidence/\` as \`NN-<screen>-design.png\` and \`NN-<screen>-impl.png\`.
 EOF
     cat <<EOF
@@ -3738,11 +3740,17 @@ If the plan seems to need two, do it all in this one and say so in the descripti
 
 Run \`pq evidence $slug\`.
 It publishes everything in \`$home/evidence/\` and prints one markdown image line per file, to paste into the description.
-Open the pull request as a draft (\`gh pr create --draft${parent:+ --base $parent}\`), following the repository's pull request conventions, with the intent line above as the first paragraph of the description.
-Add two sections to it:
+Open the pull request as a draft (\`gh pr create --draft${parent:+ --base $parent}\`).
+Its description has exactly this shape, which takes the place of any pull request template or format the repository asks for:
 
-- \`## Review guide\`: the commits in reading order, one line each on what to look at; where the risk is; what is purely mechanical.
-- \`## Visual evidence\`: every screenshot, in tables laid out as below${design:+, then a \`## Design fidelity\` table - element, design, implemented, note - followed by the deliberate deviations}.
+1. The intent line above, as the first paragraph.
+2. \`## Needs you\`: at most three bullets, each something the reviewer has to decide or know - a review finding you declined, a path you could not verify, a deliberate deviation from the plan${design:+ or the design}, a migration or a flag to turn on - or the single word \`Nothing\`.
+3. \`## Screens\`: every screenshot, in tables laid out as below - the main content of the description.
+4. The review guide, collapsed: a \`<details><summary>Review guide</summary>\` block holding the commits in reading order, one line each, and one line on where the risk is.
+
+Keep the visible prose - everything outside tables, images and \`<details>\` - to about 150 words: the reviewer reads the screenshots and the code, not a summary of them.
+Write no other section: no summary, no test plan, no list of files - the commits already say what changed.
+Once the pull request is ready, pq puts a line ending in \`<!-- pq:tier -->\` at the very top of the description, saying how closely it needs reviewing; whenever you edit the description after that, leave that line as it is.
 
 The screenshots go side by side in two-column tables, never stacked one under another: stacked, a reviewer has to scroll between a before and its after.
 Give each screen or state a one-line caption in bold, then its table, with the image lines \`pq evidence\` printed in its cells.
@@ -3751,10 +3759,10 @@ A screen with a before gets \`| Before | After |\`, one row per width, 1440 firs
 A new screen, with no before, gets \`| 1440 | 390 |\` instead, and a lone shot - one width, no before - shares a row with the next lone one, each header naming its screen.
 EOF
     [ -n "$design" ] && cat <<EOF
-The design/impl pairs get \`| Design | Implemented |\`, one row per width.
+The design/impl pairs get \`| Design | Implemented |\`, one row per width; they are the design comparison, so write no fidelity table beside them.
 EOF
     [ -n "$design" ] && [ -n "$artifact" ] && cat <<EOF
-Open \`## Design fidelity\` with a link to the design as it was reviewed, $artifact, so whoever reads the pull request can hold it up against the result.
+Open \`## Screens\` with a link to the design as it was reviewed, $artifact, so whoever reads the pull request can hold it up against the result.
 EOF
     cat <<EOF
 For example:
@@ -3785,7 +3793,31 @@ Do not run one yourself.
 EOF
     cat <<EOF
 If you get stuck, or the plan turns out not to fit the code: commit what you have, push, open a draft pull request whose title begins with \`STUCK:\` and whose description explains what blocked you, then stop.
-If something about pq itself gets in your way - this contract, its paths, \`pq evidence\`, its review - say so in the pull request description, under a \`## pq\` heading, and never in your memory: a note saved there outlives the fix and misleads every session after it.
+If something about pq itself gets in your way - this contract, its paths, \`pq evidence\`, its review - say so at the very end of the pull request description, in a collapsed \`<details><summary>pq</summary>\` block, and never in your memory: a note saved there outlives the fix and misleads every session after it.
+EOF
+    # Resolving a fixed thread is what lets the review tier tell a declined
+    # finding from a fixed one (see "review tier"); before this, no implementer
+    # ever resolved one. The commands are spelled out because the follow-up
+    # prompt is quote-free and cannot carry them.
+    cat <<'EOF'
+
+## Answering the review
+
+When pq asks you to answer its review, answer every inline thread one of two ways.
+Fix it, push, and mark the thread resolved; or reply on the thread with why you are leaving it, and leave it unresolved.
+pq reads the threads left open as declined findings and flags the pull request for a closer look, so never resolve one you did not fix.
+List the threads with their ids:
+
+    gh api graphql -F owner='{owner}' -F name='{repo}' -F pr=<number> -f query='
+      query($owner: String!, $name: String!, $pr: Int!) {
+        repository(owner: $owner, name: $name) { pullRequest(number: $pr) {
+          reviewThreads(first: 100) { nodes { id isResolved comments(first: 1) { nodes { path body } } } } } } }'
+
+and resolve one with:
+
+    gh api graphql -F id=<thread id> -f query='
+      mutation($id: ID!) { resolveReviewThread(input: { threadId: $id }) { thread { isResolved } } }'
+
 Never wait for input - there is nobody watching.
 EOF
   } > "$tmp" || { rm -f "$tmp"; return 1; }
@@ -4618,9 +4650,9 @@ stack_task() {                          # task_dir dry
 # request as a DRAFT and wait. This section is what happens next: once the agent has gone quiet,
 # pq runs `claude -p "/code-review N --comment"` in the background, in the
 # worktree, which posts inline review comments on the pull request; when that
-# finishes, pq prompts the implementer to resolve every comment, put an executive
-# summary for the human reviewer on top of the description, and mark the draft
-# ready. Nobody reviews the review. The point is that a second pair of
+# finishes, pq prompts the implementer to answer every comment, make one last
+# pass over the description in place, and mark the draft ready. Nobody reviews
+# the review. The point is that a second pair of
 # eyes has been over the diff, and that the first pair had to answer them,
 # before Tom reads either.
 #
@@ -5180,16 +5212,17 @@ security_skip() {                       # task_dir why
 # many threads to answer; the reviewer's own reply is pointed at from the
 # fallback when it posted nothing, since it may list findings it could only print.
 #
-# Both openings end by asking for an executive summary at the very top of the
-# description, for the human about to review it: a confidence pulse, the few
-# changes to focus on, what to settle before merging, anything else worth knowing.
-# It is asked for here, at ready time, and not by the contract at the draft,
-# because what it says - which findings were declined, how sure the change is -
-# only exists once the reviews are answered. Above the intent the contract put
-# first, so the decisions and concerns are the first thing read. The body goes
-# through a file, because `gh pr edit` replaces all of it, and a description
-# retyped from memory drops the evidence images the draft carried. It is also the
-# last chance to put screenshots a draft stacked into the contract's tables.
+# Both openings end by asking for one last pass over the description, editing
+# it in place: Needs you gains the findings that were declined and anything left
+# unverified, Screens loses what the fixes made stale. It is asked for here, at
+# ready time, because what it says only exists once the reviews are answered. It
+# replaced an executive summary put on top, which repeated the body and made it
+# longer; the body the contract asks for is short enough to be its own summary.
+# The body goes through a file, because `gh pr edit` replaces all of it, and a
+# description retyped from memory drops the evidence images the draft carried.
+#
+# The ok opening asks for each fixed thread to be resolved and each declined one
+# left open, which is what lets the review tier count the declined findings.
 review_prompt() {                       # pr result split lines base [security_result security_posted report] [landed reply] [branch]
   local pr=$1 result=$2 split=${3:-} lines=${4:-} base=${5:-} splitc="" why text
   local sec=${6:-} sposted=${7:-} report=${8:-} secc="" swhy
@@ -5216,24 +5249,17 @@ the pull request what you checked. " ;;
   [ "$split" = 1 ] && splitc="The pull request is a single commit of $lines changed lines. \
 Before marking it ready, restructure the branch into small logical commits, each coherent \
 on its own with a message saying why, and push with --force-with-lease --force-if-includes. "
-  local tail="Then, before marking it ready, put an executive summary at the very top of the pull request description, \
-above the intent paragraph, for the person who reviews it next: in under a minute it should tell them where to look \
-and what is worth worrying about. Save the description as it stands (gh pr view $pr --json body -q .body) to a file \
-in a directory made with mktemp -d, never inside the worktree, add the summary on top, and apply it with \
-gh pr edit $pr --body-file <file>. Keep every section and image the description has, changing one only where the \
-review fixes made it wrong, such as the commits the review guide lists, or the visual evidence, if its screenshots \
-are still stacked rather than side by side in tables. Head it ## Executive summary and keep it \
-to a handful of bullets under four bold labels. \
-Confidence: high, medium or low, with one line on why - how many review findings you fixed and how many you declined, \
-and saying plainly if a review pq tried to run did not happen. \
-Focus your review on: the few changes that carry the risk or a key decision, every deviation from the plan among them, \
-each pinned to its file or commit with what to check there. \
-Before merging: every review finding you declined with a link to its thread, decisions a human has not yet agreed to, \
-anything you could not verify end to end, and any other concern - or None. \
-Also consider: anything else worth knowing before it ships, such as a migration, a flag to turn on or a follow-up - or None. \
-Be candid: it is read first, and it is only worth reading if it names the weak spots. \
+  local tail="Then, before marking it ready, make one last pass over the pull request description, editing it in place \
+rather than adding to it. Save the description as it stands (gh pr view $pr --json body -q .body) to a file in a \
+directory made with mktemp -d, never inside the worktree, edit that file, and apply it with gh pr edit $pr --body-file <file>. \
+Bring the intent line, Needs you and Screens up to date with what the review changed: every finding you declined goes \
+in Needs you with a link to its thread, and so does anything you could not verify end to end, in at most three bullets, \
+or Nothing. Retake any screenshot the fixes made stale, publish it again with pq evidence and replace its image; move \
+any screenshots still stacked rather than side by side into tables; and update the commits the review guide lists. \
+Keep every other image the description has, keep the visible prose to about 150 words, and add no new section and \
+no summary. If a line ending in <!-- pq:tier --> is at the top, leave it as it is. \
 Then, if the pull request is still a draft, mark it ready with gh pr ready $pr. \
-If you opened it because you were stuck, do neither - no summary, and do not mark it ready; answer what you can and stop. \
+If you opened it because you were stuck, do neither - do not edit the description and do not mark it ready; answer what you can and stop. \
 Never wait for input - there is nobody watching."
   case "$result" in
     ok)
@@ -5245,7 +5271,9 @@ Never wait for input - there is nobody watching."
       esac
       text="$(sync_first "$branch")pq has finished an independent review of pull request #$pr and posted $posted. \
 Read every one (gh api repos/{owner}/{repo}/pulls/$pr/comments) and \
-resolve each: fix it and push, or reply on that thread with the reasoning for leaving it. \
+answer each: fix it, push, and mark its thread resolved (gh api graphql with the resolveReviewThread mutation), \
+or reply on that thread with the reasoning for leaving it and leave the thread unresolved - pq counts the threads \
+left open as declined findings, so never resolve one you did not fix. \
 Leave no comment unanswered. ${secc}${splitc}${tail}" ;;
     *)
       case "$result" in
@@ -5755,7 +5783,8 @@ If a failure has nothing to do with this change and is a flaky test, rerun only 
     review)
       printf '%s' "${sync}There is new review feedback on pull request #$pr since it was marked ready, from $what. \
 Read all of it (gh api repos/{owner}/{repo}/pulls/$pr/comments for the inline threads, gh pr view $pr --comments for the rest) \
-and resolve each point: fix it and push, or reply on its thread with your reasoning. Leave none unanswered. $tail" ;;
+and answer each point: fix it, push, and mark its thread resolved, or reply on its thread with your reasoning \
+and leave it unresolved. Leave none unanswered. $tail" ;;
   esac
 }
 

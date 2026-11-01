@@ -241,8 +241,28 @@ has "$(cat "$C")" "do not run \`/code-review\` yourself" "the implementer runs n
 has "$(cat "$C")" "stands in for the one the repository's conventions ask for" "and is told why its conventions do not apply here"
 has "$(cat "$C")" "Open exactly one pull request for this task" "one task, one pull request"
 has "$(cat "$C")" "only the pull request on \`tom/first\`" "since only the one on its branch is reviewed"
-has "$(cat "$C")" "under a \`## pq\` heading" "a pq defect is reported in the pull request"
+has "$(cat "$C")" "in a collapsed \`<details><summary>pq</summary>\` block" "a pq defect is reported in the pull request, collapsed at the end"
 has "$(cat "$C")" "never in your memory" "and not saved to memory, where it outlives the fix"
+# The description's shape: short, with the screenshots as its main content.
+has "$(cat "$C")" "Its description has exactly this shape, which takes the place of any pull request template" "one fixed shape"
+has "$(cat "$C")" "\`## Needs you\`: at most three bullets" "Needs you, at most three bullets"
+has "$(cat "$C")" "or the single word \`Nothing\`" "or Nothing"
+has "$(cat "$C")" "\`## Screens\`: every screenshot" "Screens"
+has "$(cat "$C")" "\`<details><summary>Review guide</summary>\`" "the review guide collapsed"
+has "$(cat "$C")" "to about 150 words" "the prose cap"
+has "$(cat "$C")" "no summary, no test plan, no list of files" "and nothing else"
+hasnt "$(cat "$C")" "## Visual evidence" "the old evidence heading is gone"
+hasnt "$(cat "$C")" "following the repository's pull request conventions" "and the repository's format no longer adds to it"
+has "$(cat "$C")" "a line ending in \`<!-- pq:tier -->\`" "the tier line is pq's"
+# Resolving fixed threads is what makes declined findings countable.
+has "$(cat "$C")" "## Answering the review" "how to answer the review"
+has "$(cat "$C")" "resolveReviewThread" "with the mutation that resolves a thread"
+has "$(cat "$C")" "never resolve one you did not fix" "and never a declined one"
+has "$(cat "$C")" "-F owner='{owner}'" "the commands keep their quotes in the file"
+eq "$(tail -1 "$C")" "Never wait for input - there is nobody watching." "the contract still ends on never waiting"
+# The dev server is stopped once the pull request is ready.
+has "$(cat "$C")" "Once your pull request is marked ready, pq stops this worktree's dev server" "the stopped server is announced"
+has "$(cat "$C")" "run \`wt restart\`, which starts it in the \`dev\` tab" "with how to get it back"
 printf 'MARKER-KEEP\n' >> "$C"
 st_set "$D" PQ_LAUNCHED ""
 set_panes "$(printf 'w1:p1\tclaude\tidle')"
@@ -258,7 +278,10 @@ has "$(cat "$C")" "## Design fidelity" "a design task gets the design section"
 has "$(cat "$C")" "Onboarding Refresh.dc.html, shot.png" "naming its files"
 has "$(cat "$C")" "$PQ_HOME/tasks/$(basename "$DB")/design/" "and where they are, through the stable path"
 has "$(cat "$C")" "NN-<screen>-design.png" "and how to name the comparison pairs"
-has "$(cat "$C")" "## Design fidelity\` table" "the PR section asks for the fidelity table"
+hasnt "$(cat "$C")" "## Design fidelity\` table" "no fidelity table: the pairs show it"
+has "$(cat "$C")" "write no fidelity table beside them" "and the implementer is told not to write one"
+has "$(cat "$C")" "a deliberate deviation from the plan or the design" "deviations go in Needs you"
+has "$(cat "$C")" "named under \`## Needs you\` in the pull request" "and the design section says so too"
 has "$(cat "$C")" "| Design | Implemented |" "and lays the design/impl pairs side by side"
 hasnt "$(cat "$C")" "claude.ai" "a design with no link names no link"
 
@@ -272,7 +295,7 @@ has "$(cat "$C")" "of the design as it was reviewed on claude.ai: https://claude
 # Chrome: told only where the design lives, it would go and open it.
 has "$(cat "$C")" "your browser is not signed in to claude.ai, so never open it" "the implementer is told the link is not for it"
 has "$(cat "$C")" "build only from the copies in \`$PQ_HOME/tasks/$(basename "$DA")/design/\`" "and to build from the copies"
-has "$(cat "$C")" "Open \`## Design fidelity\` with a link to the design as it was reviewed, https://claude.ai/artifact/7Ex85ip9EC3gFbGbPgux8q," "the pull request links it"
+has "$(cat "$C")" "Open \`## Screens\` with a link to the design as it was reviewed, https://claude.ai/artifact/7Ex85ip9EC3gFbGbPgux8q," "the pull request links it"
 grep -q -- '—' "$C" && bad "no em dashes" || ok
 
 echo "== a repo with no dev server is told so, not handed a url nothing serves ==" >&2

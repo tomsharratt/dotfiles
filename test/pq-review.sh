@@ -399,17 +399,26 @@ has "$P" "pull request #42" "the prompt names the PR"
 has "$P" "posted its findings as 2 inline review comments" "and says how many inline comments landed"
 has "$P" "gh api repos/{owner}/{repo}/pulls/42/comments" "and how to read them"
 has "$P" "gh pr ready 42" "and how to mark it ready"
-has "$P" "put an executive summary at the very top of the pull request description, above the intent paragraph" \
-  "a summary goes on top before it is marked ready"
-has "$P" "Head it ## Executive summary" "under its own heading"
-for part in "Confidence: high, medium or low" "Focus your review on:" "Before merging:" "Also consider:"; do
-  has "$P" "$part" "the summary has its part: $part"
-done
+# The executive summary on top is gone: it repeated the body. What replaces it
+# is one last pass over the body, in place.
+hasnt "$P" "xecutive summary" "no executive summary is asked for"
+has "$P" "make one last pass over the pull request description, editing it in place rather than adding to it" \
+  "one final pass over the description before it is marked ready"
+has "$P" "every finding you declined goes in Needs you with a link to its thread" "declined findings go in Needs you"
+has "$P" "anything you could not verify end to end, in at most three bullets" "with what is unverified, within three bullets"
+has "$P" "Retake any screenshot the fixes made stale, publish it again with pq evidence" "stale screenshots are retaken"
+has "$P" "add no new section and no summary" "and nothing is added on top"
+has "$P" "about 150 words" "within the prose cap"
+has "$P" "leave it as it is" "and the tier line pq owns is left alone"
+# Fixed threads resolved, declined ones left open: that is what the review tier
+# counts as declined findings.
+has "$P" "mark its thread resolved (gh api graphql with the resolveReviewThread mutation)" "a fixed finding's thread is resolved"
+has "$P" "leave the thread unresolved - pq counts the threads left open as declined findings" "and a declined one left open, saying why"
 has "$P" "gh pr edit 42 --body-file" "the body goes through a file rather than being retyped"
-has "$P" "Keep every section and image the description has" "and nothing the draft carried is dropped"
-has "$P" "still stacked rather than side by side in tables" "but stacked screenshots go into tables"
-[[ $P == *"## Executive summary"*"gh pr ready 42"* ]] && ok || bad "the summary is asked for before the pull request is marked ready"
-has "$P" "do neither - no summary, and do not mark it ready" "and a stuck pull request gets neither"
+has "$P" "Keep every other image the description has" "and nothing the draft carried is dropped"
+has "$P" "still stacked rather than side by side into tables" "but stacked screenshots go into tables"
+[[ $P == *"one last pass"*"gh pr ready 42"* ]] && ok || bad "the final pass is asked for before the pull request is marked ready"
+has "$P" "do neither - do not edit the description and do not mark it ready" "and a stuck pull request gets neither"
 has "$P" "Never wait for input" "and that nobody is watching"
 hasnt "$P" "'" "quote-free"
 hasnt "$P" "single commit" "no restructure clause for a three-commit PR"
@@ -561,9 +570,10 @@ has "$P" "the reviewer exited with an error" "and why"
 has "$P" "git diff origin/master...HEAD" "and asks for a self-review against the base"
 case "$P" in "First run git pull --rebase --autostash origin tom/flaky: "*) ok ;; *) bad "the fallback opens by syncing too (got '$P')" ;; esac
 has "$P" "gh pr ready 42" "and still asks for the PR to be marked ready"
-has "$P" "## Executive summary" "with the executive summary on top first"
-has "$P" "saying plainly if a review pq tried to run did not happen" "whose confidence says the review did not happen"
+has "$P" "one last pass over the pull request description" "with the final pass over the description first"
+hasnt "$P" "xecutive summary" "and no executive summary"
 hasnt "$P" "inline review comments" "without pretending there are comments to read"
+hasnt "$P" "resolveReviewThread" "nor threads to resolve"
 
 echo "== a stacked task's self-review diffs against the branch its pull request is aimed at ==" >&2
 reset_tasks; reset_caches; reset_logs
@@ -787,6 +797,10 @@ hasnt "$PQ_SUMMARY" "reviewing" "prompted is no longer counted as reviewing"
 reset_caches; cache_row "$REPO" tom/whole 42 OPEN "" master
 tick 3 0
 eq "$(st "$W" PQ_REVIEW)" "ready" "tick 4 sees the draft marked ready"
+# The review tier runs on the same tick (test/pq-tier.sh covers what it does):
+# this gh serves no files, so it is tried, said, and left for the next tick.
+grep -q 'pulls/42/files' "$GH_LOG" && ok || bad "the same tick works out the review tier of the pull request now ready"
+has "$OUT" "for its review tier - trying again next tick" "and a failure to read it is said"
 
 echo "== through tick_body --dry-run: would-lines only ==" >&2
 reset_tasks; reset_caches; reset_logs
