@@ -598,7 +598,8 @@ So once its gate is over, each one is labelled with how much of a human it needs
 
 The plan sets the starting point, because the tier is clearest while the plan is being approved.
 `AGENTS.md` has every plan state `Review: deep|skim|visual` and `Budget: <N> app lines` on their own lines, the way it states `Design file:`, and `pq add` reads both into the task's header as `review:` and `budget:` - by pattern, not by the namer, and without a question.
-A plan that names no tier starts at deep, and the add warns that it will.
+A plan that names no tier starts at deep, and the add warns that it will; its header reads `review: none`.
+Every task added since tiers arrived has a `review:` header, so a task without one was added before them, and it is never labelled: its plan was never asked for a tier, so it would come out deep on every pull request already waiting in review, a label that says nothing.
 
 What the diff turned out to be can only raise the tier, never lower it, and every signal is one `pq` reads for itself:
 

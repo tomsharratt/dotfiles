@@ -172,6 +172,7 @@ mk_task() {                             # state prio slug branch pane -> task_di
     printf -- '---\n'
     printf 'repo:     %s\n' "$REPO"
     printf 'branch:   %s\n' "$branch"
+    printf 'review:   none\n'   # as pq add writes it for a plan that names no tier
     printf 'model:    sonnet\n'
     printf 'effort:   xhigh\n'
     printf 'intent:   test fixture\n'

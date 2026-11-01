@@ -138,7 +138,7 @@ has "$(said)" ", 2 named" "and the summary counts them"
 eq "$(cut -f1,3 <<<"$(cost_sum "$qa")")" $'0.002\t0.002' "the naming call is in the task's ledger"
 
 echo "== the header gains its three keys where pq add always wrote them ==" >&2
-eq "$(sed -n '2,8p' "$qb/plan.md" | cut -d: -f1 | tr '\n' ' ')" "repo branch model effort intent source added " "in the same order as ever"
+eq "$(sed -n '2,9p' "$qb/plan.md" | cut -d: -f1 | tr '\n' ' ')" "repo branch review model effort intent source added " "in the same order as ever"
 eq "$(hdr "$qb/plan.md" intent)" "Do chain-b." "the intent is Haiku's"
 eq "$(plan_body "$qb/plan.md")" "$(cat "$PB")" "and the plan itself is untouched"
 

@@ -107,7 +107,7 @@ has "$out" "review: visual, budget 120 app lines" "the add says what it read"
 P=$(plan f.md '# F\n\nJust do it.\n')
 out=$(REPO=$REPO add_new "$P" 2>&1)
 D=$(queue_ordered new | tail -1)
-eq "$(hdr "$D/plan.md" review)" "" "no review: key for a plan that names no tier"
+eq "$(hdr "$D/plan.md" review)" "none" "review: none for a plan that names no tier"
 grep -q '^budget:' "$D/plan.md" && bad "no budget: key either" || ok
 has "$out" "names no Review: tier - its pull request will be labelled for a deep review" "and the add warns that it will be deep"
 rm -rf "$PQ_HOME/new"
@@ -166,6 +166,18 @@ mk_ready() {                            # prio slug [header lines] -> task_dir, 
   printf '%s' "$d"
 }
 labels() { grep -- '--add-label' "$GH_LOG" | tail -1; }
+
+echo "== a task from before tiers is never labelled ==" >&2
+reset_caches; reset_logs
+D=$(mk_ready 9 legacy)
+cache_row "$REPO" tom/legacy 42 OPEN "" master "" sha9
+threads 0 0 0
+out=$(tier_task "$D" 0 2>&1)
+eq "$(st "$D" PQ_TIER)" "" "no review: header - no tier worked out"
+[ -s "$GH_LOG" ] && bad "and no call to the forge at all (got: $(cat "$GH_LOG"))" || ok
+
+echo "== review: none is a plan with no tier ==" >&2
+eq "$(tier_of none "" "" 90 0 0)" "deep	0	no tier in the plan, 90 app lines" "none reads as no tier"
 
 reset_caches; reset_logs
 D=$(mk_ready 1 seasons 'review:   skim\nbudget:   200\n')

@@ -1698,6 +1698,8 @@ cmd_add() {
   local artifact_hdr; artifact_hdr=$(design_links "$plan" | paste -sd, - | sed 's/,/, /g')
   # What the plan says about its review, read here and never asked: a plan
   # without a tier is reviewed as deep, and the add says so (see "review tier").
+  # The header is written either way - `none` for no tier - because its absence is
+  # what marks a task added before tiers existed, which tier_task leaves alone.
   local review_hdr budget_hdr
   review_hdr=$(plan_review "$plan"); budget_hdr=$(plan_budget "$plan")
 
@@ -1787,8 +1789,9 @@ cmd_add() {
     # always had.
     [ -n "$design_hdr" ] && printf 'design:   %s\n' "$design_hdr"
     [ -n "$design_hdr" ] && [ -n "$artifact_hdr" ] && printf 'artifact: %s\n' "$artifact_hdr"
-    # The same for the review tier and the budget: absent when the plan names none.
-    [ -n "$review_hdr" ] && printf 'review:   %s\n' "$review_hdr"
+    # The review tier always, `none` when the plan names none (see above); the
+    # budget only when the plan states one.
+    printf 'review:   %s\n' "${review_hdr:-none}"
     [ -n "$budget_hdr" ] && printf 'budget:   %s\n' "$budget_hdr"
     printf 'model:    %s\n'   "$model"
     printf 'effort:   %s\n'   "$effort"
@@ -6016,6 +6019,7 @@ tier_threads() {                        # repo pr -> count
 # hold it to every combination without a forge.
 tier_of() {                             # plan_tier budget security app migrations threads -> tier<TAB>oversize<TAB>why
   local plan=$1 budget=$2 security=$3 app=${4:-0} migrations=${5:-0} threads=${6:-0} rank floor parts="" over=0 s
+  [ "$plan" = none ] && plan=""
   rank=$(tier_rank "${plan:-deep}"); floor=$rank
   [ "$migrations" -gt 0 ] 2>/dev/null && floor=3
   [ "$security" = yes ] && floor=3
@@ -6073,6 +6077,11 @@ tier_apply() {                          # repo pr tier oversize line
 tier_task() {                           # task_dir dry
   local d=$1 dry=$2 slug repo branch num prstate draft pr head
   [ -z "$(st "$d" PQ_REAPED)" ] || return 0
+  # A task added before review tiers has no `review:` header at all (pq add writes
+  # one, `none` included, for every task since). Its plan was never asked for a
+  # tier, so every one would come out deep: a label that says nothing, on pull
+  # requests already in review. It is left unlabelled.
+  grep -q '^review:' "$d/plan.md" 2>/dev/null || return 0
   review_settled "$d" || return 0
   repo=$(hdr "$d/plan.md" repo); branch=$(hdr "$d/plan.md" branch)
   num=""; prstate=""; draft=""
