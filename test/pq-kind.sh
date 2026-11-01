@@ -311,5 +311,77 @@ has "$(tr '\t' ' ' < "$WT_LOG")" "new --no-agent --no-focus --json tom/first-pag
 grep -q -- "--base" "$WT_LOG" && bad "with no --base" || ok
 eq "$(st "$R" PQ_STACK_PARENT)" "" "it builds on no branch"
 
+echo "== the contract of a task built on a design ==" >&2
+eq "$(st "$R" PQ_DESIGN_PR)" "41" "and the design's pull request is recorded at the claim"
+C=$(cat "$R/contract.md")
+H="$PQ_HOME/tasks/$(basename "$R")"
+has "$C" "## Building on design #41" "it names the design pull request"
+has "$C" "This task waited for design pull request #41 (\`tom/screens-design\`), which has merged" "and its branch"
+has "$C" "This branch starts from the default branch, which holds those components" "and where it starts from"
+has "$C" "- \`spec/components/previews/onboarding/step_component_preview.rb\`" "it lists the previews the design added"
+has "$C" "- \`spec/components/previews/onboarding/step_component_preview/empty.html.erb\`" "every one of them"
+hasnt "$C" "old_preview.rb" "but not one the design removed"
+hasnt "$C" "step_component.rb\`" "nor a component that is not a preview"
+has "$C" "Open those previews in your dev server (Lookbook at https://task.test/lookbook, where the repository has it)" "they are opened in the dev server"
+has "$C" "at the same width - 1440 and 390 - and in the same state" "and compared at the same width"
+has "$C" "are the earlier draft that pull request was built from: where a preview and the draft differ, the preview wins" "the artifact copy is the draft, and the previews win"
+has "$C" "do not restyle one, and if a page truly needs one to change, change it and say why under \`## Needs you\`" "the components are not restyled without saying so"
+has "$C" "The preview/impl pairs get \`| Preview | Implemented |\`" "the pairs are preview beside implementation"
+has "$C" "| Before | After |" "and a page still shows its before beside its after"
+has "$C" "or from the previews of the design it builds on" "a deviation from the previews goes in Needs you"
+hasnt "$C" "## Design fidelity" "no design-fidelity section arguing with it"
+hasnt "$C" "## Building the design" "and not the design task's own section"
+has "$C" "Before changing any screen the plan names, capture it as it is today." "the page task still captures its befores"
+grep -q -- '—' "$R/contract.md" && bad "no em dashes" || ok
+# With nothing from the forge, the pull request alone is named.
+reset_tasks
+X=$(mk_task running 030 lone-page tom/lone-page)
+after_line screens-design "$REPO" tom/screens-design design > "$X/after"
+st_set "$X" PQ_DESIGN_PR 41
+contract_write "$X"
+C=$(cat "$X/contract.md")
+has "$C" "## Building on design #41" "the number from the claim"
+has "$C" "Its previews are among the files it changed: \`gh pr view 41 --json files\` lists them." "and where to find the previews"
+hasnt "$C" "Lookbook at" "with no dev server, no Lookbook url"
+# The link is still the reviewers', but what is built to is the previews.
+rm -f "$X/contract.md"
+printf -- '---\nrepo:     %s\nbranch:   tom/lone-page\ndesign:   Onboarding.dc.html\nartifact: https://claude.ai/artifact/abc123\nmodel:    sonnet\neffort:   low\n---\n\nplan\n' "$REPO" > "$X/plan.md"
+contract_write "$X"
+C=$(cat "$X/contract.md")
+has "$C" "so never open it: the previews of #41 are what you build to." "the artifact link sends it to the previews"
+hasnt "$C" "build only from the copies in" "not to the copies"
+has "$C" "Open \`## Screens\` with a link to the design as it was reviewed, https://claude.ai/artifact/abc123" "and the pull request still links the design"
+
+echo "== the contract of a design task ==" >&2
+reset_tasks
+DT=$(mk_task running 040 screens-design tom/screens-design design "Onboarding.dc.html")
+dispatch_task "$DT" >/dev/null 2>&1
+C=$(cat "$DT/contract.md")
+H="$PQ_HOME/tasks/$(basename "$DT")"
+has "$C" "## Building the design" "it has the design section"
+has "$C" "reviewed by looking at it and approved by merging it" "saying how it is approved"
+has "$C" "The design is in \`$H/design/\`: Onboarding.dc.html." "naming its files"
+has "$C" "Build every artboard the design shows, and every state of each" "every artboard and state"
+has "$C" "as the app's real components" "as real components"
+has "$C" "its preview under \`spec/components/previews\`" "with previews"
+has "$C" "Wire nothing: no routes, controllers, models, migrations, jobs or data changes" "and nothing wired"
+has "$C" 'emulate --viewport "1440x900x1"' "previews are screenshot at 1440"
+has "$C" 'emulate --viewport "390x844x1"' "and at 390"
+has "$C" "NN-<preview>-design.png\` and \`NN-<preview>-built.png\`" "named as design/built pairs"
+has "$C" "### Polish, before the pull request" "a polish pass"
+has "$C" "two or three of the most polished screens the app already has near this feature" "against the best existing screens"
+has "$C" "Fix spacing, type, colour, radius, states and copy until each preview reads as finished product beside them, not a wireframe." "until it reads as finished"
+has "$C" "the existing component library cannot do" "what the library cannot do goes in Needs you"
+has "$C" "anything the design asked for that the existing component library could not do" "Needs you says so too"
+has "$C" "| Design | Built |" "the pairs are design beside built"
+has "$C" "Lookbook at https://task.test/lookbook" "previews are verified in Lookbook"
+hasnt "$C" "capture it as it is today" "no befores for a task that changes no page"
+hasnt "$C" "NN-<screen>-before.png" "nor before/after names"
+hasnt "$C" "## Design fidelity" "and not the ordinary design section"
+hasnt "$C" "| Design | Implemented |" "nor its pairs"
+hasnt "$C" "| Before | After |" "nor a before beside an after, in the rules or the example"
+has "$C" "![01-step-empty-built.png](...)" "its example is a design/built pair"
+grep -q -- '—' "$DT/contract.md" && bad "no em dashes" || ok
+
 printf '\n%d passed, %d failed\n' "$pass" "$fail" >&2
 [ "$fail" -eq 0 ]

@@ -3693,6 +3693,18 @@ $1/contract.md is how to deliver it: read it before you start and follow it to t
 ${stackc}Never wait for input - there is nobody watching."
 }
 
+# The component previews a merged design pull request added, one path per line:
+# a file under a `previews/` directory, or one named `*_preview.*`, which is
+# where ViewComponent and Lookbook keep them. Nothing when the forge does not
+# answer, which the caller reads as "name the pull request alone".
+design_previews() {                     # repo pr
+  local raw
+  raw=$(cd "$1" 2>/dev/null && gh api --paginate "repos/{owner}/{repo}/pulls/$2/files" 2>/dev/null) || return 0
+  jq -sr '[ .[] | arrays | .[] | select(.status != "removed") | .filename
+            | select(test("(^|/)previews?/") or test("_preview\\.[^/]+$")) ] | unique | .[]' <<<"$raw" 2>/dev/null
+  return 0
+}
+
 # ── the delivery contract ────────────────────────────────────────────────────
 # Everything pq asks of an implementer beyond the plan, as a file in the task
 # directory. Two things about a pq pull request cost the most time to review: it
@@ -3721,20 +3733,50 @@ ${stackc}Never wait for input - there is nobody watching."
 # say outright where they replace it (see review_prompt and watch_prompt).
 contract_write() {                      # task_dir
   local d=$1 repo branch intent design artifact security url wt slug tmp home parent fork pnum defb
+  local kind served="" drepo="" dbranch="" dnum="" dprev="" dname="" pair pair_f deviate
   repo=$(hdr "$d/plan.md" repo);   branch=$(hdr "$d/plan.md" branch)
   intent=$(hdr "$d/plan.md" intent)
   design=$(hdr "$d/plan.md" design); artifact=$(hdr "$d/plan.md" artifact)
-  security=$(hdr "$d/plan.md" security)
+  security=$(hdr "$d/plan.md" security); kind=$(task_kind "$d")
   url=$(st "$d" PQ_URL); wt=$(st "$d" PQ_WORKTREE); slug=$(slug_of "$d")
   parent=$(st "$d" PQ_STACK_PARENT); fork=$(st "$d" PQ_STACK_FORK)
   if [ -n "$parent" ]; then
     pnum=$(pr_get "$repo" "$parent" | cut -f1)
     defb=$(repo_base "$repo")
   fi
+  # The url alone says nothing: wt hands one back for every worktree, and only a
+  # profile with a dev server (wt_dev) gives it a `dev` tab to be served from -
+  # a repo with none was told an app was being served that never would be.
+  [ -n "$url" ] && [ -n "$(st "$d" PQ_DEV_PANE)" ] && served=1
+  # The design this task waited for, which has merged: its pull request, as fill
+  # recorded it at the claim, and the previews it added, asked of the forge once
+  # here and left out when it does not answer - the number is enough to find them.
+  if [ "$kind" != design ]; then
+    IFS=$'\t' read -r _ drepo dbranch <<<"$(design_dep "$d")"
+    if [ -n "$dbranch" ]; then
+      dnum=$(st "$d" PQ_DESIGN_PR); [ -n "$dnum" ] || dnum=$(pr_get "$drepo" "$dbranch" | cut -f1)
+      [ -n "$dnum" ] && dprev=$(design_previews "$drepo" "$dnum")
+      dname=${dnum:+#$dnum}; dname=${dname:-the design on \`$dbranch\`}
+    fi
+  fi
+  # How the screenshots pair up: a design task's previews beside the design, a
+  # task built on one beside the previews, anything else from a design beside it.
+  pair=""
+  if [ "$kind" = design ]; then pair="| Design | Built |"
+  elif [ -n "$dbranch" ]; then pair="| Preview | Implemented |"
+  elif [ -n "$design" ]; then pair="| Design | Implemented |"; fi
+  # And what is built to: the previews of a merged design, or else the copies in
+  # design/; and so what a deliberate deviation is from, besides the plan.
   # Every path the agent is given is the STABLE one (task_home): the real
   # directory moves to done/ the moment the pull request is reconciled, while
   # the agent is still saving screenshots into it.
   home=$(task_home "$d")
+  local buildfrom=", and build only from the copies in \`$home/design/\`" pairword=design deviate=""
+  [ -n "$design" ] && deviate=" or the design"
+  if [ -n "$dbranch" ]; then
+    buildfrom=": the previews of $dname are what you build to"; pairword=preview
+    deviate=" or from the previews of the design it builds on"
+  fi
   tmp="$d/.contract.$$"
   {
     cat <<EOF
@@ -3790,21 +3832,34 @@ EOF
 
 Run the repository's tests and lint, per its conventions.
 EOF
-    # The url alone says nothing: wt hands one back for every worktree, and only a
-    # profile with a dev server (wt_dev) gives it a `dev` tab to be served from -
-    # a repo with none was told an app was being served that never would be.
-    if [ -n "$url" ] && [ -n "$(st "$d" PQ_DEV_PANE)" ]; then
+    if [ -n "$served" ]; then
       cat <<EOF
 The app is served at $url from the \`dev\` tab in this workspace.
 If nothing answers there, or once you have added a gem, changed an initializer or anything else a running server will not pick up, run \`wt restart\` to restart it in that tab - never \`wt dev\`, which would run the whole stack in your own shell.
 Log in with the project's development credentials: the ones its seed data (\`db/seeds.rb\`) or its docs name, and \`wt open\`, run from this worktree, opens the login page the project's profile points at, with the seed admin pre-filled; \`wt open <subdomain>\` opens the same login on another subdomain the app serves, a podcast's own site say.
+EOF
+      # A design task changes no page, so there is no before to capture and no
+      # path to walk: what it shows is its previews.
+      if [ "$kind" = design ]; then
+        cat <<EOF
+This task wires nothing into the app, so no page changes: what you verify is every preview you add, in the browser - Lookbook at $url/lookbook, where the repository has it.
+EOF
+      else
+        cat <<EOF
 Before changing any screen the plan names, capture it as it is today.
 Walk every user-facing path the change touches, in the browser.
+EOF
+      fi
+      cat <<EOF
 \`chrome-devtools-axi\` is on PATH: \`chrome-devtools-axi open <url>\`, \`chrome-devtools-axi emulate --viewport "1440x900x1"\` (or \`chrome-devtools-axi emulate --viewport "390x844x1"\`) to set the width, and \`chrome-devtools-axi screenshot <file>\`.
 Set the width with \`emulate\`, never \`resize\`: \`resize\` quietly clamps the width to what the window allows, so a 390px screenshot comes out wider without saying so.
 Export \`CHROME_DEVTOOLS_AXI_CHROME_ARGS=--ignore-certificate-errors\` first, so the \`.test\` domain's certificate does not stop it.
 Be picky: anything that looks off gets fixed, even when the plan did not name it.
+EOF
+      [ "$kind" = design ] || cat <<EOF
 Save screenshots into \`$home/evidence/\`, named \`NN-<screen>-before.png\` and \`NN-<screen>-after.png\`, at 1440px wide and, for any responsive surface, at 390px too.
+EOF
+      cat <<EOF
 Once your pull request is marked ready, pq stops this worktree's dev server, since nothing needs it while the pull request waits for review.
 If anything after that needs the app again - a review comment, a failing check - run \`wt restart\`, which starts it in the \`dev\` tab.
 EOF
@@ -3814,26 +3869,92 @@ This repository has no dev server profile, so there is no url to open; verify th
 If the change is visible anywhere - a CLI's output, a rendered file - capture it before and after into \`$home/evidence/\` as \`NN-<what>-before.png\` and \`NN-<what>-after.png\`.
 EOF
     fi
-    [ -n "$design" ] && cat <<EOF
+    # A design task: the first pull request of a series with screens, which
+    # builds the design as the app's real components with previews and wires
+    # nothing. It is reviewed by looking at it and approved by merging it, and the
+    # tasks after it build their pages from what it merged (see plan_kind).
+    if [ "$kind" = design ]; then
+      cat <<EOF
+
+## Building the design
+
+This is a design task: its pull request is the design, built as the app's real components, and it is reviewed by looking at it and approved by merging it.
+The tasks that build the pages come after it, start from the default branch once it has merged, and compare their pages against your previews - so each preview is the reference for what a page will look like.
+EOF
+      [ -n "$design" ] && cat <<EOF
+The design is in \`$home/design/\`: $design.
+EOF
+    fi
+    # Built on a design that has merged: its previews are the reference now, and
+    # the copy in design/ is the draft they were built from.
+    if [ -n "$dbranch" ]; then
+      cat <<EOF
+
+## Building on design $dname
+
+This task waited for design pull request $dname (\`$dbranch\`), which has merged: it built this feature's screens as the app's real components with previews, and merging it approved the design.
+This branch starts from the default branch, which holds those components, so build your pages from them.
+EOF
+      if [ -n "$dprev" ]; then
+        printf 'The previews it added:\n\n'
+        while IFS= read -r pair_f; do [ -n "$pair_f" ] && printf -- '- \x60%s\x60\n' "$pair_f"; done <<<"$dprev"
+        printf '\n'
+      else
+        cat <<EOF
+Its previews are among the files it changed: \`gh pr view ${dnum:-<number>} --json files\` lists them.
+EOF
+      fi
+      cat <<EOF
+Open those previews in your dev server${served:+ (Lookbook at $url/lookbook, where the repository has it)}, and compare each page you build against the preview of the same screen, at the same width - 1440 and 390 - and in the same state: they are drawn by the same CSS, so the two should match like for like.
+EOF
+      [ -n "$design" ] && cat <<EOF
+The design files in \`$home/design/\` ($design) are the earlier draft that pull request was built from: where a preview and the draft differ, the preview wins.
+EOF
+      cat <<EOF
+Use the design's components as they are: do not restyle one, and if a page truly needs one to change, change it and say why under \`## Needs you\`.
+Fix every difference between a page and its preview and compare again, until nothing differs or a difference is deliberate and named under \`## Needs you\`.
+Save the pairs into \`$home/evidence/\` as \`NN-<screen>-preview.png\` and \`NN-<screen>-impl.png\`.
+EOF
+    elif [ "$kind" != design ] && [ -n "$design" ]; then
+      cat <<EOF
 
 ## Design fidelity
 
 The plan was built from these design files, which are in \`$home/design/\`: $design.
 EOF
+    fi
     # The link is the reviewers', and the implementer is told so in as many
     # words: the page is private, and an agent told where the design lives
     # would open it in a browser that is not signed in to claude.ai.
     [ -n "$design" ] && [ -n "$artifact" ] && cat <<EOF
 They are copies, taken when this task was added, of the design as it was reviewed on claude.ai: $artifact.
-That link is for the people who review your pull request: the page is private and your browser is not signed in to claude.ai, so never open it, and build only from the copies in \`$home/design/\`.
+That link is for the people who review your pull request: the page is private and your browser is not signed in to claude.ai, so never open it$buildfrom.
 EOF
-    [ -n "$design" ] && cat <<EOF
+    if [ "$kind" = design ]; then
+      cat <<EOF
+Build every artboard the design shows, and every state of each - empty, loading, error, hover, every variant - as the app's real components, reusing the components the app already has wherever one fits, each with a preview: in a Rails app with ViewComponent, a component under \`app/components\` and its preview under \`spec/components/previews\`, or wherever this repository keeps its previews.
+Name each preview for the screen and the state it shows, so the tasks after this one can find it.
+Wire nothing: no routes, controllers, models, migrations, jobs or data changes - each preview hands its component whatever it needs.
+Open each design file with \`chrome-devtools-axi open file://$home/design/<file>\`, set the artboard's native width with \`emulate --viewport\`, and screenshot it.
+Then screenshot every preview at 1440 and at 390 wide, with \`emulate --viewport "1440x900x1"\` and \`emulate --viewport "390x844x1"\`, in the same state as its artboard, and compare the two side by side: layout, spacing, sizes, colour, type, radius, icons, copy and every state.
+Save the pairs into \`$home/evidence/\` as \`NN-<preview>-design.png\` and \`NN-<preview>-built.png\`, and the 390 ones as \`NN-<preview>-390-design.png\` and \`NN-<preview>-390-built.png\`.
+
+### Polish, before the pull request
+
+A design built straight from a mockup reads as a wireframe, and the pages built on it inherit whatever it lacks.
+So before you open the pull request, compare every preview again, side by side with its artboard, and also with two or three of the most polished screens the app already has near this feature, opened at the same widths.
+Fix spacing, type, colour, radius, states and copy until each preview reads as finished product beside them, not a wireframe.
+Where the design asks for something the existing component library cannot do - a variant, a token, a pattern it has no piece for - build the smallest honest version and say so under \`## Needs you\`.
+EOF
+    elif [ -z "$dbranch" ] && [ -n "$design" ]; then
+      cat <<EOF
 The plan names the artboards that matter.
 Open each file with \`chrome-devtools-axi open file://$home/design/<file>\`, set the artboard's native width with \`emulate --viewport\`, screenshot it, and build to it.
 Then screenshot your implementation at the same width and in the same state, and compare the two side by side: layout, spacing, sizes, colour, type, radius, icons, copy, and every state the artboard shows (hover, empty, error, blocked).
 Fix every difference and compare again, until nothing differs or a difference is deliberate - an existing component convention, accessibility, responsiveness - and named under \`## Needs you\` in the pull request.
 Save the pairs into \`$home/evidence/\` as \`NN-<screen>-design.png\` and \`NN-<screen>-impl.png\`.
 EOF
+    fi
     cat <<EOF
 
 ## The pull request
@@ -3847,7 +3968,7 @@ Open the pull request as a draft (\`gh pr create --draft${parent:+ --base $paren
 Its description has exactly this shape, which takes the place of any pull request template or format the repository asks for:
 
 1. The intent line above, as the first paragraph.
-2. \`## Needs you\`: at most three bullets, each something the reviewer has to decide or know - a review finding you declined, a path you could not verify, a deliberate deviation from the plan${design:+ or the design}, a migration or a flag to turn on - or the single word \`Nothing\`.
+2. \`## Needs you\`: at most three bullets, each something the reviewer has to decide or know - a review finding you declined, a path you could not verify, a deliberate deviation from the plan$deviate, ${kind:+anything the design asked for that the existing component library could not do, }a migration or a flag to turn on - or the single word \`Nothing\`.
 3. \`## Screens\`: every screenshot, in tables laid out as below - the main content of the description.
 4. The review guide, collapsed: a \`<details><summary>Review guide</summary>\` block holding the commits in reading order, one line each, and one line on where the risk is.
 
@@ -3858,16 +3979,39 @@ Once the pull request is ready, pq puts a line ending in \`<!-- pq:tier -->\` at
 The screenshots go side by side in two-column tables, never stacked one under another: stacked, a reviewer has to scroll between a before and its after.
 Give each screen or state a one-line caption in bold, then its table, with the image lines \`pq evidence\` printed in its cells.
 Leave a blank line before and after every table: a line written straight under one is read as another of its rows.
+EOF
+    # A design task has no page with a before, only previews beside the design,
+    # so its pairs are all its tables, and its example shows one.
+    if [ "$kind" = design ]; then
+      cat <<EOF
+Every preview gets \`$pair\`, one row per width, 1440 first: the pairs are the whole review, so leave none out, and write no fidelity table beside them.
+EOF
+    else
+      cat <<EOF
 A screen with a before gets \`| Before | After |\`, one row per width, 1440 first.
 A new screen, with no before, gets \`| 1440 | 390 |\` instead, and a lone shot - one width, no before - shares a row with the next lone one, each header naming its screen.
 EOF
-    [ -n "$design" ] && cat <<EOF
-The design/impl pairs get \`| Design | Implemented |\`, one row per width; they are the design comparison, so write no fidelity table beside them.
+      [ -n "$pair" ] && cat <<EOF
+The $pairword/impl pairs get \`$pair\`, one row per width; they are the design comparison, so write no fidelity table beside them.
 EOF
+    fi
     [ -n "$design" ] && [ -n "$artifact" ] && cat <<EOF
 Open \`## Screens\` with a link to the design as it was reviewed, $artifact, so whoever reads the pull request can hold it up against the result.
 EOF
-    cat <<EOF
+    if [ "$kind" = design ]; then
+      cat <<EOF
+For example:
+
+    **Onboarding step: empty**
+
+    | Design | Built |
+    |---|---|
+    | ![01-step-empty-design.png](...) | ![01-step-empty-built.png](...) |
+    | ![01-step-empty-390-design.png](...) | ![01-step-empty-390-built.png](...) |
+
+EOF
+    else
+      cat <<EOF
 For example:
 
     **Subscriber list: a held subscription now reads Disputed**
@@ -3883,6 +4027,9 @@ For example:
     |---|---|
     | ![03-dispute-panel-after.png](...) | ![04-dispute-panel-390-after.png](...) |
 
+EOF
+    fi
+    cat <<EOF
 Leave it a draft.
 pq runs an independent \`/code-review\` of every pull request and will tell you when to resolve its findings and mark the pull request ready.
 That review stands in for the one the repository's conventions ask for, so do not run \`/code-review\` yourself, before the pull request or after it: a review by the session that wrote the change is not independent, and one more on top of pq's only costs time.
@@ -6994,6 +7141,14 @@ tick_body() {                           # cap dry
       case "$verdict" in
         stack\ *) st_set "$claimed" PQ_STACK_PARENT "$(stack_branch "$claimed" "${verdict#stack }")" ;;
       esac
+      # And the design it waited for, which has merged: its contract names that
+      # pull request (see contract_write), and only this pass has its row in hand.
+      local drow dnum
+      drow=$(design_dep "$claimed")
+      if [ -n "$drow" ]; then
+        dnum=$(pr_get "$(cut -f2 <<<"$drow")" "$(cut -f3 <<<"$drow")" | cut -f1)
+        [ -n "$dnum" ] && st_set "$claimed" PQ_DESIGN_PR "$dnum"
+      fi
       dispatch_try "$claimed"
       [ $? = 1 ] && ! dispatch_gaveup "$claimed" && warn "$slug: left in running/ half-dispatched - the next tick will retry it"
       started=$((started + 1)); free=$((free - 1))
