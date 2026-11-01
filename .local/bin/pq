@@ -5145,12 +5145,12 @@ REVIEWER_GIT_DENY=("Bash(git checkout:*)" "Bash(git switch:*)" "Bash(git restore
 # real review reached for the design file to check the change against it and was
 # refused, because the task directory is outside the worktree it runs in - and a
 # reviewer that can see what the change was built to is a better reviewer.
-review_cmd() {                          # pr task_home
+review_cmd() {                          # pr task_home [from]
   headless_claude -p --model "$PQ_REVIEWER_MODEL" --effort "$PQ_REVIEW_EFFORT" \
     --permission-mode auto --allowedTools "$PQ_REVIEW_TOOLS" \
     --disallowedTools "Edit(/$HOME/**)" "Bash(gh pr ready:*)" "Bash(gh pr merge:*)" "Bash(gh pr close:*)" \
       "${REVIEWER_GIT_DENY[@]}" \
-    --append-system-prompt "$(review_brief "$1")" \
+    --append-system-prompt "$(review_brief "$1" "${3:-}")" \
     --add-dir "$2" \
     --output-format json "/code-review $PQ_REVIEW_EFFORT --comment $1 --max-findings all"
 }
@@ -5185,8 +5185,18 @@ report_whole() {                        # text -> 0 when it reads as a whole rep
 # bare `bundle exec rspec` from it lands on the machine's shared test database,
 # which is where the cross-branch deadlocks in the README came from, while
 # `wt run` and `wt test` find this worktree's own from the directory they run in.
-review_brief() {                        # pr
-  printf '%s' "You are reviewing pull request #$1 from inside the worktree of the agent that wrote it, which is still working there. Your only output is the review you post on the pull request. $(reviewer_wait) Change nothing else: no file edits, no commits, no checkouts, no pushes, and do not mark the pull request ready, merge it or close it - its author does that once it has answered your review. Write the review payload, and any other scratch file, as a new file inside a directory made with \`mktemp -d\`, never inside the worktree. This worktree has its own databases, ports and environment: run project commands through \`wt run <cmd>\`, and anything that runs in the test environment, such as specs, through \`wt test <cmd>\` - only the specs a finding needs. A bare \`bundle exec\` or \`bin/rails\` uses the shared databases of the whole machine instead."
+#
+# A second review (see "the second review" below) is told what it is and where
+# it ends: the commits the author made to answer the first review, read as
+# `git diff <from> HEAD` - two trees, so a branch restructured since still
+# diffs cleanly - with the rest of the pull request as context only. Tried on
+# #7344 before it shipped, with the same command but without --comment: eight of
+# its ten findings sat on lines the fixes had changed, among them an access leak
+# the fixes had opened, and the other two were in files the fixes had touched.
+review_brief() {                        # pr [from]
+  local scope=""
+  [ -n "${2:-}" ] && scope=" This is a second review. Pull request #$1 already had an independent review at commit $2, and its author has answered every finding of it, with commits of its own or replies on the threads; those threads are settled, so do not raise them again. Review only what the author changed since that review, git diff $2 HEAD, and read the rest of the pull request only as context for it. Report a finding only on a line that change added or altered, and only where the change is wrong: a fix that introduced a bug, a fix that does not do what its thread asked, a race, a leak or an access gap the new code opens, or a test that does not prove what it claims. If the change is sound, post nothing and say so in your reply."
+  printf '%s' "You are reviewing pull request #$1 from inside the worktree of the agent that wrote it, which is still working there.$scope Your only output is the review you post on the pull request. $(reviewer_wait) Change nothing else: no file edits, no commits, no checkouts, no pushes, and do not mark the pull request ready, merge it or close it - its author does that once it has answered your review. Write the review payload, and any other scratch file, as a new file inside a directory made with \`mktemp -d\`, never inside the worktree. This worktree has its own databases, ports and environment: run project commands through \`wt run <cmd>\`, and anything that runs in the test environment, such as specs, through \`wt test <cmd>\` - only the specs a finding needs. A bare \`bundle exec\` or \`bin/rails\` uses the shared databases of the whole machine instead."
 }
 
 # The security reviewer, one swappable function like review_cmd and read-only
@@ -5317,11 +5327,11 @@ sync_first() {                          # branch -> the opening, or nothing with
 # One `gh` call, right before launching: is this a STUCK pull request, and is it
 # one commit big enough to want restructuring? Tabs and newlines in a title are
 # squeezed so the TSV stays one line.
-review_probe() {                        # repo pr -> title<TAB>state<TAB>draft|open<TAB>commits<TAB>changed
+review_probe() {                        # repo pr -> title<TAB>state<TAB>draft|open<TAB>commits<TAB>changed<TAB>head
   local raw
-  raw=$(cd "$1" 2>/dev/null && gh pr view "$2" --json title,state,isDraft,commits,additions,deletions 2>/dev/null) || return 1
+  raw=$(cd "$1" 2>/dev/null && gh pr view "$2" --json title,state,isDraft,commits,additions,deletions,headRefOid 2>/dev/null) || return 1
   jq -er '[(.title | gsub("[\t\n]"; " ")), .state, (if .isDraft then "draft" else "open" end),
-           (.commits | length | tostring), ((.additions + .deletions) | tostring)] | @tsv' <<<"$raw" 2>/dev/null
+           (.commits | length | tostring), ((.additions + .deletions) | tostring), (.headRefOid // "")] | @tsv' <<<"$raw" 2>/dev/null
 }
 
 # How many inline review threads the pull request carries - top-level comments,
@@ -5589,6 +5599,57 @@ report_skip() {                         # task_dir why
   return 0
 }
 
+# How every follow-up that hands the pull request back ends: one last pass
+# over the description, then marking it ready. See review_prompt.
+review_tail() {                         # pr
+  local pr=$1
+  printf '%s' "Then, before marking it ready, make one last pass over the pull request description, editing it in place \
+rather than adding to it. Save the description as it stands (gh pr view $pr --json body -q .body) to a file in a \
+directory made with mktemp -d, never inside the worktree, edit that file, and apply it with gh pr edit $pr --body-file <file>. \
+Bring the intent line, Needs you and Screens up to date with what the review changed: every finding you declined goes \
+in Needs you with a link to its thread, and so does anything you could not verify end to end, in at most three bullets, \
+or Nothing. Retake any screenshot the fixes made stale, publish it again with pq evidence and replace its image; move \
+any screenshots still stacked rather than side by side into tables; and update the commits the review guide lists. \
+Keep every other image the description has, keep the visible prose to about 150 words, and add no new section and \
+no summary. If a line ending in <!-- pq:tier --> is at the top, leave it as it is. \
+Then, if the pull request is still a draft, mark it ready with gh pr ready $pr. \
+If you opened it because you were stuck, do neither - do not edit the description and do not mark it ready; answer what you can and stop. \
+Never wait for input - there is nobody watching."
+}
+
+# How the first follow-up ends instead when a second review may follow (see
+# "the second review"): answered, pushed, and left a draft, so the pull request
+# is not marked ready on fixes nobody else has read.
+review_hold_text() {
+  printf '%s' "When every finding is answered and your fixes are pushed, stop there and leave the pull request a draft: do not edit its description and do not mark it ready yet. pq looks over your fixes next, and then tells you how to finish. Never wait for input - there is nobody watching."
+}
+
+# The follow-up to a second review: what it found in the fixes, or that it
+# found nothing, or that it could not run - each ending in the usual tail.
+rereview_prompt() {                     # pr result landed from [branch]
+  local pr=$1 result=$2 landed=${3:-} from=$4 branch=${5:-} text
+  case "$result" in
+    ok)
+      if [ "${landed:-0}" = 0 ]; then
+        text="pq has reviewed the fixes you made to pull request #$pr since its first review (git diff $from HEAD) and found nothing more to raise. "
+      else
+        text="pq has reviewed the fixes you made to pull request #$pr since its first review (git diff $from HEAD) and posted $landed more inline review comment$([ "$landed" = 1 ] || printf s) on them. \
+Answer each new one the way you answered the first review: fix it, push, and mark its thread resolved, or reply on the thread with the reasoning for leaving it and leave the thread unresolved. \
+Leave no comment unanswered. "
+      fi ;;
+    *)
+      text="pq could not get a second review of the fixes you made to pull request #$pr since its first review. \
+Read them yourself as a stranger would (git diff $from HEAD), looking for a fix that introduced a bug or does not do what its thread asked; fix and push. " ;;
+  esac
+  printf '%s' "$(sync_first "$branch")${text}$(review_tail "$pr")"
+}
+
+# The follow-up when the answers to the first review added no app code, so
+# there is nothing new for a second review to read.
+finish_prompt() {                       # pr [branch]
+  printf '%s' "$(sync_first "${2:-}")pq has looked over your answers to the review of pull request #$1, and they add no app code for a second review to read. $(review_tail "$1")"
+}
+
 # What the follow-up says about one report reviewer that has run to `done`:
 # where its report is and what to do with it, or that it did not happen and
 # what to check instead. Quote-free, like review_prompt.
@@ -5666,25 +5727,15 @@ reports_clause() {                      # task_dir pr
 #
 # The ok opening asks for each fixed thread to be resolved and each declined one
 # left open, which is what lets the review tier count the declined findings.
-review_prompt() {                       # pr result split lines base [reports_clause] [landed reply] [branch]
+review_prompt() {                       # pr result split lines base [reports_clause] [landed reply] [branch] [hold]
   local pr=$1 result=$2 split=${3:-} lines=${4:-} base=${5:-} splitc="" why text
   local secc=${6:-}
   local landed=${7:-} reply=${8:-} replyc="" branch=${9:-}
   [ "$split" = 1 ] && splitc="The pull request is a single commit of $lines changed lines. \
 Before marking it ready, restructure the branch into small logical commits, each coherent \
 on its own with a message saying why, and push with --force-with-lease --force-if-includes. "
-  local tail="Then, before marking it ready, make one last pass over the pull request description, editing it in place \
-rather than adding to it. Save the description as it stands (gh pr view $pr --json body -q .body) to a file in a \
-directory made with mktemp -d, never inside the worktree, edit that file, and apply it with gh pr edit $pr --body-file <file>. \
-Bring the intent line, Needs you and Screens up to date with what the review changed: every finding you declined goes \
-in Needs you with a link to its thread, and so does anything you could not verify end to end, in at most three bullets, \
-or Nothing. Retake any screenshot the fixes made stale, publish it again with pq evidence and replace its image; move \
-any screenshots still stacked rather than side by side into tables; and update the commits the review guide lists. \
-Keep every other image the description has, keep the visible prose to about 150 words, and add no new section and \
-no summary. If a line ending in <!-- pq:tier --> is at the top, leave it as it is. \
-Then, if the pull request is still a draft, mark it ready with gh pr ready $pr. \
-If you opened it because you were stuck, do neither - do not edit the description and do not mark it ready; answer what you can and stop. \
-Never wait for input - there is nobody watching."
+  local hold=${10:-} tail
+  if [ "$hold" = 1 ]; then tail=$(review_hold_text); else tail=$(review_tail "$pr"); fi
   case "$result" in
     ok)
       local posted="its findings as inline review comments"
@@ -5773,30 +5824,23 @@ review_task() {                         # task_dir dry
       # yet to launch, or still running.
       reports_busy "$d" && return 0
       [ "$dry" = 1 ] && { msg "would prompt $slug to resolve the review of #$pr"; return 0; }
-      local text result base code rc
+      local text result base hold=""
       result=$(st "$d" PQ_REVIEW_RESULT); base=$(live_base "$d")
+      if [ "$(st "$d" PQ_REVIEW_ROUND)" = 2 ]; then
+        text=$(rereview_prompt "$pr" "${result:-failed}" "$(st "$d" PQ_REVIEW_POSTED)" "$(st "$d" PQ_REVIEW_FROM)" "$branch")
+        review_deliver "$d" "$text" "asked to answer the second review of #$pr and mark it ready" ""
+        return 0
+      fi
       local reply=""
       [ "${result:-failed}" != ok ] && [ -s "$d/review.md" ] && reply="$(task_home "$d")/review.md"
+      rereview_possible "$d" && hold=1
       text=$(review_prompt "$pr" "${result:-failed}" "$(st "$d" PQ_REVIEW_SPLIT)" "$(st "$d" PQ_REVIEW_LINES)" "$base" \
-               "$(reports_clause "$d" "$pr")" "$(st "$d" PQ_REVIEW_POSTED)" "$reply" "$branch")
-      code=$(agent_prompt "$(task_pane "$d")" "$text"); rc=$?
-      case "$rc" in
-        0)
-          st_set "$d" PQ_REVIEW prompted; st_set "$d" PQ_REVIEW_PROMPTED "$(now)"; st_set "$d" PQ_REVIEW_WAIT ""
-          # This tick's snapshot predates the prompt and still reads idle, so a
-          # wrap-up clock started under the hold would release the slot moments
-          # after the agent was handed more work.
-          [ -z "$(st "$d" PQ_WRAPUP_SINCE)" ] || st_set "$d" PQ_WRAPUP_SINCE ""
-          msg "$slug: asked to resolve the review of #$pr and mark it ready" ;;
-        2)
-          # The existing `permission` handling is not fought: the prompt goes on
-          # the first tick after you answer the dialog.
-          [ "$(st "$d" PQ_REVIEW_WAIT)" = blocked ] || { st_set "$d" PQ_REVIEW_WAIT blocked
-            msg "$slug: the agent is on a dialog - the review follow-up waits for you to answer it"; } ;;
-        *)
-          [ "$(st "$d" PQ_REVIEW_WAIT)" = error ] || { st_set "$d" PQ_REVIEW_WAIT error
-            warn "$slug: could not deliver the review follow-up ($code) - retrying each tick"; } ;;
-      esac
+               "$(reports_clause "$d" "$pr")" "$(st "$d" PQ_REVIEW_POSTED)" "$reply" "$branch" "$hold")
+      if [ "$hold" = 1 ]; then
+        review_deliver "$d" "$text" "asked to answer the review of #$pr - its fixes are looked over before it is marked ready" 1
+      else
+        review_deliver "$d" "$text" "asked to resolve the review of #$pr and mark it ready" ""
+      fi
       ;;
     prompted)
       case "${prstate:-}" in
@@ -5817,7 +5861,25 @@ review_task() {                         # task_dir dry
           st_set "$d" PQ_REVIEW skipped; st_set "$d" PQ_REVIEW_WHY settled; return 0 ;;
         *) return 0 ;;                  # no row this tick - nothing to judge
       esac
-      # Still a draft.
+      # Still a draft. Answered and stopped, when the first follow-up held the
+      # pull request for a look over the fixes: a second review when they added
+      # app code, or else the finishing prompt.
+      if [ "$(st "$d" PQ_REVIEW_STAGED)" = 1 ] && review_answered "$d" "$pstate"; then
+        [ "$dry" = 1 ] && { msg "would look over $slug's answers to the review of #$pr"; return 0; }
+        local from lines; from=$(st "$d" PQ_REVIEW_HEAD)
+        lines=$(fix_lines "$d" "$from")
+        if [ "${lines:-0}" -gt 0 ] 2>/dev/null; then
+          st_set "$d" PQ_REVIEW_ROUND 2; st_set "$d" PQ_REVIEW_FROM "$from"; st_set "$d" PQ_REVIEW_STAGED ""
+          st_set "$d" PQ_REVIEW_TRIES 0; st_set "$d" PQ_REVIEW_RESULT ""; st_set "$d" PQ_REVIEW_POSTED ""
+          st_set "$d" PQ_REVIEW_RETRY_AT ""; st_set "$d" PQ_REVIEW_SPLIT ""; st_set "$d" PQ_REVIEW_WAIT ""
+          st_set "$d" PQ_REVIEW pending
+          [ -z "$(st "$d" PQ_WRAPUP_SINCE)" ] || st_set "$d" PQ_WRAPUP_SINCE ""
+          msg "$slug: the answers to the review of #$pr added $lines app line$([ "$lines" = 1 ] || printf s) - a second review reads them next"
+        else
+          review_deliver "$d" "$(finish_prompt "$pr" "$branch")" "asked to finish #$pr and mark it ready - its answers added no app code" ""
+        fi
+        return 0
+      fi
       case "$pstate" in
         noagent|missing)
           [ "$dry" = 1 ] && return 0
@@ -5836,6 +5898,80 @@ review_task() {                         # task_dir dry
       ;;
   esac
   return 0
+}
+
+# One follow-up to the implementer, through herdr's agent API. Delivered, the
+# gate is `prompted`; `staged` says whether this one held the pull request for
+# a look over the fixes (see "the second review"). On a dialog, or an error, it
+# is tried again on every tick, and said once.
+review_deliver() {                      # task_dir text okmsg staged
+  local d=$1 text=$2 okmsg=$3 staged=${4:-} slug code rc
+  slug=$(slug_of "$d")
+  code=$(agent_prompt "$(task_pane "$d")" "$text"); rc=$?
+  case "$rc" in
+    0)
+      st_set "$d" PQ_REVIEW prompted; st_set "$d" PQ_REVIEW_PROMPTED "$(now)"; st_set "$d" PQ_REVIEW_WAIT ""
+      st_set "$d" PQ_REVIEW_STAGED "$staged"
+      # This tick's snapshot predates the prompt and still reads idle, so a
+      # wrap-up clock started under the hold would release the slot moments
+      # after the agent was handed more work.
+      [ -z "$(st "$d" PQ_WRAPUP_SINCE)" ] || st_set "$d" PQ_WRAPUP_SINCE ""
+      msg "$slug: $okmsg" ;;
+    2)
+      # The existing `permission` handling is not fought: the prompt goes on
+      # the first tick after you answer the dialog.
+      [ "$(st "$d" PQ_REVIEW_WAIT)" = blocked ] || { st_set "$d" PQ_REVIEW_WAIT blocked
+        msg "$slug: the agent is on a dialog - the review follow-up waits for you to answer it"; } ;;
+    *)
+      [ "$(st "$d" PQ_REVIEW_WAIT)" = error ] || { st_set "$d" PQ_REVIEW_WAIT error
+        warn "$slug: could not deliver the review follow-up ($code) - retrying each tick"; } ;;
+  esac
+  return 0
+}
+
+# THE SECOND REVIEW. Answering a review is new code, and until this nobody read
+# it: on #7344 the answers added a resumable job that re-queues itself and a
+# re-render-on-change loop in the feed precompute, and on #7329 they reworked
+# the refund locking, all marked ready on the author's word alone. So when the
+# first review landed, its follow-up asks for answers and a push and then a
+# stop, with the pull request left a draft (review_hold_text). Once the agent
+# has stopped - its own Stop record newer than the prompt, never the pane's
+# snapshot, which still reads idle the moment after a prompt - pq measures what
+# the answers added: app lines, by the review tier's own rule, in
+# `git diff <reviewed head> HEAD`. Any at all, and the gate goes round once more
+# with a second code review scoped to them (review_brief), whose follow-up ends
+# in the usual tail; none, and the finishing prompt asks for that tail alone.
+# Across thirteen recent pull requests the answers added 0 to 142 app lines,
+# with no size below which a second look was not worth having, so there is no
+# threshold. Once only, code review only: the security and design reports are
+# not run again, and a second review that posts nothing is clean, not failed.
+#
+# It needs the head the first review read (PQ_REVIEW_HEAD, from the probe) and
+# an agent with hooks to say when it has stopped; a task without either gets
+# the one follow-up it always got.
+rereview_possible() {                   # task_dir -> 0 when a second review may follow
+  [ "$(st "$1" PQ_REVIEW_ROUND)" != 2 ] && [ "$(st "$1" PQ_REVIEW_RESULT)" = ok ] \
+    && [ -n "$(st "$1" PQ_REVIEW_HEAD)" ] && [ -n "$(agent_event "$1")" ]
+}
+review_answered() {                     # task_dir pstate -> 0 once the agent has stopped since the follow-up
+  local ev at prompted
+  case "$2" in idle|done) ;; *) return 1 ;; esac
+  agent_blocked "$1" && return 1
+  IFS=$'\t' read -r ev at _ <<<"$(agent_event "$1")"
+  prompted=$(epoch_of "$(st "$1" PQ_REVIEW_PROMPTED)")
+  [ "$ev" = idle ] && [ -n "$prompted" ] && [ "${at:-0}" -gt "$prompted" ] 2>/dev/null
+}
+# App lines added since the head the first review read, by the tier's rule
+# (TIER_FILES_JQ), read off the worktree. Two trees, so a branch restructured
+# or rebased since still diffs; a base that moved under it only adds lines,
+# which costs at worst a second review. Nothing when it cannot be told.
+fix_lines() {                           # task_dir from -> app lines
+  local wt raw; wt=$(st "$1" PQ_WORKTREE)
+  [ -n "${2:-}" ] && [ -n "$wt" ] && [ -d "$wt" ] || return 0
+  raw=$(git -C "$wt" diff --numstat "$2" HEAD 2>/dev/null) || return 0
+  jq -Rs '[split("\n")[] | select(length > 0) | split("\t")
+           | {filename: .[2], additions: ((.[0] | tonumber?) // 0), status: "modified"}]' <<<"$raw" 2>/dev/null \
+    | jq -sr "$TIER_FILES_JQ" 2>/dev/null | cut -f1
 }
 
 # The code reviewer's step while the gate is pending or running - the gate's
@@ -5867,13 +6003,14 @@ review_step() {                         # task_dir dry pr pstate
         return 0
       fi
       [ "$dry" = 1 ] && { msg "would probe #$pr and launch a review of $slug"; return 0; }
-      local probe title pstate2 ncommits changed
+      local probe title pstate2 ncommits changed head round from
+      round=$(st "$d" PQ_REVIEW_ROUND); from=$(st "$d" PQ_REVIEW_FROM)
       if ! probe=$(review_probe "$repo" "$pr"); then
         st_set "$d" PQ_REVIEW_TRIES "$((tries + 1))"
         reviewer_try_failed "$d" review failed "could not read #$pr with gh"
         return 0
       fi
-      IFS=$'\t' read -r title pstate2 _ ncommits changed <<<"$probe"
+      IFS=$'\t' read -r title pstate2 _ ncommits changed head <<<"$probe"
       if grep -qiE "$PQ_STUCK_RE" <<<"$title"; then
         st_set "$d" PQ_REVIEW skipped; st_set "$d" PQ_REVIEW_WHY stuck
         report_skip "$d" stuck
@@ -5887,15 +6024,24 @@ review_step() {                         # task_dir dry pr pstate
           msg "$slug: review skipped - #$pr has settled"
           return 0 ;;
       esac
-      if [ "${ncommits:-0}" = 1 ] && [ "${changed:-0}" -gt "$PQ_REVIEW_SPLIT_LINES" ]; then
+      # The second review asks for no restructuring: the commits are the
+      # answers to the first, and the history was settled there.
+      if [ "$round" != 2 ] && [ "${ncommits:-0}" = 1 ] && [ "${changed:-0}" -gt "$PQ_REVIEW_SPLIT_LINES" ]; then
         st_set "$d" PQ_REVIEW_SPLIT 1; st_set "$d" PQ_REVIEW_LINES "$changed"
       fi
       local cwd; cwd=$(st "$d" PQ_WORKTREE)
       [ -n "$cwd" ] && [ -d "$cwd" ] || cwd=$repo
       st_set "$d" PQ_REVIEW_TRIES "$((tries + 1))"
       st_set "$d" PQ_REVIEW_COMMENTS "$(review_comments "$repo" "$pr")"
-      reviewer_launch "$d" review "$cwd" review_cmd "$pr" "$(task_home "$d")"
-      msg "$slug: reviewing #$pr with $PQ_REVIEWER_MODEL in the background"
+      # The head the first review read, which the second review starts from.
+      [ "$round" = 2 ] || st_set "$d" PQ_REVIEW_HEAD "$head"
+      if [ "$round" = 2 ]; then
+        reviewer_launch "$d" review "$cwd" review_cmd "$pr" "$(task_home "$d")" "$from"
+        msg "$slug: reviewing the fixes to #$pr since ${from:0:9} with $PQ_REVIEWER_MODEL in the background"
+      else
+        reviewer_launch "$d" review "$cwd" review_cmd "$pr" "$(task_home "$d")"
+        msg "$slug: reviewing #$pr with $PQ_REVIEWER_MODEL in the background"
+      fi
       ;;
     running)
       local pid; pid=$(st "$d" PQ_REVIEW_PID)
@@ -5919,6 +6065,17 @@ review_step() {                         # task_dir dry pr pstate
             msg "$slug: review of #$pr posted${landed:+ - $landed inline comment$([ "$landed" = 1 ] || printf s)}$(fmt_cost "$(jq -r '.total_cost_usd // empty' "$d/review.json" 2>/dev/null)" \
                                                         "$(jq -r '.duration_ms // empty' "$d/review.json" 2>/dev/null)")$(reports_hold "$d")" ;;
           empty)
+            # A second review that posts nothing has found the fixes sound,
+            # which is the common outcome, not a failure: it read a small diff
+            # it was told to leave alone if it was right. The limit, an error
+            # and a vanished process are all caught before this.
+            if [ "$(st "$d" PQ_REVIEW_ROUND)" = 2 ]; then
+              [ "$dry" = 1 ] && { msg "would record $slug's second review as clean"; return 0; }
+              st_set "$d" PQ_REVIEW posted; st_set "$d" PQ_REVIEW_RESULT ok; st_set "$d" PQ_REVIEW_POSTED 0
+              msg "$slug: the second review of #$pr found nothing in the fixes$(fmt_cost "$(jq -r '.total_cost_usd // empty' "$d/review.json" 2>/dev/null)" \
+                                                        "$(jq -r '.duration_ms // empty' "$d/review.json" 2>/dev/null)")"
+              return 0
+            fi
             [ "$dry" = 1 ] && { msg "would count $slug's review as a failed try - it posted nothing"; return 0; }
             # Its reply may still carry findings GitHub refused inline; the
             # fallback prompt points at it (review_prompt).
@@ -6059,8 +6216,10 @@ report_step() {                         # task_dir dry pr pstate stem
 review_cell() {                         # task_dir
   local d=$1 stem key
   case "$(st "$d" PQ_REVIEW)" in
-    pending)  printf 'review due' ;;
-    running)  printf 'reviewing %s' "$(age_since "$(st "$d" PQ_REVIEW_AT)")" ;;
+    pending)  if [ "$(st "$d" PQ_REVIEW_ROUND)" = 2 ]; then printf 'fixes review due'; else printf 'review due'; fi ;;
+    running)
+      if [ "$(st "$d" PQ_REVIEW_ROUND)" = 2 ]; then printf 'reviewing fixes %s' "$(age_since "$(st "$d" PQ_REVIEW_AT)")"
+      else printf 'reviewing %s' "$(age_since "$(st "$d" PQ_REVIEW_AT)")"; fi ;;
     posted)
       for stem in $PQ_REPORT_STEMS; do
         key=$(reviewer_key "$stem")

@@ -813,5 +813,124 @@ has "$OUT" "would probe #42 and launch a review of dry" "the would-line"
 eq "$(st "$Y" PQ_REVIEW)" "pending" "nothing changed"
 eq "$(claude_calls)" "0" "nothing launched"
 
+echo "== the second review: answers that add app code are reviewed before the pull request is ready ==" >&2
+# A worktree with history: the head the first review read, then the answers.
+FIXWT=$(mktemp -d)
+git -C "$FIXWT" init -q -b tom/fixed
+gcommit() { git -C "$FIXWT" -c user.email=t@t -c user.name=t commit -q --allow-empty -m "$1"; }
+mkdir -p "$FIXWT/app" "$FIXWT/spec"
+printf 'a\n' > "$FIXWT/app/a.rb"; git -C "$FIXWT" add -A; gcommit reviewed
+REVIEWED=$(git -C "$FIXWT" rev-parse HEAD)
+agent_rec() { mkdir -p "$PQ_HOME/tasks"; task_link "$1"; printf '{"event":"%s","at":%s}' "$2" "$3" > "$(task_home "$1")/agent.json"; }
+pr_head() {                             # title state draft commits additions deletions head
+  jq -nc --arg t "$1" --arg s "$2" --argjson d "$3" --argjson c "$4" --argjson a "$5" --argjson r "$6" --arg h "$7" \
+    '{title:$t, state:$s, isDraft:$d, commits:[range($c)|{oid:"x"}], additions:$a, deletions:$r, headRefOid:$h}' > "$PRJSON"
+}
+reset_tasks; reset_caches; reset_logs; mode ok
+pr_head "Do the thing" OPEN true 3 100 20 "$REVIEWED"
+G=$(mk_gated 200 fixed wF:p1)
+st_set "$G" PQ_WORKTREE "$FIXWT"
+agent_rec "$G" idle $(( FAKE_NOW - 60 ))
+set_panes "$(printf 'wF:p1\tclaude\tidle')"
+review_task "$G" 0 >/dev/null 2>&1
+eq "$(st "$G" PQ_REVIEW_HEAD)" "$REVIEWED" "the head the first review read is recorded"
+wait_rc "$G"; review_task "$G" 0 >/dev/null 2>&1; review_task "$G" 0 >"$PQ_HOME/.out" 2>&1
+eq "$(st "$G" PQ_REVIEW)" "prompted" "the follow-up goes"
+eq "$(st "$G" PQ_REVIEW_STAGED)" "1" "holding the pull request for a look over the fixes"
+has "$(cat "$PQ_HOME/.out")" "its fixes are looked over before it is marked ready" "said"
+P=$(prompt_text)
+has "$P" "Leave no comment unanswered." "it still asks for every finding to be answered"
+has "$P" "stop there and leave the pull request a draft: do not edit its description and do not mark it ready yet" "and then to stop"
+hasnt "$P" "gh pr ready" "not to mark it ready"
+hasnt "$P" "one last pass" "nor to do the description pass yet"
+eq "$(review_cell "$G")" "resolving" "resolving, in pq ls"
+# Still working: nothing moves.
+FAKE_NOW=$(( FAKE_NOW + 120 ))
+review_task "$G" 0 >/dev/null 2>&1
+eq "$(st "$G" PQ_REVIEW_STAGED)" "1" "an agent whose last stop predates the follow-up has not answered yet"
+# The answers: an app fix and a spec.
+printf 'a\nb\nc\n' > "$FIXWT/app/a.rb"; printf 'x\ny\n' > "$FIXWT/spec/a_spec.rb"; git -C "$FIXWT" add -A; gcommit fixes
+eq "$(fix_lines "$G" "$REVIEWED")" "2" "the answers add two app lines; the spec does not count"
+agent_rec "$G" idle "$FAKE_NOW"
+review_task "$G" 0 >"$PQ_HOME/.out" 2>&1
+eq "$(st "$G" PQ_REVIEW)" "pending" "answered: the gate goes round again"
+eq "$(st "$G" PQ_REVIEW_ROUND)" "2" "for a second review"
+eq "$(st "$G" PQ_REVIEW_FROM)" "$REVIEWED" "from the head the first one read"
+has "$(cat "$PQ_HOME/.out")" "the answers to the review of #42 added 2 app lines - a second review reads them next" "said"
+eq "$(review_cell "$G")" "fixes review due" "and pq ls says so"
+review_inflight "$G" && ok || bad "the slot stays held through it"
+pr_head "Do the thing" OPEN true 4 130 20 "$(git -C "$FIXWT" rev-parse HEAD)"
+: > "$CLAUDE_LOG"
+review_task "$G" 0 >"$PQ_HOME/.out" 2>&1
+has "$(cat "$PQ_HOME/.out")" "reviewing the fixes to #42 since ${REVIEWED:0:9}" "the second review goes out"
+eq "$(st "$G" PQ_REVIEW_HEAD)" "$REVIEWED" "and the first review's head stays put"
+has "$(review_cell "$G")" "reviewing fixes" "pq ls says what it is reviewing"
+wait_rc "$G"
+line=$(head -1 "$CLAUDE_LOG")
+has "$line" "This is a second review. Pull request #42 already had an independent review at commit $REVIEWED" "briefed as a second review"
+has "$line" "git diff $REVIEWED HEAD" "scoped to the answers"
+has "$line" "/code-review low --comment 42 --max-findings all" "the same skill and command"
+review_task "$G" 0 >/dev/null 2>&1
+eq "$(st "$G" PQ_REVIEW)" "posted" "the second review posted"
+review_task "$G" 0 >"$PQ_HOME/.out" 2>&1
+eq "$(st "$G" PQ_REVIEW)" "prompted" "its follow-up goes"
+eq "$(st "$G" PQ_REVIEW_STAGED)" "" "and this one is the last"
+P=$(prompt_text)
+has "$P" "pq has reviewed the fixes you made to pull request #42 since its first review (git diff $REVIEWED HEAD) and posted 2 more inline review comments on them." "naming what it read and what it found"
+has "$P" "one last pass" "then the description pass"
+has "$P" "gh pr ready 42" "and marking it ready"
+hasnt "$P" "'" "quote-free"
+reset_caches; cache_row "$REPO" tom/fixed 42 OPEN "" master
+review_task "$G" 0 >/dev/null 2>&1
+eq "$(st "$G" PQ_REVIEW)" "ready" "and the gate closes on ready"
+
+echo "== the second review that posts nothing is clean ==" >&2
+reset_tasks; reset_caches; reset_logs; mode empty
+G=$(mk_gated 201 clean wF:p1)
+st_set "$G" PQ_WORKTREE "$FIXWT"
+st_set "$G" PQ_REVIEW pending; st_set "$G" PQ_REVIEW_ROUND 2; st_set "$G" PQ_REVIEW_FROM "$REVIEWED"
+set_panes "$(printf 'wF:p1\tclaude\tidle')"
+review_task "$G" 0 >/dev/null 2>&1
+wait_rc "$G"; review_task "$G" 0 >"$PQ_HOME/.out" 2>&1
+eq "$(st "$G" PQ_REVIEW)" "posted" "nothing posted is not a failed try"
+eq "$(st "$G" PQ_REVIEW_RESULT)" "ok" "it is clean"
+eq "$(st "$G" PQ_REVIEW_TRIES)" "1" "and is not retried"
+has "$(cat "$PQ_HOME/.out")" "the second review of #42 found nothing in the fixes" "said"
+review_task "$G" 0 >/dev/null 2>&1
+has "$(prompt_text)" "since its first review (git diff $REVIEWED HEAD) and found nothing more to raise." "the follow-up says so, and finishes"
+has "$(prompt_text)" "gh pr ready 42" "with marking it ready"
+
+echo "== answers that add no app code: the finishing prompt, no second review ==" >&2
+reset_tasks; reset_caches; reset_logs; mode ok
+HEADNOW=$(git -C "$FIXWT" rev-parse HEAD)
+pr_head "Do the thing" OPEN true 3 100 20 "$HEADNOW"
+G=$(mk_gated 202 testsonly wF:p1)
+st_set "$G" PQ_WORKTREE "$FIXWT"
+agent_rec "$G" idle $(( FAKE_NOW - 60 ))
+set_panes "$(printf 'wF:p1\tclaude\tidle')"
+review_task "$G" 0 >/dev/null 2>&1; wait_rc "$G"; review_task "$G" 0 >/dev/null 2>&1; review_task "$G" 0 >/dev/null 2>&1
+eq "$(st "$G" PQ_REVIEW_STAGED)" "1" "held for a look"
+printf 'z\n' >> "$FIXWT/spec/a_spec.rb"; git -C "$FIXWT" add -A; gcommit "spec only"
+FAKE_NOW=$(( FAKE_NOW + 60 )); agent_rec "$G" idle "$FAKE_NOW"
+: > "$CLAUDE_LOG"
+review_task "$G" 0 >"$PQ_HOME/.out" 2>&1
+eq "$(st "$G" PQ_REVIEW)" "prompted" "straight to the finish"
+eq "$(st "$G" PQ_REVIEW_ROUND)" "" "with no second review"
+eq "$(claude_calls)" "0" "and no reviewer launched"
+has "$(cat "$PQ_HOME/.out")" "asked to finish #42 and mark it ready - its answers added no app code" "said"
+has "$(prompt_text)" "they add no app code for a second review to read" "the finishing prompt says why"
+has "$(prompt_text)" "gh pr ready 42" "and asks for ready"
+
+echo "== a task with no agent record, or no reviewed head, gets the one follow-up it always got ==" >&2
+reset_tasks; reset_caches; reset_logs; mode ok
+pr_head "Do the thing" OPEN true 3 100 20 "$REVIEWED"
+G=$(mk_gated 203 nohooks wF:p1)
+set_panes "$(printf 'wF:p1\tclaude\tidle')"
+review_task "$G" 0 >/dev/null 2>&1; wait_rc "$G"; review_task "$G" 0 >/dev/null 2>&1; review_task "$G" 0 >/dev/null 2>&1
+eq "$(st "$G" PQ_REVIEW_STAGED)" "" "no hooks: nothing to say when it has stopped, so no hold"
+has "$(prompt_text)" "gh pr ready 42" "and the follow-up asks for ready, as before"
+pr_json "Do the thing" OPEN true 3 100 20
+rm -rf "$FIXWT"
+
 printf '\n%d passed, %d failed\n' "$pass" "$fail" >&2
 [ "$fail" -eq 0 ]

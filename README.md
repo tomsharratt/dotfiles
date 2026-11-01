@@ -597,6 +597,28 @@ A security reviewer's limit line is never posted on the pull request as its repo
 A gate that nobody is going to close is `lapsed`: the agent has exited, or has sat idle past the wrap-up grace with the draft still open.
 That is warned about once, counts into "needs you", and reads `review lapsed` in `pq ls` - the comments are there, and resolving them is yours.
 
+#### The second review
+
+Answering a review is new code, and until this nobody read it.
+On #7344 the answers added a resumable job that re-queues itself and a re-render loop in the feed precompute; on #7329 they reworked the refund locking; both were marked ready on their author's word.
+So the gate can go round once more, for the answers alone.
+
+When the first review landed and the agent has hooks to say when it stops, the follow-up asks it to answer every finding and push, and then to stop with the pull request still a draft - no description pass and no `gh pr ready` yet.
+`pq` records the head the first review read, from the same probe that checks for `STUCK:`.
+Once the agent's own Stop record is newer than the follow-up (never the pane's snapshot, which still reads idle the moment after a prompt), `pq` measures the app lines the answers added, by the review tier's rule, in `git diff <reviewed head> HEAD` in the worktree - two trees, so a branch restructured or rebased since still diffs.
+Any app lines at all, and a second `/code-review` runs, told it is a second review, that the first review's threads are settled, and to report only on lines the answers changed, where a change is wrong.
+Its follow-up names what it read, asks for its comments to be answered the same way, and ends with the description pass and `gh pr ready`.
+None, and a finishing prompt asks for that description pass and `gh pr ready` alone.
+Across thirteen recent pull requests the answers added 0 to 142 app lines, with no size below which a second look was not worth having, so there is no threshold.
+
+It was tried on #7344 before it shipped, with the same command but without `--comment`.
+Eight of its ten findings sat on lines the answers had changed, the other two in files they had touched, and the first was an access leak the answers had opened: the new job switched gating on before the gated feed was uploaded, so a season buyer recomputed in that window could see every episode.
+
+It runs once, and only the code review: the security and design reports are not run again.
+A second review that posts nothing has found the answers sound, which is its usual outcome, so it is clean rather than a failed try; one that cannot run asks the implementer to read its own answers as a stranger would.
+`pq ls` reads `fixes review due` and `reviewing fixes 4m` while it runs, and the slot stays held, as it does for the first.
+A task without a recorded head or an agent record - one dispatched before this - gets the one follow-up it always got.
+
 #### The security review
 
 Some plans ask for a security review as well - "run `/security-review` as well as `/code-review`", with what it should look at - and those get one, run by `pq` the same way.
