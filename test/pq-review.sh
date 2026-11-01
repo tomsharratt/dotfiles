@@ -327,6 +327,7 @@ has "$line" "	--disallowedTools	Edit(/$HOME/**)	Bash(gh pr ready:*)	Bash(gh pr m
 has "$line" "	Bash(git checkout:*)	Bash(git switch:*)	Bash(git restore:*)	Bash(git reset:*)	Bash(git stash:*)	Bash(git clean:*)	Bash(git commit:*)	Bash(git push:*)	--append-system-prompt	" \
   "and none of the git verbs that discard the implementer's work or write over its branch"
 has "$line" "	--append-system-prompt	You are reviewing pull request #42 " "briefed on this pull request"
+has "$line" "Run any sub-agent you start in the foreground and wait for its result" "told never to leave a sub-agent running behind it"
 has "$line" "through \`wt test <cmd>\`" "and told to run specs through wt test, not on the shared database"
 # One line, or this stub's log - one call per line - would split it; quote-free
 # by the convention dispatch_prompt keeps.

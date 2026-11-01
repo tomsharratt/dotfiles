@@ -4984,8 +4984,9 @@ stack_task() {                          # task_dir dry
 #             on the same readiness as the code reviewer, so both go out on the
 #             same tick; retried on the same backoff
 #   running   a background process group, collected from security.rc
-#   done      finished. PQ_SECURITY_RESULT is `ok`, or `failed` / `timeout`, for
-#             which the follow-up asks for a security self-review instead, and
+#   done      finished. PQ_SECURITY_RESULT is `ok`, or `failed` / `timeout` /
+#             `limit` / `incomplete`, for which the follow-up asks for a
+#             security self-review instead, and
 #             PQ_SECURITY_POSTED says whether the report reached the PR
 #   skipped   stopped with the gate - the PR was STUCK or settled
 #
@@ -5123,6 +5124,29 @@ review_cmd() {                          # pr task_home
     --output-format json "/code-review $PQ_REVIEW_EFFORT --comment $1"
 }
 
+# What every reviewer is told about sub-agents. A headless session ends the
+# moment it replies, and whatever it left running in the background goes with
+# it. Two security reviews did exactly that: each started reviewers of its own
+# in the background, replied "I'll verify their findings once they report back"
+# and exited 0 - $8.67 on one, $4.67 on the other - and that one line was posted
+# as the report on two access-control pull requests, one of which then merged.
+# The code reviewer is told the same, since its comment count only catches the
+# failure after a whole try has been paid for. Quote-free, like the briefs.
+reviewer_wait() {
+  printf '%s' "Run any sub-agent you start in the foreground and wait for its result: this session ends the moment you reply, and anything still running in the background is lost with it. Never end your turn while a sub-agent is running or before your review is complete."
+}
+
+# A reviewer whose whole output is its reply has written one only if the reply
+# reads as one: at least PQ_REPORT_MIN_LINES non-blank lines. Both of the
+# replies above were a single line, and the shortest real report so far, of 76,
+# was fourteen - a review that finds nothing still says what it checked. A
+# length and not a phrase, because a phrase test misfires on the words a real
+# report uses about its own sub-tasks.
+PQ_REPORT_MIN_LINES=5
+report_whole() {                        # text -> 0 when it reads as a whole report
+  [ "$(grep -c '[^[:space:]]' <<<"${1:-}")" -ge "$PQ_REPORT_MIN_LINES" ]
+}
+
 # What the reviewer is told beside the skill: what it may touch, where its
 # scratch goes, and how to run anything in the worktree. One line, and
 # quote-free by the same convention as dispatch_prompt. The `wt` clause is there
@@ -5131,7 +5155,7 @@ review_cmd() {                          # pr task_home
 # which is where the cross-branch deadlocks in the README came from, while
 # `wt run` and `wt test` find this worktree's own from the directory they run in.
 review_brief() {                        # pr
-  printf '%s' "You are reviewing pull request #$1 from inside the worktree of the agent that wrote it, which is still working there. Your only output is the review you post on the pull request. Change nothing else: no file edits, no commits, no checkouts, no pushes, and do not mark the pull request ready, merge it or close it - its author does that once it has answered your review. Write the review payload, and any other scratch file, as a new file inside a directory made with \`mktemp -d\`, never inside the worktree. This worktree has its own databases, ports and environment: run project commands through \`wt run <cmd>\`, and anything that runs in the test environment, such as specs, through \`wt test <cmd>\` - only the specs a finding needs. A bare \`bundle exec\` or \`bin/rails\` uses the shared databases of the whole machine instead."
+  printf '%s' "You are reviewing pull request #$1 from inside the worktree of the agent that wrote it, which is still working there. Your only output is the review you post on the pull request. $(reviewer_wait) Change nothing else: no file edits, no commits, no checkouts, no pushes, and do not mark the pull request ready, merge it or close it - its author does that once it has answered your review. Write the review payload, and any other scratch file, as a new file inside a directory made with \`mktemp -d\`, never inside the worktree. This worktree has its own databases, ports and environment: run project commands through \`wt run <cmd>\`, and anything that runs in the test environment, such as specs, through \`wt test <cmd>\` - only the specs a finding needs. A bare \`bundle exec\` or \`bin/rails\` uses the shared databases of the whole machine instead."
 }
 
 # The security reviewer, one swappable function like review_cmd and read-only
@@ -5173,7 +5197,7 @@ security_cmd() {                        # pr task_home base
 security_brief() {                      # pr task_home base
   local basec=""
   [ -n "${3:-}" ] && basec=" The pull request is against $3, so the change under review is exactly \`git diff origin/$3...HEAD\`: where the diff shown to you differs from that, review what that command shows and nothing else."
-  printf '%s' "You are running a security review of pull request #$1 from inside the worktree of the agent that wrote it, which is still working there.$basec The plan the change was built from is $2/plan.md, and it says why it asked for this review and what to focus on. Your only output is your final reply, the markdown report: pq posts it on the pull request and hands it to the author. Change nothing: no file edits, no commits, no checkouts, no pushes, and no gh. Write any scratch file as a new file inside a directory made with \`mktemp -d\`, never inside the worktree. This worktree has its own databases, ports and environment: run project commands through \`wt run <cmd>\`, and anything that runs in the test environment, such as specs, through \`wt test <cmd>\`. A bare \`bundle exec\` or \`bin/rails\` uses the shared databases of the whole machine instead."
+  printf '%s' "You are running a security review of pull request #$1 from inside the worktree of the agent that wrote it, which is still working there.$basec The plan the change was built from is $2/plan.md, and it says why it asked for this review and what to focus on. Your only output is your final reply, the markdown report: pq posts it on the pull request and hands it to the author, so your final reply is the whole report and nothing else. $(reviewer_wait) Change nothing: no file edits, no commits, no checkouts, no pushes, and no gh. Write any scratch file as a new file inside a directory made with \`mktemp -d\`, never inside the worktree. This worktree has its own databases, ports and environment: run project commands through \`wt run <cmd>\`, and anything that runs in the test environment, such as specs, through \`wt test <cmd>\`. A bare \`bundle exec\` or \`bin/rails\` uses the shared databases of the whole machine instead."
 }
 
 # The branch a task's pull request is aimed at right now, from the PR cache - for
@@ -5374,9 +5398,10 @@ reviewer_try_failed() {                 # task_dir stem result why
 }
 
 # What a finished security reviewer amounts to: `ok` when it exited cleanly with
-# a report, `failed` otherwise. It never posts, so unlike review_collect there
-# is no `denied` - a denial is only ever warned about.
-security_collect() {                    # task_dir -> ok | failed
+# a whole report (report_whole), `incomplete` when it exited cleanly with a
+# reply too short to be one, `failed` otherwise. It never posts, so unlike
+# review_collect there is no `denied` - a denial is only ever warned about.
+security_collect() {                    # task_dir -> ok | incomplete | failed
   local d=$1 rc is_error report denied
   rc=$(cat "$d/security.rc" 2>/dev/null)
   is_error=$(jq -r 'if type == "object" then ((.is_error // false) | tostring) else "malformed" end' \
@@ -5384,6 +5409,7 @@ security_collect() {                    # task_dir -> ok | failed
   report=$(jq -r 'if type == "object" then (.result // "" | tostring) else "" end' "$d/security.json" 2>/dev/null)
   denied=$(jq -r '[.permission_denials[]?] | length' "$d/security.json" 2>/dev/null) || denied=0
   if [ "$rc" = 0 ] && [ "$is_error" = false ] && [ -n "$(tr -d '[:space:]' <<<"$report")" ]; then
+    report_whole "$report" || { printf 'incomplete'; return; }
     [ "${denied:-0}" = 0 ] || warn "$(slug_of "$d"): the security reviewer reached for things it was denied ($denied denials) - see $d/security.json"
     printf 'ok'; return
   fi
@@ -5490,6 +5516,7 @@ review_prompt() {                       # pr result split lines base [security_r
       case "$sec" in
         timeout) swhy="the security reviewer ran out of time" ;;
         limit)   swhy="the security reviewer hit the usage limit" ;;
+        incomplete) swhy="the security reviewer stopped before it had written its report" ;;
         *)       swhy="the security reviewer exited with an error" ;;
       esac
       secc="The security review the plan asked for did not happen - $swhy. \
@@ -5838,6 +5865,12 @@ security_step() {                       # task_dir dry pr pstate
               st_set "$d" PQ_SECURITY_POSTED ""
               warn "$slug: security review of #$pr finished$cost, but could not be posted on it - the implementer will be asked to"
             fi ;;
+          incomplete)
+            [ "$dry" = 1 ] && { msg "would count $slug's security review as a failed try - it replied before its report was written"; return 0; }
+            # Kept, so what it did say can be read; the next launch clears it.
+            jq -j '.result' "$d/security.json" > "$d/security.md" 2>/dev/null
+            reviewer_try_failed "$d" security incomplete \
+              "the security reviewer replied before its report was written ('$(sed -n '/[^[:space:]]/{p;q;}' "$d/security.md" | cut -c1-120)') - see $d/security.md" ;;
           *)
             [ "$dry" = 1 ] && { msg "would count $slug's failed security review as a try"; return 0; }
             local rc why; rc=$(cat "$d/security.rc" 2>/dev/null)

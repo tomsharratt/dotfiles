@@ -612,6 +612,13 @@ The two reviews meet at one point: the follow-up waits until both have finished,
 The tick says so as well when the code review lands first - `review of #7116 posted - 9 inline comments ($0.99, 3m38s) - the follow-up waits for the security review, running 4m` - since `posted` alone read as the implementer being told next, while the agent sat idle for eight more minutes behind a security review nothing mentioned.
 A security review that fails is retried and then given up on exactly like the code review, and the follow-up then asks the implementer to check its own diff for the risks the plan names.
 A report that could not be posted is not a failed review: the follow-up asks the implementer to post it from `security.md`.
+
+A clean exit with a reply is not taken as a report, either.
+Two security reviewers started reviewers of their own in the background, replied "I'll verify their findings once they report back", and exited 0, since a headless session ends the moment it replies - $8.67 on one, $4.67 on the other.
+That one line was posted as the report on two access-control pull requests, and one of them merged.
+So a reply under five non-blank lines is `incomplete`, a failed try like any other: it is kept in `security.md` to read, never posted, and retried; the shortest real report, of 76, was fourteen lines.
+It is a length and not a phrase, because a real report talks about its own sub-tasks too.
+Every reviewer's brief now also says to run any sub-agent in the foreground and wait for it, and never to end its turn before its review is complete.
 The security reviewer never probes the pull request itself - it launches only once the code reviewer's probe has passed - so a `STUCK:` title or a settled pull request stops both, and one that settles mid-review has both killed.
 The one exception is an agent that has gone: a security review already under way is let finish, so its report still reaches the pull request, and then the gate lapses as it would have.
 

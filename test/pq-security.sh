@@ -41,7 +41,7 @@ printf '{"result":{"snapshot":{"panes":[]}}}' > "$PANES_JSON"
 : > "$HERDR_LOG"; : > "$CLAUDE_LOG"; : > "$CLAUDE_ENV"; : > "$GH_LOG"
 printf 'ok' > "$MODE"; printf 'ok' > "$SMODE"; printf '0' > "$COMMENTS"
 # shellcheck disable=SC2016  # the backticks are markdown in the report, not a substitution
-printf '# Security review: PR #42\n\n# Vuln 1: SQL injection: `app/notes.rb:12`\n\n* Severity: High\n* Recommendation: bind the term.\n' > "$REPORT"
+printf '# Security review: PR #42\n\n# Vuln 1: SQL injection: `app/notes.rb:12`\n\n* Severity: High\n* Confidence: 9\n* Exploit: a search term reaches the query unbound.\n* Recommendation: bind the term.\n' > "$REPORT"
 
 cat > "$STUBBIN/claude" <<EOF
 #!/bin/sh
@@ -81,6 +81,7 @@ fi
 case "\$m" in
   ok)        jq -nc --rawfile r "$REPORT" '{is_error:false,total_cost_usd:0.9,duration_ms:90000,session_id:"security-1",permission_denials:[],result:\$r}' ;;
   empty)     printf '{"is_error":false,"result":"  "}\n' ;;
+  short)     printf '{"is_error":false,"total_cost_usd":4.67,"result":"The vulnerability-identification sub-task is still running. I will verify its findings once it reports back."}\n' ;;
   otherdeny) jq -nc --rawfile r "$REPORT" '{is_error:false,permission_denials:[{tool_name:"Bash",tool_input:{command:"gh pr view 42"}}],result:\$r}' ;;
 esac
 exit 0
@@ -352,6 +353,8 @@ has "$line" "	--append-system-prompt	You are running a security review of pull r
 has "$line" "\`git diff origin/master...HEAD\`" "told the diff it is reviewing, off the task's base"
 has "$line" "$home/plan.md" "pointed at the plan, through the stable path"
 has "$line" "no pushes, and no gh" "and told pq does the posting"
+has "$line" "your final reply is the whole report and nothing else" "told its reply is the report"
+has "$line" "Run any sub-agent you start in the foreground and wait for its result" "and never to leave a sub-agent running behind it"
 has "$line" "through \`wt test <cmd>\`" "and to run specs through wt test"
 case "$(security_brief 42 "$home" master)" in *"'"*|*$'\n'*) bad "the brief must be one line and quote-free" ;; *) ok ;; esac
 has "$line" "	--add-dir	$home	" "with the task's own directory opened to it"
@@ -511,6 +514,31 @@ eq "$(st "$G" PQ_SECURITY_RESULT)" "failed" "an empty report is not a review"
 has "$(cat "$PQ_HOME/.out")" "the security reviewer finished without a report - see $G/security.json" "and is named for what it was"
 [ -f "$G/security.md" ] && bad "no security.md for a review that produced none" || ok
 PQ_REVIEW_MAX_TRIES=2
+
+echo "== a reply too short to be a report: a failed try, never posted ==" >&2
+reset_tasks; reset_caches; reset_logs; mode ok; smode short
+G=$(mk_gated 035 shortreply w1:p1)
+set_panes "$(printf 'w1:p1\tclaude\tidle')"
+review_task "$G" 0 >/dev/null 2>&1
+wait_for test -f "$G/security.rc"
+review_task "$G" 0 >"$PQ_HOME/.out" 2>&1
+eq "$(st "$G" PQ_SECURITY)" "pending" "a one-line reply is retried, not taken as the report"
+eq "$(st "$G" PQ_SECURITY_RESULT)" "incomplete" "named for what it was"
+has "$(cat "$PQ_HOME/.out")" "the security reviewer replied before its report was written ('The vulnerability-identification sub-task is still running." "said, quoting it"
+has "$(cat "$G/security.md")" "sub-task is still running" "and kept to read"
+[ -f "$STUBBIN/.comment-body" ] && bad "a reply that is not a report is never posted" || ok
+eq "$(st "$G" PQ_SECURITY_POSTED)" "" "nor recorded as posted"
+FAKE_NOW=$(( FAKE_NOW + PQ_REVIEW_RETRY + 1 ))
+review_task "$G" 0 >/dev/null 2>&1
+eq "$(st "$G" PQ_SECURITY)" "running" "the retry goes out"
+wait_for test -f "$G/security.rc"
+review_task "$G" 0 >/dev/null 2>&1
+eq "$(st "$G" PQ_SECURITY_RESULT)" "incomplete" "short again, and that is final"
+review_task "$G" 0 >/dev/null 2>&1
+has "$(prompt_text)" "The security review the plan asked for did not happen - the security reviewer stopped before it had written its report." "the follow-up says why there is no report"
+[ -f "$STUBBIN/.comment-body" ] && bad "still nothing posted" || ok
+report_whole "$(cat "$REPORT")" && ok || bad "a real report reads as whole"
+report_whole $'one\ntwo\n\n  \nthree\nfour' && bad "four non-blank lines is not a report" || ok
 
 echo "== a denial is warned about and changes nothing ==" >&2
 reset_tasks; reset_caches; reset_logs; mode ok; smode otherdeny
