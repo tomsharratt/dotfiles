@@ -5049,8 +5049,18 @@ REVIEWER_GIT_DENY=("Bash(git checkout:*)" "Bash(git switch:*)" "Bash(git restore
 # last typed on this machine happened to be xhigh too.
 #
 # `--comment`, `--fix`, `--post` and `--no-post` are stripped from anywhere in
-# the string before the level is read, so only the level and the target are
-# order-sensitive.
+# the string before the level is read, and so is `--max-findings <n>`, so only
+# the level and the target are order-sensitive.
+#
+# `--max-findings all`, because the skill's default limit was the one that
+# bound: of 102 reviews, 40 posted exactly ten findings and almost none more,
+# while the ones at ten led with access leaks and races and ran on into
+# cleanups, so a correctness finding ranked eleventh was simply dropped. The
+# level is what sets the bar for a finding; the count should not cut it off.
+# The skill may still apply a ceiling of its own (32 in some modes). Like the level, the skill
+# remembers the choice in ~/.claude.json (codeReviewLastMaxFindings), so an
+# interactive `/code-review` with no `--max-findings` reports every finding too,
+# until `--max-findings default` is typed there.
 #
 # It asks for `high`, a step above the implementer's medium (PQ_DEFAULT_EFFORT):
 # the reviewer reads a diff it did not write, against a plan and a design it has
@@ -5121,7 +5131,7 @@ review_cmd() {                          # pr task_home
       "${REVIEWER_GIT_DENY[@]}" \
     --append-system-prompt "$(review_brief "$1")" \
     --add-dir "$2" \
-    --output-format json "/code-review $PQ_REVIEW_EFFORT --comment $1"
+    --output-format json "/code-review $PQ_REVIEW_EFFORT --comment $1 --max-findings all"
 }
 
 # What every reviewer is told about sub-agents. A headless session ends the

@@ -337,7 +337,7 @@ has "$line" "	--add-dir	$PQ_HOME/tasks/$(basename "$G")	" "with the task's own d
 # The level must come FIRST and the target last: the skill reads the first
 # non-flag token as the level and everything after it as the target, so the
 # other order loses both - see the comment above review_cmd.
-has "$line" "	/code-review low --comment 42	" "the skill, the level FIRST, --comment, then the PR as the target"
+has "$line" "	/code-review low --comment 42 --max-findings all	" "the skill, the level FIRST, --comment, then the PR as the target, and every finding"
 PID=$(st "$G" PQ_REVIEW_PID)
 [ -n "$PID" ] && review_alive "$PID" && ok || bad "the process group is recorded and alive"
 [ -f "$G/review.rc" ] && bad "no exit code yet while it runs" || ok
