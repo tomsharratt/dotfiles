@@ -13,6 +13,10 @@ Preserve normal Markdown structure, but avoid wrapping multiple sentences onto o
 Instead, prefer quality, simplicity, robustness, scalability, and long term maintainability.
 - When doing bug fixes, always start with reproducting the bug in an E2E setting as closely aligned with how an end user would experience it as possible.
 This makes sure you find the real problem so your fix will actually solve it. You can use Claude in Chrome if enabled to do this.
+- Never call user-facing work done because the specs pass.
+Walk every path the change touches in the running app, in a browser, the way a user would, and fix what you find.
+Do that walkthrough by driving the browser yourself, not by writing end-to-end tests to run once and throw away - script it only when there is no other way to exercise the path.
+Commit new end-to-end tests only for critical flows - sign-up, login, payments, access - so the suite stays lean.
 - When end-to-end testing a product, be picky about the UI you see and be obsessed with pixel perfection.
 If something clearly looks off, even if it is not directly related to what you are doing, try to get it fixed along the way.
 - Apply that same high standard to engineering execellence: lint, test failures, and test flakiness.
@@ -37,11 +41,3 @@ Every plan states, on their own lines, how much of a human its pull request need
 `skim` means read the review guide and skim the diff: logic with a small blast radius, mechanical changes.
 `visual` means the screenshots are the review: UI, copy and styling with no risky backend change.
 `pq` labels the pull request from these and raises the tier when the diff turns out riskier, so choose the lowest one that is honest.
-
-## Tom's opinions
-
-When you are working on something that would benefit from being informed by Tom's viewpoints, read ~/OPINIONS.md to understand what Tom believes.
-
-## Voice profile
-
-WHen you are talking/posting on behalf of Tom using his identity, read ~/VOICE.md to see how Tom talks.
