@@ -141,7 +141,8 @@ Human-facing output always goes to stderr, so `--json` leaves stdout clean for a
 The dev server always comes with it, and `pq` dispatches with it on.
 `pq` used to pass a `--no-dev` flag, because a batch running overnight would otherwise hold a foreman stack per task behind agents that never opened a browser - but batches no longer run overnight, most of the work is visual, and the delivery contract (see "Delivering a reviewable pull request" below) has every implementer verify each screen it touches in the browser and screenshot it.
 An agent with no running app cannot do that, so the server is part of what dispatch provides.
-`wt open`'s own autostart stays, for a server that has died by the time you come to look: it starts the server itself when nothing is serving that port, waits for it to bind, and then opens the browser.
+It is also only needed until then: once the pull request is marked ready, `pq` stops it with `wt stop` (see "Stopping the dev server at ready" below), so a queue of pull requests waiting on review does not keep a foreman stack per worktree running.
+`wt open`'s own autostart stays, for a server that has died or been stopped by the time you come to look: it starts the server itself when nothing is serving that port, waits for it to bind, and then opens the browser.
 
 It declines in every case where starting one would be wrong: outside Herdr there is no pane to start it in, a profile with no `wt_dev` has no server, and a profile that allocates no port gives nothing to probe (which is what leaves the two mobile profiles alone).
 The gate that matters most is an existing `dev` tab, because "nothing is listening" stays true for the whole time a foreman stack is binding.
@@ -615,6 +616,19 @@ It is worked out on the first tick the pull request is open, not a draft and pas
 The labels are created in a repository the first time an edit finds one missing.
 A failure to read the files or threads, or to label, is warned about once and tried again on the next tick.
 The reasons are kept in `<task>/tier.txt`, beside `state.env`, which only holds single words.
+
+#### Stopping the dev server at ready
+
+A task's dev server is there for its agent to verify and screenshot its work, and that work is finished by the time the pull request is marked ready.
+Left running, it holds a foreman stack - puma, sidekiq, the css and js watchers - for every pull request waiting on review, which is most of them at any one time.
+So once a task's review gate reaches `ready`, the next tick runs `wt stop` on its worktree, which closes the `dev` tab and keeps everything else: the worktree, its databases, its port and its redis indexes.
+
+It waits while Herdr reports the agent `working` or `blocked`, the same hold the teardown uses, since an agent still wrapping up may be in the middle of something that needs the app; it goes on the first tick the agent is quiet.
+A pull request that has already settled is left to the teardown, which removes the server with everything else.
+
+It happens once per task, recorded as `PQ_DEVSTOP` in its `state.env`, and never again.
+A server started afterwards - by you with `wt open`, or by the agent with `wt restart` because a CI failure, a conflict or your review needs the app - stays up until the teardown, so `pq` never stops a server somebody started on purpose.
+A `wt stop` that fails is warned about once and recorded as failed rather than retried, since a server left running is only what every task had before.
 
 #### Tearing a task down
 

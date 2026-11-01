@@ -6373,6 +6373,53 @@ reap_task() {                           # task_dir dry -> 0 torn down, 2 would (
   return 1
 }
 
+# ── stopping the dev server at ready ─────────────────────────────────────────
+# A task's dev server is there for its agent to verify and screenshot its work, and
+# that work is done once the pull request is marked ready. Left up, it is a foreman
+# stack - puma, sidekiq, the css and js watchers - behind every pull request waiting
+# on review, which is most of them at any one time. So a task whose review gate has
+# reached `ready` has `wt stop` run on its worktree: the dev tab closes, and the
+# worktree, its databases, its port and its redis indexes all stay.
+#
+# Once per task, and PQ_DEVSTOP is what makes it once: stamped with the time, or
+# `failed`, and never tried again either way. A server started after it - by Tom with
+# `wt open`, or by the agent with `wt restart` because CI, a conflict or a review
+# needs the app - was started on purpose, and must stay up until the teardown. A
+# failure is said once and not retried: a server left running is what every task
+# had before this existed, not worth a warning every tick.
+#
+# Held while Herdr reports the agent working or blocked, the same hold the teardown
+# makes: an agent still wrapping up after marking its pull request ready may be in
+# the middle of something that needs the app. A settled pull request, or a worktree
+# already gone, is the teardown's business, not this.
+devstop_task() {                        # task_dir dry
+  local d=$1 dry=$2 slug repo wt errf rc why
+  [ "$(st "$d" PQ_REVIEW)" = ready ] || return 0
+  [ -z "$(st "$d" PQ_DEVSTOP)" ] || return 0
+  [ -z "$(st "$d" PQ_REAPED)" ] || return 0
+  [ -z "$(st "$d" PQ_MERGED)" ] && [ -z "$(st "$d" PQ_CLOSED)" ] || return 0
+  wt=$(st "$d" PQ_WORKTREE)
+  [ -n "$wt" ] && [ -d "$wt" ] || return 0
+  repo=$(hdr "$d/plan.md" repo)
+  [ -d "$repo" ] || return 0
+  case "$(pane_state "$(task_pane "$d")")" in working|blocked) return 0 ;; esac
+  slug=$(slug_of "$d")
+  [ "$dry" = 1 ] && { msg "would stop $slug's dev server - its pull request is ready"; return 0; }
+  errf="$PQ_HOME/.wtstop.$$"
+  wt_in_errto "$errf" "$repo" stop "$wt"; rc=$?
+  if [ "$rc" = 0 ]; then
+    rm -f "$errf"
+    st_set "$d" PQ_DEVSTOP "$(now)"
+    msg "$slug: pull request ready - stopped its dev server (wt open or wt restart brings it back)"
+    return 0
+  fi
+  why=$(sed -e $'s/\033\\[[0-9;]*m//g' -e 's/^wt: //' "$errf" 2>/dev/null | sed '/^$/d' | tail -1)
+  rm -f "$errf"
+  st_set "$d" PQ_DEVSTOP failed
+  warn "$slug: could not stop its dev server${why:+ - $why} (left running; stop it with: wt stop $wt)"
+  return 0
+}
+
 # ── archive ─────────────────────────────────────────────────────────────────
 # `done/` never gets pruned on its own, so every task pq has ever finished
 # still shows in it - and, once reap_task has torn a merged task's worktree
@@ -6711,6 +6758,17 @@ tick_body() {                           # cap dry
     [ -d "$d" ] || continue
     tier_task "${d%/}" "$dry"
   done
+
+  # 1.245 Stop the dev server of a pull request marked ready - see "Stopping the dev
+  # server at ready". After the gate, so a pull request marked ready this tick has its
+  # server stopped this tick once its agent is quiet; behind reap's own herdr gate,
+  # since `wt stop` closes a herdr tab and there is nothing to close without one.
+  if reap_ok; then
+    for d in "$PQ_HOME/done"/*/; do
+      [ -d "$d" ] || continue
+      devstop_task "${d%/}" "$dry"
+    done
+  fi
 
   # 1.25 Reap - tear down what merged, once the agent has stopped and pq is not
   # itself sitting in the workspace about to be closed. Runs after reconcile, so
