@@ -302,7 +302,7 @@ cat > "$FILES" <<'JSON'
  {"filename":"spec/components/previews/onboarding/step_component_preview/empty.html.erb","status":"added","additions":5},
  {"filename":"spec/components/previews/old_preview.rb","status":"removed","additions":0}]
 JSON
-ROWS=""; row "$REPO" tom/screens-design 41 MERGED ""
+ROWS=""; row "$REPO" tom/screens-design 40 CLOSED ""; row "$REPO" tom/screens-design 41 MERGED ""
 PQ_SUMMARY=""
 tick_body 1 0 >/dev/null 2>&1
 R=$(find_task first-page 2>/dev/null)

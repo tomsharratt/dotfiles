@@ -7142,11 +7142,13 @@ tick_body() {                           # cap dry
         stack\ *) st_set "$claimed" PQ_STACK_PARENT "$(stack_branch "$claimed" "${verdict#stack }")" ;;
       esac
       # And the design it waited for, which has merged: its contract names that
-      # pull request (see contract_write), and only this pass has its row in hand.
+      # pull request (see contract_write), and only this pass has its row in hand -
+      # the merged one, should the branch have a closed pull request beside it.
       local drow dnum
       drow=$(design_dep "$claimed")
       if [ -n "$drow" ]; then
-        dnum=$(pr_get "$(cut -f2 <<<"$drow")" "$(cut -f3 <<<"$drow")" | cut -f1)
+        dnum=$(awk -F'\t' -v r="$(cut -f2 <<<"$drow")" -v b="$(cut -f3 <<<"$drow")" \
+                 '$1 == r && $2 == b && $4 == "MERGED" { print $3; exit }' "${PR_CACHE:-/dev/null}" 2>/dev/null)
         [ -n "$dnum" ] && st_set "$claimed" PQ_DESIGN_PR "$dnum"
       fi
       dispatch_try "$claimed"
