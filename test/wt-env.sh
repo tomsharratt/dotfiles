@@ -16,6 +16,8 @@
 set -uo pipefail
 
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+# shellcheck source=test/sandbox.sh
+source "$HERE/sandbox.sh"
 
 # Exported BEFORE the source below: wt computes STATE_DIR and PROFILE_DIR at source
 # time, so setting these afterwards would leave this file pointed at the real state
@@ -30,6 +32,7 @@ mkdir -p "$XDG_STATE_HOME/wt" "$XDG_CONFIG_HOME/wt/profiles"
 # git repo or a herdr socket.
 # shellcheck source=/dev/null
 source "$HERE/../.local/bin/wt"
+sandbox_guard
 # shellcheck source=/dev/null
 source "$HERE/../.config/wt/profiles/supercast.sh"
 
@@ -38,7 +41,7 @@ ok()  { pass=$((pass + 1)); }
 bad() { fail=$((fail + 1)); printf 'FAIL: %s\n' "$1" >&2; }
 eq() { [ "$1" = "$2" ] && ok || bad "$3 (got '$1', want '$2')"; }
 
-cleanup() { rm -rf "$XDG_STATE_HOME" "$XDG_CONFIG_HOME"; }
+cleanup() { sandbox_cleanup; }
 trap cleanup EXIT
 
 WT_SLUG=tom-login-code-submit-button

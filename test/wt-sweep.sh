@@ -25,6 +25,8 @@
 set -uo pipefail
 
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+# shellcheck source=test/sandbox.sh
+source "$HERE/sandbox.sh"
 
 XDG_STATE_HOME=$(mktemp -d)
 XDG_CONFIG_HOME=$(mktemp -d)
@@ -61,6 +63,7 @@ export PATH="$STUBBIN:$PATH"
 
 # shellcheck source=/dev/null
 source "$HERE/../.local/bin/wt"      # msg / warn / slugify
+sandbox_guard
 # shellcheck source=/dev/null
 source "$HERE/../.config/wt/profiles/supercast.sh"
 
@@ -69,7 +72,7 @@ ok()  { pass=$((pass + 1)); }
 bad() { fail=$((fail + 1)); printf 'FAIL: %s\n' "$1" >&2; }
 eq() { [ "$1" = "$2" ] && ok || bad "$3 (got '$1', want '$2')"; }
 
-cleanup() { rm -rf "$XDG_STATE_HOME" "$XDG_CONFIG_HOME" "$STUBBIN" "$HOME"; }
+cleanup() { sandbox_cleanup; }
 trap cleanup EXIT
 
 # The real branch whose database this was found on, and its slug.

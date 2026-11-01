@@ -18,6 +18,8 @@
 set -uo pipefail
 
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+# shellcheck source=test/sandbox.sh
+source "$HERE/sandbox.sh"
 
 PQ_HOME=$(mktemp -d)
 export PQ_HOME
@@ -113,6 +115,7 @@ export PQ_WT="$STUBBIN/wt-stub"
 
 # shellcheck source=/dev/null
 source "$HERE/../.local/bin/pq"
+sandbox_guard
 # shellcheck source=test/lib.sh
 source "$HERE/lib.sh"
 gum_stub "$STUBBIN" "$PQ_HOME/.gum"
@@ -134,7 +137,7 @@ cleanup() {
   local d
   touch "$STUBBIN/.release-code" "$STUBBIN/.release-security" 2>/dev/null
   for d in "$PQ_HOME"/done/*/; do [ -d "$d" ] && review_kill "${d%/}"; done
-  rm -rf "$PQ_HOME" "$PQ_PLANS_DIR" "$STUBBIN" "${REPO:-}" "${WT:-}"
+  sandbox_cleanup
 }
 trap cleanup EXIT
 
@@ -144,7 +147,7 @@ git -C "$REPO" -c user.email=test@test -c user.name=test commit -q --allow-empty
 mkdir -p "$REPO/.git/refs/remotes/origin"
 git -C "$REPO" update-ref refs/remotes/origin/master refs/heads/master
 git -C "$REPO" symbolic-ref refs/remotes/origin/HEAD refs/remotes/origin/master
-WT=$(mktemp -d)                         # the task's worktree, where both reviewers must run
+TASK_WT=$(mktemp -d)                         # the task's worktree, where both reviewers must run
 
 unset HERDR_ENV HERDR_SOCKET_PATH HERDR_WORKSPACE_ID
 PQ_DONE_KEEP=99
@@ -211,7 +214,7 @@ mk_task() {                             # state prio slug branch pane security -
     printf -- '---\n\nplan body\n'
   } > "$dir/plan.md"
   [ -n "$pane" ] && st_set "$dir" PQ_PANE "$pane"
-  st_set "$dir" PQ_WORKTREE "$WT"
+  st_set "$dir" PQ_WORKTREE "$TASK_WT"
   task_link "$dir"
   printf '%s' "$dir"
 }
@@ -334,7 +337,7 @@ eq "$(st "$G" PQ_SECURITY_TRIES)" "1" "one security try"
 wait_for calls_at_least sec_calls 1
 line=$(grep $'\t/security-review\t$' "$CLAUDE_LOG" | head -1)
 home="$PQ_HOME/tasks/$(basename "$G")"
-eq "$(cut -f1 <<<"$line")" "$WT" "it runs in the task's worktree"
+eq "$(cut -f1 <<<"$line")" "$TASK_WT" "it runs in the task's worktree"
 grep -q "pane=unset tab=unset workspace=unset" "$CLAUDE_ENV" && [ "$(grep -c "pane=w9" "$CLAUDE_ENV")" = 0 ] \
   && ok || bad "neither reviewer inherits the launching pane's identity: $(cat "$CLAUDE_ENV")"
 has "$line" "	-p	" "in print mode"

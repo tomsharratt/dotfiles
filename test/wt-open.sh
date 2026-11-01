@@ -14,6 +14,8 @@
 set -uo pipefail
 
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+# shellcheck source=test/sandbox.sh
+source "$HERE/sandbox.sh"
 WT="$HERE/../.local/bin/wt"
 
 XDG_STATE_HOME=$(mktemp -d)
@@ -21,6 +23,7 @@ XDG_CONFIG_HOME=$(mktemp -d)
 export XDG_STATE_HOME XDG_CONFIG_HOME
 PROFILE_DIR="$XDG_CONFIG_HOME/wt/profiles"
 mkdir -p "$PROFILE_DIR" "$XDG_STATE_HOME/wt"
+sandbox_guard
 
 # Stub `open` so a profile that falls back to wt_open_url (or the bare `wt open`
 # default) never actually launches a browser - it just records what it was
@@ -41,7 +44,7 @@ ok()  { pass=$((pass + 1)); }
 bad() { fail=$((fail + 1)); printf 'FAIL: %s\n' "$1" >&2; }
 eq() { [ "$1" = "$2" ] && ok || bad "$3 (got '$1', want '$2')"; }
 
-cleanup() { rm -rf "$XDG_STATE_HOME" "$XDG_CONFIG_HOME" "$STUBBIN" "${REPO:-}" "${WT1_PARENT:-}" "${REPO2:-}"; }
+cleanup() { sandbox_cleanup; }
 trap cleanup EXIT
 
 # ── one real, throwaway git repo with a linked worktree ─────────────────────

@@ -16,6 +16,8 @@
 set -uo pipefail
 
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+# shellcheck source=test/sandbox.sh
+source "$HERE/sandbox.sh"
 
 PQ_HOME=$(mktemp -d)
 export PQ_HOME
@@ -46,6 +48,7 @@ export PQ_WT="$STUBBIN/wt-stub"
 
 # shellcheck source=/dev/null
 source "$HERE/../.local/bin/pq"
+sandbox_guard
 
 # Never let a tick_body case pay for a real `gh` round trip - each one primes
 # PR_CACHE itself. Same neutering as test/pq-reap.sh.
@@ -56,7 +59,7 @@ ok()  { pass=$((pass + 1)); }
 bad() { fail=$((fail + 1)); printf 'FAIL: %s\n' "$1" >&2; }
 eq() { [ "$1" = "$2" ] && ok || bad "$3 (got '$1', want '$2')"; }
 
-cleanup() { rm -rf "$PQ_HOME" "$STUBBIN" "${REPO:-}"; }
+cleanup() { sandbox_cleanup; }
 trap cleanup EXIT
 
 # A real throwaway repo: hdr's repo field is checked for existence on the

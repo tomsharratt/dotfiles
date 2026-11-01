@@ -11,6 +11,16 @@
 #       in for, then the tick's naming of what it added, for the tests that only
 #       need a task queued
 
+# Every file that uses these sources test/sandbox.sh before pq, and this is
+# where the paths pq resolved are checked again: lib.sh is sourced after pq, so
+# a file run on its own that forgot the sandbox stops here, before add_new ever
+# writes a plan.
+if ! declare -F sandbox_guard >/dev/null; then
+  echo "test/lib.sh: source test/sandbox.sh first - refusing to run against real user state" >&2
+  exit 1
+fi
+sandbox_guard -q
+
 # A `gum` in $1 answering from a queue kept in $2. The Nth call it receives
 # prints answer N (a.N, or stdin lines for "@N" or "@N,M") and exits with a.N.rc, or 0; with none queued it exits
 # 130, as gum does on Ctrl-C. Every call's argv is appended to $2/calls, one

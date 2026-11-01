@@ -12,6 +12,8 @@
 set -uo pipefail
 
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+# shellcheck source=test/sandbox.sh
+source "$HERE/sandbox.sh"
 
 PQ_HOME=$(mktemp -d)
 export PQ_HOME
@@ -31,6 +33,7 @@ export PATH="$STUBBIN:$PATH"
 
 # shellcheck source=/dev/null
 source "$HERE/../.local/bin/pq"
+sandbox_guard
 # shellcheck source=test/lib.sh
 source "$HERE/lib.sh"
 
@@ -41,7 +44,7 @@ eq() {                                   # got want msg
   [ "$1" = "$2" ] && ok || bad "$3 (got '$1', want '$2')"
 }
 
-cleanup() { rm -rf "$PQ_HOME" "$STUBBIN" "${REPO:-}"; }
+cleanup() { sandbox_cleanup; }
 trap cleanup EXIT
 
 # A real, throwaway git repo - branch_taken/git check-ref-format need one, even

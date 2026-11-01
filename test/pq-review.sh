@@ -15,6 +15,8 @@
 set -uo pipefail
 
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+# shellcheck source=test/sandbox.sh
+source "$HERE/sandbox.sh"
 
 PQ_HOME=$(mktemp -d)
 export PQ_HOME
@@ -85,6 +87,7 @@ export PQ_WT="$STUBBIN/wt-stub"
 
 # shellcheck source=/dev/null
 source "$HERE/../.local/bin/pq"
+sandbox_guard
 # shellcheck source=test/lib.sh
 source "$HERE/lib.sh"
 gum_stub "$STUBBIN" "$PQ_HOME/.gum"
@@ -108,7 +111,7 @@ hasnt() { case "$1" in *"$2"*) bad "$3 (got '$1')" ;; *) ok ;; esac; }
 cleanup() {
   local d
   for d in "$PQ_HOME"/done/*/; do [ -d "$d" ] && review_kill "${d%/}"; done
-  rm -rf "$PQ_HOME" "$STUBBIN" "${REPO:-}" "${WT:-}"
+  sandbox_cleanup
 }
 trap cleanup EXIT
 
@@ -118,7 +121,7 @@ git -C "$REPO" -c user.email=test@test -c user.name=test commit -q --allow-empty
 mkdir -p "$REPO/.git/refs/remotes/origin"
 git -C "$REPO" update-ref refs/remotes/origin/master refs/heads/master
 git -C "$REPO" symbolic-ref refs/remotes/origin/HEAD refs/remotes/origin/master
-WT=$(mktemp -d)                         # the task's worktree, where the reviewer must run
+TASK_WT=$(mktemp -d)                         # the task's worktree, where the reviewer must run
 
 unset HERDR_ENV HERDR_SOCKET_PATH HERDR_WORKSPACE_ID
 PQ_DONE_KEEP=99
@@ -176,7 +179,7 @@ mk_task() {                             # state prio slug branch pane -> task_di
     printf -- '---\n\nplan body\n'
   } > "$dir/plan.md"
   [ -n "$pane" ] && st_set "$dir" PQ_PANE "$pane"
-  st_set "$dir" PQ_WORKTREE "$WT"
+  st_set "$dir" PQ_WORKTREE "$TASK_WT"
   printf '%s' "$dir"
 }
 # A done task with an open draft PR #42, its review gate pending.
@@ -306,7 +309,7 @@ eq "$(st "$G" PQ_REVIEW_COMMENTS)" "3" "the comment count at launch is recorded"
 wait_calls 1
 eq "$(claude_calls)" "1" "one reviewer"
 line=$(head -1 "$CLAUDE_LOG")
-eq "$(cut -f1 <<<"$line")" "$WT" "it runs in the task's worktree"
+eq "$(cut -f1 <<<"$line")" "$TASK_WT" "it runs in the task's worktree"
 eq "$(head -1 "$CLAUDE_ENV")" "pane=unset tab=unset workspace=unset env=1 socket=/tmp/herdr-test.sock" \
   "without the launching pane's identity, but still able to reach herdr for wt"
 # The namer handed its pane a session the same way, so every

@@ -16,6 +16,8 @@
 set -uo pipefail
 
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+# shellcheck source=test/sandbox.sh
+source "$HERE/sandbox.sh"
 
 # A temp PQ_HOME, exported BEFORE sourcing - pq's own top-level
 # `for d in $STATES; do mkdir -p ...` runs at source time, so this is what
@@ -63,6 +65,7 @@ export PATH="$STUBBIN:$PATH"
 
 # shellcheck source=/dev/null
 source "$HERE/../.local/bin/pq"
+sandbox_guard
 # shellcheck source=test/lib.sh
 source "$HERE/lib.sh"
 
@@ -73,7 +76,7 @@ eq() {                                   # got want msg
   [ "$1" = "$2" ] && ok || bad "$3 (got '$1', want '$2')"
 }
 
-cleanup() { rm -rf "$PQ_HOME" "$STUBBIN" "${REPO:-}" "${REPO2:-}"; }
+cleanup() { sandbox_cleanup; }
 first_dir() { [ -d "${1:-}" ] && printf '%s' "$1"; }
 trap cleanup EXIT
 

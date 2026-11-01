@@ -24,6 +24,8 @@
 set -uo pipefail
 
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+# shellcheck source=test/sandbox.sh
+source "$HERE/sandbox.sh"
 WT="$HERE/../.local/bin/wt"
 
 pass=0 fail=0
@@ -37,7 +39,7 @@ FIX=$(mktemp -d)
 SOCK="/tmp/wt-open-dev.$$.sock"
 cleanup() {
   [ -n "${SOCKPID:-}" ] && kill "$SOCKPID" 2>/dev/null
-  rm -rf "$FIX"; rm -f "$SOCK"
+  sandbox_cleanup; rm -f "$SOCK"
 }
 trap cleanup EXIT
 
@@ -50,6 +52,7 @@ export XDG_STATE_HOME="$FIX/state" XDG_CONFIG_HOME="$FIX/config"
 STATE_DIR="$XDG_STATE_HOME/wt"
 PROFILE_DIR="$XDG_CONFIG_HOME/wt/profiles"
 mkdir -p "$HOME/.local/bin" "$STATE_DIR" "$PROFILE_DIR"
+sandbox_guard
 
 # ── a real unix socket, so in_herdr() is satisfied ──────────────────────────
 python3 -c "

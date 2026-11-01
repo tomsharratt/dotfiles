@@ -26,6 +26,8 @@
 set -uo pipefail
 
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+# shellcheck source=test/sandbox.sh
+source "$HERE/sandbox.sh"
 
 # Exported BEFORE the source below: wt computes STATE_DIR and PROFILE_DIR at source
 # time, so setting these afterwards would leave the whole file pointed at the real
@@ -52,6 +54,7 @@ chmod +x "$STUBBIN/herdr"
 
 # shellcheck source=/dev/null
 source "$HERE/../.local/bin/wt"
+sandbox_guard
 
 # Where gc looks for husks, pointed at a throwaway root for the whole file: gc_run
 # removes any directory there with no .git in it, and with the real root it
@@ -76,7 +79,7 @@ ok()  { pass=$((pass + 1)); }
 bad() { fail=$((fail + 1)); printf 'FAIL: %s\n' "$1" >&2; }
 eq() { [ "$1" = "$2" ] && ok || bad "$3 (got '$1', want '$2')"; }
 
-cleanup() { rm -rf "$XDG_STATE_HOME" "$XDG_CONFIG_HOME" "$STUBBIN" "${REPO:-}" "${WTROOT:-}" "${WORKTREE_ROOT:-}"; }
+cleanup() { sandbox_cleanup; }
 trap cleanup EXIT
 
 # ── one real, throwaway git repo with two linked worktrees ──────────────────

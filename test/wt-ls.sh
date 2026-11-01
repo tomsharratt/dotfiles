@@ -19,6 +19,8 @@
 set -uo pipefail
 
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+# shellcheck source=test/sandbox.sh
+source "$HERE/sandbox.sh"
 WT="$HERE/../.local/bin/wt"
 
 pass=0 fail=0
@@ -27,12 +29,13 @@ bad() { fail=$((fail + 1)); printf 'FAIL: %s\n' "$1" >&2; }
 eq() { [ "$1" = "$2" ] && ok || bad "$3 (got '$1', want '$2')"; }
 
 FIX=$(mktemp -d)
-trap 'rm -rf "$FIX"' EXIT
+trap sandbox_cleanup EXIT
 
 # No herdr under this HOME, so AGENT reads "?"; nothing here needs one.
 export HOME="$FIX/home" XDG_STATE_HOME="$FIX/state" XDG_CONFIG_HOME="$FIX/config"
 STATE_DIR="$XDG_STATE_HOME/wt"
 mkdir -p "$HOME" "$STATE_DIR" "$FIX/bin"
+sandbox_guard
 
 # Three worktrees with the lengths of the live ones. A fixed commit date keeps AGE
 # the same from one run to the next, so two renderings can be compared.

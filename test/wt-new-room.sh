@@ -23,6 +23,8 @@
 set -uo pipefail
 
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+# shellcheck source=test/sandbox.sh
+source "$HERE/sandbox.sh"
 WT="$HERE/../.local/bin/wt"
 
 pass=0 fail=0
@@ -37,7 +39,7 @@ FIX=$(mktemp -d)
 SOCK="/tmp/wt-new-room.$$.sock"
 cleanup() {
   [ -n "${SOCKPID:-}" ] && kill "$SOCKPID" 2>/dev/null
-  rm -rf "$FIX"; rm -f "$SOCK"
+  sandbox_cleanup; rm -f "$SOCK"
 }
 trap cleanup EXIT
 
@@ -48,6 +50,7 @@ PROFILE_DIR="$XDG_CONFIG_HOME/wt/profiles"
 WTROOT="$FIX/worktrees"
 HERDR_LOG="$FIX/herdr-calls"
 mkdir -p "$HOME/.local/bin" "$STATE_DIR" "$PROFILE_DIR" "$WTROOT"
+sandbox_guard
 : > "$HERDR_LOG"
 
 # ── a real git repo ─────────────────────────────────────────────────────────

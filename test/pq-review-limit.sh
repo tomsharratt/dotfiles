@@ -18,6 +18,8 @@
 set -uo pipefail
 
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+# shellcheck source=test/sandbox.sh
+source "$HERE/sandbox.sh"
 
 PQ_HOME=$(mktemp -d)
 export PQ_HOME
@@ -88,6 +90,7 @@ export PQ_WT="$STUBBIN/wt-stub"
 
 # shellcheck source=/dev/null
 source "$HERE/../.local/bin/pq"
+sandbox_guard
 
 pr_load_all() { :; }
 
@@ -101,7 +104,7 @@ hasnt() { case "$1" in *"$2"*) bad "$3 (got '$1')" ;; *) ok ;; esac; }
 cleanup() {
   local d
   for d in "$PQ_HOME"/done/*/; do [ -d "$d" ] && review_kill "${d%/}"; done
-  rm -rf "$PQ_HOME" "$STUBBIN" "${REPO:-}" "${WT:-}"
+  sandbox_cleanup
 }
 trap cleanup EXIT
 
@@ -111,7 +114,7 @@ git -C "$REPO" -c user.email=test@test -c user.name=test commit -q --allow-empty
 mkdir -p "$REPO/.git/refs/remotes/origin"
 git -C "$REPO" update-ref refs/remotes/origin/master refs/heads/master
 git -C "$REPO" symbolic-ref refs/remotes/origin/HEAD refs/remotes/origin/master
-WT=$(mktemp -d)
+TASK_WT=$(mktemp -d)
 
 unset HERDR_ENV HERDR_SOCKET_PATH HERDR_WORKSPACE_ID
 PQ_DONE_KEEP=99
@@ -157,7 +160,7 @@ mk_gated() {                            # prio slug pane [security] -> task_dir
     [ "${4:-}" = yes ] && printf 'security: yes\n'
     printf 'model:    sonnet\neffort:   xhigh\nintent:   test fixture\nadded:    2026-01-01T00:00:00Z\n---\n\nplan body\n'
   } > "$dir/plan.md"
-  st_set "$dir" PQ_PANE "$3"; st_set "$dir" PQ_WORKTREE "$WT"
+  st_set "$dir" PQ_PANE "$3"; st_set "$dir" PQ_WORKTREE "$TASK_WT"
   st_set "$dir" PQ_LAUNCHED "$(now)"; st_set "$dir" PQ_PR 42; st_set "$dir" PQ_FINISHED "$(now)"
   st_set "$dir" PQ_REVIEW pending
   [ "${4:-}" = yes ] && st_set "$dir" PQ_SECURITY pending

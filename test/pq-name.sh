@@ -14,6 +14,8 @@
 set -uo pipefail
 
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+# shellcheck source=test/sandbox.sh
+source "$HERE/sandbox.sh"
 
 PQ_HOME=$(mktemp -d)
 export PQ_HOME
@@ -53,6 +55,7 @@ export PQ_WT="$STUBBIN/wt-stub"
 
 # shellcheck source=/dev/null
 source "$HERE/../.local/bin/pq"
+sandbox_guard
 # shellcheck source=test/lib.sh
 source "$HERE/lib.sh"
 gum_stub "$STUBBIN" "$PQ_HOME/.gum"
@@ -65,7 +68,7 @@ eq() { if [ "$1" = "$2" ]; then ok; else bad "$3 (got '$1', want '$2')"; fi; }
 has()   { case "$1" in *"$2"*) ok ;; *) bad "$3 (got '$1')" ;; esac; }
 hasnt() { case "$1" in *"$2"*) bad "$3 (got '$1')" ;; *) ok ;; esac; }
 
-cleanup() { rm -rf "$PQ_HOME" "$STUBBIN" "${REPO:-}"; }
+cleanup() { sandbox_cleanup; }
 trap cleanup EXIT
 
 REPO=$(mktemp -d)

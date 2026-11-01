@@ -9,6 +9,8 @@
 set -uo pipefail
 
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+# shellcheck source=test/sandbox.sh
+source "$HERE/sandbox.sh"
 
 PQ_HOME=$(mktemp -d)
 export PQ_HOME
@@ -49,6 +51,7 @@ export PQ_WT="$STUBBIN/wt-stub"
 
 # shellcheck source=/dev/null
 source "$HERE/../.local/bin/pq"
+sandbox_guard
 
 # Every tick_body-level test in this file hand-primes PR_CACHE/PR_ANS itself
 # (reset_caches/cache_row below, same idiom pq-after.sh uses for the pure
@@ -62,7 +65,7 @@ ok()  { pass=$((pass + 1)); }
 bad() { fail=$((fail + 1)); printf 'FAIL: %s\n' "$1" >&2; }
 eq() { [ "$1" = "$2" ] && ok || bad "$3 (got '$1', want '$2')"; }
 
-cleanup() { rm -rf "$PQ_HOME" "$STUBBIN" "${REPO:-}" "${REPO2:-}" "${SOCKDIR:-}"; }
+cleanup() { sandbox_cleanup; }
 trap cleanup EXIT
 
 # Declared up front (not just inside the python3-gated block below) so later
