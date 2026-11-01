@@ -5074,8 +5074,9 @@ REVIEWER_GIT_DENY=("Bash(git checkout:*)" "Bash(git switch:*)" "Bash(git restore
 # the level and the target are order-sensitive.
 #
 # `--max-findings all`, because the skill's default limit was the one that
-# bound: of 102 reviews, 40 posted exactly ten findings and almost none more,
-# while the ones at ten led with access leaks and races and ran on into
+# bound: of 102 reviews, 40 posted exactly ten findings, and since reviews moved
+# to high on 2026-10-02 one has posted more; the ones at ten led with access
+# leaks and races and ran on into
 # cleanups, so a correctness finding ranked eleventh was simply dropped. The
 # level is what sets the bar for a finding; the count should not cut it off.
 # The skill may still apply a ceiling of its own (32 in some modes). Like the level, the skill
@@ -5258,6 +5259,14 @@ security_brief() {                      # pr task_home base
 # skill can post with --comment, which pq never passes, and the deny rules make
 # sure of it. Its screenshots go to <task>/visual/, beside its report.
 PQ_VISUAL_EFFORT=high
+# Its browser is a bridge and a headless Chrome of its own, which outlive the
+# session unless stopped - eleven implementers' bridges were still running a
+# week on - so pq stops it whenever the reviewer is collected or killed, rather
+# than trusting the skill to.
+visual_browser_stop() {                 # task_dir
+  command -v chrome-devtools-axi >/dev/null 2>&1 || return 0
+  CHROME_DEVTOOLS_AXI_SESSION="pq-visual-$(slug_of "$1")" chrome-devtools-axi stop >/dev/null 2>&1 </dev/null || true
+}
 visual_wanted() {                       # task_dir -> 0 when the task was built from a design
   [ -n "$(hdr "$1/plan.md" design)" ] || [ "$(task_kind "$1")" = design ] || [ -n "$(design_dep "$1")" ]
 }
@@ -5420,6 +5429,7 @@ reviewer_kill() {                       # task_dir stem
   if [ -n "$pid" ] && review_alive "$pid"; then
     kill -TERM -- "-$pid" 2>/dev/null || pkill -TERM -g "$pid" 2>/dev/null || true
   fi
+  [ "$stem" = visual ] && visual_browser_stop "$d"
   rm -f "$d/$stem".*.tmp
   return 0
 }
@@ -6155,6 +6165,7 @@ report_step() {                         # task_dir dry pr pstate stem
     running)
       if [ -f "$d/$stem.rc" ]; then
         [ "$dry" = 1 ] || cost_book "$d" "$stem"
+        [ "$dry" = 1 ] || [ "$stem" != visual ] || visual_browser_stop "$d"
         local limit
         if limit=$(reviewer_limit_text "$d" "$stem"); then
           [ "$dry" = 1 ] && { msg "would count $slug's $noun as a failed try - it hit the usage limit"; return 0; }

@@ -122,6 +122,10 @@ esac
 exit 1
 EOF
 printf '#!/bin/sh\nexit 0\n' > "$STUBBIN/wt-stub"
+# The design reviewer's browser is stopped by pq; the stub logs who asked.
+# shellcheck disable=SC2016  # the stub's own shell expands these, not this one
+printf '#!/bin/sh\nprintf "%%s %%s\\n" "$CHROME_DEVTOOLS_AXI_SESSION" "$*" >> "%s/.axi-calls"\nexit 0\n' "$STUBBIN" > "$STUBBIN/chrome-devtools-axi"
+chmod +x "$STUBBIN/chrome-devtools-axi"
 chmod +x "$STUBBIN/claude" "$STUBBIN/gh" "$STUBBIN/herdr" "$STUBBIN/wt-stub"
 export PATH="$STUBBIN:$PATH"
 export PQ_WT="$STUBBIN/wt-stub"
@@ -360,6 +364,7 @@ review_task "$G" 0 >"$PQ_HOME/.out" 2>&1
 eq "$(st "$G" PQ_VISUAL)" "done" "collected"
 eq "$(st "$G" PQ_VISUAL_RESULT)" "ok" "as ok"
 eq "$(st "$G" PQ_VISUAL_POSTED)" "1" "and posted"
+grep -qx "pq-visual-posted stop" "$STUBBIN/.axi-calls" && ok || bad "its browser session is stopped once it is collected: $(cat "$STUBBIN/.axi-calls" 2>/dev/null)"
 has "$(cat "$PQ_HOME/.out")" "design review of #42 posted (\$2.50, 5m0s)" "with its cost"
 eq "$(cut -f7 <<<"$(cost_sum "$G")")" "2.5" "in the ledger under its own kind"
 cmp -s "$G/visual.md" "$VREPORT" && ok || bad "visual.md is the report"
