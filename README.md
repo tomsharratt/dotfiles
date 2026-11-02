@@ -603,18 +603,33 @@ Answering a review is new code, and until this nobody read it.
 On #7344 the answers added a resumable job that re-queues itself and a re-render loop in the feed precompute; on #7329 they reworked the refund locking; both were marked ready on their author's word.
 So the gate can go round once more, for the answers alone.
 
-When the first review landed and the agent has hooks to say when it stops, the follow-up asks it to answer every finding and push, and then to stop with the pull request still a draft - no description pass and no `gh pr ready` yet.
+When an independent review landed (the code review, or a security or design report) and the agent has hooks to say when it stops, the follow-up asks it to answer every finding and push, and then to stop with the pull request still a draft - no description pass and no `gh pr ready` yet.
 `pq` records the head the first review read, from the same probe that checks for `STUCK:`.
 Once the agent's own Stop record is newer than the follow-up (never the pane's snapshot, which still reads idle the moment after a prompt), `pq` measures the app lines the answers added, by the review tier's rule, in `git diff <reviewed head> HEAD` in the worktree - two trees, so a branch restructured or rebased since still diffs.
-Any app lines at all, and a second `/code-review` runs, told it is a second review, that the first review's threads are settled, and to report only on lines the answers changed, where a change is wrong.
+Any app lines at all, and a second `/code-review` runs.
+It is told it is a second review, what the first round had and where each review's findings are, that those findings are settled, and to report only on lines the answers changed, where a change is wrong.
+All of that goes in the skill's target, after the pull request's number, and not in the system prompt beside it: in print mode the skill hands the whole review, its finding and its posting, to a sub-agent that sees only its own recipe and the target.
+The scope was in the system prompt at first, and never arrived.
+The trial on #7344 that shipped it read the whole pull request from its base, and on #7349, the first real second review, three of its four comments raised findings of the first review again.
 Its follow-up names what it read, asks for its comments to be answered the same way, and ends with the description pass and `gh pr ready`.
 None, and a finishing prompt asks for that description pass and `gh pr ready` alone.
 Across thirteen recent pull requests the answers added 0 to 142 app lines, with no size below which a second look was not worth having, so there is no threshold.
 
-It was tried on #7344 before it shipped, with the same command but without `--comment`.
-Eight of its ten findings sat on lines the answers had changed, the other two in files they had touched, and the first was an access leak the answers had opened: the new job switched gating on before the gated feed was uploaded, so a season buyer recomputed in that window could see every episode.
+It was tried on two merged pull requests, with `pq`'s own command but without `--comment`.
+On #7298 the security report had found that an account whose email was never proved could pay with the saved card of the person who owned that email, and the answers fixed it.
+The reviewer opened the report second, said the answer closed the hole it named, and found three other paths that still put someone else's card on a customer stamped as the buyer's, one of them the guest donation the report had named.
+All twelve of its findings sat on lines the answers changed, where the same review with its scope in the system prompt put five of fourteen there.
+On #7349 its three findings all sat on lines the answers changed, one of them the stubbed test the author went on to replace, and none raised a first-round finding again.
 
 It runs once, and only the code review: the security and design reports are not run again.
+The answers to them are in the diff it reads all the same, and it is pointed at each report in the task's directory, so every answer is held to the finding it answers.
+An answer to a security finding is also wrong if it does not close the hole the report names on every path the report says it is open, and one to a design finding if it does not change what the report measured to what the report asked for.
+
+A report that landed opens the second round even when the code reviewer could not run.
+The answers to it, and the author's own review in place of the code review, are new code all the same, and the second reviewer is told there was no independent code review.
+`pq ls` and `--json` keep saying so after the second review posts, since it read only the answers: `review failed`, and the first review's `review_result`.
+A code reviewer denied permission to post opens no second round, since a second one would be denied too, and nor does a first round in which no reviewer landed.
+
 A second review that posts nothing has found the answers sound, which is its usual outcome, so it is clean rather than a failed try; one that cannot run asks the implementer to read its own answers as a stranger would.
 `pq ls` reads `fixes review due` and `reviewing fixes 4m` while it runs, and the slot stays held, as it does for the first.
 A task without a recorded head or an agent record - one dispatched before this - gets the one follow-up it always got.

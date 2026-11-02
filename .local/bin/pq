@@ -3282,7 +3282,7 @@ cmd_ls() {
         --arg draft "$draft" --arg stamp "$(stamp_of "$d")" \
         --arg merged "$merged" --arg closed "$closed" \
         --arg reaped "$reaped" --arg held "$held" \
-        --arg review "$(st "$d" PQ_REVIEW)" --arg review_result "$(st "$d" PQ_REVIEW_RESULT)" \
+        --arg review "$(st "$d" PQ_REVIEW)" --arg review_result "$(review_result "$d")" \
         --arg security "$(st "$d" PQ_SECURITY)" --arg security_result "$(st "$d" PQ_SECURITY_RESULT)" \
         --arg visual "$(st "$d" PQ_VISUAL)" --arg visual_result "$(st "$d" PQ_VISUAL_RESULT)" \
         --arg design "$(hdr "$d/plan.md" design)" --arg artifact "$(hdr "$d/plan.md" artifact)" \
@@ -5141,19 +5141,38 @@ REVIEWER_GIT_DENY=("Bash(git checkout:*)" "Bash(git switch:*)" "Bash(git restore
 # `--append-system-prompt` carries what the skill's prompt cannot - everything
 # after the level is the target - see review_brief.
 #
+# THE TARGET IS THE ONLY THING THE REVIEW ITSELF SEES. In print mode the skill
+# hands the whole review, its finding and its posting, to a sub-agent whose
+# prompt is the skill's own recipe and the line `Review target: <target>`, and
+# nothing of this session's system prompt. So a second review's scope
+# (rereview_scope) rides in the target, after the pull request's number, which
+# the skill passes through word for word. It was in the brief at first, and
+# never arrived: on the trial behind it (#7344) and on #7298, the reviewer read
+# the whole pull request from its base and never opened the security report it
+# was pointed at, and on #7349, the first real second review, three of its four
+# comments raised findings of the first review again. With it in the target,
+# the same two came back scoped: on #7298 the reviewer read the report second
+# and put all twelve findings on lines the answers changed, and on #7349 none
+# of its three raised a first-round finding again. The number comes first so
+# the skill still takes the target for the pull request: run on #7349 with
+# --comment and gh's credentials taken away, it went to post there, and
+# printed its findings only because gh could not.
+#
 # `--add-dir` opens the task's own directory (through its stable path) to the
 # reviewer: the plan, the contract, the design files and the evidence. The first
 # real review reached for the design file to check the change against it and was
 # refused, because the task directory is outside the worktree it runs in - and a
 # reviewer that can see what the change was built to is a better reviewer.
-review_cmd() {                          # pr task_home [from]
+review_cmd() {                          # pr task_home [scope]
+  local target=$1
+  [ -n "${3:-}" ] && target="$1. $3"
   headless_claude -p --model "$PQ_REVIEWER_MODEL" --effort "$PQ_REVIEW_EFFORT" \
     --permission-mode auto --allowedTools "$PQ_REVIEW_TOOLS" \
     --disallowedTools "Edit(/$HOME/**)" "Bash(gh pr ready:*)" "Bash(gh pr merge:*)" "Bash(gh pr close:*)" \
       "${REVIEWER_GIT_DENY[@]}" \
-    --append-system-prompt "$(review_brief "$1" "${3:-}")" \
+    --append-system-prompt "$(review_brief "$1")" \
     --add-dir "$2" \
-    --output-format json "/code-review $PQ_REVIEW_EFFORT --comment $1 --max-findings all"
+    --output-format json "/code-review $PQ_REVIEW_EFFORT --comment $target --max-findings all"
 }
 
 # What every reviewer is told about sub-agents. A headless session ends the
@@ -5187,17 +5206,10 @@ report_whole() {                        # text -> 0 when it reads as a whole rep
 # which is where the cross-branch deadlocks in the README came from, while
 # `wt run` and `wt test` find this worktree's own from the directory they run in.
 #
-# A second review (see "the second review" below) is told what it is and where
-# it ends: the commits the author made to answer the first review, read as
-# `git diff <from> HEAD` - two trees, so a branch restructured since still
-# diffs cleanly - with the rest of the pull request as context only. Tried on
-# #7344 before it shipped, with the same command but without --comment: eight of
-# its ten findings sat on lines the fixes had changed, among them an access leak
-# the fixes had opened, and the other two were in files the fixes had touched.
-review_brief() {                        # pr [from]
-  local scope=""
-  [ -n "${2:-}" ] && scope=" This is a second review. Pull request #$1 already had an independent review at commit $2, and its author has answered every finding of it, with commits of its own or replies on the threads; those threads are settled, so do not raise them again. Review only what the author changed since that review, git diff $2 HEAD, and read the rest of the pull request only as context for it. Report a finding only on a line that change added or altered, and only where the change is wrong: a fix that introduced a bug, a fix that does not do what its thread asked, a race, a leak or an access gap the new code opens, or a test that does not prove what it claims. If the change is sound, post nothing and say so in your reply."
-  printf '%s' "You are reviewing pull request #$1 from inside the worktree of the agent that wrote it, which is still working there.$scope Your only output is the review you post on the pull request. $(reviewer_wait) Change nothing else: no file edits, no commits, no checkouts, no pushes, and do not mark the pull request ready, merge it or close it - its author does that once it has answered your review. Write the review payload, and any other scratch file, as a new file inside a directory made with \`mktemp -d\`, never inside the worktree. This worktree has its own databases, ports and environment: run project commands through \`wt run <cmd>\`, and anything that runs in the test environment, such as specs, through \`wt test <cmd>\` - only the specs a finding needs. A bare \`bundle exec\` or \`bin/rails\` uses the shared databases of the whole machine instead."
+# A second review is told what it is and where it ends in its target, not
+# here (see review_cmd).
+review_brief() {                        # pr
+  printf '%s' "You are reviewing pull request #$1 from inside the worktree of the agent that wrote it, which is still working there. Your only output is the review you post on the pull request. $(reviewer_wait) Change nothing else: no file edits, no commits, no checkouts, no pushes, and do not mark the pull request ready, merge it or close it - its author does that once it has answered your review. Write the review payload, and any other scratch file, as a new file inside a directory made with \`mktemp -d\`, never inside the worktree. This worktree has its own databases, ports and environment: run project commands through \`wt run <cmd>\`, and anything that runs in the test environment, such as specs, through \`wt test <cmd>\` - only the specs a finding needs. A bare \`bundle exec\` or \`bin/rails\` uses the shared databases of the whole machine instead."
 }
 
 # The security reviewer, one swappable function like review_cmd and read-only
@@ -5641,15 +5653,15 @@ rereview_prompt() {                     # pr result landed from [branch]
   case "$result" in
     ok)
       if [ "${landed:-0}" = 0 ]; then
-        text="pq has reviewed the fixes you made to pull request #$pr since its first review (git diff $from HEAD) and found nothing more to raise. "
+        text="pq has reviewed the fixes you made to pull request #$pr since its first reviews (git diff $from HEAD) and found nothing more to raise. "
       else
-        text="pq has reviewed the fixes you made to pull request #$pr since its first review (git diff $from HEAD) and posted $landed more inline review comment$([ "$landed" = 1 ] || printf s) on them. \
-Answer each new one the way you answered the first review: fix it, push, and mark its thread resolved, or reply on the thread with the reasoning for leaving it and leave the thread unresolved. \
+        text="pq has reviewed the fixes you made to pull request #$pr since its first reviews (git diff $from HEAD) and posted $landed more inline review comment$([ "$landed" = 1 ] || printf s) on them. \
+Answer each new one the way you answered the first: fix it, push, and mark its thread resolved, or reply on the thread with the reasoning for leaving it and leave the thread unresolved. \
 Leave no comment unanswered. "
       fi ;;
     *)
-      text="pq could not get a second review of the fixes you made to pull request #$pr since its first review. \
-Read them yourself as a stranger would (git diff $from HEAD), looking for a fix that introduced a bug or does not do what its thread asked; fix and push. " ;;
+      text="pq could not get a second review of the fixes you made to pull request #$pr since its first reviews. \
+Read them yourself as a stranger would (git diff $from HEAD), looking for a fix that introduced a bug or does not do what its finding asked; fix and push. " ;;
   esac
   printf '%s' "$(sync_first "$branch")${text}$(review_tail "$pr")"
 }
@@ -5657,7 +5669,7 @@ Read them yourself as a stranger would (git diff $from HEAD), looking for a fix 
 # The follow-up when the answers to the first review added no app code, so
 # there is nothing new for a second review to read.
 finish_prompt() {                       # pr [branch]
-  printf '%s' "$(sync_first "${2:-}")pq has looked over your answers to the review of pull request #$1, and they add no app code for a second review to read. $(review_tail "$1")"
+  printf '%s' "$(sync_first "${2:-}")pq has looked over your answers to the reviews of pull request #$1, and they add no app code for a second review to read. $(review_tail "$1")"
 }
 
 # What the follow-up says about one report reviewer that has run to `done`:
@@ -5880,6 +5892,7 @@ review_task() {                         # task_dir dry
         lines=$(fix_lines "$d" "$from")
         if [ "${lines:-0}" -gt 0 ] 2>/dev/null; then
           st_set "$d" PQ_REVIEW_ROUND 2; st_set "$d" PQ_REVIEW_FROM "$from"; st_set "$d" PQ_REVIEW_STAGED ""
+          st_set "$d" PQ_REVIEW_FIRST "$(st "$d" PQ_REVIEW_RESULT)"
           st_set "$d" PQ_REVIEW_TRIES 0; st_set "$d" PQ_REVIEW_RESULT ""; st_set "$d" PQ_REVIEW_POSTED ""
           st_set "$d" PQ_REVIEW_RETRY_AT ""; st_set "$d" PQ_REVIEW_SPLIT ""; st_set "$d" PQ_REVIEW_WAIT ""
           st_set "$d" PQ_REVIEW pending
@@ -5942,26 +5955,92 @@ review_deliver() {                      # task_dir text okmsg staged
 # THE SECOND REVIEW. Answering a review is new code, and until this nobody read
 # it: on #7344 the answers added a resumable job that re-queues itself and a
 # re-render-on-change loop in the feed precompute, and on #7329 they reworked
-# the refund locking, all marked ready on the author's word alone. So when the
-# first review landed, its follow-up asks for answers and a push and then a
-# stop, with the pull request left a draft (review_hold_text). Once the agent
-# has stopped - its own Stop record newer than the prompt, never the pane's
-# snapshot, which still reads idle the moment after a prompt - pq measures what
-# the answers added: app lines, by the review tier's own rule, in
-# `git diff <reviewed head> HEAD`. Any at all, and the gate goes round once more
-# with a second code review scoped to them (review_brief), whose follow-up ends
-# in the usual tail; none, and the finishing prompt asks for that tail alone.
-# Across thirteen recent pull requests the answers added 0 to 142 app lines,
-# with no size below which a second look was not worth having, so there is no
-# threshold. Once only, code review only: the security and design reports are
-# not run again, and a second review that posts nothing is clean, not failed.
+# the refund locking, all marked ready on the author's word alone. So when an
+# independent review landed - the code review, or a security or design report -
+# its follow-up asks for answers and a push and then a stop, with the pull
+# request left a draft (review_hold_text). Once the agent has stopped - its own
+# Stop record newer than the prompt, never the pane's snapshot, which still
+# reads idle the moment after a prompt - pq measures what the answers added:
+# app lines, by the review tier's own rule, in `git diff <reviewed head> HEAD`.
+# Any at all, and the gate goes round once more with a second code review
+# scoped to them (rereview_scope), whose follow-up ends in the usual tail;
+# none, and the finishing prompt asks for that tail alone. Across thirteen
+# recent pull requests the answers added 0 to 142 app lines, with no size below
+# which a second look was not worth having, so there is no threshold. Once
+# only, code review only: the security and design reports are not run again,
+# but the second code review reads every answer to them, with the reports
+# beside it, and a second review that posts nothing is clean, not failed.
+#
+# A report that landed beside a code review that could not run opens the
+# second round too: the answers to it, and the author's own review in place of
+# the code review, are new code all the same. A code reviewer denied
+# permission to post does not, since a second one would be denied as well.
 #
 # It needs the head the first review read (PQ_REVIEW_HEAD, from the probe) and
 # an agent with hooks to say when it has stopped; a task without either gets
 # the one follow-up it always got.
 rereview_possible() {                   # task_dir -> 0 when a second review may follow
-  [ "$(st "$1" PQ_REVIEW_ROUND)" != 2 ] && [ "$(st "$1" PQ_REVIEW_RESULT)" = ok ] \
-    && [ -n "$(st "$1" PQ_REVIEW_HEAD)" ] && [ -n "$(agent_event "$1")" ]
+  [ "$(st "$1" PQ_REVIEW_ROUND)" != 2 ] && [ "$(st "$1" PQ_REVIEW_RESULT)" != denied ] \
+    && [ -n "$(st "$1" PQ_REVIEW_HEAD)" ] && [ -n "$(agent_event "$1")" ] && review_landed "$1"
+}
+# The code review's result for the pull request as a whole, which is what
+# `pq ls` and --json report: a first review that could not run is still the
+# answer once a second one has posted, since that second one read only the
+# fixes, and the pull request was never independently reviewed.
+review_result() {                       # task_dir
+  local first; first=$(st "$1" PQ_REVIEW_FIRST)
+  case "$first" in ""|ok) st "$1" PQ_REVIEW_RESULT ;; *) printf '%s' "$first" ;; esac
+}
+# Did any independent reviewer of the first round get its findings to the author?
+review_landed() {                       # task_dir
+  local stem key
+  [ "$(st "$1" PQ_REVIEW_RESULT)" = ok ] && return 0
+  for stem in $PQ_REPORT_STEMS; do
+    key=$(reviewer_key "$stem")
+    [ "$(st "$1" "$key")" = "done" ] && [ "$(st "$1" "${key}_RESULT")" = ok ] && return 0
+  done
+  return 1
+}
+# What the second reviewer is told, in its target (see review_cmd): what the
+# first round had, review by review, and where each one's findings are, so
+# that every answer is held to the finding it answers - the reports through
+# the task's own directory, which review_cmd opens to it. Then where it ends:
+# the commits the author made since, read as `git diff <from> HEAD` - two
+# trees, so a branch restructured since still diffs cleanly - with the rest of
+# the pull request as context only. One line, quote-free, and with no word
+# that starts with a dash, which the skill would read as a flag of its own.
+#
+# PQ_REVIEW_FIRST is the first code review's result, kept as the second round
+# begins; unset is a second round from before it, which only an `ok` opened.
+rereview_scope() {                      # task_dir pr from
+  local d=$1 pr=$2 from=$3 home had checks="" stem key
+  home=$(task_home "$d")
+  case "$(st "$d" PQ_REVIEW_FIRST)" in
+    ""|ok) had="An independent code review posted its findings on it as inline review comments." ;;
+    *)     had="No independent code review of it could run, so its author reviewed its own diff instead." ;;
+  esac
+  for stem in $PQ_REPORT_STEMS; do
+    key=$(reviewer_key "$stem")
+    [ "$(st "$d" "$key")" = "done" ] || continue
+    case "$stem:$(st "$d" "${key}_RESULT")" in
+      security:ok)
+        had="$had A security review wrote its findings in the report $home/security.md."
+        checks="$checks An answer to a finding of the security report is also wrong if it does not close the hole the report names, on every path the report says it is open." ;;
+      security:*)
+        had="$had No security review of it could run, so its author checked its own diff for the security risks the plan names." ;;
+      visual:ok)
+        had="$had A design review compared its screens against the design, with screenshots and measurements of its own, and wrote its findings in the report $home/visual.md."
+        checks="$checks An answer to a finding of the design report is also wrong if it does not change what the report measured to what the report asked for." ;;
+      visual:*)
+        had="$had No design review of it could run, so its author compared its screens against the design itself." ;;
+    esac
+  done
+  printf '%s' "This is a second review. Pull request #$pr was reviewed at commit $from. $had \
+Its author has answered every finding since, with commits of its own or replies on the pull request; those findings are settled, so do not raise them again. \
+Review only what the author changed since then, git diff $from HEAD, and read the rest of the pull request only as context for it. \
+Report a finding only on a line that change added or altered, and only where the change is wrong: a fix that introduced a bug, \
+a fix that does not do what its finding asked, a race, a leak or an access gap the new code opens, or a test that does not prove what it claims.$checks \
+If the change is sound, post nothing and say so in your reply."
 }
 review_answered() {                     # task_dir pstate -> 0 once the agent has stopped since the follow-up
   local ev at prompted
@@ -6046,7 +6125,7 @@ review_step() {                         # task_dir dry pr pstate
       # The head the first review read, which the second review starts from.
       [ "$round" = 2 ] || st_set "$d" PQ_REVIEW_HEAD "$head"
       if [ "$round" = 2 ]; then
-        reviewer_launch "$d" review "$cwd" review_cmd "$pr" "$(task_home "$d")" "$from"
+        reviewer_launch "$d" review "$cwd" review_cmd "$pr" "$(task_home "$d")" "$(rereview_scope "$d" "$pr" "$from")"
         msg "$slug: reviewing the fixes to #$pr since ${from:0:9} with $PQ_REVIEWER_MODEL in the background"
       else
         reviewer_launch "$d" review "$cwd" review_cmd "$pr" "$(task_home "$d")"
@@ -6239,7 +6318,7 @@ review_cell() {                         # task_dir
           running) printf '%s %s' "$(report_noun "$stem")" "$(age_since "$(st "$d" "${key}_AT")")"; return ;;
         esac
       done
-      if [ "$(st "$d" PQ_REVIEW_RESULT)" != ok ]; then printf 'review failed'; return; fi
+      if [ "$(review_result "$d")" != ok ]; then printf 'review failed'; return; fi
       for stem in $PQ_REPORT_STEMS; do
         key=$(reviewer_key "$stem")
         if [ "$(st "$d" "$key")" = "done" ] && [ "$(st "$d" "${key}_RESULT")" != ok ]; then

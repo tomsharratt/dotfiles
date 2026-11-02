@@ -856,6 +856,7 @@ review_task "$G" 0 >"$PQ_HOME/.out" 2>&1
 eq "$(st "$G" PQ_REVIEW)" "pending" "answered: the gate goes round again"
 eq "$(st "$G" PQ_REVIEW_ROUND)" "2" "for a second review"
 eq "$(st "$G" PQ_REVIEW_FROM)" "$REVIEWED" "from the head the first one read"
+eq "$(st "$G" PQ_REVIEW_FIRST)" "ok" "keeping what the first code review came to"
 has "$(cat "$PQ_HOME/.out")" "the answers to the review of #42 added 2 app lines - a second review reads them next" "said"
 eq "$(review_cell "$G")" "fixes review due" "and pq ls says so"
 review_inflight "$G" && ok || bad "the slot stays held through it"
@@ -867,16 +868,24 @@ eq "$(st "$G" PQ_REVIEW_HEAD)" "$REVIEWED" "and the first review's head stays pu
 has "$(review_cell "$G")" "reviewing fixes" "pq ls says what it is reviewing"
 wait_rc "$G"
 line=$(head -1 "$CLAUDE_LOG")
-has "$line" "This is a second review. Pull request #42 already had an independent review at commit $REVIEWED" "briefed as a second review"
-has "$line" "git diff $REVIEWED HEAD" "scoped to the answers"
-has "$line" "/code-review low --comment 42 --max-findings all" "the same skill and command"
+# The skill hands the review to a sub-agent that sees its target and nothing of
+# the session's system prompt, so the scope must ride in the target.
+arg_after() { awk -F'\t' -v f="$2" '{for (i = 1; i < NF; i++) if ($i == f) { print $(i + 1); exit }}' <<<"$1"; }
+skill=$(arg_after "$line" json); brief=$(arg_after "$line" --append-system-prompt)
+has "$skill" "/code-review low --comment 42. This is a second review. Pull request #42 was reviewed at commit $REVIEWED. An independent code review posted its findings on it as inline review comments. Its author has answered every finding since" \
+  "the scope rides in the target, after the pull request"
+has "$skill" "git diff $REVIEWED HEAD" "scoped to the answers"
+eq "${skill##* --max-findings}" " all" "and every finding, as the first review"
+eq "$(grep -o ' -[^ ]*' <<<"$skill" | tr '\n' ' ')" " --comment  --max-findings " "with no word of the scope the skill could read as a flag"
+hasnt "$skill" "report" "and told of no report it did not have"
+hasnt "$brief" "second review" "and none of it in the brief, which never reaches the review"
 review_task "$G" 0 >/dev/null 2>&1
 eq "$(st "$G" PQ_REVIEW)" "posted" "the second review posted"
 review_task "$G" 0 >"$PQ_HOME/.out" 2>&1
 eq "$(st "$G" PQ_REVIEW)" "prompted" "its follow-up goes"
 eq "$(st "$G" PQ_REVIEW_STAGED)" "" "and this one is the last"
 P=$(prompt_text)
-has "$P" "pq has reviewed the fixes you made to pull request #42 since its first review (git diff $REVIEWED HEAD) and posted 2 more inline review comments on them." "naming what it read and what it found"
+has "$P" "pq has reviewed the fixes you made to pull request #42 since its first reviews (git diff $REVIEWED HEAD) and posted 2 more inline review comments on them." "naming what it read and what it found"
 has "$P" "one last pass" "then the description pass"
 has "$P" "gh pr ready 42" "and marking it ready"
 hasnt "$P" "'" "quote-free"
@@ -897,7 +906,7 @@ eq "$(st "$G" PQ_REVIEW_RESULT)" "ok" "it is clean"
 eq "$(st "$G" PQ_REVIEW_TRIES)" "1" "and is not retried"
 has "$(cat "$PQ_HOME/.out")" "the second review of #42 found nothing in the fixes" "said"
 review_task "$G" 0 >/dev/null 2>&1
-has "$(prompt_text)" "since its first review (git diff $REVIEWED HEAD) and found nothing more to raise." "the follow-up says so, and finishes"
+has "$(prompt_text)" "since its first reviews (git diff $REVIEWED HEAD) and found nothing more to raise." "the follow-up says so, and finishes"
 has "$(prompt_text)" "gh pr ready 42" "with marking it ready"
 
 echo "== answers that add no app code: the finishing prompt, no second review ==" >&2
@@ -920,6 +929,87 @@ eq "$(claude_calls)" "0" "and no reviewer launched"
 has "$(cat "$PQ_HOME/.out")" "asked to finish #42 and mark it ready - its answers added no app code" "said"
 has "$(prompt_text)" "they add no app code for a second review to read" "the finishing prompt says why"
 has "$(prompt_text)" "gh pr ready 42" "and asks for ready"
+
+echo "== a report that landed beside a code review that could not run opens the second round too ==" >&2
+# The first round as it stood once every reviewer was done: the code reviewer
+# out of tries, the security reviewer's report posted.
+first_round() {                         # task_dir code_result security_result
+  st_set "$1" PQ_WORKTREE "$FIXWT"
+  st_set "$1" PQ_REVIEW posted; st_set "$1" PQ_REVIEW_RESULT "$2"; st_set "$1" PQ_REVIEW_HEAD "$REVIEWED"
+  st_set "$1" PQ_SECURITY "done"; st_set "$1" PQ_SECURITY_RESULT "$3"; st_set "$1" PQ_SECURITY_POSTED 1
+  agent_rec "$1" idle $(( FAKE_NOW - 60 ))
+}
+reset_tasks; reset_caches; reset_logs; mode ok
+pr_head "Do the thing" OPEN true 3 100 20 "$REVIEWED"
+G=$(mk_gated 204 selfreview wF:p1)
+first_round "$G" timeout ok
+set_panes "$(printf 'wF:p1\tclaude\tidle')"
+review_task "$G" 0 >/dev/null 2>&1
+eq "$(st "$G" PQ_REVIEW_STAGED)" "1" "held for a look over the fixes"
+P=$(prompt_text)
+has "$P" "pq could not get an independent review of pull request #42 - the reviewer ran out of time." "the self-review fallback, as before"
+has "$P" "The security review the plan asked for has run as well" "with the security report beside it"
+has "$P" "stop there and leave the pull request a draft" "and then a stop"
+FAKE_NOW=$(( FAKE_NOW + 60 )); agent_rec "$G" idle "$FAKE_NOW"
+review_task "$G" 0 >/dev/null 2>&1
+eq "$(st "$G" PQ_REVIEW_ROUND)" "2" "the answers get a second review"
+eq "$(st "$G" PQ_REVIEW_FIRST)" "timeout" "which keeps what the first code review came to"
+pr_head "Do the thing" OPEN true 4 130 20 "$(git -C "$FIXWT" rev-parse HEAD)"
+: > "$CLAUDE_LOG"
+review_task "$G" 0 >/dev/null 2>&1
+wait_rc "$G"
+line=$(head -1 "$CLAUDE_LOG")
+has "$line" "This is a second review. Pull request #42 was reviewed at commit $REVIEWED. No independent code review of it could run, so its author reviewed its own diff instead." \
+  "told there was no code review, and the author reviewed its own diff"
+has "$line" "A security review wrote its findings in the report $(task_home "$G")/security.md." "and where the security findings are"
+has "$line" "An answer to a finding of the security report is also wrong if it does not close the hole the report names, on every path the report says it is open." \
+  "and what an answer to one must do"
+hasnt "$line" "design" "and nothing of a design review it did not have"
+review_task "$G" 0 >/dev/null 2>&1
+eq "$(st "$G" PQ_REVIEW)" "posted" "the second review posted"
+eq "$(st "$G" PQ_REVIEW_RESULT)" "ok" "and posted"
+eq "$(review_cell "$G")" "review failed" "but pq ls still says the pull request had no independent review"
+J=$(main ls --json 2>/dev/null)
+eq "$(jq -r '.[] | select(.task == "selfreview") | .review_result' <<<"$J")" "timeout" "and so does --json, with the first review's result"
+
+echo "== a code reviewer denied permission to post opens no second round ==" >&2
+reset_tasks; reset_caches; reset_logs; mode ok
+G=$(mk_gated 205 denied2 wF:p1)
+first_round "$G" denied ok
+set_panes "$(printf 'wF:p1\tclaude\tidle')"
+review_task "$G" 0 >/dev/null 2>&1
+eq "$(st "$G" PQ_REVIEW_STAGED)" "" "a second one would be denied too: no hold"
+has "$(prompt_text)" "gh pr ready 42" "the one follow-up it always got"
+
+echo "== nor does a first round in which no reviewer landed ==" >&2
+reset_tasks; reset_caches; reset_logs; mode ok
+G=$(mk_gated 206 nonelanded wF:p1)
+first_round "$G" failed timeout
+set_panes "$(printf 'wF:p1\tclaude\tidle')"
+review_task "$G" 0 >/dev/null 2>&1
+eq "$(st "$G" PQ_REVIEW_STAGED)" "" "nothing independent to answer: no hold, as before"
+has "$(prompt_text)" "The security review the plan asked for did not happen" "both self-reviews asked for"
+has "$(prompt_text)" "gh pr ready 42" "in the one follow-up it always got"
+
+echo "== the second reviewer is told every report the answers responded to ==" >&2
+reset_tasks
+G=$(mk_gated 207 allthree wF:p1)
+st_set "$G" PQ_REVIEW_FIRST ok
+st_set "$G" PQ_SECURITY "done"; st_set "$G" PQ_SECURITY_RESULT ok
+st_set "$G" PQ_VISUAL "done"; st_set "$G" PQ_VISUAL_RESULT ok
+S=$(rereview_scope "$G" 42 "$REVIEWED")
+has "$S" "An independent code review posted its findings on it as inline review comments. A security review wrote its findings in the report $(task_home "$G")/security.md. A design review compared its screens against the design, with screenshots and measurements of its own, and wrote its findings in the report $(task_home "$G")/visual.md. Its author has answered" \
+  "the code review, then each report, in order"
+has "$S" "An answer to a finding of the design report is also wrong if it does not change what the report measured to what the report asked for." \
+  "and what an answer to a design finding must do"
+has "$S" "Review only what the author changed since then, git diff $REVIEWED HEAD" "scoped to the answers"
+case "$S" in *"'"*|*$'\n'*) bad "the scope must be one line and quote-free" ;; *) ok ;; esac
+st_set "$G" PQ_VISUAL_RESULT timeout
+S=$(rereview_scope "$G" 42 "$REVIEWED")
+has "$S" "No design review of it could run, so its author compared its screens against the design itself." "a design review that could not run is said too"
+hasnt "$S" "design report" "with no design report to hold answers to"
+st_set "$G" PQ_REVIEW_FIRST ""
+has "$(rereview_scope "$G" 42 "$REVIEWED")" "An independent code review posted its findings" "a second round from before the key had an ok code review"
 
 echo "== a task with no agent record, or no reviewed head, gets the one follow-up it always got ==" >&2
 reset_tasks; reset_caches; reset_logs; mode ok
