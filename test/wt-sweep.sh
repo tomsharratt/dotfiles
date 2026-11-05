@@ -302,5 +302,65 @@ WT_REDIS=0 WT_REDIS_TEST=15 wt_teardown >/dev/null 2>&1
 eq "$(cat "$REDIS_LOG")" "" "15 is the canonical checkout's spec db, and db 0 its dev db - neither is ever flushed"
 rm -f "$STUBBIN/redis-cli"
 
+echo "== a database early in a LONG listing is still found ==" >&2
+# The bug: `psql -lqtA | cut | grep -qx`, under wt's `set -o pipefail`. grep -q
+# exits at its first match, so once the listing is longer than a pipe holds the
+# writers upstream die of SIGPIPE, the pipeline reports 141, and the database
+# reads as missing. A test database sorts near the top, so teardown skipped every
+# one: 277 were left on this machine, one set per worktree ever reaped, and the
+# longer the listing grew the surer the next miss. Re-provisioning then said
+# "creating test database", and createdb failed on the one that was there.
+td_tdb=$(_wt_test_db tom-teardown-case)
+{ printf '%s\n' "$td_tdb"
+  for i in $(seq 1 3000); do printf 'supercast-web_development_test_tom_filler_%04d\n' "$i"; done
+} > "$DB_LIST"
+: > "$DROP_LOG"
+_wt_dropdb "$td_tdb" && ok || bad "a database listed first, ahead of 3000 others, must be found"
+eq "$(cat "$DROP_LOG")" "$td_tdb" "and dropped"
+_wt_db_exists "$td_tdb" && ok || bad "_wt_db_exists must find it too"
+_wt_db_exists supercast-web_development_never_existed \
+  && bad "_wt_db_exists must still say no to a database that is not there" || ok
+
+echo "== a worktree's parallel_tests worker databases are its own ==" >&2
+# parallel_tests runs worker N against database.yml's test url with N appended,
+# trimmed so the whole name stays inside 63 bytes (supercast's database.yml). So
+# every worktree that ran the suite in parallel holds up to one database per
+# worker beside its test database. Teardown dropped only the test database, so
+# the workers' were left behind, and the sweep, building its live list from the
+# two base names, would have taken a LIVE worktree's workers mid-run.
+WT_SLUG=tom-fix-checkout-schedule-discount-count   # long enough to be trimmed
+WT_REDIS=0 WT_REDIS_TEST=""
+td_db=$(_wt_db); td_tdb=$(_wt_test_db)
+w2=${td_tdb:0:62}2 w8=${td_tdb:0:62}8 w12=${td_tdb:0:61}12
+eq "$w2" supercast-web_development_test_tom_fix_checkout_schedule_disco2 \
+  "precondition: worker 2's name is the one parallel_tests actually created"
+other=$(_wt_test_db tom-other-branch)2
+printf '%s\n' "$td_db" "$td_tdb" "$w2" "$w8" "$w12" "$other" > "$DB_LIST"
+: > "$DROP_LOG"
+WT_LIVE_SLUGS="" out=$(wt_teardown 2>&1)
+eq "$(sort < "$DROP_LOG" | tr '\n' ' ')" "$(printf '%s\n' "$td_db" "$td_tdb" "$w2" "$w8" "$w12" | sort | tr '\n' ' ')" \
+  "teardown drops the worktree's dev, test and every worker database - and nobody else's"
+case "$out" in
+  *"dropped 3 parallel test worker databases"*) ok ;;
+  *) bad "and says how many workers it dropped, once (got '$out')" ;;
+esac
+WT_LIVE_SLUGS=$WT_SLUG
+export WT_LIVE_SLUGS
+preview=$(WT_SWEEP_DRY=1 wt_sweep 2>/dev/null | grep '^database ')
+eq "$preview" "database $other" "the sweep spares a live worktree's workers, and still takes a dead one's"
+
+echo "== a worker name another LIVE worktree owns is never dropped ==" >&2
+# Worker 3 of tom-sup-3 is tom-sup-33's test database, byte for byte. Tearing
+# tom-sup-3 down while tom-sup-33 lives must leave that database alone.
+WT_SLUG=tom-sup-3
+td_db=$(_wt_db); td_tdb=$(_wt_test_db); w2=${td_tdb}2
+theirs=$(_wt_test_db tom-sup-33)
+eq "$theirs" "${td_tdb}3" "precondition: the two names really are the same"
+printf '%s\n' "$td_db" "$td_tdb" "$w2" "$theirs" > "$DB_LIST"
+: > "$DROP_LOG"
+WT_LIVE_SLUGS=tom-sup-33 wt_teardown >/dev/null 2>&1
+eq "$(sort < "$DROP_LOG" | tr '\n' ' ')" "$(printf '%s\n' "$td_db" "$td_tdb" "$w2" | sort | tr '\n' ' ')" \
+  "its own workers go, the live worktree's test database stays"
+
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]

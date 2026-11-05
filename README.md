@@ -85,7 +85,9 @@ wt dev  <path>       run a worktree's dev server (this is the dev pane's command
                      applying any pending migrations to its database first
 wt restart [path]    restart the worktree's dev server in its dev tab, and wait for it -
                      after a new gem, an initializer, anything a running stack misses;
-                     it also starts a server that was stopped
+                     it also starts a server that was stopped, waits out a
+                     provisioning still running there rather than kill it, and
+                     refuses a worktree whose provisioning failed or was stopped
 wt stop [path]       stop the worktree's dev server and close its dev tab, keeping
                      everything else - worktree, databases, port, redis indexes;
                      wt open or wt restart starts it again
@@ -103,7 +105,8 @@ wt open [subdomain]  open this worktree's dev url in the browser, starting the
                      --launch-only/-l to skip the build and just relaunch;
                      run from anywhere but inside a worktree, it asks which
                      worktree (of any repo) with a gum filter, then carries on
-wt provision <path>  re-run provisioning for a worktree (idempotent)
+wt provision [path]  re-run provisioning for a worktree (resets its databases);
+                     the path is recorded absolute, so `wt provision .` is fine
 wt rm  [-y] [name]   tear a worktree down (drop db, free port, remove worktree);
                      one holding work that is not pushed is refused under -y
 wt ls                list worktrees with their port, age, agent, pull request and
@@ -852,6 +855,11 @@ Counting only the last held the worktrees of #7117, #7121 and #7123, with their 
 
 `wt gc --sweep` reclaims project-owned resources (databases, puma-dev entries) whose worktree is gone entirely, so no state file points at them any more.
 It previews what it would reclaim first, since - unlike the other two passes - it deletes on a naming pattern rather than on a recorded fact.
+
+For supercast a worktree owns more databases than its two: every parallel_tests worker gets one beside the test database, named the way supercast's `database.yml` builds it - the test database's name with the worker's number appended, trimmed to fit 63 bytes.
+The teardown drops those too, and both it and the sweep keep any name a live worktree could own, because a worker's name can be exactly another worktree's test database (worker 3 of `tom-sup-3` is `tom-sup-33`'s).
+Every "is this database there?" check reads the whole listing before searching it.
+It used to pipe `psql -l` into `grep -q` under `pipefail`, and once the listing outgrew a pipe, a database near the top - every test database - read as missing, so teardowns quietly left them behind: 277 were swept on 2026-11-04.
 
 ## Requirements
 

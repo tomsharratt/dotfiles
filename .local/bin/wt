@@ -387,6 +387,12 @@ load_profile() {                        # repo_name
 # free to follow the rename - it is display text, and reap_one takes the branch from git.
 prepare_state() {                       # name path repo repo_name [workspace_id]
   local name=$1 path=$2 repo=$3 repo_name=$4 ws=${5:-} slug res sf
+  # The path is recorded absolute, whatever the caller typed. It is the key every
+  # later lookup finds this file by, resolved against THAT caller's directory: an
+  # implementer's `wt provision .` stored `.`, which then named whichever worktree
+  # the next `wt` ran in, and named none when `wt rm` came for the real one at
+  # merge - so it ignored the file and left the port and redis indexes behind.
+  path=$(realpath_p "$path")
   # Every WT_* a state file can supply, cleared before we read one, so a value
   # left in the process cannot pose as this worktree's saved state. The port and
   # redis index matter because the loop below KEEPS whatever it finds rather than
@@ -659,6 +665,7 @@ gc_run() {
     # The worktree is gone, but a dev server left running in its workspace is not,
     # and it would write the directory back after rm_leftover below.
     stop_tabs "$own_ws"
+    WT_LIVE_SLUGS=$([ -n "${WT_REPO:-}" ] && live_slugs "$WT_REPO"); export WT_LIVE_SLUGS
     declare -F wt_teardown >/dev/null && run_profile_fn wt_teardown || true
     if [ -n "$own_ws" ]; then
       "$HERDR" worktree remove --workspace "$own_ws" --force --json >/dev/null 2>&1 \
@@ -666,7 +673,7 @@ gc_run() {
     fi
     [ -n "${WT_REPO:-}" ] && git -C "$WT_REPO" worktree prune 2>/dev/null || true
     rm_leftover "${WT_PATH:-}"
-    rm -f "$f"
+    rm -f "$f" "$(provision_mark "$f")"
   done
   # Leave the process as we found it. The per-iteration wt_reset above is not
   # enough on its own: the load happens BEFORE the "live worktree? leave it
@@ -944,6 +951,7 @@ reap_one() {                            # repo repo_name branch path del_branch(
   # 1. Free external resources while we are certain to still be alive.
   if declare -F wt_teardown >/dev/null; then
     msg "$rn/$name: releasing external resources"
+    WT_LIVE_SLUGS=$(live_slugs "$repo" "$path"); export WT_LIVE_SLUGS
     run_profile_fn wt_teardown || warn "teardown reported errors"
   fi
 
@@ -962,7 +970,7 @@ reap_one() {                            # repo repo_name branch path del_branch(
   #    we found turned out to describe a different worktree (see above) - there is then
   #    nothing of ours to drop, and `rm -f ""` would be a silent no-op rather than a
   #    stated one.
-  [ -n "$sf" ] && rm -f "$sf"
+  [ -n "$sf" ] && rm -f "$sf" "$(provision_mark "$sf")"
   msg "removed $rn/$name"
 
   # 5. Close the Herdr workspace LAST (see the ordering note above). A worktree we
@@ -1049,25 +1057,41 @@ gc_settled() {                          # yes(1|0)
 # only the guest list: WT_LIVE_SLUGS, every slug that still has a live worktree. The
 # profile's wt_sweep reclaims whatever of its own is not on it.
 #
+# Every slug a live worktree of REPO answers to, one per line, but the one at SKIP:
+# the slug its state file was born with and the slug of its branch today, so the list
+# is a superset. A profile is handed this as WT_LIVE_SLUGS whenever it reclaims by
+# NAME - the sweep, and a teardown, which has names that are only probably its own
+# (supercast's parallel test databases) - and keeps whatever any of them could own.
+# SKIP is the worktree being torn down, still live while its own teardown runs.
+# The index is loaded here if nobody has yet - `wt new`'s orphan pass has not -
+# since without it every renamed worktree's original slug drops off the list.
+live_slugs() {                          # repo [skip_path]
+  local path branch sf slug skip
+  [ -n "${SIDX:-}" ] || SIDX=$(state_index)
+  skip=$(realpath_p "${2:-}")
+  while IFS=$'\t' read -r path branch; do
+    [ -n "$path" ] || continue
+    [ -n "$skip" ] && [ "$(realpath_p "$path")" = "$skip" ] && continue
+    [ "$branch" != "-" ] && slugify "$branch" && echo
+    sf=$(sf_for_path "$path")
+    slug=$(state_get "${sf:-/dev/null}" WT_SLUG)
+    [ -n "$slug" ] && printf '%s\n' "$slug"
+  done <<<"$(repo_worktrees "$1")"
+  return 0
+}
+
 # Opt-in and confirmed, never automatic: alone among these paths it deletes on a naming
 # pattern rather than on a recorded fact. So the guest list is deliberately a superset -
 # both the slugs recorded in state files and the slugs of today's branches. Over
 # including leaves an orphan for next time; under-including would break a live worktree.
 gc_sweep() {                            # yes(1|0)
-  local yes=$1 repo rn live path branch sf slug ans preview
+  local yes=$1 repo rn live ans preview
   while IFS= read -r repo; do
     [ -n "$repo" ] || continue
     rn=$(basename "$repo")
     load_profile "$rn"
     declare -F wt_sweep >/dev/null || continue
-    live=""
-    while IFS=$'\t' read -r path branch; do
-      [ -n "$path" ] || continue
-      [ "$branch" != "-" ] && live="${live}$(slugify "$branch")"$'\n'
-      sf=$(sf_for_path "$path")
-      slug=$(state_get "${sf:-/dev/null}" WT_SLUG)
-      [ -n "$slug" ] && live="${live}${slug}"$'\n'
-    done <<<"$(repo_worktrees "$repo")"
+    live=$(live_slugs "$repo")
     wt_reset
     WT_REPO=$repo WT_REPO_NAME=$rn
     WT_LIVE_SLUGS=$live; export WT_LIVE_SLUGS
@@ -1517,6 +1541,10 @@ cmd_restart() {
   ws_is_for "$ws" "$path" || ws=$(herdr_ws_for "$repo" "$path" "$name")
   [ -n "$ws" ] && [ "$ws" != null ] || die "no herdr workspace holds $path"
   WT_WORKSPACE=$ws
+  provision_guard "restarting"
+  # Provisioning that was still running boots the server itself as it finishes,
+  # in that same tab: wait for it, rather than restart what is just starting.
+  [ "$PROVISION_WAITED" = 1 ] && { dev_autostart; return 0; }
   msg "stopping the dev server in $ws"
   stop_tabs "$ws" dev
   dev_autostart
@@ -1546,6 +1574,9 @@ cmd_stop() {
     msg "no dev server running in $ws"
     return 0
   fi
+  # A provisioning that failed or was stopped leaves nothing worth keeping up, so
+  # only a live one stands in the way of stopping.
+  [ "$(provision_status "${WT_STATE_FILE:-}")" = running ] && provision_guard "stopping"
   msg "stopping the dev server in $ws"
   stop_tabs "$ws" dev
   msg "dev server stopped - wt open or wt restart starts it again"
@@ -1630,14 +1661,67 @@ cmd_open() {
   else die "no 'open'/'xdg-open' on PATH - visit: $url"; fi
 }
 
+# ── provisioning in progress ────────────────────────────────────────────────
+# `wt new` provisions in the worktree's `dev` tab and boots the server from the same
+# command line, so for the minutes that takes nothing answers on the port - and the
+# answer to "nothing answers" is `wt restart`, for a person and for pq's implementer,
+# whose contract says exactly that. Restarting closes the `dev` tab, so it killed the
+# provisioning running in it: fix-checkout-schedule-discount-count's implementer
+# restarted 17 seconds in, and its worktree came up with a test database but no
+# puma-dev route and no url or database on file. Its `wt provision .` to repair that
+# then failed on the test database the killed run had left.
+#
+# So provisioning leaves a mark beside the state file while it runs: its pid, then
+# `failed` if it fails, and nothing once it succeeds. A pid that is no longer running
+# is a provisioning that was killed. `wt restart` and `wt stop` wait for a live one
+# instead of killing it, and refuse a worktree whose provisioning never finished,
+# since a server started on it serves a half-made environment.
+provision_mark() { printf '%s.provisioning' "${1%.env}"; }   # state_file
+provision_status() {                    # state_file -> running | failed | interrupted | nothing
+  local m v; m=$(provision_mark "$1")
+  [ -n "${1:-}" ] && [ -f "$m" ] || return 0
+  v=$(cat "$m" 2>/dev/null)
+  case "$v" in
+    failed) echo failed ;;
+    ''|*[!0-9]*) echo interrupted ;;
+    *) if kill -0 "$v" 2>/dev/null; then echo running; else echo interrupted; fi ;;
+  esac
+}
+# Wait out a provisioning still running, then refuse one that did not finish.
+# Returns 0 when there is nothing in the way. WT_PROVISION_WAIT bounds the wait:
+# provisioning copies the whole dev database, so it is minutes, not seconds.
+PROVISION_WAITED=0
+provision_guard() {                     # what the caller is about to do
+  local s waited=0 limit=${WT_PROVISION_WAIT:-900}
+  s=$(provision_status "${WT_STATE_FILE:-}")
+  if [ "$s" = running ]; then
+    PROVISION_WAITED=1
+    msg "still provisioning in the 'dev' tab - waiting for it to finish before $1"
+    while [ "$s" = running ] && [ "$waited" -lt "$limit" ]; do
+      sleep 1; waited=$((waited + 1)); s=$(provision_status "$WT_STATE_FILE")
+    done
+    [ "$s" = running ] && die "provisioning is still running after ${limit}s - left alone; the 'dev' tab shows how far it got"
+    [ -n "$s" ] || msg "provisioning finished after ${waited}s"
+  fi
+  case "$s" in
+    failed)      die "provisioning failed - the 'dev' tab has the error; fix it, then run: wt provision $WT_PATH" ;;
+    interrupted) die "provisioning was stopped before it finished - run it again: wt provision $WT_PATH" ;;
+  esac
+  return 0
+}
+
 cmd_provision() {
-  local path=${1:-$PWD} repo repo_name name
+  local path=${1:-$PWD} repo repo_name name mark rc
   repo=$(main_worktree "$path"); [ -n "$repo" ] || die "not a git worktree: $path"
   repo_name=$(basename "$repo"); name=$(cur_branch "$path")
   load_profile "$repo_name"
   prepare_state "$name" "$path" "$repo" "$repo_name"
   declare -F wt_provision >/dev/null || { msg "no provisioning configured for $repo_name"; return 0; }
-  run_profile_fn wt_provision
+  mark=$(provision_mark "$WT_STATE_FILE")
+  printf '%s\n' "$$" > "$mark"
+  run_profile_fn wt_provision; rc=$?
+  if [ "$rc" = 0 ]; then rm -f "$mark"; else echo failed > "$mark"; fi
+  return "$rc"
 }
 
 cmd_rm() {
@@ -1872,7 +1956,7 @@ main() {
     rm)         shift; cmd_rm "$@" ;;
     ls)         shift; cmd_ls "$@" ;;
     gc)         shift; cmd_gc "$@" ;;
-    *) die "usage: wt {new [--no-agent] [--no-focus] [--base REF] [--json] [name] | dev <path> | restart [path] | stop [path] | run [cmd...] | test [cmd...] | open [subdomain] | provision <path> | rm [-y] [name] | ls | gc [--settled] [--sweep] [-y]}" ;;
+    *) die "usage: wt {new [--no-agent] [--no-focus] [--base REF] [--json] [name] | dev <path> | restart [path] | stop [path] | run [cmd...] | test [cmd...] | open [subdomain] | provision [path] | rm [-y] [name] | ls | gc [--settled] [--sweep] [-y]}" ;;
   esac
 }
 if [ "${BASH_SOURCE[0]}" = "$0" ]; then main "$@"; fi

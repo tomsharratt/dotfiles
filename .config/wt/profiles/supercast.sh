@@ -67,13 +67,51 @@ _wt_db() { local s=${1:-$WT_SLUG}; s="supercast-web_development_${s//-/_}"; prin
 # bytes, leaving 32 for the underscored slug.
 _wt_test_db() { local s=${1:-$WT_SLUG}; s="supercast-web_development_test_${s//-/_}"; printf '%s' "${s:0:63}"; }
 
+# The databases parallel_tests' workers run against, beside the test database.
+# Worker N's is the test database's name with N appended, trimmed so the whole of
+# it fits in 63 bytes - supercast's config/database.yml builds it that way from the
+# DATABASE_URL _wt_rspec hands the suite. Every N up to 64, more workers than any
+# machine here runs; a name with no database behind it is simply not there.
+#
+# Unlike the two names above, these are only PROBABLY this worktree's: worker 3 of
+# tom-sup-3 is named exactly as tom-sup-33's test database. So whatever reclaims
+# them by name keeps any a live worktree could own - see _wt_live_dbs.
+_wt_worker_dbs() {
+  local t n; t=$(_wt_test_db "${1:-$WT_SLUG}")
+  for n in $(seq 1 64); do printf '%s\n' "${t:0:$((63 - ${#n}))}$n"; done
+}
+
+# Every database a live worktree could own, one per line: for each slug in
+# WT_LIVE_SLUGS, its dev, test and worker databases. A superset, on purpose - a
+# name kept by mistake is an orphan left for the next sweep, a name dropped by
+# mistake is somebody's database gone mid-run.
+_wt_live_dbs() {
+  local slug
+  while IFS= read -r slug; do
+    [ -n "$slug" ] || continue
+    printf '%s\n%s\n' "$(_wt_db "$slug")" "$(_wt_test_db "$slug")"
+    _wt_worker_dbs "$slug"
+  done <<<"${WT_LIVE_SLUGS:-}"
+}
+
+# Whether a database is there. The listing is captured whole and then searched,
+# never piped into `grep -q`: under wt's `set -o pipefail`, grep -q leaving at its
+# first match kills the writers upstream with SIGPIPE once the listing outgrows a
+# pipe, the pipeline reports 141, and a database near the top reads as missing.
+# Test databases sort near the top, so teardown skipped every one of them - 277
+# were swept on 2026-11-04 - and a re-provision ran createdb on one that was there.
+_wt_db_exists() {
+  local all; all=$(psql -lqtA 2>/dev/null | cut -d'|' -f1)
+  grep -qxF -- "$1" <<<"$all"
+}
+
 # Drop a db, first terminating any connections to it (a still-running dev server)
 # so dropdb can't fail on "database is being accessed by other users". Silent -
 # the caller prints its own context. Returns non-zero if the db doesn't exist or
 # the drop fails, so `_wt_dropdb x && msg ...` reports only a real drop.
 _wt_dropdb() {
   local db=$1
-  psql -lqtA 2>/dev/null | cut -d'|' -f1 | grep -qx "$db" || return 1
+  _wt_db_exists "$db" || return 1
   psql -q -d postgres -c \
     "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname='$db' AND pid<>pg_backend_pid();" \
     >/dev/null 2>&1
@@ -89,8 +127,7 @@ _wt_dropdb() {
 _wt_drop_reported() {                   # db label
   local db=$1 label=$2
   if _wt_dropdb "$db"; then msg "dropped $label$db"; return 0; fi
-  psql -lqtA 2>/dev/null | cut -d'|' -f1 | grep -qx "$db" \
-    && warn "could not drop $label$db - still on disk"
+  _wt_db_exists "$db" && warn "could not drop $label$db - still on disk"
   return 0
 }
 
@@ -271,7 +308,7 @@ wt_provision() {
   #    back to a clean copy. A logical dump is used rather than CREATE DATABASE
   #    ... TEMPLATE, which needs exclusive access to the source the canonical dev
   #    server holds open.
-  if psql -lqtA 2>/dev/null | cut -d'|' -f1 | grep -qx "$db"; then
+  if _wt_db_exists "$db"; then
     msg "resetting database $db (fresh copy of supercast-web_development)"
     _wt_dropdb "$db" || { warn "dropping $db failed"; return 1; }
   else
@@ -301,7 +338,7 @@ wt_provision() {
   #    the right schema. Loaded under RAILS_ENV=test so ar_internal_metadata
   #    records `test` and a spec run never trips EnvironmentMismatchError. Reset on
   #    re-provision, the same contract as the dev copy above.
-  if psql -lqtA 2>/dev/null | cut -d'|' -f1 | grep -qx "$tdb"; then
+  if _wt_db_exists "$tdb"; then
     msg "resetting test database $tdb"
     _wt_dropdb "$tdb" || { warn "dropping $tdb failed"; return 1; }
   else
@@ -547,15 +584,7 @@ wt_dev() {
 wt_sweep() {
   local live f slug port db livedbs dry=${WT_SWEEP_DRY:-}
   live=$(printf '%s\n' "${WT_LIVE_SLUGS:-}" | sed '/^$/d')
-  # printf, because _wt_db deliberately emits no trailing newline - it is written to
-  # be read through command substitution. Without one every name here lands on a
-  # single line and matches nothing, which is the same live-database-looks-orphaned
-  # failure this rewrite exists to remove.
-  livedbs=$(while IFS= read -r slug; do
-    [ -n "$slug" ] || continue
-    printf '%s\n' "$(_wt_db "$slug")"
-    printf '%s\n' "$(_wt_test_db "$slug")"
-  done <<<"$live")
+  livedbs=$(_wt_live_dbs)
 
   for f in "$HOME"/.puma-dev/*; do
     [ -f "$f" ] || continue
@@ -594,6 +623,17 @@ wt_teardown() {
   fi
   _wt_drop_reported "$db" "database "
   _wt_drop_reported "$tdb" "test database "
+  # The parallel_tests workers' databases, each one there and not one a live
+  # worktree could own (see _wt_worker_dbs). WT_LIVE_SLUGS is wt's list of every
+  # other worktree's slugs.
+  local all keep w n=0
+  all=$(psql -lqtA 2>/dev/null | cut -d'|' -f1); keep=$(_wt_live_dbs)
+  while IFS= read -r w; do
+    grep -qxF -- "$w" <<<"$all" || continue
+    grep -qxF -- "$w" <<<"$keep" && continue
+    if _wt_dropdb "$w"; then n=$((n + 1)); else warn "could not drop test worker database $w"; fi
+  done < <(_wt_worker_dbs)
+  [ "$n" = 0 ] || msg "dropped $n parallel test worker database$([ "$n" = 1 ] || printf s)"
   # wt_dev writes this outside the repo (see there); nothing else removes it.
   # No -e guard: `rm -f` is already silent about a path that was never there, and
   # as the LAST statement the guard made this function return non-zero for every
