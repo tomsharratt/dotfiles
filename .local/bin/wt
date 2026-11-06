@@ -1677,16 +1677,27 @@ cmd_open() {
 # instead of killing it, and refuse a worktree whose provisioning never finished,
 # since a server started on it serves a half-made environment.
 provision_mark() { printf '%s.provisioning' "${1%.env}"; }   # state_file
+# A provisioning ends by taking its mark away, or writing `failed` into it, and
+# then exiting, so a read can race that end: a mark checked for and then gone, or
+# a pid read just before its process exited. Both once read as `interrupted`, and
+# the guard refused a restart of a worktree that had just provisioned - 132 of
+# 17791 reads in a stress loop, and wt-provision.sh's waiting test about one run
+# in eight. So the mark is read once, and read again when its pid has gone: gone
+# or changed by then is how the provisioning ended, not a kill. cmd_provision
+# writes it whole (mark_write), so it is never read half-written either.
 provision_status() {                    # state_file -> running | failed | interrupted | nothing
-  local m v; m=$(provision_mark "$1")
-  [ -n "${1:-}" ] && [ -f "$m" ] || return 0
-  v=$(cat "$m" 2>/dev/null)
+  local m v; [ -n "${1:-}" ] || return 0
+  m=$(provision_mark "$1")
+  v=$(cat "$m" 2>/dev/null) || return 0
   case "$v" in
-    failed) echo failed ;;
-    ''|*[!0-9]*) echo interrupted ;;
-    *) if kill -0 "$v" 2>/dev/null; then echo running; else echo interrupted; fi ;;
+    failed) echo failed; return 0 ;;
+    ''|*[!0-9]*) echo interrupted; return 0 ;;
   esac
+  if kill -0 "$v" 2>/dev/null; then echo running; return 0; fi
+  if [ "$(cat "$m" 2>/dev/null)" = "$v" ]; then echo interrupted; return 0; fi
+  provision_status "$1"                 # it ended between the two reads: say how
 }
+mark_write() { printf '%s\n' "$2" > "$1.tmp" && mv -f "$1.tmp" "$1"; }   # mark value
 # Wait out a provisioning still running, then refuse one that did not finish.
 # Returns 0 when there is nothing in the way. WT_PROVISION_WAIT bounds the wait:
 # provisioning copies the whole dev database, so it is minutes, not seconds.
@@ -1718,9 +1729,9 @@ cmd_provision() {
   prepare_state "$name" "$path" "$repo" "$repo_name"
   declare -F wt_provision >/dev/null || { msg "no provisioning configured for $repo_name"; return 0; }
   mark=$(provision_mark "$WT_STATE_FILE")
-  printf '%s\n' "$$" > "$mark"
+  mark_write "$mark" "$$"
   run_profile_fn wt_provision; rc=$?
-  if [ "$rc" = 0 ]; then rm -f "$mark"; else echo failed > "$mark"; fi
+  if [ "$rc" = 0 ]; then rm -f "$mark"; else mark_write "$mark" failed; fi
   return "$rc"
 }
 

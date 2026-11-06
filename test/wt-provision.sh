@@ -118,5 +118,21 @@ err=$( (WT_STATE_FILE=$sf WT_PATH=$WTP; provision_guard restarting) 2>&1 ); rc=$
 case "$rc:$err" in 0:*) bad "the guard must stop a restart of a half-provisioned worktree" ;; *"run it again: wt provision $WTP"*) ok ;; *) bad "and says to provision again (got '$err')" ;; esac
 touch "$FIX/go"
 
+echo "== one that ends as it is read is not mistaken for a kill ==" >&2
+# A provisioning ends by taking its mark away, or writing `failed` into it, and
+# then exiting; a read that lands between the two once said `interrupted`, and
+# the waiting test above failed about one run in eight. `kill` stands in for the
+# process ending exactly as its pid is checked.
+# shellcheck disable=SC2329,SC2317  # called by provision_status, not here
+kill() { rm -f "$mark"; return 1; }
+printf '%s\n' "$$" > "$mark"
+eq "$(provision_status "$sf")" "" "a mark taken away as its pid was checked: it finished"
+# shellcheck disable=SC2329,SC2317
+kill() { printf 'failed\n' > "$mark"; return 1; }
+printf '%s\n' "$$" > "$mark"
+eq "$(provision_status "$sf")" failed "and one marked failed as it was checked: it failed"
+unset -f kill
+rm -f "$mark"
+
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]
