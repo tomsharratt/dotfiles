@@ -39,6 +39,7 @@ VREPORT="$STUBBIN/.vreport"
 PRJSON="$STUBBIN/.pr.json"
 COMMENTS="$STUBBIN/.comments"
 REPORT="$STUBBIN/.report"
+FILES="$STUBBIN/.files"                 # the pull request's files, as the API pages them; none is a failure
 printf '{"result":{"snapshot":{"panes":[]}}}' > "$PANES_JSON"
 : > "$HERDR_LOG"; : > "$CLAUDE_LOG"; : > "$CLAUDE_ENV"; : > "$GH_LOG"
 printf 'ok' > "$MODE"; printf 'ok' > "$SMODE"; printf 'ok' > "$VMODE"; printf '0' > "$COMMENTS"
@@ -108,6 +109,7 @@ case "\$*" in
     for a in "\$@"; do [ "\$prev" = --body-file ] && f=\$a; prev=\$a; done
     cat "\$f" > "$STUBBIN/.comment-body"; exit 0 ;;
   *"pr view"*)   [ -f "$PRJSON" ] && cat "$PRJSON" && exit 0; exit 1 ;;
+  *"/pulls/"*"/files"*) printf '%s\n' "\$*" >> "$GH_LOG"; [ -f "$FILES" ] || exit 1; cat "$FILES"; exit 0 ;;
   *"/comments"*) awk -v n="\$(cat "$COMMENTS")" 'BEGIN { for (i = 1; i <= n; i++) print i }'; exit 0 ;;
 esac
 exit 1
@@ -196,7 +198,7 @@ reset_tasks() {
 reset_tasks
 reset_logs() {
   : > "$HERDR_LOG"; : > "$CLAUDE_LOG"; : > "$CLAUDE_ENV"; : > "$GH_LOG"
-  rm -f "$STUBBIN/.comment-fail" "$STUBBIN/.comment-body"
+  rm -f "$STUBBIN/.comment-fail" "$STUBBIN/.comment-body" "$FILES"
 }
 mode()  { printf '%s' "$1" > "$MODE"; }
 smode() { printf '%s' "$1" > "$SMODE"; }
@@ -240,9 +242,10 @@ mk_task() {                             # state prio slug branch pane security d
 }
 # A done task with an open draft PR #42 built from a design board, served from
 # a dev tab, its gate and the design ladder pending - what reconcile leaves
-# behind. A fourth argument of `yes` asks for a security review as well.
-mk_gated() {                            # prio slug pane [security] -> task_dir
-  local d; d=$(mk_task "done" "$1" "$2" "tom/$2" "$3" "${4:-}" Board.dc.html)
+# behind. A fourth argument of `yes` asks for a security review as well, and a
+# fifth of `design` makes it a design task.
+mk_gated() {                            # prio slug pane [security] [kind] -> task_dir
+  local d; d=$(mk_task "done" "$1" "$2" "tom/$2" "$3" "${4:-}" Board.dc.html "${5:-}")
   st_set "$d" PQ_LAUNCHED "$(now)"; st_set "$d" PQ_PR 42; st_set "$d" PQ_FINISHED "$(now)"
   st_set "$d" PQ_URL "https://tom-$2.test"; st_set "$d" PQ_DEV_PANE w1:p2
   st_set "$d" PQ_REVIEW pending; st_set "$d" PQ_VISUAL pending
@@ -269,6 +272,8 @@ wait_for() {                            # command... -> polls up to 5s
 calls_at_least() { [ "$("$1")" -ge "$2" ]; }
 prompt_text() { grep "^agent	prompt	" "$HERDR_LOG" | tail -1 | cut -f4; }
 prompts()     { grep -c "^agent	prompt	" "$HERDR_LOG" 2>/dev/null || true; }
+files_json()  { jq -nc '$ARGS.positional | map({filename: ., status: "modified", additions: 1})' --args "$@"; }
+draws()       { jq -sr "$SCREEN_FILES_JQ" <<<"$(files_json "$@")"; }
 
 
 echo "== which tasks get a design review ==" >&2
@@ -286,6 +291,10 @@ visual_wanted "$V4" && bad "a task with no design gets none" || ok
 echo "== the contract names the design reviewer only for a task built from a design ==" >&2
 contract_write "$V1"
 has "$(cat "$V1/contract.md")" "pq also runs an independent \`/design-review\` of the pull request" "a design task is told pq runs it"
+has "$(cat "$V1/contract.md")" "A pull request that changes no file that draws a screen - no template, component, stylesheet, frontend code, copy or asset - gets no design review" "and that a pull request drawing nothing gets none"
+contract_write "$V2"
+has "$(cat "$V2/contract.md")" "pq also runs an independent \`/design-review\` of the pull request" "a design task is told pq runs it"
+hasnt "$(cat "$V2/contract.md")" "gets no design review" "and never that it may not: a design task always draws"
 contract_write "$V4"
 hasnt "$(cat "$V4/contract.md")" "design-review" "a task with no design hears nothing about it"
 
@@ -422,6 +431,84 @@ eq "$(st "$G" PQ_VISUAL)" "skipped" "a STUCK pull request gets no design review"
 sleep 0.3
 eq "$(vis_calls)" "0" "nothing launched"
 pr_json "Do the thing" OPEN true 3 100 20
+
+echo "== which files draw a screen ==" >&2
+eq "$(draws app/models/plan.rb app/services/products/unlock_offer.rb app/controllers/x_controller.rb \
+            app/presenters/current_subscriber_presenter.rb config/routes.rb db/migrate/1_add_x.rb db/schema.rb \
+            spec/models/plan_spec.rb spec/components/x_component_spec.rb features/x.feature)" "0" \
+  "models, services, controllers, presenters, routes, migrations and tests draw nothing"
+for f in app/views/x/show.html.erb engines/e/app/components/e/x_component.rb app/components/x_component_controller.js \
+         app/assets/stylesheets/a.scss app/frontend/packs/p.js app/helpers/price_helper.rb config/locales/en.yml \
+         spec/components/previews/x_component_preview.rb test/components/previews/y_preview.rb \
+         app/javascript/controllers/z_controller.ts public/logo.svg app/assets/images/a.png; do
+  eq "$(draws "$f")" "1" "$f draws a screen"
+done
+eq "$(draws app/frontend/x.test.js app/components/__snapshots__/x.snap package-lock.json)" "0" \
+  "a frontend test, a snapshot and a lockfile do not"
+eq "$(jq -sr "$SCREEN_FILES_JQ" <<<"$(files_json app/models/a.rb) $(files_json app/views/a.html.erb)")" "1" \
+  "every page is read"
+
+echo "== a pull request that draws no screen gets no design review ==" >&2
+reset_tasks; reset_caches; reset_logs; mode ok; vmode ok
+files_json app/models/plan.rb app/services/products/unlock_offer.rb spec/models/plan_spec.rb > "$FILES"
+G=$(mk_gated 070 backend w1:p1)
+set_panes "$(printf 'w1:p1\tclaude\tidle')"
+review_task "$G" 0 >"$PQ_HOME/.out" 2>&1
+eq "$(st "$G" PQ_REVIEW)" "running" "the code reviewer goes out as ever"
+eq "$(st "$G" PQ_VISUAL)" "skipped" "the design review does not"
+eq "$(st "$G" PQ_VISUAL_WHY)" "noscreen" "and why is kept"
+has "$(cat "$PQ_HOME/.out")" "backend: no design review of #42 - it changes no file that draws a screen" "said"
+grep -q 'pulls/42/files' "$GH_LOG" && ok || bad "decided off the pull request's own files"
+wait_for test -f "$G/review.rc"
+review_task "$G" 0 >"$PQ_HOME/.out" 2>&1
+eq "$(st "$G" PQ_REVIEW)" "posted" "the code review is collected"
+hasnt "$(cat "$PQ_HOME/.out")" "the follow-up waits for" "and nothing holds the follow-up"
+review_task "$G" 0 >/dev/null 2>&1
+eq "$(st "$G" PQ_REVIEW)" "prompted" "which goes out on the next tick, as for a task with no design"
+P=$(prompt_text)
+hasnt "$P" "design review" "and says nothing of a design review"
+hasnt "$P" "Compare every screen you built" "nor asks for a comparison by hand"
+sleep 0.3
+eq "$(vis_calls)" "0" "no design reviewer was launched"
+st_set "$G" PQ_REVIEW posted
+eq "$(review_cell "$G")" "reviewed" "and the cell does not call it failed"
+
+echo "== one that draws a screen still gets one ==" >&2
+reset_tasks; reset_caches; reset_logs; mode sleep; vmode sleep
+files_json app/models/plan.rb app/components/x_component.html.erb > "$FILES"
+G=$(mk_gated 071 drawing w1:p1)
+set_panes "$(printf 'w1:p1\tclaude\tidle')"
+review_task "$G" 0 >/dev/null 2>&1
+eq "$(st "$G" PQ_VISUAL)" "running" "a template among the models: launched"
+wait_for calls_at_least vis_calls 1 && ok || bad "the design reviewer ran"
+
+echo "== files that cannot be read leave the review to run ==" >&2
+reset_tasks; reset_caches; reset_logs; mode sleep; vmode sleep
+G=$(mk_gated 072 unread w1:p1)
+set_panes "$(printf 'w1:p1\tclaude\tidle')"
+review_task "$G" 0 >/dev/null 2>&1
+grep -q 'pulls/42/files' "$GH_LOG" && ok || bad "the files were asked for"
+eq "$(st "$G" PQ_VISUAL)" "running" "and, unread, the review launched as it always did"
+
+echo "== a design task is always design-reviewed ==" >&2
+reset_tasks; reset_caches; reset_logs; mode sleep; vmode sleep
+files_json app/models/plan.rb > "$FILES"
+G=$(mk_gated 073 designpr w1:p1 "" design)
+set_panes "$(printf 'w1:p1\tclaude\tidle')"
+review_task "$G" 0 >/dev/null 2>&1
+eq "$(st "$G" PQ_VISUAL)" "running" "launched, whatever its files"
+grep -q 'pulls/42/files' "$GH_LOG" && bad "without reading them" || ok
+
+echo "== a dry run reads nothing ==" >&2
+reset_tasks; reset_caches; reset_logs
+files_json app/models/plan.rb > "$FILES"
+G=$(mk_gated 074 dryrun w1:p1)
+st_set "$G" PQ_REVIEW posted; st_set "$G" PQ_REVIEW_RESULT ok
+set_panes "$(printf 'w1:p1\tclaude\tidle')"
+out=$(review_task "$G" 1 2>&1)
+has "$out" "would read #42's files and launch a design review of dryrun if one draws a screen" "says what it would do"
+eq "$(st "$G" PQ_VISUAL)" "pending" "and changes nothing"
+grep -q 'pulls/42/files' "$GH_LOG" && bad "nor calls the forge" || ok
 
 echo "== pq ls --json carries it ==" >&2
 reset_tasks; reset_caches

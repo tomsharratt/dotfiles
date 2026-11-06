@@ -12,7 +12,7 @@ Personal dotfiles for macOS. Manages:
 - `~/.config/wt/profiles/<repo>.sh` - per-project provisioning + dev-server steps for `wt` (e.g. `supercast.sh`, `supercast-ios.sh`, `supercast-android.sh`).
 - `~/.local/bin/pq` - plan queue: holds Claude Code plans and runs them as unattended implementer sessions, one worktree each, via `wt`.
 - `~/.claude/settings.json` - Claude Code settings. Agent status now comes from Herdr's built-in Claude integration (`herdr integration install claude`), which installs a `SessionStart` hook. Git-tracked for reference but applied manually - `install.sh` does not touch `~/.claude`.
-- `~/.claude/skills/design-review` - the `/design-review` skill: an independent review of a built UI against its design, run by `pq` on every task built from a design and usable on its own. Applied manually, as a symlink: `ln -s ~/projects/dotfiles/.claude/skills/design-review ~/.claude/skills/design-review`.
+- `~/.claude/skills/design-review` - the `/design-review` skill: an independent review of a built UI against its design, run by `pq` on every pull request built from a design that draws a screen, and usable on its own. Applied manually, as a symlink: `ln -s ~/projects/dotfiles/.claude/skills/design-review ~/.claude/skills/design-review`.
 - `AGENTS.md` - global agent instructions, read by Claude Code via the `~/.claude/CLAUDE.md` symlink (mirrors `~/AGENTS.md`). Git-tracked for reference but applied manually - the sync scripts don't touch it.
 - Hack Nerd Font.
 
@@ -677,6 +677,17 @@ Code got two independent reviews before a person saw it, and the design got none
 The only comparison against the design was the implementer grading its own screenshots, and differences it had noticed shipped anyway - "Dialog confirm is purple where the design has red" sat in one pull request's own description.
 So a task built from a design - one that carries design files, a design task, or one built on a merged design pull request - gets a design review beside the code review, run by `pq` the same way as the security review.
 
+Being built from a design is not the same as drawing something, though.
+Every plan in a series with screens cites the design, so the series' backend pull requests were design-reviewed too: on #7480 (models, services, a controller) the reviewer wrote "This PR adds no screens", and on #7479 (presenters) "This pull request draws no new UI".
+So a pull request that changes no file that draws a screen gets no design review.
+A file draws when it is a template, a component, a stylesheet, frontend code, copy, an image or font, or a component preview, judged by its path alone like the review tier's rules; tests and generated files do not.
+The rule leans towards reviewing: a component's Ruby class and every script count, because #7482 changed only those and its review found a crash and a padded sheet.
+Of the first 29 design reviews it would have skipped those two and no others.
+What it gives up: #7480's review also checked the new unlock rule against the board's notes and found two bugs the code review had not.
+`pq` reads the pull request's files when the review would launch rather than when the pull request opens, since the agent can push again in between.
+A design task is always reviewed, and files that cannot be read leave the review to run.
+A skipped review is said once in the tick's output, holds nothing, and adds nothing to the follow-up; the implementer's contract already says a pull request that draws nothing gets none.
+
 It is a skill, `/design-review`, kept in this repository under `.claude/skills/design-review` and linked into `~/.claude/skills`, so it can be run by hand on any pull request or branch as well.
 It takes its own screenshots and measurements and never the implementer's: it lists every frame and state of the design, screenshots each at its native width, finds the page or preview that draws it in the running app, screenshots that at the same width and in the same state, and measures what differs with computed styles, so a finding reads "20px/600 in the design, 18px/500 built" rather than "looks smaller".
 It replies with a report - a coverage table of every frame, the findings ranked must-fix first with the file that draws each, the deviations the description already owns, and a one-line verdict.
@@ -687,7 +698,7 @@ Its brief says what the reference is for the kind of task: a design task's previ
 It runs in a browser session of its own (`CHROME_DEVTOOLS_AXI_SESSION=pq-visual-<task>`), so it never drives an implementer's browser, and `pq` stops that browser once the reviewer is collected or killed, since a bridge left running outlives its session by days. It may not post, edit, push, call `gh api`, or run `wt open`, which would open the user's own browser.
 Its report is saved as `visual.md` - the stem is `visual`, since `design` is already the task's directory of design files - and posted on the pull request as one comment, and it shares everything else with the security review: the same ladder, the same tries and retry, the same check that a reply is a whole report, and the same single follow-up, which waits for every review and then names each report in turn.
 A design review that does not happen asks the implementer to compare its screens against the design once more itself.
-`pq ls` reads `design review 4m` while the gate waits on it, and `design review failed` if it did not happen; `--json` carries `visual` and `visual_result`, and the cost ledger a `visual` part.
+`pq ls` reads `design review 4m` while the gate waits on it, and `design review failed` if it did not happen; `--json` carries `visual`, which reads `skipped` for a pull request that draws nothing as it does for one that was STUCK or settled, and `visual_result`, and the cost ledger a `visual` part.
 
 #### Watching a ready pull request
 

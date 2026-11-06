@@ -3695,13 +3695,29 @@ $1/contract.md is how to deliver it: read it before you start and follow it to t
 ${stackc}Never wait for input - there is nobody watching."
 }
 
+# A pull request's files, every page, as the forge returns them: what a merged
+# design's previews, the design review's screen check (screen_files) and the
+# review tier (tier_files) are all read off.
+pr_files() {                            # repo pr -> the API's pages, or a failure
+  (cd "$1" 2>/dev/null && gh api --paginate "repos/{owner}/{repo}/pulls/$2/files" 2>/dev/null)
+}
+# Where tests and generated files live, by path alone, so it is project-agnostic:
+# the usual homes of tests, schema dumps, lockfiles and snapshots across Rails
+# and JS repos. The head of every jq program that reads pr_files' paths, so it
+# is assigned here, above all of them.
+PR_PATHS_JQ='
+  def test_path: test("(^|/)(spec|test|tests|__tests__)/") or test("(_spec|_test|\\.test|\\.spec)\\.[^/]+$");
+  def generated: test("(^|/)db/[a-z_]*(schema\\.rb|structure\\.sql)$") or test("\\.lock$")
+                 or test("(^|/)(package-lock\\.json|pnpm-lock\\.yaml|npm-shrinkwrap\\.json)$")
+                 or test("\\.snap$") or test("(^|/)__snapshots__/");'
+
 # The component previews a merged design pull request added, one path per line:
 # a file under a `previews/` directory, or one named `*_preview.*`, which is
 # where ViewComponent and Lookbook keep them. Nothing when the forge does not
 # answer, which the caller reads as "name the pull request alone".
 design_previews() {                     # repo pr
   local raw
-  raw=$(cd "$1" 2>/dev/null && gh api --paginate "repos/{owner}/{repo}/pulls/$2/files" 2>/dev/null) || return 0
+  raw=$(pr_files "$1" "$2") || return 0
   jq -sr '[ .[] | arrays | .[] | select(.status != "removed") | .filename
             | select(test("(^|/)previews?/") or test("_preview\\.[^/]+$")) ] | unique | .[]' <<<"$raw" 2>/dev/null
   return 0
@@ -4048,6 +4064,10 @@ EOF
     visual_wanted "$d" && cat <<EOF
 This task was built from a design, so pq also runs an independent \`/design-review\` of the pull request: it screenshots and measures your screens against the design in a browser of its own, and its report comes to you with the code review's findings.
 Do not run one yourself; your own comparison, above, is still yours to make before the pull request opens.
+EOF
+    # Only where the review can be skipped: a design task always draws.
+    visual_wanted "$d" && [ "$kind" != design ] && cat <<EOF
+A pull request that changes no file that draws a screen - no template, component, stylesheet, frontend code, copy or asset - gets no design review, and you will hear only about the others.
 EOF
     cat <<EOF
 If you get stuck, or the plan turns out not to fit the code: commit what you have, push, open a draft pull request whose title begins with \`STUCK:\` and whose description explains what blocked you, then stop.
@@ -5282,6 +5302,32 @@ visual_browser_stop() {                 # task_dir
 visual_wanted() {                       # task_dir -> 0 when the task was built from a design
   [ -n "$(hdr "$1/plan.md" design)" ] || [ "$(task_kind "$1")" = design ] || [ -n "$(design_dep "$1")" ]
 }
+# Being built from a design is not the same as drawing something. A plan in a
+# series with screens cites the design whatever it builds, so the backend pull
+# requests of the series were design-reviewed too: on #7480 (models, services,
+# a controller) the reviewer wrote "This PR adds no screens ... there is nothing
+# on screen to capture", and on #7479 (presenters) "This pull request draws no
+# new UI" - $6 and sixteen minutes between them. So a pull request that changes
+# no file that draws a screen gets no design review. A file draws when it is a
+# template, a component, a stylesheet, frontend code, copy, an image or font,
+# or a preview, by path alone like the tier's rules; tests and generated files
+# do not, except a component preview, which lives among the tests and is
+# exactly what a design review opens. The rule leans towards reviewing - a
+# component's Ruby class and every script count, because #7482 changed only
+# those and its review found a crash and a padded sheet - so of the first 29
+# design reviews it would have skipped those two and no others.
+# shellcheck disable=SC2016  # jq, not a shell expansion
+SCREEN_FILES_JQ="$PR_PATHS_JQ"'
+  def preview: test("(^|/)previews/") or test("_preview\\.[^/]+$") or test("\\.stories\\.[^/]+$");
+  def draws: test("(^|/)(views|components|layouts|templates|helpers|assets|frontend|javascript|stylesheets|styles|locales|public)/")
+             or test("\\.(erb|haml|slim|liquid|mustache|hbs|handlebars|html?|svg|css|scss|sass|less|styl|js|mjs|cjs|jsx|ts|tsx|vue|svelte|astro)$")
+             or test("\\.(png|jpe?g|gif|webp|avif|ico|woff2?|ttf|otf|eot)$");
+  [ .[] | arrays | .[] | .filename | select(preview or ((test_path | not) and (generated | not) and draws)) ] | length'
+screen_files() {                        # repo pr -> how many of its files draw a screen, or a failure
+  local raw
+  raw=$(pr_files "$1" "$2") || return 1
+  jq -sr "$SCREEN_FILES_JQ" <<<"$raw" 2>/dev/null
+}
 visual_cmd() {                          # task_dir pr base
   local home; home=$(task_home "$1")
   mkdir -p "$1/visual" 2>/dev/null
@@ -6216,6 +6262,20 @@ report_step() {                         # task_dir dry pr pstate stem
       case "$pstate" in working|blocked|"") return 0 ;; esac
       local at; at=$(st "$d" "${key}_RETRY_AT")
       [ -n "$at" ] && [ "$nowsec" -lt "$at" ] && return 0
+      # A design review only of a pull request that draws a screen (see
+      # SCREEN_FILES_JQ); a design task always does. Read now rather than when
+      # the pull request opened, since the agent can push again before it
+      # stops, and above the fallbacks below, since a change that draws
+      # nothing has nothing to compare by hand either. Files that cannot be
+      # read leave the review to run: a retry would hold the follow-up.
+      if [ "$stem" = visual ] && [ "$(task_kind "$d")" != design ]; then
+        [ "$dry" = 1 ] && { msg "would read #$pr's files and launch a $noun of $slug if one draws a screen"; return 0; }
+        if [ "$(screen_files "$(hdr "$d/plan.md" repo)" "$pr")" = 0 ]; then
+          st_set "$d" "$key" skipped; st_set "$d" "${key}_WHY" noscreen
+          msg "$slug: no $noun of #$pr - it changes no file that draws a screen"
+          return 0
+        fi
+      fi
       if [ "$PQ_REVIEW_MAX_TRIES" = 0 ]; then
         [ "$dry" = 1 ] && { msg "would send $slug straight to its own check in place of the $noun (PQ_REVIEW_MAX_TRIES=0)"; return 0; }
         st_set "$d" "$key" "done"; st_set "$d" "${key}_RESULT" failed
@@ -6667,16 +6727,11 @@ TIER_MARK='<!-- pq:tier -->'
 tier_rank() { case "$1" in visual) printf 1 ;; skim) printf 2 ;; *) printf 3 ;; esac; }
 tier_word() { case "$1" in 1) printf visual ;; 2) printf skim ;; *) printf deep ;; esac; }
 
-# The pull request's files, every page, reduced to app<TAB>migrations: the lines
-# added outside tests and generated files, and how many migration files it adds
-# or changes. Paths only, so it is project-agnostic; the patterns are the usual
-# homes of tests, schema dumps, lockfiles and snapshots across Rails and JS repos.
+# The pull request's files (pr_files) reduced to app<TAB>migrations: the lines
+# added outside tests and generated files (PR_PATHS_JQ), and how many migration
+# files it adds or changes.
 # shellcheck disable=SC2016  # jq, not a shell expansion
-TIER_FILES_JQ='
-  def test_path: test("(^|/)(spec|test|tests|__tests__)/") or test("(_spec|_test|\\.test|\\.spec)\\.[^/]+$");
-  def generated: test("(^|/)db/[a-z_]*(schema\\.rb|structure\\.sql)$") or test("\\.lock$")
-                 or test("(^|/)(package-lock\\.json|pnpm-lock\\.yaml|npm-shrinkwrap\\.json)$")
-                 or test("\\.snap$") or test("(^|/)__snapshots__/");
+TIER_FILES_JQ="$PR_PATHS_JQ"'
   def migration: test("(^|/)db/migrate/") or test("(^|/)migrations/");
   [ .[] | arrays | .[] ] as $f
   | [ ([ $f[] | select((.filename | test_path | not) and (.filename | generated | not)) | .additions ] | add // 0),
@@ -6684,7 +6739,7 @@ TIER_FILES_JQ='
   | @tsv'
 tier_files() {                          # repo pr -> app<TAB>migrations
   local raw
-  raw=$(cd "$1" 2>/dev/null && gh api --paginate "repos/{owner}/{repo}/pulls/$2/files" 2>/dev/null) || return 1
+  raw=$(pr_files "$1" "$2") || return 1
   jq -sr "$TIER_FILES_JQ" <<<"$raw" 2>/dev/null
 }
 
